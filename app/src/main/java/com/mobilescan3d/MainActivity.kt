@@ -407,11 +407,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
         toolbar.addView(toolButton("物体锁定") {
             objectLockEnabled = !objectLockEnabled
-            if (!objectLockEnabled) {
+            NativeBridge.nativeSetObjectLockEnabled(objectLockEnabled)
+            if (objectLockEnabled) {
+                targetOverlay.state = TargetUiState(visible = true, state = 1)
+            } else {
                 NativeBridge.nativeClearTarget()
                 targetOverlay.state = TargetUiState()
             }
-            toast(if (objectLockEnabled) "点击画面中的目标物体" else "已退出物体锁定")
+            toast(if (objectLockEnabled) "点击需要扫描的物体" else "已退出物体锁定")
         },
             android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
         toolbar.addView(toolButton("对焦/防抖") { showFocusStabDialog() },
@@ -951,7 +954,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val norm = viewToCameraNorm(x, y) ?: return
         targetTapX = x
         targetTapY = y
-        NativeBridge.nativeSelectTarget(norm.x, norm.y)
+        val ok = try {
+            NativeBridge.nativeSelectTarget(norm.x, norm.y)
+        } catch (t: Throwable) {
+            false
+        }
+        if (!ok) {
+            targetOverlay.state = TargetUiState(visible = true, state = 1)
+            toast("目标暂时无法锁定，请重新点击")
+            return
+        }
+        targetOverlay.state = TargetUiState(visible = true, state = 2)
         focusAt(x, y)
         targetFocusLocked = true
         targetFocusDistance = lastLensFocusDistance
@@ -1533,7 +1546,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (!s.visible || width <= 0 || height <= 0) return
 
             paint.color = when {
-                s.state == 3 -> android.graphics.Color.RED
+                s.state == 3 -> android.graphics.Color.GREEN
+                s.state == 4 -> android.graphics.Color.RED
                 s.confidence < 0.5f -> android.graphics.Color.YELLOW
                 else -> android.graphics.Color.GREEN
             }

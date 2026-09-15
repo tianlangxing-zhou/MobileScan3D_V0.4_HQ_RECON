@@ -16,6 +16,7 @@ object NativeBridge {
     external fun nativeGetPointCount(): Int
     external fun nativeSelectTarget(u: Float, v: Float): Boolean
     external fun nativeClearTarget()
+    external fun nativeSetObjectLockEnabled(enabled: Boolean)
     external fun nativeGetTargetState(out: FloatArray): Int
     external fun nativeVinsInit(fx: Float, fy: Float, cx: Float, cy: Float, w: Int, h: Int, ric: FloatArray, tic: FloatArray, accN: Float, accW: Float, gyrN: Float, gyrW: Float)
     external fun nativeVinsImu(t: Long, ax: Float, ay: Float, az: Float, gx: Float, gy: Float, gz: Float)

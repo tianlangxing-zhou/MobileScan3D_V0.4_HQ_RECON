@@ -11,6 +11,7 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <utility>
 
 #include "vins/vins_bridge.h"
@@ -38,7 +39,7 @@ static DepthFusion df;
 static AiQualityEngine ai;
 static TsdfEngine tsdf;
 static KeyframeEngine kf;
-static ObjectTracker objectTracker;
+static std::unique_ptr<ObjectTracker> objectTracker;
 static bool vk = false;
 static int mode = 0;
 static uint64_t frames = 0;
@@ -226,6 +227,7 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     ai.reset();
     tsdf.reset();
     kf.reset();
+    objectTracker = std::make_unique<ObjectTracker>();
     aiBackend.initialize(w, h);
     frames = 0;
     lastKF = 0;
@@ -288,6 +290,7 @@ Java_com_mobilescan3d_NativeBridge_nativeDestroy(JNIEnv*, jobject) {
     ai.reset();
     tsdf.reset();
     kf.reset();
+    objectTracker.reset();
     snaps.clear();
 }
 
@@ -338,7 +341,10 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
     const auto vinsEnd = std::chrono::steady_clock::now();
     const double vinsMs = std::chrono::duration<double, std::milli>(vinsEnd - vinsStart).count();
 
-    objectTracker.track(yy, w, h, rs, (uint64_t)frameTs);
+    if (objectTracker) {
+        objectTracker->updateFrame(yy, w, h, rs, (uint64_t)frameTs);
+        objectTracker->track(yy, w, h, rs, (uint64_t)frameTs);
+    }
 
     float vp[7];
     const bool poseOk = vinsGetPose(vp);
@@ -518,12 +524,14 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     e->GetFloatArrayRegion(depth, 0, w * h, d.data());
 
     std::lock_guard<std::mutex> lk(gStateMutex);
-    if (objectTracker.isEnabled()) {
-        if (!objectTracker.isTracking()) {
+    if (objectTracker && objectTracker->isEnabled()) {
+        if (!objectTracker->isTracking()) {
             return;
         }
-        objectTracker.filterDepth(d.data(), w, h, (uint64_t)t);
-        objectTracker.updateFromDepth(d.data(), w, h, (uint64_t)t);
+        objectTracker->updateFromDepth(d.data(), w, h, (uint64_t)t);
+        if (!objectTracker->filterDepth(d.data(), w, h, (uint64_t)t)) {
+            return;
+        }
     }
 
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
@@ -723,20 +731,31 @@ Java_com_mobilescan3d_NativeBridge_nativeGetPointCount(JNIEnv*, jobject) {
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeSelectTarget(JNIEnv*, jobject, jfloat u, jfloat v) {
     std::lock_guard<std::mutex> lk(gStateMutex);
-    objectTracker.select(u, v, 0.0f, 0);
-    return JNI_TRUE;
+    if (!objectTracker) return JNI_FALSE;
+    try {
+        return objectTracker->selectTarget(u, v) ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeClearTarget(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(gStateMutex);
-    objectTracker.clear();
+    if (objectTracker) objectTracker->reset();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetObjectLockEnabled(JNIEnv*, jobject, jboolean enabled) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    if (objectTracker) objectTracker->setEnabled(enabled);
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jfloatArray out) {
     std::lock_guard<std::mutex> lk(gStateMutex);
-    const TargetTrackInfo info = objectTracker.info();
+    if (!objectTracker) return 0;
+    const TargetTrackInfo info = objectTracker->info();
     if (out != nullptr) {
         jfloat* dst = env->GetFloatArrayElements(out, nullptr);
         if (dst != nullptr) {
