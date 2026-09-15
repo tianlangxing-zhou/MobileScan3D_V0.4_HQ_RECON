@@ -1,3 +1,25 @@
+import java.util.Properties
+
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) {
+        file.inputStream().use { load(it) }
+    }
+}
+
+fun requiredLocalPath(name: String): String {
+    return localProperties.getProperty(name)
+        ?.replace("\\", "/")
+        ?: error(
+            "Missing '$name' in local.properties. " +
+                "Please configure Ceres/OpenCV paths."
+        )
+}
+
+val ceresSourceDir = requiredLocalPath("ceres.sourceDir")
+val ceresBuildDir = requiredLocalPath("ceres.buildDir")
+val opencvSdkDir = requiredLocalPath("opencv.sdkDir")
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -15,7 +37,20 @@ android {
         versionCode = 40
         versionName = "0.4.0-hq-recon"
         ndk { abiFilters += listOf("arm64-v8a") }
-        externalNativeBuild { cmake { cppFlags += listOf("-std=c++20", "-O3") } }
+        externalNativeBuild {
+            cmake {
+                cppFlags += listOf(
+                    "-std=c++20",
+                    "-O3"
+                )
+
+                arguments += listOf(
+                    "-DCERES_SOURCE_DIR=$ceresSourceDir",
+                    "-DCERES_BUILD_DIR=$ceresBuildDir",
+                    "-DOPENCV_ANDROID_SDK=$opencvSdkDir"
+                )
+            }
+        }
     }
 
     compileOptions {
