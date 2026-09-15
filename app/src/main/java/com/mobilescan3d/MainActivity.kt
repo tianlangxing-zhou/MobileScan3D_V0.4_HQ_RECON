@@ -1041,6 +1041,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("MobileScan3D 配置反馈报告")
         sb.appendLine("时间戳: ${System.currentTimeMillis()}")
         sb.appendLine()
+        sb.appendLine("[SELF-CHECK SUMMARY]")
+        val warns = mutableListOf<String>()
+        if (NativeBridge.nativeVinsInitialized()) sb.appendLine("PASS VINS") else warns.add("VINS not initialized")
+        if (targetState == 4) warns.add("TARGET_LOST")
+        if (targetTrackedPoints in 1..19) warns.add("TARGET_LOW_FEATURES")
+        if (previewRot != 0) warns.add("DISPLAY_ROTATION_NOT_APPLIED")
+        if (frameMetaMiss > frameMetaHit / 20L && frameMetaHit > 0) warns.add("CAMERA_METADATA_LOSS")
+        if (warns.isEmpty()) {
+            sb.appendLine("overall=PASS")
+        } else {
+            sb.appendLine("overall=WARNING")
+            warns.forEach { sb.appendLine("WARN $it") }
+        }
+        sb.appendLine()
         sb.appendLine("[0] 设备型号: $deviceModel")
         sb.appendLine("    预览方向 sensorOrientation=$sensorOrientation actualPreviewRot=$previewRot")
         sb.appendLine("[1] 相机对焦模式: ${if (fixedFocus) "固定对焦(AF关闭)" else "自动对焦(连续)"}")

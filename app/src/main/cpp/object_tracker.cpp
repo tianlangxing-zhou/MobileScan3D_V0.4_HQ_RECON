@@ -203,6 +203,10 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         info_.prevGrayWidth = prevGray_.cols;
         info_.prevGrayHeight = prevGray_.rows;
         info_.prevPointCount = static_cast<int>(prevPoints_.size());
+        info_.bboxWidthPx = roi.width;
+        info_.bboxHeightPx = roi.height;
+        info_.lastAffineScale = 1.0f;
+        info_.affineScaleEMA = 1.0f;
         info_.timestamp = timestamp;
         info_.acquireSuccess++;
         info_.state = TargetState::TRACKING;
@@ -324,6 +328,13 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.x1 = std::clamp((newCx + halfW) / width, 0.0f, 1.0f);
     info_.y1 = std::clamp((newCy + halfH) / height, 0.0f, 1.0f);
 
+    const int bboxW = static_cast<int>((info_.x1 - info_.x0) * width);
+    const int bboxH = static_cast<int>((info_.y1 - info_.y0) * height);
+    info_.bboxWidthPx = bboxW;
+    info_.bboxHeightPx = bboxH;
+    info_.lastAffineScale = scale;
+    info_.affineScaleEMA = 0.7f * info_.affineScaleEMA + 0.3f * scale;
+
     int inlierCount = 0;
     if (!inliers.empty()) {
         for (int i = 0; i < inliers.rows; ++i) {
@@ -344,6 +355,32 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.prevGrayWidth = prevGray_.cols;
     info_.prevGrayHeight = prevGray_.rows;
     info_.prevPointCount = static_cast<int>(prevPoints_.size());
+
+    if (bboxW < 80 || bboxH < 80 || goodNext.size() < 30) {
+        const int rx0 = std::max(0, static_cast<int>(info_.x0 * width));
+        const int ry0 = std::max(0, static_cast<int>(info_.y0 * height));
+        const int rx1 = std::min(width - 1, static_cast<int>(info_.x1 * width));
+        const int ry1 = std::min(height - 1, static_cast<int>(info_.y1 * height));
+        cv::Rect reseedRect(rx0, ry0, rx1 - rx0 + 1, ry1 - ry0 + 1);
+        reseedRect &= cv::Rect(0, 0, width, height);
+        if (reseedRect.width >= 48 && reseedRect.height >= 48) {
+            cv::Mat reseedGray = owned(reseedRect).clone();
+            std::vector<cv::Point2f> reseedPts;
+            cv::goodFeaturesToTrack(reseedGray, reseedPts, 120, 0.01, 5.0);
+            if (reseedPts.size() >= 20) {
+                prevPoints_.clear();
+                for (auto p : reseedPts) {
+                    p.x += reseedRect.x;
+                    p.y += reseedRect.y;
+                    prevPoints_.push_back(p);
+                }
+                info_.reseedCount++;
+                info_.trackedPoints = static_cast<int>(prevPoints_.size());
+                info_.prevPointCount = info_.trackedPoints;
+                info_.lastError = "reseeded features";
+            }
+        }
+    }
 }
 
 void ObjectTracker::updateFromDepth(const float* depth, int width, int height, uint64_t timestamp)

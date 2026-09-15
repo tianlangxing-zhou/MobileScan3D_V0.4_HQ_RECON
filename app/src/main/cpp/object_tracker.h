@@ -57,6 +57,11 @@ struct TargetTrackInfo
     int prevGrayWidth = 0;
     int prevGrayHeight = 0;
     int prevPointCount = 0;
+    int bboxWidthPx = 0;
+    int bboxHeightPx = 0;
+    float lastAffineScale = 1.0f;
+    float affineScaleEMA = 1.0f;
+    uint64_t reseedCount = 0;
     std::string lastError;
 };
 
