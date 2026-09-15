@@ -692,6 +692,14 @@ void Estimator::optimization()
         }
         else
             ROS_DEBUG("estimate extinsic param");
+        if (ESTIMATE_EXTRINSIC)
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                problem.SetParameterLowerBound(para_Ex_Pose[i], k, -0.10);
+                problem.SetParameterUpperBound(para_Ex_Pose[i], k, 0.10);
+            }
+        }
     }
     if (ESTIMATE_TD)
     {

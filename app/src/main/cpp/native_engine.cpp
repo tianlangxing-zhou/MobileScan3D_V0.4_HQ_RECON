@@ -55,6 +55,13 @@ static float acceptedVinsQ[4] = {0.f, 0.f, 0.f, 1.f};
 static float lastVinsStep = 0.f;
 static uint64_t vinsRejectCount = 0;
 static const char* vinsRejectReason = "";
+static bool haveFirstReject = false;
+static float firstRejectStep = 0.f;
+static float firstRejectT[3] = {0.f, 0.f, 0.f};
+static float firstRejectVelocity = 0.f;
+static float firstRejectAccBias = 0.f;
+static float firstRejectGyroBias = 0.f;
+static double firstRejectTd = 0.0;
 static uint64_t vinsFrames = 0;
 static uint64_t depthFrames = 0;
 static double lastVinsMs = 0.0;
@@ -235,6 +242,13 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     lastVinsStep = 0.f;
     vinsRejectCount = 0;
     vinsRejectReason = "";
+    haveFirstReject = false;
+    firstRejectStep = 0.f;
+    firstRejectT[0] = firstRejectT[1] = firstRejectT[2] = 0.f;
+    firstRejectVelocity = 0.f;
+    firstRejectAccBias = 0.f;
+    firstRejectGyroBias = 0.f;
+    firstRejectTd = 0.0;
     vinsT[0] = vinsT[1] = vinsT[2] = 0;
     vinsQ[0] = vinsQ[1] = vinsQ[2] = 0;
     vinsQ[3] = 1;
@@ -392,6 +406,23 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 vinsRejectReason = "step_or_lost";
                 vinsPoseOk = false;
                 if (haveLastGoodVinsPose) {
+                    if (!haveFirstReject) {
+                        const float dx = vp[0] - lastGoodVinsT[0];
+                        const float dy = vp[1] - lastGoodVinsT[1];
+                        const float dz = vp[2] - lastGoodVinsT[2];
+                        firstRejectStep = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        firstRejectT[0] = vp[0];
+                        firstRejectT[1] = vp[1];
+                        firstRejectT[2] = vp[2];
+                        VinsHealth health;
+                        if (vinsGetHealth(&health)) {
+                            firstRejectVelocity = health.velocity;
+                            firstRejectAccBias = health.accBias;
+                            firstRejectGyroBias = health.gyroBias;
+                            firstRejectTd = health.timeOffset;
+                        }
+                        haveFirstReject = true;
+                    }
                     vinsLostAfterInit = true;
                     snaps.clear();
                 }
@@ -402,6 +433,20 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 vinsRejectReason = "non_finite";
             }
             if (haveLastGoodVinsPose) {
+                if (!haveFirstReject) {
+                    firstRejectStep = 0.f;
+                    firstRejectT[0] = vp[0];
+                    firstRejectT[1] = vp[1];
+                    firstRejectT[2] = vp[2];
+                    VinsHealth health;
+                    if (vinsGetHealth(&health)) {
+                        firstRejectVelocity = health.velocity;
+                        firstRejectAccBias = health.accBias;
+                        firstRejectGyroBias = health.gyroBias;
+                        firstRejectTd = health.timeOffset;
+                    }
+                    haveFirstReject = true;
+                }
                 vinsLostAfterInit = true;
                 snaps.clear();
             }
@@ -559,6 +604,21 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
           << " trackedFeatures=" << health.trackedFeatures
           << " lastImuDt=" << health.lastImuDt
           << " estimatedTD=" << (health.timeOffset * 1000.0) << "ms\n";
+        s << "VINS estimated RIC: ["
+          << health.ric[0] << " " << health.ric[1] << " " << health.ric[2] << "; "
+          << health.ric[3] << " " << health.ric[4] << " " << health.ric[5] << "; "
+          << health.ric[6] << " " << health.ric[7] << " " << health.ric[8] << "]\n";
+        s << "VINS estimated TIC: ("
+          << health.tic[0] << ", " << health.tic[1] << ", " << health.tic[2] << ")\n";
+    }
+
+    if (haveFirstReject) {
+        s << "First VINS reject: step=" << firstRejectStep
+          << " t=(" << firstRejectT[0] << ", " << firstRejectT[1] << ", " << firstRejectT[2] << ")"
+          << " velocity=" << firstRejectVelocity
+          << " accBias=" << firstRejectAccBias
+          << " gyroBias=" << firstRejectGyroBias
+          << " td=" << (firstRejectTd * 1000.0) << "ms\n";
     }
 
     s

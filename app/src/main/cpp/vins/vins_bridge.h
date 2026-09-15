@@ -14,6 +14,8 @@ struct VinsHealth {
 
     double lastImuDt = 0.0;
     double timeOffset = 0.0;
+    float ric[9] = {};
+    float tic[3] = {};
 };
 
 void vinsInit(

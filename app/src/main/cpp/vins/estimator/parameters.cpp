@@ -58,6 +58,11 @@ void setTemporalParams(
     TR = tr;
 }
 
+void setExtrinsicEstimateMode(int mode)
+{
+    ESTIMATE_EXTRINSIC = mode;
+}
+
 void setExtrinsic(const Eigen::Matrix3d& ric, const Eigen::Vector3d& tic) {
     RIC[0] = ric;
     TIC[0] = tic;
