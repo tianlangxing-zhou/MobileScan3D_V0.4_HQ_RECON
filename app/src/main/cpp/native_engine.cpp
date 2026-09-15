@@ -40,7 +40,7 @@ static DepthFusion df;
 static AiQualityEngine ai;
 static TsdfEngine tsdf;
 static KeyframeEngine kf;
-static std::unique_ptr<ObjectTracker> objectTracker;
+static std::shared_ptr<ObjectTracker> objectTracker;
 static bool vk = false;
 static int mode = 0;
 static uint64_t frames = 0;
@@ -228,7 +228,7 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     ai.reset();
     tsdf.reset();
     kf.reset();
-    objectTracker = std::make_unique<ObjectTracker>();
+    objectTracker = std::make_shared<ObjectTracker>();
     aiBackend.initialize(w, h);
     frames = 0;
     lastKF = 0;
@@ -342,9 +342,22 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
     const auto vinsEnd = std::chrono::steady_clock::now();
     const double vinsMs = std::chrono::duration<double, std::milli>(vinsEnd - vinsStart).count();
 
-    if (objectTracker) {
-        objectTracker->updateFrame(yy, w, h, rs, (uint64_t)frameTs);
-        objectTracker->track(yy, w, h, rs, (uint64_t)frameTs);
+    std::shared_ptr<ObjectTracker> tracker;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        tracker = objectTracker;
+    }
+    if (tracker) {
+        try {
+            tracker->updateFrame(yy, w, h, rs, static_cast<uint64_t>(frameTs));
+            tracker->track(yy, w, h, rs, static_cast<uint64_t>(frameTs));
+        } catch (const cv::Exception& ex) {
+            __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Target", "OpenCV tracker exception: %s", ex.what());
+        } catch (const std::exception& ex) {
+            __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Target", "Tracker exception: %s", ex.what());
+        } catch (...) {
+            __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Target", "Unknown tracker exception");
+        }
     }
 
     float vp[7];

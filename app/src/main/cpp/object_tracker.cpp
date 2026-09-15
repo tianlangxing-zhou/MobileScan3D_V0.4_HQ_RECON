@@ -7,6 +7,9 @@
 void ObjectTracker::reset()
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    pendingSelect_.store(false, std::memory_order_release);
+    pendingU_.store(0.5f);
+    pendingV_.store(0.5f);
     enabled_ = false;
     info_ = TargetTrackInfo{};
     lastGray_.release();
@@ -26,6 +29,7 @@ void ObjectTracker::setEnabled(bool enabled)
             info_.state = TargetState::ARMED;
         }
     } else {
+        pendingSelect_.store(false, std::memory_order_release);
         info_.state = TargetState::OFF;
         targetTemplate_.release();
         mask_.release();
@@ -203,6 +207,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         info_.trackedPoints = static_cast<int>(prevPoints_.size());
         info_.inlierRatio = 1.0f;
         info_.confidence = std::min(1.0f, info_.trackedPoints / 80.0f);
+        info_.timestamp = timestamp;
         info_.state = TargetState::TRACKING;
         info_.lastError.clear();
         havePrev_ = true;
@@ -211,7 +216,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
 
 void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp)
 {
-    if (!gray || width <= 0 || height <= 0 || stride <= 0) {
+    if (!gray || width <= 0 || height <= 0 || stride < width) {
         return;
     }
 
@@ -223,74 +228,104 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
 
     std::lock_guard<std::mutex> lock(mutex_);
     info_.trackerUpdateCalls++;
+
     if (!enabled_ || info_.state != TargetState::TRACKING) {
         return;
     }
 
-    const int x0 = std::max(0, static_cast<int>(info_.x0 * width));
-    const int y0 = std::max(0, static_cast<int>(info_.y0 * height));
-    const int x1 = std::min(width - 1, static_cast<int>(info_.x1 * width));
-    const int y1 = std::min(height - 1, static_cast<int>(info_.y1 * height));
-    if (x1 <= x0 || y1 <= y0) {
-        info_.state = TargetState::LOST;
+    if (timestamp <= info_.timestamp) {
         return;
     }
 
-    cv::Mat roi = owned(cv::Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)).clone();
-    if (!havePrev_) {
-        prevGray_ = roi;
-        cv::goodFeaturesToTrack(prevGray_, prevPoints_, 120, 0.01, 10.0);
-        havePrev_ = true;
-        info_.trackedPoints = static_cast<int>(prevPoints_.size());
-        info_.inlierRatio = 1.0f;
-        info_.timestamp = timestamp;
+    if (!havePrev_ || prevGray_.empty() || prevGray_.size() != owned.size() || prevGray_.type() != owned.type() || prevPoints_.empty()) {
+        info_.state = TargetState::LOST;
+        info_.lastError = "track: invalid previous frame";
         return;
     }
 
     std::vector<cv::Point2f> next;
     std::vector<uint8_t> status;
-    std::vector<float> err;
-    cv::calcOpticalFlowPyrLK(prevGray_, roi, prevPoints_, next, status, err, cv::Size(21, 21), 3);
+    std::vector<float> error;
 
-    std::vector<cv::Point2f> goodPrev, goodNext;
-    for (size_t i = 0; i < status.size(); ++i) {
-        if (status[i] && next[i].x >= 0 && next[i].y >= 0 && next[i].x < roi.cols && next[i].y < roi.rows) {
-            goodPrev.push_back(prevPoints_[i]);
-            goodNext.push_back(next[i]);
-        }
-    }
-
-    if (goodPrev.size() < 20) {
+    try {
+        cv::calcOpticalFlowPyrLK(prevGray_, owned, prevPoints_, next, status, error, cv::Size(21, 21), 3);
+    } catch (const cv::Exception& e) {
         info_.state = TargetState::LOST;
-        info_.trackedPoints = static_cast<int>(goodPrev.size());
-        info_.inlierRatio = 0.0f;
+        info_.lastError = std::string("LK exception: ") + e.what();
         return;
     }
 
-    cv::Mat affine = cv::estimateAffinePartial2D(goodPrev, goodNext);
-    if (!affine.empty()) {
-        const double* a = affine.ptr<double>(0);
-        const double dx = a[2];
-        const double dy = a[5];
-        const float scaleX = static_cast<float>(std::hypot(a[0], a[1]));
-        const float scaleY = static_cast<float>(std::hypot(a[3], a[4]));
-        const float halfW = (x1 - x0) * 0.5f;
-        const float halfH = (y1 - y0) * 0.5f;
-        const float cx = x0 + halfW;
-        const float cy = y0 + halfH;
-        const float newHalfW = std::max(10.0f, halfW * scaleX);
-        const float newHalfH = std::max(10.0f, halfH * scaleY);
-        info_.x0 = std::max(0.0, (cx + dx - newHalfW) / width);
-        info_.y0 = std::max(0.0, (cy + dy - newHalfH) / height);
-        info_.x1 = std::min(1.0, (cx + dx + newHalfW) / width);
-        info_.y1 = std::min(1.0, (cy + dy + newHalfH) / height);
+    std::vector<cv::Point2f> goodPrev, goodNext;
+    for (size_t i = 0; i < status.size() && i < next.size() && i < prevPoints_.size(); ++i) {
+        if (!status[i]) continue;
+        const cv::Point2f& p = next[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
+        if (p.x < 0 || p.y < 0 || p.x >= width || p.y >= height) continue;
+        goodPrev.push_back(prevPoints_[i]);
+        goodNext.push_back(p);
     }
 
-    info_.trackedPoints = static_cast<int>(goodPrev.size());
-    info_.inlierRatio = goodPrev.empty() ? 0.0f : static_cast<float>(goodPrev.size()) / prevPoints_.size();
+    if (goodPrev.size() < 15) {
+        info_.state = TargetState::LOST;
+        info_.trackedPoints = static_cast<int>(goodPrev.size());
+        info_.inlierRatio = 0.0f;
+        info_.lastError = "track: too few LK points";
+        return;
+    }
+
+    cv::Mat inliers;
+    cv::Mat affine;
+    try {
+        affine = cv::estimateAffinePartial2D(goodPrev, goodNext, inliers, cv::RANSAC, 3.0);
+    } catch (const cv::Exception& e) {
+        info_.state = TargetState::LOST;
+        info_.lastError = std::string("affine exception: ") + e.what();
+        return;
+    }
+
+    if (affine.empty()) {
+        info_.state = TargetState::LOST;
+        info_.lastError = "track: affine failed";
+        return;
+    }
+
+    affine.convertTo(affine, CV_64F);
+    const double* a = affine.ptr<double>(0);
+    const double dx = a[2];
+    const double dy = a[5];
+    const float scale = static_cast<float>(std::hypot(a[0], a[1]));
+
+    const float x0 = info_.x0 * width;
+    const float y0 = info_.y0 * height;
+    const float x1 = info_.x1 * width;
+    const float y1 = info_.y1 * height;
+    const float cx = (x0 + x1) * 0.5f;
+    const float cy = (y0 + y1) * 0.5f;
+    const float halfW = std::max(10.0f, (x1 - x0) * 0.5f * scale);
+    const float halfH = std::max(10.0f, (y1 - y0) * 0.5f * scale);
+    const float newCx = cx + static_cast<float>(dx);
+    const float newCy = cy + static_cast<float>(dy);
+
+    info_.x0 = std::clamp((newCx - halfW) / width, 0.0f, 1.0f);
+    info_.y0 = std::clamp((newCy - halfH) / height, 0.0f, 1.0f);
+    info_.x1 = std::clamp((newCx + halfW) / width, 0.0f, 1.0f);
+    info_.y1 = std::clamp((newCy + halfH) / height, 0.0f, 1.0f);
+
+    int inlierCount = 0;
+    if (!inliers.empty()) {
+        for (int i = 0; i < inliers.rows; ++i) {
+            if (inliers.at<uchar>(i)) inlierCount++;
+        }
+    }
+
+    info_.trackedPoints = static_cast<int>(goodNext.size());
+    info_.inlierRatio = goodNext.empty() ? 0.0f : static_cast<float>(inlierCount) / static_cast<float>(goodNext.size());
+    info_.confidence = std::clamp(info_.inlierRatio * std::min(1.0f, info_.trackedPoints / 60.0f), 0.0f, 1.0f);
     info_.timestamp = timestamp;
-    prevGray_ = roi.clone();
-    prevPoints_ = goodNext;
+    info_.lastError.clear();
+
+    prevGray_ = owned.clone();
+    prevPoints_ = std::move(goodNext);
 }
 
 void ObjectTracker::updateFromDepth(const float* depth, int width, int height, uint64_t timestamp)
