@@ -1,0 +1,6 @@
+#version 450
+// V0.2 HQ: placeholder for GPU tile binning. Final pass consumes SoA Gaussian buffers.
+layout(local_size_x = 64) in;
+layout(std430,binding=0) readonly buffer Gaussians { vec4 data[]; } g;
+layout(std430,binding=1) buffer Tiles { uint counts[]; } tiles;
+void main(){ uint id=gl_GlobalInvocationID.x; if(id<g.data.length()) { /* projection/binning implemented in V0.3 */ } }

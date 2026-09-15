@@ -1,0 +1,25 @@
+#version 450
+// V0.2 skeleton: GPU Gaussian projection/binning.
+// Workgroup: one invocation per Gaussian.
+layout(local_size_x = 64) in;
+
+struct Gaussian {
+    vec4 position;
+    vec4 scale;
+    vec4 rotation;
+    vec4 colorOpacity;
+};
+
+layout(std430, set=0, binding=0) readonly buffer Gaussians {
+    Gaussian g[];
+};
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    // TODO V0.2:
+    // 1. frustum cull
+    // 2. project covariance
+    // 3. compute screen-space bbox
+    // 4. tile bin
+    // 5. depth key
+}

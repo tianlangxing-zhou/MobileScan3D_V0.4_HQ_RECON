@@ -1,0 +1,574 @@
+package com.mobilescan3d
+
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.ImageFormat
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
+import android.media.Image
+import android.media.ImageReader
+import android.opengl.GLSurfaceView
+import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
+import android.view.ViewGroup
+import android.widget.TextView
+import java.util.concurrent.atomic.AtomicBoolean
+
+class MainActivity : Activity(), SensorEventListener {
+
+    private lateinit var status: TextView
+    private lateinit var cameraManager: CameraManager
+    private lateinit var sensorManager: SensorManager
+    private lateinit var texture: TextureView
+    private lateinit var glView: GLSurfaceView
+    private lateinit var buildButton: android.widget.Button
+    private lateinit var renderer: PointCloudRenderer
+
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var reader: ImageReader? = null
+    private var cameraThread: HandlerThread? = null
+    private var sensorThread: HandlerThread? = null
+    private var cameraHandler: Handler? = null
+    private val started = AtomicBoolean(false)
+    private var lastSensorNs = 0L
+    private var lastImu = FloatArray(6)
+    private lateinit var depthProvider: DepthProvider
+    private var depthThread: HandlerThread? = null
+    private var depthHandler: Handler? = null
+
+    @Volatile
+    private var depthBusy = false
+
+    private var captureSize: android.util.Size? = null
+    private var sensorOrientation = 90
+    private var previewRotation = 0
+    private var fixedFocus = false
+    private var stabilization = true
+    private var pendingReport: String? = null
+    private var previewSurface: Surface? = null
+    private var scanning = false
+    private var nativeW = 0
+    private var nativeH = 0
+    private var nativeFx = 0f
+    private var nativeFy = 0f
+    private var nativeCx = 0f
+    private var nativeCy = 0f
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val root = android.widget.FrameLayout(this)
+
+        texture = TextureView(this)
+        root.addView(texture, ViewGroup.LayoutParams(-1, -1))
+
+        val density = resources.displayMetrics.density
+        val side = (150 * density).toInt()
+        glView = GLSurfaceView(this)
+        glView.setEGLContextClientVersion(2)
+        glView.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+        glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+        renderer = PointCloudRenderer()
+        glView.setRenderer(renderer)
+        glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        glView.setZOrderOnTop(true)
+        setupPointCloudTouch()
+        root.addView(glView, android.widget.FrameLayout.LayoutParams(
+            side, side, Gravity.BOTTOM or Gravity.START
+        ).apply {
+            bottomMargin = (28 * density).toInt()
+            leftMargin = (24 * density).toInt()
+        })
+
+        val cropFrame = object : android.view.View(this) {
+            private val paint = android.graphics.Paint().apply {
+                style = android.graphics.Paint.Style.STROKE
+                color = android.graphics.Color.argb(210, 0, 220, 255)
+                strokeWidth = 5f
+            }
+            override fun onDraw(canvas: android.graphics.Canvas) {
+                val w = width * 0.78f
+                val h = height * 0.60f
+                val left = (width - w) / 2f
+                val top = (height - h) / 2f
+                canvas.drawRoundRect(left, top, left + w, top + h, 24f, 24f, paint)
+            }
+        }
+        root.addView(cropFrame, ViewGroup.LayoutParams(-1, -1))
+
+        status = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 14f
+            setPadding(28, 42, 28, 28)
+            gravity = Gravity.TOP or Gravity.START
+            text = "MobileScan3D V0.4 HQ Reconstruction\n初始化中…"
+        }
+        root.addView(status, ViewGroup.LayoutParams(-1, -1))
+
+        buildButton = android.widget.Button(this).apply {
+            text = "开始拍摄构建"
+            setTextColor(android.graphics.Color.WHITE)
+            setBackgroundColor(android.graphics.Color.argb(230, 0, 122, 255))
+            setPadding(48, 24, 48, 24)
+            setOnClickListener { toggleScan() }
+        }
+        root.addView(buildButton, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        ).apply { bottomMargin = 90 })
+
+        val optionRow = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER
+            setBackgroundColor(android.graphics.Color.TRANSPARENT)
+        }
+        fun addOptionButton(text: String, onClick: () -> Unit) {
+            val b = android.widget.Button(this).apply {
+                this.text = text
+                setTextColor(android.graphics.Color.WHITE)
+                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                textSize = 15f
+                setPadding(22, 12, 22, 12)
+                setOnClickListener { onClick() }
+            }
+            optionRow.addView(b, android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = 8; marginEnd = 8 })
+        }
+        addOptionButton("旋转画面") { rotatePreview() }
+        addOptionButton("固定对焦") {
+            fixedFocus = !fixedFocus
+            applyCaptureSettings()
+        }
+        addOptionButton("防抖") {
+            stabilization = !stabilization
+            applyCaptureSettings()
+        }
+        addOptionButton("反馈报告") {
+            generateReport()
+        }
+        root.addView(optionRow, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        ).apply { topMargin = 48 })
+
+        setContentView(root)
+
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), 100)
+        } else {
+            startSystem()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 100 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startSystem()
+        }
+    }
+
+    private fun setupPointCloudTouch() {
+        val scaleDetector = android.view.ScaleGestureDetector(this, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: android.view.ScaleGestureDetector): Boolean {
+                renderer.zoom = (renderer.zoom * detector.scaleFactor).coerceIn(0.3f, 4f)
+                return true
+            }
+        })
+        val gestureDetector = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
+            override fun onScroll(e1: android.view.MotionEvent?, e2: android.view.MotionEvent, distanceX: Float, distanceY: Float): Boolean {
+                renderer.rotY += distanceX * 0.4f
+                renderer.rotX = (renderer.rotX + distanceY * 0.4f).coerceIn(-80f, 80f)
+                return true
+            }
+        })
+        glView.setOnTouchListener { _, event ->
+            scaleDetector.onTouchEvent(event)
+            gestureDetector.onTouchEvent(event)
+            true
+        }
+    }
+
+    private fun startSystem() {
+        cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        cameraThread = HandlerThread("CameraCapture").also { it.start() }
+        sensorThread = HandlerThread("IMU").also { it.start() }
+        cameraHandler = Handler(cameraThread!!.looper)
+        depthProvider = DepthProvider(assets)
+        depthThread = HandlerThread("DepthInference").also { it.start() }
+        depthHandler = Handler(depthThread!!.looper)
+        registerImu()
+
+        texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: android.graphics.SurfaceTexture, w: Int, h: Int) {
+                openCamera()
+            }
+
+            override fun onSurfaceTextureSizeChanged(st: android.graphics.SurfaceTexture, w: Int, h: Int) {
+                configureTransform(w, h)
+            }
+
+            override fun onSurfaceTextureDestroyed(st: android.graphics.SurfaceTexture): Boolean {
+                closeCamera()
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) {}
+        }
+        if (texture.isAvailable) {
+            openCamera()
+        }
+    }
+
+    private fun registerImu() {
+        val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        val acc = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val sensorHandler = Handler(sensorThread!!.looper)
+        sensorManager.registerListener(this, gyro, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler)
+        sensorManager.registerListener(this, acc, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler)
+    }
+
+    private fun openCamera() {
+        try {
+            val id = cameraManager.cameraIdList.firstOrNull { cameraId ->
+                cameraManager.getCameraCharacteristics(cameraId)
+                    .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            } ?: cameraManager.cameraIdList.first()
+            val chars = cameraManager.getCameraCharacteristics(id)
+            sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            val outputSizes = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+                .getOutputSizes(ImageFormat.YUV_420_888)
+            val dm = resources.displayMetrics
+            val largest = outputSizes.maxByOrNull { it.width * it.height }
+                ?: sizeFallback(chars)
+            val aspect = if (sensorOrientation == 90 || sensorOrientation == 270) {
+                android.util.Size(largest.height, largest.width)
+            } else {
+                android.util.Size(largest.width, largest.height)
+            }
+            val size = chooseOptimalSize(
+                outputSizes,
+                dm.widthPixels,
+                dm.heightPixels,
+                1920,
+                1440,
+                aspect
+            )
+            captureSize = size
+            val focal = chars.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
+            nativeW = size.width
+            nativeH = size.height
+            nativeFx = focal?.getOrNull(0) ?: size.width * 0.9f
+            nativeFy = focal?.getOrNull(1) ?: size.height * 0.9f
+            nativeCx = focal?.getOrNull(2) ?: size.width * 0.5f
+            nativeCy = focal?.getOrNull(3) ?: size.height * 0.5f
+            NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
+
+            reader = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 4).apply {
+                setOnImageAvailableListener({ r -> r.acquireLatestImage()?.let { processImage(it) } }, cameraHandler)
+            }
+
+            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                return
+            }
+            cameraManager.openCamera(id, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    previewSurface = Surface(texture.surfaceTexture!!)
+                    texture.surfaceTexture!!.setDefaultBufferSize(size.width, size.height)
+                    configureTransform(texture.width, texture.height)
+                    camera.createCaptureSession(listOf(previewSurface, reader!!.surface), object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(session: CameraCaptureSession) {
+                            captureSession = session
+                            applyCaptureSettings()
+                            started.set(true)
+                        }
+
+                        override fun onConfigureFailed(session: CameraCaptureSession) {
+                            status.text = "Camera session failed"
+                        }
+                    }, cameraHandler)
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    camera.close()
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    camera.close()
+                    status.text = "Camera error: $error"
+                }
+            }, cameraHandler)
+        } catch (e: Exception) {
+            status.text = "相机初始化失败：${e.message}"
+        }
+    }
+
+    private fun sizeFallback(chars: CameraCharacteristics): android.util.Size =
+        chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+            .getOutputSizes(ImageFormat.YUV_420_888).first()
+
+    private fun chooseOptimalSize(
+        choices: Array<android.util.Size>,
+        textureViewWidth: Int,
+        textureViewHeight: Int,
+        maxWidth: Int,
+        maxHeight: Int,
+        aspectRatio: android.util.Size
+    ): android.util.Size {
+        val bigEnough = ArrayList<android.util.Size>()
+        val notBigEnough = ArrayList<android.util.Size>()
+        val w = aspectRatio.width
+        val h = aspectRatio.height
+        for (option in choices) {
+            if (option.width <= maxWidth && option.height <= maxHeight &&
+                option.height == option.width * h / w
+            ) {
+                if (option.width >= textureViewWidth && option.height >= textureViewHeight) {
+                    bigEnough.add(option)
+                } else {
+                    notBigEnough.add(option)
+                }
+            }
+        }
+        return when {
+            bigEnough.isNotEmpty() -> java.util.Collections.min(bigEnough, CompareSizesByArea())
+            notBigEnough.isNotEmpty() -> java.util.Collections.max(notBigEnough, CompareSizesByArea())
+            else -> choices[0]
+        }
+    }
+
+    private class CompareSizesByArea : java.util.Comparator<android.util.Size> {
+        override fun compare(lhs: android.util.Size, rhs: android.util.Size): Int =
+            java.lang.Long.signum(lhs.width.toLong() * lhs.height - rhs.width.toLong() * rhs.height)
+    }
+
+    private fun configureTransform(viewW: Int, viewH: Int) {
+        val st = texture.surfaceTexture ?: return
+        val size = captureSize ?: return
+        val rot = ((sensorOrientation + previewRotation) % 360 + 360) % 360
+        val swap = rot == 90 || rot == 270
+        val dw = if (swap) size.height else size.width
+        val dh = if (swap) size.width else size.height
+        val scale = maxOf(viewW.toFloat() / dw, viewH.toFloat() / dh)
+        val matrix = android.graphics.Matrix()
+        matrix.setRotate(rot.toFloat(), size.width / 2f, size.height / 2f)
+        matrix.postScale(scale, scale, size.width / 2f, size.height / 2f)
+        matrix.postTranslate(viewW / 2f - size.width / 2f, viewH / 2f - size.height / 2f)
+        texture.setTransform(matrix)
+    }
+
+    private fun applyCaptureSettings() {
+        val session = captureSession ?: return
+        val camera = cameraDevice ?: return
+        val readerSurface = reader?.surface ?: return
+        val ps = previewSurface ?: return
+        try {
+            val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                addTarget(ps)
+                addTarget(readerSurface)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                if (fixedFocus) {
+                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                } else {
+                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                }
+                set(
+                    CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                    if (stabilization) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                    else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                )
+            }.build()
+            session.setRepeatingRequest(req, null, cameraHandler)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun generateReport() {
+        val sb = StringBuilder()
+        sb.appendLine("MobileScan3D 配置反馈报告")
+        sb.appendLine("时间戳: ${System.currentTimeMillis()}")
+        sb.appendLine()
+        sb.appendLine("[1] 相机对焦模式: ${if (fixedFocus) "固定对焦(AF关闭)" else "自动对焦(连续)"}")
+        sb.appendLine()
+        sb.appendLine("[2] IMU 标定 YAML:")
+        sb.appendLine("    acc_n: 0.1")
+        sb.appendLine("    acc_w: 0.001")
+        sb.appendLine("    gyr_n: 0.001")
+        sb.appendLine("    gyr_w: 0.0001")
+        sb.appendLine("    image_width: $nativeW")
+        sb.appendLine("    image_height: $nativeH")
+        sb.appendLine("    fx: $nativeFx")
+        sb.appendLine("    fy: $nativeFy")
+        sb.appendLine("    cx: $nativeCx")
+        sb.appendLine("    cy: $nativeCy")
+        sb.appendLine("    ric: [1,0,0,0,1,0,0,0,1]  # 相机-IMU旋转(待标定)")
+        sb.appendLine("    tic: [0,0,0]              # 相机-IMU平移(待标定)")
+        sb.appendLine()
+        sb.appendLine("[3] 点云采集计算数据:")
+        sb.appendLine(NativeBridge.nativeGetStats())
+        sb.appendLine()
+        sb.appendLine("[4] 相机防抖(EIS): ${if (stabilization) "开" else "关"}")
+
+        pendingReport = sb.toString()
+        val intent = android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(android.content.Intent.CATEGORY_OPENABLE)
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_TITLE, "config_report_${System.currentTimeMillis()}.txt")
+        }
+        startActivityForResult(intent, 200)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 200 && resultCode == RESULT_OK && data?.data != null) {
+            val text = pendingReport ?: return
+            pendingReport = null
+            try {
+                contentResolver.openOutputStream(data.data!!)?.use { out ->
+                    out.write(text.toByteArray())
+                }
+                android.widget.Toast.makeText(this, "报告已保存", android.widget.Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                android.widget.Toast.makeText(this, "保存失败：${e.message}", android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun processImage(image: Image) {
+        try {
+            val p = image.planes
+            val y = extractPlane(p[0])
+            val u = extractPlane(p[1])
+            val v = extractPlane(p[2])
+            if (scanning) {
+                NativeBridge.nativeOnCameraFrame(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, image.timestamp)
+                scheduleDepth(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride)
+                status.text = "MobileScan3D V0.4 HQ Reconstruction\n" + NativeBridge.nativeGetStats() +
+                        "\n\n下一视角：" + NativeBridge.nativeGetGuidance()
+            }
+        } catch (_: Throwable) {
+        } finally {
+            image.close()
+        }
+    }
+
+    private fun scheduleDepth(y: ByteArray, u: ByteArray, v: ByteArray, w: Int, h: Int, rowStride: Int, uRowStride: Int, uPixelStride: Int) {
+        if (depthBusy) return
+        depthBusy = true
+        depthHandler?.post {
+            try {
+                val depth = FloatArray(w * h)
+                depthProvider.estimate(y, u, v, w, h, rowStride, uRowStride, uPixelStride, depth)
+                NativeBridge.nativeOnDepthMap(depth, w, h, 0.5f)
+            } catch (_: Throwable) {
+            } finally {
+                depthBusy = false
+            }
+        }
+    }
+
+    private fun extractPlane(plane: Image.Plane): ByteArray {
+        val b = plane.buffer
+        val out = ByteArray(b.remaining())
+        b.get(out)
+        return out
+    }
+
+    private fun toggleScan() {
+        if (scanning) stopScan() else startScan()
+    }
+
+    private fun rotatePreview() {
+        previewRotation = (previewRotation + 90) % 360
+        configureTransform(texture.width, texture.height)
+    }
+
+    private fun startScan() {
+        scanning = true
+        NativeBridge.nativeDestroy()
+        NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
+        buildButton.text = "停止并构建"
+        status.text = "MobileScan3D V0.4 HQ Reconstruction\n扫描中…"
+    }
+
+    private fun stopScan() {
+        scanning = false
+        buildButton.text = "开始拍摄构建"
+        exportModel()
+    }
+
+    private fun exportModel() {
+        val dir = getExternalFilesDir(null) ?: filesDir
+        val path = "${dir.absolutePath}/scan_${System.currentTimeMillis()}.ply"
+        val ok = NativeBridge.nativeExportPly(path)
+        android.widget.Toast.makeText(
+            this,
+            if (ok) "模型已导出：$path" else "导出失败（模型数据不足）",
+            android.widget.Toast.LENGTH_LONG
+        ).show()
+    }
+
+    override fun onSensorChanged(e: SensorEvent) {
+        if (lastSensorNs == 0L) lastSensorNs = e.timestamp
+        when (e.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> {
+                lastImu[0] = e.values[0]; lastImu[1] = e.values[1]; lastImu[2] = e.values[2]
+            }
+            Sensor.TYPE_GYROSCOPE -> {
+                lastImu[3] = e.values[0]; lastImu[4] = e.values[1]; lastImu[5] = e.values[2]
+            }
+        }
+        if (e.timestamp - lastSensorNs >= 5_000_000L) {
+            NativeBridge.nativeOnImu(e.timestamp, lastImu[0], lastImu[1], lastImu[2], lastImu[3], lastImu[4], lastImu[5])
+            lastSensorNs = e.timestamp
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    private fun closeCamera() {
+        captureSession?.close(); captureSession = null
+        cameraDevice?.close(); cameraDevice = null
+        reader?.close(); reader = null
+    }
+
+    override fun onPause() {
+        closeCamera()
+        glView.onPause()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        glView.onResume()
+    }
+
+    override fun onDestroy() {
+        started.set(false)
+        sensorManager.unregisterListener(this)
+        NativeBridge.nativeDestroy()
+        cameraThread?.quitSafely()
+        sensorThread?.quitSafely()
+        depthThread?.quitSafely()
+        super.onDestroy()
+    }
+}

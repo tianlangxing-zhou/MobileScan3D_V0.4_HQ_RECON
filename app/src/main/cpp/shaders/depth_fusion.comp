@@ -1,0 +1,4 @@
+#version 450
+// V0.2 HQ: GPU depth fusion interface. Inputs: luma/depth/confidence/keyframe pose.
+layout(local_size_x=16, local_size_y=16) in;
+void main(){ }
