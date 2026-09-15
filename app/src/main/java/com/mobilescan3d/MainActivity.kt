@@ -1178,6 +1178,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    trackedPoints=${out.getOrElse(8) { 0f }.toInt()}")
         sb.appendLine("    inlierRatio=${out.getOrElse(9) { 0f }}")
         sb.appendLine("    AF state=$lastAfState lensFocusDistance=$lastLensFocusDistance focusLocked=$targetFocusLocked relockCount=$focusRelockCount")
+        sb.appendLine(NativeBridge.nativeGetTargetDiagnostics())
 
         pendingReport = sb.toString()
         createReportLauncher.launch("config_report_${System.currentTimeMillis()}.txt")

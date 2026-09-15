@@ -20,6 +20,29 @@ void ObjectTracker::reset()
     havePrev_ = false;
 }
 
+void ObjectTracker::clearTarget()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingSelect_.store(false, std::memory_order_release);
+
+    targetTemplate_.release();
+    mask_.release();
+    prevGray_.release();
+    prevPoints_.clear();
+    havePrev_ = false;
+
+    info_.x0 = 0.f;
+    info_.y0 = 0.f;
+    info_.x1 = 0.f;
+    info_.y1 = 0.f;
+    info_.confidence = 0.f;
+    info_.trackedPoints = 0;
+    info_.inlierRatio = 0.f;
+    info_.medianDepth = 0.f;
+    info_.roiSharpness = 0.f;
+    info_.state = enabled_ ? TargetState::ARMED : TargetState::OFF;
+}
+
 void ObjectTracker::setEnabled(bool enabled)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -44,13 +67,13 @@ bool ObjectTracker::requestTarget(float u, float v)
     if (!std::isfinite(u) || !std::isfinite(v)) {
         return false;
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!enabled_) {
-            info_.lastError = "requestTarget: not enabled";
-            return false;
-        }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!enabled_) {
+        info_.lastError = "requestTarget: not enabled";
+        return false;
     }
+
     pendingU_.store(std::clamp(u, 0.0f, 1.0f));
     pendingV_.store(std::clamp(v, 0.0f, 1.0f));
     pendingSelect_.store(true, std::memory_order_release);
@@ -144,6 +167,11 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!enabled_) {
+        pendingSelect_.store(false, std::memory_order_release);
+        return;
+    }
+
     lastGray_ = owned;
     info_.haveCameraFrame = true;
     info_.frameWidth = width;

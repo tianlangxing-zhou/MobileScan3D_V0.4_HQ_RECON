@@ -757,8 +757,12 @@ Java_com_mobilescan3d_NativeBridge_nativeSelectTarget(JNIEnv*, jobject, jfloat u
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeClearTarget(JNIEnv*, jobject) {
-    std::lock_guard<std::mutex> lk(gStateMutex);
-    if (objectTracker) objectTracker->reset();
+    std::shared_ptr<ObjectTracker> tracker;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        tracker = objectTracker;
+    }
+    if (tracker) tracker->clearTarget();
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -792,4 +796,33 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jf
         }
     }
     return static_cast<jint>(info.state);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobject) {
+    std::shared_ptr<ObjectTracker> tracker;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        tracker = objectTracker;
+    }
+    if (!tracker) {
+        return env->NewStringUTF("tracker=null");
+    }
+
+    const TargetTrackInfo i = tracker->info();
+    std::ostringstream s;
+    s << "haveCameraFrame=" << (i.haveCameraFrame ? "true" : "false") << "\n"
+      << "frame=" << i.frameWidth << "x" << i.frameHeight << "\n"
+      << "lastFrameTs=" << i.lastFrameTs << "\n"
+      << "cameraUpdateCalls=" << i.cameraUpdateCalls << "\n"
+      << "trackerUpdateCalls=" << i.trackerUpdateCalls << "\n"
+      << "selectTargetCalls=" << i.selectTargetCalls << "\n"
+      << "selectTargetSuccess=" << i.selectTargetSuccess << "\n"
+      << "selectTargetFail=" << i.selectTargetFail << "\n"
+      << "templateAllocated=" << (i.targetTemplateAllocated ? "true" : "false") << "\n"
+      << "templateSize=" << i.templateWidth << "x" << i.templateHeight << "\n"
+      << "depthFilterCalls=" << i.depthFilterCalls << "\n"
+      << "depthFilterSkipped=" << i.depthFilterSkipped << "\n"
+      << "lastError=" << i.lastError;
+    return env->NewStringUTF(s.str().c_str());
 }

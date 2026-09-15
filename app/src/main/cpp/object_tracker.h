@@ -57,6 +57,7 @@ public:
     ObjectTracker() = default;
 
     void reset();
+    void clearTarget();
     void setEnabled(bool enabled);
     bool requestTarget(float u, float v);
     bool selectTarget(float u, float v);
