@@ -178,7 +178,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var lastPlyFileBytes: Long? = null
     private var lastPlyExportTs: Long? = null
     private var lastPlySessionId: String? = null
-    private val buildGitSha = "8e35c61"
+    private val buildGitSha = BuildConfig.GIT_COMMIT
 
     private data class TargetUiState(
         val visible: Boolean = false,
@@ -1051,7 +1051,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine()
         sb.appendLine("[SESSION]")
         sb.appendLine("gitCommit=$buildGitSha")
-        sb.appendLine("buildTime=${System.currentTimeMillis()}")
+        sb.appendLine("buildTime=${BuildConfig.BUILD_TIME_MS}")
         sb.appendLine("sessionId=$sessionId")
         sb.appendLine("scanStartTimestamp=$sessionStartTs")
         sb.appendLine("reportTimestamp=${System.currentTimeMillis()}")

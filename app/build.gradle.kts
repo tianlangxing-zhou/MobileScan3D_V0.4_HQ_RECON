@@ -20,6 +20,26 @@ val ceresSourceDir = requiredLocalPath("ceres.sourceDir")
 val ceresBuildDir = requiredLocalPath("ceres.buildDir")
 val opencvSdkDir = requiredLocalPath("opencv.sdkDir")
 
+fun gitOutput(vararg args: String): String {
+    return try {
+        ProcessBuilder("git", *args)
+            .directory(rootProject.projectDir)
+            .redirectErrorStream(true)
+            .start()
+            .inputStream
+            .bufferedReader()
+            .readText()
+            .trim()
+    } catch (_: Exception) {
+        "unknown"
+    }
+}
+
+val gitSha = gitOutput("rev-parse", "--short=8", "HEAD")
+val gitDirty = gitOutput("status", "--porcelain").isNotBlank()
+val gitBuildId = if (gitDirty) "$gitSha-dirty" else gitSha
+val buildTimestamp = System.currentTimeMillis()
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -30,12 +50,18 @@ android {
     compileSdk = 36
     ndkVersion = "27.1.12297006"
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         applicationId = "com.mobilescan3d"
         minSdk = 26
         targetSdk = 36
         versionCode = 40
         versionName = "0.4.0-hq-recon"
+        buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
+        buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake {

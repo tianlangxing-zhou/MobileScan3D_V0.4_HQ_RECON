@@ -537,19 +537,34 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     std::vector<float> d((size_t)w * h);
     e->GetFloatArrayRegion(depth, 0, w * h, d.data());
 
-    std::lock_guard<std::mutex> lk(gStateMutex);
+    {
+        std::shared_ptr<ObjectTracker> tracker;
+        {
+            std::lock_guard<std::mutex> lk(gStateMutex);
+            tracker = objectTracker;
+        }
+        if (tracker && tracker->isTracking()) {
+            tracker->updateFromDepth(d.data(), w, h, (uint64_t)t);
+        }
+    }
+
 #if TARGET_DEPTH_FILTER_ENABLED
-    if (objectTracker && objectTracker->isEnabled()) {
-        if (!objectTracker->isTracking()) {
+    {
+        std::shared_ptr<ObjectTracker> tracker;
+        {
+            std::lock_guard<std::mutex> lk(gStateMutex);
+            tracker = objectTracker;
+        }
+        if (!tracker || !tracker->isEnabled() || !tracker->isTracking()) {
             return;
         }
-        objectTracker->updateFromDepth(d.data(), w, h, (uint64_t)t);
-        if (!objectTracker->filterDepth(d.data(), w, h, (uint64_t)t)) {
+        if (!tracker->filterDepth(d.data(), w, h, (uint64_t)t)) {
             return;
         }
     }
 #endif
 
+    std::lock_guard<std::mutex> lk(gStateMutex);
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
     haveExternalDepth = true;
     depthFrames++;

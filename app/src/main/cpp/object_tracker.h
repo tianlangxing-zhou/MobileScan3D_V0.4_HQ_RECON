@@ -103,6 +103,8 @@ private:
     float trackCy_ = 0.f;
     float trackHalfW_ = 120.f;
     float trackHalfH_ = 120.f;
+    int framesSinceLastReseed_ = 0;
+    int edgeLostFrames_ = 0;
 
     std::atomic<bool> pendingSelect_{false};
     std::atomic<float> pendingU_{0.5f};

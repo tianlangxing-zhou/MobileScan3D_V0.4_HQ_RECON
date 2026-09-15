@@ -331,9 +331,20 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     const float fullArea = static_cast<float>(fullBox.area());
     const float visibleArea = static_cast<float>(visibleBox.area());
     info_.visibleFraction = fullArea > 0.f ? visibleArea / fullArea : 0.f;
-    if (visibleBox.width < 32 || visibleBox.height < 32 || info_.visibleFraction < 0.15f) {
+
+    if (info_.visibleFraction < 0.12f) {
+        edgeLostFrames_++;
+    } else {
+        edgeLostFrames_ = 0;
+    }
+
+    if (edgeLostFrames_ >= 3) {
         markLost("track: target left frame");
         return;
+    }
+
+    if (info_.visibleFraction < 0.40f) {
+        info_.lastEvent = "target near frame edge";
     }
 
     info_.x0 = std::clamp(static_cast<float>(visibleBox.x) / width, 0.0f, 1.0f);
@@ -373,7 +384,11 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.prevGrayHeight = prevGray_.rows;
     info_.prevPointCount = static_cast<int>(prevPoints_.size());
 
-    if (bboxW < 80 || bboxH < 80 || goodNext.size() < 30) {
+    const bool lowFeatures = goodNext.size() < 35;
+    const bool enoughVisible = info_.visibleFraction >= 0.40f;
+    const bool cooldownOk = framesSinceLastReseed_ >= 10;
+
+    if (lowFeatures && enoughVisible && cooldownOk) {
         const int rx0 = std::max(0, static_cast<int>(info_.x0 * width));
         const int ry0 = std::max(0, static_cast<int>(info_.y0 * height));
         const int rx1 = std::min(width - 1, static_cast<int>(info_.x1 * width));
@@ -396,8 +411,13 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                 info_.prevPointCount = info_.trackedPoints;
                 info_.lastEvent = "reseeded " + std::to_string(info_.trackedPoints) + " features";
                 info_.lastError.clear();
+                framesSinceLastReseed_ = 0;
             }
+        } else {
+            framesSinceLastReseed_++;
         }
+    } else {
+        framesSinceLastReseed_++;
     }
 }
 
