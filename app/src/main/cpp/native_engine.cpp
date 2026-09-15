@@ -557,7 +557,8 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
           << " gyroBias=" << health.gyroBias
           << " gravity=" << health.gravity
           << " trackedFeatures=" << health.trackedFeatures
-          << " lastImuDt=" << health.lastImuDt << "\n";
+          << " lastImuDt=" << health.lastImuDt
+          << " estimatedTD=" << (health.timeOffset * 1000.0) << "ms\n";
     }
 
     s

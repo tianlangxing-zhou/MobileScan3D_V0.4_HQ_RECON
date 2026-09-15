@@ -46,6 +46,18 @@ void setEstimatorParams(
     SOLVER_TIME = solverTime;
 }
 
+void setTemporalParams(
+    double td,
+    int estimateTd,
+    int rollingShutter,
+    double tr)
+{
+    TD = td;
+    ESTIMATE_TD = estimateTd;
+    ROLLING_SHUTTER = rollingShutter;
+    TR = tr;
+}
+
 void setExtrinsic(const Eigen::Matrix3d& ric, const Eigen::Vector3d& tic) {
     RIC[0] = ric;
     TIC[0] = tic;

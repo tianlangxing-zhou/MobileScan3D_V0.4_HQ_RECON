@@ -45,6 +45,11 @@ void setEstimatorParams(
     double minParallax,
     int numIterations,
     double solverTime);
+void setTemporalParams(
+    double td,
+    int estimateTd,
+    int rollingShutter,
+    double tr);
 void setExtrinsic(const Eigen::Matrix3d& ric, const Eigen::Vector3d& tic);
 void setImageSize(double row, double col);
 

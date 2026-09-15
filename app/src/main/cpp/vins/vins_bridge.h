@@ -13,6 +13,7 @@ struct VinsHealth {
     int trackedFeatures = 0;
 
     double lastImuDt = 0.0;
+    double timeOffset = 0.0;
 };
 
 void vinsInit(

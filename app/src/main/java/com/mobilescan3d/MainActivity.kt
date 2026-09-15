@@ -167,6 +167,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private val frameMetaLock = Any()
     private val frameMeta = LinkedHashMap<Long, FrameMeta>()
+    private var frameMetaHit = 0L
+    private var frameMetaMiss = 0L
 
     private val captureResultCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
@@ -998,6 +1000,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             sb.appendLine("    Crop region: " + (lastCropRegion ?: "unknown"))
             sb.appendLine("    Distortion correction mode: " + (lastDistortionCorrectionMode ?: "unknown"))
             sb.appendLine("    Lens distortion: " + (lensDistortion?.joinToString(", ") ?: "unknown"))
+            sb.appendLine("    Frame metadata matched: $frameMetaHit")
+            sb.appendLine("    Frame metadata missed: $frameMetaMiss")
+            val poseRef = ch.get(CameraCharacteristics.LENS_POSE_REFERENCE)
+            val poseRot = ch.get(CameraCharacteristics.LENS_POSE_ROTATION)
+            val poseTrans = ch.get(CameraCharacteristics.LENS_POSE_TRANSLATION)
+            sb.appendLine("    Lens pose reference: $poseRef")
+            sb.appendLine("    Lens pose rotation: " + (poseRot?.joinToString(", ") ?: "null"))
+            sb.appendLine("    Lens pose translation: " + (poseTrans?.joinToString(", ") ?: "null"))
         } catch (_: Throwable) {
             sb.appendLine("    摄像头硬件参数读取失败")
         }
@@ -1026,16 +1036,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val v = extractPlane(p[2])
             if (scanning) {
                 val meta = synchronized(frameMetaLock) { frameMeta.remove(ts) }
-                var effectiveSkewNs = meta?.skewNs ?: 0L
-                val active = activeArray
-                val crop = meta?.crop
-                if (crop != null && active.height() > 0) {
-                    val ratio = crop.height().toDouble() / active.height().toDouble()
-                    effectiveSkewNs = (effectiveSkewNs * ratio).toLong()
-                }
-                val exposureNs = meta?.exposureNs ?: 0L
-                val centerOffsetNs = exposureNs / 2L + effectiveSkewNs / 2L
-                val vinsTs = ts + centerOffsetNs
+                if (meta != null) frameMetaHit++ else frameMetaMiss++
+                val vinsTs = ts
                 NativeBridge.nativeOnCameraFrame(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts, vinsTs)
                 scheduleDepth(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts)
                 glView.requestRender()

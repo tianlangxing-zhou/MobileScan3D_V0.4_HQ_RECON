@@ -84,6 +84,7 @@ Java_com_mobilescan3d_NativeBridge_nativeVinsInit(
     g_camera = camodocal::CameraPtr(
         new camodocal::PinholeCamera("cam0", w, h, 0.0, 0.0, 0.0, 0.0, fx, fy, cx, cy));
     g_tracker[0].setCamera(g_camera);
+    setTemporalParams(0.0, 1, 0, 0.0);
     g_estimator.setParameter();
     g_vinsReady = true;
 }
@@ -207,6 +208,7 @@ void vinsInit(
     // 重复初始化（如重开相机/二次扫描）时清掉滑窗与预积分的残留状态，
     // 否则旧内参/旧时刻的滑窗会与新会话混跑。clearState 后必须重新 setParameter。
     g_estimator.clearState();
+    setTemporalParams(0.0, 1, 0, 0.0);
     g_estimator.setParameter();
     g_estimatorTime = -1.0;
     g_lastEstimatorAcc.setZero();
@@ -397,7 +399,12 @@ void vinsInputImage(double t, const std::uint8_t* gray, int w, int h, int stride
         return;
     }
 
-    if (!processImuUntil(t)) {
+    double syncTime = t;
+    if (ESTIMATE_TD) {
+        syncTime += g_estimator.td;
+    }
+
+    if (!processImuUntil(syncTime)) {
         return;
     }
 
@@ -460,6 +467,7 @@ bool vinsGetHealth(VinsHealth* out) {
         g_estimator.f_manager.last_track_num;
 
     out->lastImuDt = g_lastImuDt;
+    out->timeOffset = g_estimator.td;
 
     return true;
 }

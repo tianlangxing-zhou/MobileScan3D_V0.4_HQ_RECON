@@ -696,7 +696,8 @@ void Estimator::optimization()
     if (ESTIMATE_TD)
     {
         problem.AddParameterBlock(para_Td[0], 1);
-        //problem.SetParameterBlockConstant(para_Td[0]);
+        problem.SetParameterLowerBound(para_Td[0], 0, -0.030);
+        problem.SetParameterUpperBound(para_Td[0], 0, 0.030);
     }
 
     TicToc t_whole, t_prepare;
