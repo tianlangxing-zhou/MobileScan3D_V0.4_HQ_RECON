@@ -969,7 +969,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             return
         }
         targetOverlay.state = TargetUiState(visible = true, state = 2)
-        focusAt(x, y)
+        // 崩溃隔离测试阶段暂时禁用
+        // focusAt(x, y)
         targetFocusLocked = false
         targetFocusDistance = null
         updateTargetOverlay()
@@ -1241,6 +1242,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         cameraHandler?.post {
             NativeBridge.nativeDestroy()
             NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
+            if (objectLockEnabled) {
+                NativeBridge.nativeSetObjectLockEnabled(true)
+            }
             sessionCreated = true
         }
         primaryButton.text = "停止实验扫描"

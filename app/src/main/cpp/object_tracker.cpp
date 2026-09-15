@@ -44,6 +44,13 @@ bool ObjectTracker::requestTarget(float u, float v)
     if (!std::isfinite(u) || !std::isfinite(v)) {
         return false;
     }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!enabled_) {
+            info_.lastError = "requestTarget: not enabled";
+            return false;
+        }
+    }
     pendingU_.store(std::clamp(u, 0.0f, 1.0f));
     pendingV_.store(std::clamp(v, 0.0f, 1.0f));
     pendingSelect_.store(true, std::memory_order_release);
@@ -126,7 +133,7 @@ bool ObjectTracker::selectTarget(float u, float v)
 
 void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp)
 {
-    if (!gray || width <= 0 || height <= 0 || stride <= 0) {
+    if (!gray || width <= 0 || height <= 0 || stride < width) {
         return;
     }
 
@@ -294,6 +301,19 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     const double dx = a[2];
     const double dy = a[5];
     const float scale = static_cast<float>(std::hypot(a[0], a[1]));
+
+    if (!std::isfinite(dx) ||
+        !std::isfinite(dy) ||
+        !std::isfinite(scale) ||
+        scale < 0.5f ||
+        scale > 2.0f ||
+        std::abs(dx) > width * 0.5 ||
+        std::abs(dy) > height * 0.5)
+    {
+        info_.state = TargetState::LOST;
+        info_.lastError = "track: insane affine";
+        return;
+    }
 
     const float x0 = info_.x0 * width;
     const float y0 = info_.y0 * height;
