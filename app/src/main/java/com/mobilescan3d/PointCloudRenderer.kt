@@ -19,6 +19,10 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     private val cameraPose = FloatArray(12)
     @Volatile private var cameraFy = 901f
     @Volatile private var cameraImageHeight = 960
+    @Volatile private var cameraFx = 1100f
+    @Volatile private var cameraCx = 640f
+    @Volatile private var cameraCy = 480f
+    @Volatile private var cameraImageWidth = 1280
     private val vertexData = FloatArray(MAX_POINTS * 6)
     private var vertexBuffer: FloatBuffer = ByteBuffer.allocateDirect(MAX_POINTS * 6 * 4)
         .order(ByteOrder.nativeOrder())
@@ -27,6 +31,17 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     fun setCameraIntrinsics(fy: Float, imageHeight: Int) {
         if (fy > 1f && imageHeight > 0) {
             cameraFy = fy
+            cameraImageHeight = imageHeight
+        }
+    }
+
+    fun setCameraModel(fx: Float, fy: Float, cx: Float, cy: Float, imageWidth: Int, imageHeight: Int) {
+        if (fx > 1f && fy > 1f && imageWidth > 0 && imageHeight > 0) {
+            cameraFx = fx
+            cameraFy = fy
+            cameraCx = cx
+            cameraCy = cy
+            cameraImageWidth = imageWidth
             cameraImageHeight = imageHeight
         }
     }

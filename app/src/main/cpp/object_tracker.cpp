@@ -259,19 +259,26 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     }
 
     std::vector<cv::Point2f> next;
-    std::vector<uint8_t> status;
-    std::vector<float> error;
+    std::vector<cv::Point2f> back;
+    std::vector<uint8_t> statusForward;
+    std::vector<uint8_t> statusBackward;
+    std::vector<float> errorForward;
+    std::vector<float> errorBackward;
 
     try {
-        cv::calcOpticalFlowPyrLK(prevGray_, owned, prevPoints_, next, status, error, cv::Size(21, 21), 3);
+        cv::calcOpticalFlowPyrLK(prevGray_, owned, prevPoints_, next, statusForward, errorForward, cv::Size(21, 21), 3);
+        cv::calcOpticalFlowPyrLK(owned, prevGray_, next, back, statusBackward, errorBackward, cv::Size(21, 21), 3);
     } catch (const cv::Exception& e) {
         markLost(std::string("LK exception: ") + e.what());
         return;
     }
 
     std::vector<cv::Point2f> goodPrev, goodNext;
-    for (size_t i = 0; i < status.size() && i < next.size() && i < prevPoints_.size(); ++i) {
-        if (!status[i]) continue;
+    for (size_t i = 0; i < statusForward.size() && i < statusBackward.size() && i < next.size() && i < prevPoints_.size(); ++i) {
+        if (!statusForward[i] || !statusBackward[i]) continue;
+        const float fb = cv::norm(prevPoints_[i] - back[i]);
+        if (fb > 1.5f) continue;
+        if (errorForward[i] > 20.f) continue;
         const cv::Point2f& p = next[i];
         if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
         if (p.x < 0 || p.y < 0 || p.x >= width || p.y >= height) continue;
@@ -364,9 +371,15 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.affineScaleEMA = 0.7f * info_.affineScaleEMA + 0.3f * scale;
 
     int inlierCount = 0;
+    std::vector<cv::Point2f> inlierNext;
     if (!inliers.empty()) {
         for (int i = 0; i < inliers.rows; ++i) {
-            if (inliers.at<uchar>(i)) inlierCount++;
+            if (inliers.at<uchar>(i)) {
+                inlierCount++;
+                if (i < static_cast<int>(goodNext.size())) {
+                    inlierNext.push_back(goodNext[i]);
+                }
+            }
         }
     }
 
@@ -378,7 +391,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.trackSuccess++;
 
     prevGray_ = owned.clone();
-    prevPoints_ = std::move(goodNext);
+    prevPoints_ = inlierNext.empty() ? std::move(goodNext) : std::move(inlierNext);
     info_.prevGrayValid = !prevGray_.empty();
     info_.prevGrayWidth = prevGray_.cols;
     info_.prevGrayHeight = prevGray_.rows;

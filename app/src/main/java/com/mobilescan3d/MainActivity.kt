@@ -245,6 +245,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         super.onCreate(savedInstanceState)
 
         val root = android.widget.FrameLayout(this)
+        val density = resources.displayMetrics.density
 
         texture = TextureView(this)
         root.addView(texture, ViewGroup.LayoutParams(-1, -1))
@@ -281,23 +282,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             }
         }
 
-        val density = resources.displayMetrics.density
-        val side = (180 * density).toInt()
-        glView = GLSurfaceView(this)
-        glView.setEGLContextClientVersion(2)
-        glView.holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
-        glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
-        renderer = PointCloudRenderer()
-        glView.setRenderer(renderer)
-        glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
-        glView.setZOrderOnTop(true)
-        // setupPointCloudTouch()
+        glView = GLSurfaceView(this).apply {
+            setEGLContextClientVersion(2)
+            holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+            setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+            renderer = PointCloudRenderer()
+            setRenderer(renderer)
+            renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+            setZOrderOnTop(true)
+            isClickable = false
+            isFocusable = false
+        }
         root.addView(glView, android.widget.FrameLayout.LayoutParams(
-            side, side, Gravity.BOTTOM or Gravity.START
-        ).apply {
-            bottomMargin = (156 * density).toInt()
-            leftMargin = (16 * density).toInt()
-        })
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ))
 
         hudText = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
@@ -619,7 +618,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             nativeFy = fy0 * scale
             nativeCx = cx0 * scale
             nativeCy = (cy0 - cropTop) * scale
-            renderer.setCameraIntrinsics(nativeFy, nativeH)
+            renderer.setCameraModel(nativeFx, nativeFy, nativeCx, nativeCy, nativeW, nativeH)
             // 重开相机（onResume）不应重置重建状态——nativeCreate 会清空点云/TSDF，
             // 息屏回来一次就把已积累的扫描全部丢掉。只在首次建会话时创建。
             if (!sessionCreated) {
