@@ -19,6 +19,7 @@ object NativeBridge {
     external fun nativeSetObjectLockEnabled(enabled: Boolean)
     external fun nativeGetTargetState(out: FloatArray): Int
     external fun nativeGetTargetDiagnostics(): String
+    external fun nativeGetRenderPose(out: FloatArray): Boolean
     external fun nativeVinsInit(fx: Float, fy: Float, cx: Float, cy: Float, w: Int, h: Int, ric: FloatArray, tic: FloatArray, accN: Float, accW: Float, gyrN: Float, gyrW: Float)
     external fun nativeVinsImu(t: Long, ax: Float, ay: Float, az: Float, gx: Float, gy: Float, gz: Float)
     external fun nativeVinsImage(t: Double, gray: ByteArray, w: Int, h: Int, stride: Int)

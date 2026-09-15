@@ -283,7 +283,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
         glView.setZOrderOnTop(true)
-        setupPointCloudTouch()
+        // setupPointCloudTouch()
         root.addView(glView, android.widget.FrameLayout.LayoutParams(
             side, side, Gravity.BOTTOM or Gravity.START
         ).apply {
@@ -442,29 +442,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 100 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             startSystem()
-        }
-    }
-
-    private fun setupPointCloudTouch() {
-        val scaleDetector = android.view.ScaleGestureDetector(this, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            override fun onScale(detector: android.view.ScaleGestureDetector): Boolean {
-                renderer.zoom = (renderer.zoom * detector.scaleFactor).coerceIn(0.3f, 4f)
-                glView.requestRender()
-                return true
-            }
-        })
-        val gestureDetector = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
-            override fun onScroll(e1: android.view.MotionEvent?, e2: android.view.MotionEvent, distanceX: Float, distanceY: Float): Boolean {
-                renderer.rotY += distanceX * 0.4f
-                renderer.rotX = (renderer.rotX + distanceY * 0.4f).coerceIn(-80f, 80f)
-                glView.requestRender()
-                return true
-            }
-        })
-        glView.setOnTouchListener { _, event ->
-            scaleDetector.onTouchEvent(event)
-            gestureDetector.onTouchEvent(event)
-            true
         }
     }
 
@@ -634,6 +611,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             nativeFy = fy0 * scale
             nativeCx = cx0 * scale
             nativeCy = (cy0 - cropTop) * scale
+            renderer.setCameraIntrinsics(nativeFy, nativeH)
             // 重开相机（onResume）不应重置重建状态——nativeCreate 会清空点云/TSDF，
             // 息屏回来一次就把已积累的扫描全部丢掉。只在首次建会话时创建。
             if (!sessionCreated) {
@@ -1179,6 +1157,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    inlierRatio=${out.getOrElse(9) { 0f }}")
         sb.appendLine("    AF state=$lastAfState lensFocusDistance=$lastLensFocusDistance focusLocked=$targetFocusLocked relockCount=$focusRelockCount")
         sb.appendLine(NativeBridge.nativeGetTargetDiagnostics())
+        sb.appendLine()
+        sb.appendLine("[8] World-Locked Render:")
+        val renderPose = FloatArray(12)
+        val renderPoseValid = NativeBridge.nativeGetRenderPose(renderPose)
+        sb.appendLine("    enabled=true")
+        sb.appendLine("    poseSource=accepted_vins")
+        sb.appendLine("    renderPoseValid=$renderPoseValid")
+        sb.appendLine("    cameraT=(${renderPose[9]}, ${renderPose[10]}, ${renderPose[11]})")
+        sb.appendLine("    autoYaw=false")
+        sb.appendLine("    touchOrbit=false")
 
         pendingReport = sb.toString()
         createReportLauncher.launch("config_report_${System.currentTimeMillis()}.txt")
@@ -1306,7 +1294,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         hudShownPoints += (target - hudShownPoints) * 0.35f
         val shown = hudShownPoints.toInt()
         hudText.text = if (hudExpanded) {
-            "点云 $shown 点 · 非米制、不拼接\n拖动旋转，双指缩放"
+            "点云 $shown 点 · 世界锁定\n视角跟随 VINS 相机"
         } else {
             "点云 $shown 点 · 非米制"
         }

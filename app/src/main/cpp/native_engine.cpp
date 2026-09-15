@@ -834,3 +834,25 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "lastError=" << i.lastError;
     return env->NewStringUTF(s.str().c_str());
 }
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetRenderPose(JNIEnv* env, jobject, jfloatArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 12) {
+        return JNI_FALSE;
+    }
+
+    float pose[12];
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        if (!vinsPoseOk || vinsLostAfterInit || !haveLastGoodVinsPose) {
+            return JNI_FALSE;
+        }
+        quatToR(acceptedVinsQ[0], acceptedVinsQ[1], acceptedVinsQ[2], acceptedVinsQ[3], pose);
+        pose[9] = acceptedVinsT[0];
+        pose[10] = acceptedVinsT[1];
+        pose[11] = acceptedVinsT[2];
+    }
+
+    env->SetFloatArrayRegion(out, 0, 12, pose);
+    return JNI_TRUE;
+}
