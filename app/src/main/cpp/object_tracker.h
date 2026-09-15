@@ -37,9 +37,14 @@ struct TargetTrackInfo
     uint64_t lastFrameTs = 0;
     uint64_t cameraUpdateCalls = 0;
     uint64_t trackerUpdateCalls = 0;
-    uint64_t selectTargetCalls = 0;
-    uint64_t selectTargetSuccess = 0;
-    uint64_t selectTargetFail = 0;
+    uint64_t targetRequestCalls = 0;
+    uint64_t targetRequestAccepted = 0;
+    uint64_t targetRequestRejected = 0;
+    uint64_t acquireCalls = 0;
+    uint64_t acquireSuccess = 0;
+    uint64_t acquireFail = 0;
+    uint64_t trackSuccess = 0;
+    uint64_t trackLost = 0;
     uint64_t depthFilterCalls = 0;
     uint64_t depthFilterSkipped = 0;
     bool maskAllocated = false;
@@ -48,6 +53,10 @@ struct TargetTrackInfo
     bool targetTemplateAllocated = false;
     int templateWidth = 0;
     int templateHeight = 0;
+    bool prevGrayValid = false;
+    int prevGrayWidth = 0;
+    int prevGrayHeight = 0;
+    int prevPointCount = 0;
     std::string lastError;
 };
 

@@ -40,6 +40,16 @@ void ObjectTracker::clearTarget()
     info_.inlierRatio = 0.f;
     info_.medianDepth = 0.f;
     info_.roiSharpness = 0.f;
+    info_.targetTemplateAllocated = false;
+    info_.templateWidth = 0;
+    info_.templateHeight = 0;
+    info_.maskAllocated = false;
+    info_.maskWidth = 0;
+    info_.maskHeight = 0;
+    info_.prevGrayValid = false;
+    info_.prevGrayWidth = 0;
+    info_.prevGrayHeight = 0;
+    info_.prevPointCount = 0;
     info_.state = enabled_ ? TargetState::ARMED : TargetState::OFF;
 }
 
@@ -64,12 +74,17 @@ void ObjectTracker::setEnabled(bool enabled)
 
 bool ObjectTracker::requestTarget(float u, float v)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
+    info_.targetRequestCalls++;
+
     if (!std::isfinite(u) || !std::isfinite(v)) {
+        info_.targetRequestRejected++;
+        info_.lastError = "requestTarget: invalid coordinate";
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!enabled_) {
+        info_.targetRequestRejected++;
         info_.lastError = "requestTarget: not enabled";
         return false;
     }
@@ -77,6 +92,7 @@ bool ObjectTracker::requestTarget(float u, float v)
     pendingU_.store(std::clamp(u, 0.0f, 1.0f));
     pendingV_.store(std::clamp(v, 0.0f, 1.0f));
     pendingSelect_.store(true, std::memory_order_release);
+    info_.targetRequestAccepted++;
     return true;
 }
 
@@ -87,71 +103,9 @@ void ObjectTracker::setError(const std::string& msg)
 
 bool ObjectTracker::selectTarget(float u, float v)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    info_.selectTargetCalls++;
-    info_.lastError.clear();
-
-    if (!enabled_) {
-        info_.selectTargetFail++;
-        setError("selectTarget: not enabled");
-        return false;
-    }
-    if (!info_.haveCameraFrame || lastGray_.empty()) {
-        info_.selectTargetFail++;
-        setError("selectTarget: no camera frame");
-        return false;
-    }
-    if (lastGray_.type() != CV_8UC1) {
-        info_.selectTargetFail++;
-        setError("selectTarget: bad frame type");
-        return false;
-    }
-
-    const int w = lastGray_.cols;
-    const int h = lastGray_.rows;
-    if (w < 64 || h < 64) {
-        info_.selectTargetFail++;
-        setError("selectTarget: frame too small");
-        return false;
-    }
-
-    u = std::clamp(u, 0.0f, 1.0f);
-    v = std::clamp(v, 0.0f, 1.0f);
-    const int cx = std::clamp(static_cast<int>(u * w), 0, w - 1);
-    const int cy = std::clamp(static_cast<int>(v * h), 0, h - 1);
-    const int roiW = std::min(240, w / 3);
-    const int roiH = std::min(240, h / 3);
-
-    cv::Rect wanted(cx - roiW / 2, cy - roiH / 2, roiW, roiH);
-    const cv::Rect imageRect(0, 0, w, h);
-    cv::Rect roi = wanted & imageRect;
-    if (roi.width < 48 || roi.height < 48) {
-        info_.selectTargetFail++;
-        setError("selectTarget: roi too small");
-        return false;
-    }
-
-    targetTemplate_ = lastGray_(roi).clone();
-    if (targetTemplate_.empty()) {
-        info_.selectTargetFail++;
-        setError("selectTarget: template empty");
-        return false;
-    }
-
-    info_.x0 = static_cast<float>(roi.x) / w;
-    info_.y0 = static_cast<float>(roi.y) / h;
-    info_.x1 = static_cast<float>(roi.x + roi.width) / w;
-    info_.y1 = static_cast<float>(roi.y + roi.height) / h;
-    info_.targetTemplateAllocated = true;
-    info_.templateWidth = roi.width;
-    info_.templateHeight = roi.height;
-    info_.state = TargetState::ACQUIRING;
-    info_.selectTargetSuccess++;
-
-    prevGray_.release();
-    prevPoints_.clear();
-    havePrev_ = false;
-    return true;
+    (void)u;
+    (void)v;
+    return false;
 }
 
 void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp)
@@ -203,6 +157,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
     }
 
     if (info_.state == TargetState::ACQUIRING) {
+        info_.acquireCalls++;
         info_.lastError.clear();
         const int x0 = std::max(0, static_cast<int>(info_.x0 * width));
         const int y0 = std::max(0, static_cast<int>(info_.y0 * height));
@@ -211,6 +166,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         cv::Rect roi(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
         roi &= cv::Rect(0, 0, width, height);
         if (roi.width < 48 || roi.height < 48) {
+            info_.acquireFail++;
             info_.lastError = "acquire: ROI too small";
             return;
         }
@@ -225,6 +181,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         std::vector<cv::Point2f> localPts;
         cv::goodFeaturesToTrack(roiGray, localPts, 120, 0.01, 5.0);
         if (localPts.size() < 15) {
+            info_.acquireFail++;
             info_.trackedPoints = static_cast<int>(localPts.size());
             info_.confidence = 0.0f;
             info_.lastError = "acquire: too few features";
@@ -242,7 +199,12 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         info_.trackedPoints = static_cast<int>(prevPoints_.size());
         info_.inlierRatio = 1.0f;
         info_.confidence = std::min(1.0f, info_.trackedPoints / 80.0f);
+        info_.prevGrayValid = !prevGray_.empty();
+        info_.prevGrayWidth = prevGray_.cols;
+        info_.prevGrayHeight = prevGray_.rows;
+        info_.prevPointCount = static_cast<int>(prevPoints_.size());
         info_.timestamp = timestamp;
+        info_.acquireSuccess++;
         info_.state = TargetState::TRACKING;
         info_.lastError.clear();
         havePrev_ = true;
@@ -273,6 +235,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     }
 
     if (!havePrev_ || prevGray_.empty() || prevGray_.size() != owned.size() || prevGray_.type() != owned.type() || prevPoints_.empty()) {
+        info_.trackLost++;
         info_.state = TargetState::LOST;
         info_.lastError = "track: invalid previous frame";
         return;
@@ -301,6 +264,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     }
 
     if (goodPrev.size() < 15) {
+        info_.trackLost++;
         info_.state = TargetState::LOST;
         info_.trackedPoints = static_cast<int>(goodPrev.size());
         info_.inlierRatio = 0.0f;
@@ -319,6 +283,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     }
 
     if (affine.empty()) {
+        info_.trackLost++;
         info_.state = TargetState::LOST;
         info_.lastError = "track: affine failed";
         return;
@@ -371,9 +336,14 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.confidence = std::clamp(info_.inlierRatio * std::min(1.0f, info_.trackedPoints / 60.0f), 0.0f, 1.0f);
     info_.timestamp = timestamp;
     info_.lastError.clear();
+    info_.trackSuccess++;
 
     prevGray_ = owned.clone();
     prevPoints_ = std::move(goodNext);
+    info_.prevGrayValid = !prevGray_.empty();
+    info_.prevGrayWidth = prevGray_.cols;
+    info_.prevGrayHeight = prevGray_.rows;
+    info_.prevPointCount = static_cast<int>(prevPoints_.size());
 }
 
 void ObjectTracker::updateFromDepth(const float* depth, int width, int height, uint64_t timestamp)
