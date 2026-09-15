@@ -165,6 +165,10 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         const int y1 = std::min(height - 1, static_cast<int>(info_.y1 * height));
         cv::Rect roi(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
         roi &= cv::Rect(0, 0, width, height);
+        trackCx_ = roi.x + roi.width * 0.5f;
+        trackCy_ = roi.y + roi.height * 0.5f;
+        trackHalfW_ = roi.width * 0.5f;
+        trackHalfH_ = roi.height * 0.5f;
         if (roi.width < 48 || roi.height < 48) {
             info_.acquireFail++;
             info_.lastError = "acquire: ROI too small";
@@ -312,24 +316,23 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         return;
     }
 
-    const float x0 = info_.x0 * width;
-    const float y0 = info_.y0 * height;
-    const float x1 = info_.x1 * width;
-    const float y1 = info_.y1 * height;
-    const float cx = (x0 + x1) * 0.5f;
-    const float cy = (y0 + y1) * 0.5f;
-    const float halfW = std::max(10.0f, (x1 - x0) * 0.5f * scale);
-    const float halfH = std::max(10.0f, (y1 - y0) * 0.5f * scale);
-    const float newCx = cx + static_cast<float>(dx);
-    const float newCy = cy + static_cast<float>(dy);
+    trackCx_ += static_cast<float>(dx);
+    trackCy_ += static_cast<float>(dy);
 
-    info_.x0 = std::clamp((newCx - halfW) / width, 0.0f, 1.0f);
-    info_.y0 = std::clamp((newCy - halfH) / height, 0.0f, 1.0f);
-    info_.x1 = std::clamp((newCx + halfW) / width, 0.0f, 1.0f);
-    info_.y1 = std::clamp((newCy + halfH) / height, 0.0f, 1.0f);
+    const int left = static_cast<int>(std::floor(trackCx_ - trackHalfW_));
+    const int top = static_cast<int>(std::floor(trackCy_ - trackHalfH_));
+    const int right = static_cast<int>(std::ceil(trackCx_ + trackHalfW_));
+    const int bottom = static_cast<int>(std::ceil(trackCy_ + trackHalfH_));
+    cv::Rect fullBox(left, top, right - left, bottom - top);
+    cv::Rect visibleBox = fullBox & cv::Rect(0, 0, width, height);
 
-    const int bboxW = static_cast<int>((info_.x1 - info_.x0) * width);
-    const int bboxH = static_cast<int>((info_.y1 - info_.y0) * height);
+    info_.x0 = std::clamp(static_cast<float>(visibleBox.x) / width, 0.0f, 1.0f);
+    info_.y0 = std::clamp(static_cast<float>(visibleBox.y) / height, 0.0f, 1.0f);
+    info_.x1 = std::clamp(static_cast<float>(visibleBox.x + visibleBox.width) / width, 0.0f, 1.0f);
+    info_.y1 = std::clamp(static_cast<float>(visibleBox.y + visibleBox.height) / height, 0.0f, 1.0f);
+
+    const int bboxW = visibleBox.width;
+    const int bboxH = visibleBox.height;
     info_.bboxWidthPx = bboxW;
     info_.bboxHeightPx = bboxH;
     info_.lastAffineScale = scale;

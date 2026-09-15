@@ -175,6 +175,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var sessionStartTs = 0L
     private var lastPlyFilename: String? = null
     private var lastPlyVertexCount: Int? = null
+    private var lastPlyFileBytes: Long? = null
+    private var lastPlyExportTs: Long? = null
 
     private data class TargetUiState(
         val visible: Boolean = false,
@@ -1051,6 +1053,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("reportTimestamp=${System.currentTimeMillis()}")
         sb.appendLine("lastPlyFilename=${lastPlyFilename ?: "unknown"}")
         sb.appendLine("plyVertexCount=${lastPlyVertexCount ?: "unknown"}")
+        sb.appendLine("plyFileBytes=${lastPlyFileBytes ?: "unknown"}")
+        sb.appendLine("plyExportTimestamp=${lastPlyExportTs ?: "unknown"}")
         sb.appendLine()
         sb.appendLine("[SELF-CHECK SUMMARY]")
         val warns = mutableListOf<String>()
@@ -1064,6 +1068,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         } else {
             sb.appendLine("overall=WARNING")
             warns.forEach { sb.appendLine("WARN $it") }
+        }
+        val metaTotal = frameMetaHit + frameMetaMiss
+        if (metaTotal > 0) {
+            sb.appendLine("metadataMatchRate=${"%.2f".format(frameMetaHit * 100.0 / metaTotal)}%")
+            sb.appendLine("metadataMissRate=${"%.2f".format(frameMetaMiss * 100.0 / metaTotal)}%")
         }
         sb.appendLine()
         sb.appendLine("[0] 设备型号: $deviceModel")
@@ -1297,14 +1306,31 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val path = "${dir.absolutePath}/$filename"
         val ok = NativeBridge.nativeExportPly(path)
         if (ok) {
+            val plyFile = java.io.File(path)
             lastPlyFilename = filename
-            lastPlyVertexCount = null
+            lastPlyVertexCount = readPlyVertexCount(plyFile)
+            lastPlyFileBytes = plyFile.length()
+            lastPlyExportTs = System.currentTimeMillis()
         }
         android.widget.Toast.makeText(
             this,
             if (ok) "模型已导出：$path" else "导出失败（模型数据不足）",
             android.widget.Toast.LENGTH_LONG
         ).show()
+    }
+
+    private fun readPlyVertexCount(file: java.io.File): Int? {
+        if (!file.exists()) return null
+        file.bufferedReader().use { br ->
+            repeat(32) {
+                val line = br.readLine() ?: return null
+                if (line.startsWith("element vertex ")) {
+                    return line.substringAfter("element vertex ").trim().toIntOrNull()
+                }
+                if (line.trim() == "end_header") return null
+            }
+        }
+        return null
     }
 
     private fun toast(msg: String) {

@@ -93,6 +93,10 @@ private:
     cv::Mat prevGray_;
     std::vector<cv::Point2f> prevPoints_;
     bool havePrev_ = false;
+    float trackCx_ = 0.f;
+    float trackCy_ = 0.f;
+    float trackHalfW_ = 120.f;
+    float trackHalfH_ = 120.f;
 
     std::atomic<bool> pendingSelect_{false};
     std::atomic<float> pendingU_{0.5f};
