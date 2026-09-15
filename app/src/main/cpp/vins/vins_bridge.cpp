@@ -21,6 +21,7 @@ static camodocal::CameraPtr g_camera;
 static FeatureTracker g_tracker[NUM_OF_CAM];
 static Estimator g_estimator;
 static bool g_vinsReady = false;
+static double g_lastImuTimestamp = -1.0;
 // IMU（传感器线程）与图像（相机线程）并发进入 estimator，
 // VINS-Mono 原版靠带锁缓冲队列串行化，移植时被删掉了，这里用互斥锁补上。
 static std::mutex g_vinsMutex;
@@ -80,13 +81,8 @@ Java_com_mobilescan3d_NativeBridge_nativeVinsImu(
         jfloat gx,
         jfloat gy,
         jfloat gz) {
-    if (!g_vinsReady) {
-        return;
-    }
-    const double ts = static_cast<double>(t) * 1e-9;
-    Eigen::Vector3d acc(ax, ay, az);
-    Eigen::Vector3d gyr(gx, gy, gz);
-    g_estimator.processIMU(ts, acc, gyr);
+    const double timestamp = static_cast<double>(t) * 1e-9;
+    vinsInputImu(timestamp, ax, ay, az, gx, gy, gz);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -187,17 +183,36 @@ void vinsInit(
     // 否则旧内参/旧时刻的滑窗会与新会话混跑。clearState 后必须重新 setParameter。
     g_estimator.clearState();
     g_estimator.setParameter();
+    g_lastImuTimestamp = -1.0;
     g_vinsReady = true;
 }
 
-void vinsInputImu(double t, double ax, double ay, double az, double gx, double gy, double gz) {
+void vinsInputImu(double timestamp, double ax, double ay, double az, double gx, double gy, double gz) {
     if (!g_vinsReady) {
         return;
     }
     std::lock_guard<std::mutex> lk(g_vinsMutex);
     Eigen::Vector3d acc(ax, ay, az);
     Eigen::Vector3d gyr(gx, gy, gz);
-    g_estimator.processIMU(t, acc, gyr);
+
+    if (g_lastImuTimestamp < 0.0) {
+        g_lastImuTimestamp = timestamp;
+        g_estimator.processIMU(0.0, acc, gyr);
+        return;
+    }
+
+    const double dt = timestamp - g_lastImuTimestamp;
+    g_lastImuTimestamp = timestamp;
+
+    if (dt <= 0.0) {
+        return;
+    }
+
+    if (dt > 0.1) {
+        return;
+    }
+
+    g_estimator.processIMU(dt, acc, gyr);
 }
 
 void vinsInputImage(double t, const std::uint8_t* gray, int w, int h, int stride) {
