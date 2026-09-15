@@ -22,6 +22,7 @@ static FeatureTracker g_tracker[NUM_OF_CAM];
 static Estimator g_estimator;
 static bool g_vinsReady = false;
 static double g_lastImuTimestamp = -1.0;
+static double g_lastImuDt = 0.0;
 static double g_lastFeaturePubTimestamp = -1.0;
 static bool g_firstFeaturePublish = true;
 // IMU（传感器线程）与图像（相机线程）并发进入 estimator，
@@ -218,6 +219,8 @@ void vinsInputImu(double timestamp, double ax, double ay, double az, double gx, 
         return;
     }
 
+    g_lastImuDt = dt;
+
     g_estimator.processIMU(dt, acc, gyr);
 }
 
@@ -313,4 +316,36 @@ bool vinsReady() {
 
 bool vinsInitialized() {
     return g_vinsReady && g_estimator.solver_flag == Estimator::NON_LINEAR;
+}
+
+bool vinsGetHealth(VinsHealth* out) {
+    if (out == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(g_vinsMutex);
+
+    const int i = WINDOW_SIZE;
+
+    out->initialized =
+        g_estimator.solver_flag == Estimator::NON_LINEAR;
+
+    out->velocity =
+        static_cast<float>(g_estimator.Vs[i].norm());
+
+    out->accBias =
+        static_cast<float>(g_estimator.Bas[i].norm());
+
+    out->gyroBias =
+        static_cast<float>(g_estimator.Bgs[i].norm());
+
+    out->gravity =
+        static_cast<float>(g_estimator.g.norm());
+
+    out->trackedFeatures =
+        g_estimator.f_manager.last_track_num;
+
+    out->lastImuDt = g_lastImuDt;
+
+    return true;
 }

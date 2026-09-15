@@ -496,7 +496,19 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << "VINS: " << (vinsInitialized() ? "nonlinear initialized" : "initializing")
       << "  poseSource: " << (vinsPoseOk ? "vins" : "vio") << "\n"
       << "VINS raw q: (" << vinsQ[0] << ", " << vinsQ[1] << ", " << vinsQ[2] << ", " << vinsQ[3] << ")\n"
-      << "VINS raw t: (" << vinsT[0] << ", " << vinsT[1] << ", " << vinsT[2] << ")\n"
+      << "VINS raw t: (" << vinsT[0] << ", " << vinsT[1] << ", " << vinsT[2] << ")\n";
+
+    VinsHealth health;
+    if (vinsGetHealth(&health)) {
+        s << "VINS health: velocity=" << health.velocity
+          << " accBias=" << health.accBias
+          << " gyroBias=" << health.gyroBias
+          << " gravity=" << health.gravity
+          << " trackedFeatures=" << health.trackedFeatures
+          << " lastImuDt=" << health.lastImuDt << "\n";
+    }
+
+    s
       << "Cam pose t: (" << T[0] << ", " << T[1] << ", " << T[2] << ")\n"
       << "Cam pose R: ["
       << R[0] << ", " << R[1] << ", " << R[2] << "; "

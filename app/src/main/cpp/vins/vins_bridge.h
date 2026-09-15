@@ -2,6 +2,19 @@
 
 #include <cstdint>
 
+struct VinsHealth {
+    bool initialized = false;
+
+    float velocity = 0.0f;
+    float accBias = 0.0f;
+    float gyroBias = 0.0f;
+    float gravity = 0.0f;
+
+    int trackedFeatures = 0;
+
+    double lastImuDt = 0.0;
+};
+
 void vinsInit(
     float fx,
     float fy,
@@ -25,3 +38,5 @@ bool vinsGetPose(float* out7);
 bool vinsReady();
 
 bool vinsInitialized();
+
+bool vinsGetHealth(VinsHealth* out);

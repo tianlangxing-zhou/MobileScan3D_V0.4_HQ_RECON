@@ -136,6 +136,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var focalLengths = floatArrayOf()
     private var apertures = floatArrayOf()
     private var lensFacing = 0
+    private var activePhysicalCameraId: String? = null
+    private var rollingShutterSkewNs: Long? = null
+    private var exposureTimeNs: Long? = null
     private var aeLockAvailable = false
     private var awbLockAvailable = false
     private var manualFocusAvailable = false
@@ -151,6 +154,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var hudShownPoints = 0f
     private var modeLabel = "连续单帧点云"
     @Volatile private var resumed = false
+
+    private val captureResultCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: android.hardware.camera2.TotalCaptureResult
+        ) {
+            activePhysicalCameraId =
+                result.get(android.hardware.camera2.CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+            rollingShutterSkewNs =
+                result.get(android.hardware.camera2.CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW)
+            exposureTimeNs =
+                result.get(android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -813,7 +831,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 }.build()
                 session.capture(trigger, null, cameraHandler)
             }
-            session.setRepeatingRequest(req, null, cameraHandler)
+            session.setRepeatingRequest(req, captureResultCallback, cameraHandler)
         } catch (e: Exception) {
             toast("应用相机参数失败：${e.message}")
         }
@@ -934,6 +952,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                         CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN -> "UNKNOWN"
                         else -> "UNKNOWN_VALUE($timestampSource)"
                     }
+            )
+            sb.appendLine("    Active physical camera: " + (activePhysicalCameraId ?: "unknown"))
+            sb.appendLine(
+                "    Rolling shutter skew: " +
+                    (rollingShutterSkewNs?.let { "${it / 1_000_000.0} ms" } ?: "unknown")
+            )
+            sb.appendLine(
+                "    Exposure time: " +
+                    (exposureTimeNs?.let { "${it / 1_000_000.0} ms" } ?: "unknown")
             )
         } catch (_: Throwable) {
             sb.appendLine("    摄像头硬件参数读取失败")
