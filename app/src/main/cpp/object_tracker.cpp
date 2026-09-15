@@ -35,6 +35,17 @@ void ObjectTracker::setEnabled(bool enabled)
     }
 }
 
+bool ObjectTracker::requestTarget(float u, float v)
+{
+    if (!std::isfinite(u) || !std::isfinite(v)) {
+        return false;
+    }
+    pendingU_.store(std::clamp(u, 0.0f, 1.0f));
+    pendingV_.store(std::clamp(v, 0.0f, 1.0f));
+    pendingSelect_.store(true, std::memory_order_release);
+    return true;
+}
+
 void ObjectTracker::setError(const std::string& msg)
 {
     info_.lastError = msg;
@@ -128,6 +139,29 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
     info_.frameHeight = height;
     info_.lastFrameTs = timestamp;
     info_.cameraUpdateCalls++;
+
+    if (pendingSelect_.exchange(false, std::memory_order_acq_rel)) {
+        const float u = pendingU_.load();
+        const float v = pendingV_.load();
+        const int cx = std::clamp(static_cast<int>(u * (width - 1)), 0, width - 1);
+        const int cy = std::clamp(static_cast<int>(v * (height - 1)), 0, height - 1);
+        constexpr int ROI_W = 240;
+        constexpr int ROI_H = 240;
+        cv::Rect wanted(cx - ROI_W / 2, cy - ROI_H / 2, ROI_W, ROI_H);
+        const cv::Rect bounds(0, 0, width, height);
+        cv::Rect roi = wanted & bounds;
+        if (roi.width >= 64 && roi.height >= 64) {
+            info_.x0 = static_cast<float>(roi.x) / width;
+            info_.y0 = static_cast<float>(roi.y) / height;
+            info_.x1 = static_cast<float>(roi.x + roi.width) / width;
+            info_.y1 = static_cast<float>(roi.y + roi.height) / height;
+            info_.state = TargetState::ACQUIRING;
+            targetTemplate_.release();
+            prevGray_.release();
+            prevPoints_.clear();
+            havePrev_ = false;
+        }
+    }
 
     if (info_.state == TargetState::ACQUIRING) {
         info_.lastError.clear();

@@ -26,6 +26,7 @@
 #include "object_tracker.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MobileScan3D", __VA_ARGS__)
+#define TARGET_DEPTH_FILTER_ENABLED 0
 
 // 全局状态被 4 个线程并发访问：IMU 线程（nativeOnImu）、相机线程
 // （nativeOnCameraFrame）、深度线程（nativeOnDepthMap）、GL 渲染/UI 线程
@@ -524,6 +525,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     e->GetFloatArrayRegion(depth, 0, w * h, d.data());
 
     std::lock_guard<std::mutex> lk(gStateMutex);
+#if TARGET_DEPTH_FILTER_ENABLED
     if (objectTracker && objectTracker->isEnabled()) {
         if (!objectTracker->isTracking()) {
             return;
@@ -533,6 +535,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             return;
         }
     }
+#endif
 
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
     haveExternalDepth = true;
@@ -733,7 +736,7 @@ Java_com_mobilescan3d_NativeBridge_nativeSelectTarget(JNIEnv*, jobject, jfloat u
     std::lock_guard<std::mutex> lk(gStateMutex);
     if (!objectTracker) return JNI_FALSE;
     try {
-        return objectTracker->selectTarget(u, v) ? JNI_TRUE : JNI_FALSE;
+        return objectTracker->requestTarget(u, v) ? JNI_TRUE : JNI_FALSE;
     } catch (...) {
         return JNI_FALSE;
     }

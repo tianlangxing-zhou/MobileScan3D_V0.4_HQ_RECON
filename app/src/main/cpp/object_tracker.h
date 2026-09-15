@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -57,6 +58,7 @@ public:
 
     void reset();
     void setEnabled(bool enabled);
+    bool requestTarget(float u, float v);
     bool selectTarget(float u, float v);
     void updateFrame(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp);
     void track(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp);
@@ -76,6 +78,10 @@ private:
     cv::Mat prevGray_;
     std::vector<cv::Point2f> prevPoints_;
     bool havePrev_ = false;
+
+    std::atomic<bool> pendingSelect_{false};
+    std::atomic<float> pendingU_{0.5f};
+    std::atomic<float> pendingV_{0.5f};
 
     void setError(const std::string& msg);
 };

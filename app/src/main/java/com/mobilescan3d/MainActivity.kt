@@ -153,6 +153,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var targetState = 0
     private var targetConfidence = 0f
     private var targetTrackedPoints = 0
+    private val targetAfLockEnabled = false
     private var aeLockAvailable = false
     private var awbLockAvailable = false
     private var manualFocusAvailable = false
@@ -867,7 +868,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 if (aeLockAvailable) set(CaptureRequest.CONTROL_AE_LOCK, aeLock)
                 if (awbLockAvailable) set(CaptureRequest.CONTROL_AWB_LOCK, awbLock)
 
-                val afMode = if (targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
+                val afMode = if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
                     CaptureRequest.CONTROL_AF_MODE_OFF
                 } else when {
                     fixedFocus -> CaptureRequest.CONTROL_AF_MODE_OFF
@@ -875,7 +876,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     else -> bestContinuousAfMode()
                 }
                 set(CaptureRequest.CONTROL_AF_MODE, afMode)
-                if (targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
+                if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
                     set(CaptureRequest.LENS_FOCUS_DISTANCE, targetFocusDistance!!)
                 }
                 focusRegion?.let { region ->
@@ -995,7 +996,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun maybeRelockTargetFocus() {
-        if (!objectLockEnabled || !manualFocusAvailable) return
+        if (!targetAfLockEnabled || !objectLockEnabled || !manualFocusAvailable) return
         if (targetState != 3 || targetConfidence <= 0.60f || targetTrackedPoints < 20) return
         if (!targetFocusLocked) {
             targetFocusDistance = lastLensFocusDistance
