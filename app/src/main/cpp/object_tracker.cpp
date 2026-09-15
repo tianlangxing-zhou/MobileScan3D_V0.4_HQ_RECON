@@ -128,6 +128,51 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
     info_.frameHeight = height;
     info_.lastFrameTs = timestamp;
     info_.cameraUpdateCalls++;
+
+    if (info_.state == TargetState::ACQUIRING) {
+        info_.lastError.clear();
+        const int x0 = std::max(0, static_cast<int>(info_.x0 * width));
+        const int y0 = std::max(0, static_cast<int>(info_.y0 * height));
+        const int x1 = std::min(width - 1, static_cast<int>(info_.x1 * width));
+        const int y1 = std::min(height - 1, static_cast<int>(info_.y1 * height));
+        cv::Rect roi(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+        roi &= cv::Rect(0, 0, width, height);
+        if (roi.width < 48 || roi.height < 48) {
+            info_.lastError = "acquire: ROI too small";
+            return;
+        }
+
+        cv::Mat roiGray = owned(roi).clone();
+        cv::Mat lap;
+        cv::Laplacian(roiGray, lap, CV_32F);
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(lap, mean, stddev);
+        info_.roiSharpness = static_cast<float>(stddev[0] * stddev[0]);
+
+        std::vector<cv::Point2f> localPts;
+        cv::goodFeaturesToTrack(roiGray, localPts, 120, 0.01, 5.0);
+        if (localPts.size() < 15) {
+            info_.trackedPoints = static_cast<int>(localPts.size());
+            info_.confidence = 0.0f;
+            info_.lastError = "acquire: too few features";
+            return;
+        }
+
+        prevPoints_.clear();
+        prevPoints_.reserve(localPts.size());
+        for (auto p : localPts) {
+            p.x += roi.x;
+            p.y += roi.y;
+            prevPoints_.push_back(p);
+        }
+        prevGray_ = owned.clone();
+        info_.trackedPoints = static_cast<int>(prevPoints_.size());
+        info_.inlierRatio = 1.0f;
+        info_.confidence = std::min(1.0f, info_.trackedPoints / 80.0f);
+        info_.state = TargetState::TRACKING;
+        info_.lastError.clear();
+        havePrev_ = true;
+    }
 }
 
 void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp)

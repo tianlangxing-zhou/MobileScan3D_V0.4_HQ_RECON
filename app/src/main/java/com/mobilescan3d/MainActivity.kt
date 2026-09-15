@@ -150,6 +150,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var targetTapX = 0f
     private var targetTapY = 0f
     private var targetRelockFrames = 0
+    private var targetState = 0
+    private var targetConfidence = 0f
+    private var targetTrackedPoints = 0
     private var aeLockAvailable = false
     private var awbLockAvailable = false
     private var manualFocusAvailable = false
@@ -966,14 +969,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
         targetOverlay.state = TargetUiState(visible = true, state = 2)
         focusAt(x, y)
-        targetFocusLocked = true
-        targetFocusDistance = lastLensFocusDistance
+        targetFocusLocked = false
+        targetFocusDistance = null
         updateTargetOverlay()
     }
 
     private fun updateTargetOverlay() {
         val out = FloatArray(10)
         val state = NativeBridge.nativeGetTargetState(out)
+        targetState = state
+        targetConfidence = out.getOrElse(5) { 0f }
+        targetTrackedPoints = out.getOrElse(8) { 0f }.toInt()
         targetOverlay.state = TargetUiState(
             visible = state != 0,
             state = state,
@@ -989,7 +995,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun maybeRelockTargetFocus() {
-        if (!objectLockEnabled || !targetFocusLocked || !manualFocusAvailable) return
+        if (!objectLockEnabled || !manualFocusAvailable) return
+        if (targetState != 3 || targetConfidence <= 0.60f || targetTrackedPoints < 20) return
+        if (!targetFocusLocked) {
+            targetFocusDistance = lastLensFocusDistance
+            if (targetFocusDistance != null && targetFocusDistance!! > 0.01f) {
+                targetFocusLocked = true
+                applyCaptureSettings()
+            }
+            return
+        }
         val af = lastAfState ?: return
         val focused = af == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
             af == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
