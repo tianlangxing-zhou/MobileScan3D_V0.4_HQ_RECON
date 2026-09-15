@@ -139,6 +139,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var activePhysicalCameraId: String? = null
     private var rollingShutterSkewNs: Long? = null
     private var exposureTimeNs: Long? = null
+    private var lastCropRegion: android.graphics.Rect? = null
+    private var lastDistortionCorrectionMode: Int? = null
+    private var lensDistortion: FloatArray? = null
     private var aeLockAvailable = false
     private var awbLockAvailable = false
     private var manualFocusAvailable = false
@@ -155,6 +158,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var modeLabel = "连续单帧点云"
     @Volatile private var resumed = false
 
+    private data class FrameMeta(
+        val exposureNs: Long,
+        val skewNs: Long,
+        val crop: android.graphics.Rect?,
+        val physicalId: String?
+    )
+
+    private val frameMetaLock = Any()
+    private val frameMeta = LinkedHashMap<Long, FrameMeta>()
+
     private val captureResultCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
@@ -167,6 +180,25 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 result.get(android.hardware.camera2.CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW)
             exposureTimeNs =
                 result.get(android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME)
+            lastCropRegion =
+                result.get(android.hardware.camera2.CaptureResult.SCALER_CROP_REGION)
+            lastDistortionCorrectionMode =
+                result.get(android.hardware.camera2.CaptureResult.DISTORTION_CORRECTION_MODE)
+
+            val sensorTs = result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP)
+            if (sensorTs != null) {
+                val exposure = exposureTimeNs ?: 0L
+                val skew = rollingShutterSkewNs ?: 0L
+                val crop = lastCropRegion
+                val physicalId = activePhysicalCameraId
+                synchronized(frameMetaLock) {
+                    frameMeta[sensorTs] = FrameMeta(exposure, skew, crop, physicalId)
+                    while (frameMeta.size > 64) {
+                        val key = frameMeta.entries.first().key
+                        frameMeta.remove(key)
+                    }
+                }
+            }
         }
     }
 
@@ -518,6 +550,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             awbLockAvailable = chars.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) ?: false
             minFocusDistance = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
             manualFocusAvailable = minFocusDistance > 0f
+            lensDistortion = chars.get(CameraCharacteristics.LENS_DISTORTION)
             noiseModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: intArrayOf()
             edgeModes = chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: intArrayOf()
             val streamConfig = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
@@ -962,6 +995,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 "    Exposure time: " +
                     (exposureTimeNs?.let { "${it / 1_000_000.0} ms" } ?: "unknown")
             )
+            sb.appendLine("    Crop region: " + (lastCropRegion ?: "unknown"))
+            sb.appendLine("    Distortion correction mode: " + (lastDistortionCorrectionMode ?: "unknown"))
+            sb.appendLine("    Lens distortion: " + (lensDistortion?.joinToString(", ") ?: "unknown"))
         } catch (_: Throwable) {
             sb.appendLine("    摄像头硬件参数读取失败")
         }
@@ -989,7 +1025,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val u = extractPlane(p[1])
             val v = extractPlane(p[2])
             if (scanning) {
-                NativeBridge.nativeOnCameraFrame(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts)
+                val meta = synchronized(frameMetaLock) { frameMeta.remove(ts) }
+                var effectiveSkewNs = meta?.skewNs ?: 0L
+                val active = activeArray
+                val crop = meta?.crop
+                if (crop != null && active.height() > 0) {
+                    val ratio = crop.height().toDouble() / active.height().toDouble()
+                    effectiveSkewNs = (effectiveSkewNs * ratio).toLong()
+                }
+                val exposureNs = meta?.exposureNs ?: 0L
+                val centerOffsetNs = exposureNs / 2L + effectiveSkewNs / 2L
+                val vinsTs = ts + centerOffsetNs
+                NativeBridge.nativeOnCameraFrame(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts, vinsTs)
                 scheduleDepth(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts)
                 glView.requestRender()
             }

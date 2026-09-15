@@ -48,6 +48,13 @@ static bool vinsPoseOk = false;
 static bool haveLastGoodVinsPose = false;
 static float lastGoodVinsT[3] = {0.f, 0.f, 0.f};
 static bool vinsLostAfterInit = false;
+static float rawVinsT[3] = {0.f, 0.f, 0.f};
+static float rawVinsQ[4] = {0.f, 0.f, 0.f, 1.f};
+static float acceptedVinsT[3] = {0.f, 0.f, 0.f};
+static float acceptedVinsQ[4] = {0.f, 0.f, 0.f, 1.f};
+static float lastVinsStep = 0.f;
+static uint64_t vinsRejectCount = 0;
+static const char* vinsRejectReason = "";
 static uint64_t vinsFrames = 0;
 static uint64_t depthFrames = 0;
 static double lastVinsMs = 0.0;
@@ -219,6 +226,15 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     lastGoodVinsT[0] = 0.f;
     lastGoodVinsT[1] = 0.f;
     lastGoodVinsT[2] = 0.f;
+    rawVinsT[0] = rawVinsT[1] = rawVinsT[2] = 0.f;
+    rawVinsQ[0] = rawVinsQ[1] = rawVinsQ[2] = 0.f;
+    rawVinsQ[3] = 1.f;
+    acceptedVinsT[0] = acceptedVinsT[1] = acceptedVinsT[2] = 0.f;
+    acceptedVinsQ[0] = acceptedVinsQ[1] = acceptedVinsQ[2] = 0.f;
+    acceptedVinsQ[3] = 1.f;
+    lastVinsStep = 0.f;
+    vinsRejectCount = 0;
+    vinsRejectReason = "";
     vinsT[0] = vinsT[1] = vinsT[2] = 0;
     vinsQ[0] = vinsQ[1] = vinsQ[2] = 0;
     vinsQ[3] = 1;
@@ -271,7 +287,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
         JNIEnv* e, jobject,
         jbyteArray y, jbyteArray u, jbyteArray v,
-        jint w, jint h, jint rs, jint urs, jint ups, jlong t) {
+        jint w, jint h, jint rs, jint urs, jint ups, jlong frameTs, jlong vinsTs) {
     jsize un = e->GetArrayLength(u);
     std::vector<uint8_t> ubuf((size_t)un);
     e->GetByteArrayRegion(u, 0, un, reinterpret_cast<jbyte*>(ubuf.data()));
@@ -293,7 +309,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
         std::lock_guard<std::mutex> lk(gStateMutex);
         df.ingestLuma(yy, w, h, rs);
         ai.analyze(yy, w, h, rs);
-        vio.frame((uint64_t)t, yy, w, h, rs);
+        vio.frame((uint64_t)frameTs, yy, w, h, rs);
     }
 
     // VINS 可能耗时数十至上百毫秒，持有 gStateMutex 会拖死渲染/UI 线程，
@@ -301,12 +317,21 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
     std::vector<uint8_t> vinsGray((size_t)gVinsW * gVinsH);
     downscaleGray(yy, w, h, rs, vinsGray.data(), gVinsW, gVinsH);
     const auto vinsStart = std::chrono::steady_clock::now();
-    vinsInputImage((double)t * 1e-9, vinsGray.data(), gVinsW, gVinsH, gVinsW);
+    vinsInputImage((double)vinsTs * 1e-9, vinsGray.data(), gVinsW, gVinsH, gVinsW);
     const auto vinsEnd = std::chrono::steady_clock::now();
     const double vinsMs = std::chrono::duration<double, std::milli>(vinsEnd - vinsStart).count();
 
     float vp[7];
     const bool poseOk = vinsGetPose(vp);
+    if (poseOk) {
+        rawVinsT[0] = vp[0];
+        rawVinsT[1] = vp[1];
+        rawVinsT[2] = vp[2];
+        rawVinsQ[0] = vp[3];
+        rawVinsQ[1] = vp[4];
+        rawVinsQ[2] = vp[5];
+        rawVinsQ[3] = vp[6];
+    }
 
     float R[9], T[3];
     {
@@ -341,6 +366,21 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 vinsQ[2] = vp[5];
                 vinsQ[3] = vp[6];
 
+                acceptedVinsT[0] = vp[0];
+                acceptedVinsT[1] = vp[1];
+                acceptedVinsT[2] = vp[2];
+                acceptedVinsQ[0] = vp[3];
+                acceptedVinsQ[1] = vp[4];
+                acceptedVinsQ[2] = vp[5];
+                acceptedVinsQ[3] = vp[6];
+
+                if (haveLastGoodVinsPose) {
+                    const float dx = vp[0] - lastGoodVinsT[0];
+                    const float dy = vp[1] - lastGoodVinsT[1];
+                    const float dz = vp[2] - lastGoodVinsT[2];
+                    lastVinsStep = std::sqrt(dx * dx + dy * dy + dz * dz);
+                }
+
                 lastGoodVinsT[0] = vp[0];
                 lastGoodVinsT[1] = vp[1];
                 lastGoodVinsT[2] = vp[2];
@@ -348,6 +388,8 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 haveLastGoodVinsPose = true;
                 vinsPoseOk = true;
             } else {
+                vinsRejectCount++;
+                vinsRejectReason = "step_or_lost";
                 vinsPoseOk = false;
                 if (haveLastGoodVinsPose) {
                     vinsLostAfterInit = true;
@@ -355,6 +397,10 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 }
             }
         } else {
+            if (poseOk) {
+                vinsRejectCount++;
+                vinsRejectReason = "non_finite";
+            }
             if (haveLastGoodVinsPose) {
                 vinsLostAfterInit = true;
                 snaps.clear();
@@ -365,14 +411,14 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
         if (vinsPoseOk && !vinsLostAfterInit) {
             makePose(R, T);
 
-            bool accept = kf.consider((uint64_t)t, ai.q().sharpness, ai.q().exposure,
+            bool accept = kf.consider((uint64_t)frameTs, ai.q().sharpness, ai.q().exposure,
                                       vio.visualNovelty(), vio.features(),
                                       T[0], T[1], T[2]);
             if (accept) {
                 lastKF++;
             }
 
-            storeSnap((uint64_t)t, w, h, rs, urs, ups, yy, uu, vv, R, T);
+            storeSnap((uint64_t)frameTs, w, h, rs, urs, ups, yy, uu, vv, R, T);
         }
         frames++;
     }
@@ -496,7 +542,13 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << "VINS: " << (vinsInitialized() ? "nonlinear initialized" : "initializing")
       << "  poseSource: " << (vinsPoseOk ? "vins" : "vio") << "\n"
       << "VINS raw q: (" << vinsQ[0] << ", " << vinsQ[1] << ", " << vinsQ[2] << ", " << vinsQ[3] << ")\n"
-      << "VINS raw t: (" << vinsT[0] << ", " << vinsT[1] << ", " << vinsT[2] << ")\n";
+      << "VINS raw t: (" << vinsT[0] << ", " << vinsT[1] << ", " << vinsT[2] << ")\n"
+      << "VINS estimator raw t: (" << rawVinsT[0] << ", " << rawVinsT[1] << ", " << rawVinsT[2] << ")\n"
+      << "VINS accepted t: (" << acceptedVinsT[0] << ", " << acceptedVinsT[1] << ", " << acceptedVinsT[2] << ")\n"
+      << "VINS last step: " << lastVinsStep << "\n"
+      << "VINS reject count: " << vinsRejectCount << "\n"
+      << "VINS reject reason: " << vinsRejectReason << "\n"
+      << "VINS lost latch: " << (vinsLostAfterInit ? "true" : "false") << "\n";
 
     VinsHealth health;
     if (vinsGetHealth(&health)) {
