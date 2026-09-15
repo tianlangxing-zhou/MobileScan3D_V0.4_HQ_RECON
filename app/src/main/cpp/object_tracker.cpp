@@ -107,6 +107,8 @@ void ObjectTracker::markLost(const std::string& reason)
         info_.trackLost++;
     }
     info_.state = TargetState::LOST;
+    info_.confidence = 0.f;
+    info_.inlierRatio = 0.f;
     info_.lastError = reason;
 }
 
@@ -325,6 +327,14 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     const int bottom = static_cast<int>(std::ceil(trackCy_ + trackHalfH_));
     cv::Rect fullBox(left, top, right - left, bottom - top);
     cv::Rect visibleBox = fullBox & cv::Rect(0, 0, width, height);
+
+    const float fullArea = static_cast<float>(fullBox.area());
+    const float visibleArea = static_cast<float>(visibleBox.area());
+    info_.visibleFraction = fullArea > 0.f ? visibleArea / fullArea : 0.f;
+    if (visibleBox.width < 32 || visibleBox.height < 32 || info_.visibleFraction < 0.15f) {
+        markLost("track: target left frame");
+        return;
+    }
 
     info_.x0 = std::clamp(static_cast<float>(visibleBox.x) / width, 0.0f, 1.0f);
     info_.y0 = std::clamp(static_cast<float>(visibleBox.y) / height, 0.0f, 1.0f);

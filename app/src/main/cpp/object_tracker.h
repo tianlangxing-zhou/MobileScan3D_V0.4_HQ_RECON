@@ -63,6 +63,7 @@ struct TargetTrackInfo
     int fullBBoxHeightPx = 0;
     int visibleBBoxWidthPx = 0;
     int visibleBBoxHeightPx = 0;
+    float visibleFraction = 1.0f;
     float lastAffineScale = 1.0f;
     float affineScaleEMA = 1.0f;
     uint64_t reseedCount = 0;

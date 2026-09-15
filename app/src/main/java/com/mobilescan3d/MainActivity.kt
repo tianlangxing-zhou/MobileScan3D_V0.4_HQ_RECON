@@ -178,6 +178,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var lastPlyFileBytes: Long? = null
     private var lastPlyExportTs: Long? = null
     private var lastPlySessionId: String? = null
+    private val buildGitSha = "8e35c61"
 
     private data class TargetUiState(
         val visible: Boolean = false,
@@ -346,7 +347,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             setTextColor(android.graphics.Color.WHITE)
             textSize = 14f
             setTypeface(null, android.graphics.Typeface.BOLD)
-            text = "MobileScan3D 0.5.1 自适应矩阵版"
+            text = "MobileScan3D 0.5.1 · $buildGitSha"
         }
         headerStatus = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
@@ -1049,6 +1050,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("时间戳: ${System.currentTimeMillis()}")
         sb.appendLine()
         sb.appendLine("[SESSION]")
+        sb.appendLine("gitCommit=$buildGitSha")
+        sb.appendLine("buildTime=${System.currentTimeMillis()}")
         sb.appendLine("sessionId=$sessionId")
         sb.appendLine("scanStartTimestamp=$sessionStartTs")
         sb.appendLine("reportTimestamp=${System.currentTimeMillis()}")
