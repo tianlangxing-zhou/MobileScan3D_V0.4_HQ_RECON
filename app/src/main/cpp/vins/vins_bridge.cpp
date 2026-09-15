@@ -62,7 +62,7 @@ Java_com_mobilescan3d_NativeBridge_nativeVinsInit(
         jfloat gyrW) {
     setImageSize((double)h, (double)w);
     setFeatureTrackerParams(h, w, (int)fx, 0, 1, 30, 150, 1.0);
-    setEstimatorParams(accN, accW, gyrN, gyrW, 0.0, 10.0 / 460.0, 8, 0.04);
+    setEstimatorParams(accN, accW, gyrN, gyrW, 5.0, 10.0 / 460.0, 8, 0.04);
 
     jfloat* r = env->GetFloatArrayElements(ric, nullptr);
     jfloat* t = env->GetFloatArrayElements(tic, nullptr);
@@ -84,7 +84,7 @@ Java_com_mobilescan3d_NativeBridge_nativeVinsInit(
     g_camera = camodocal::CameraPtr(
         new camodocal::PinholeCamera("cam0", w, h, 0.0, 0.0, 0.0, 0.0, fx, fy, cx, cy));
     g_tracker[0].setCamera(g_camera);
-    setExtrinsicEstimateMode(1);
+    setExtrinsicEstimateMode(0);
     setTemporalParams(0.0, 1, 0, 0.0);
     g_estimator.setParameter();
     g_vinsReady = true;
@@ -183,7 +183,7 @@ void vinsInit(
         float gyrW) {
     setImageSize((double)h, (double)w);
     setFeatureTrackerParams(h, w, (int)fx, 0, 1, 30, 150, 1.0);
-    setEstimatorParams(accN, accW, gyrN, gyrW, 0.0, 10.0 / 460.0, 8, 0.04);
+    setEstimatorParams(accN, accW, gyrN, gyrW, 5.0, 10.0 / 460.0, 8, 0.04);
 
     Eigen::Matrix3d Ric = Eigen::Matrix3d::Identity();
     Eigen::Vector3d Tic = Eigen::Vector3d::Zero();
@@ -209,7 +209,7 @@ void vinsInit(
     // 重复初始化（如重开相机/二次扫描）时清掉滑窗与预积分的残留状态，
     // 否则旧内参/旧时刻的滑窗会与新会话混跑。clearState 后必须重新 setParameter。
     g_estimator.clearState();
-    setExtrinsicEstimateMode(1);
+    setExtrinsicEstimateMode(0);
     setTemporalParams(0.0, 1, 0, 0.0);
     g_estimator.setParameter();
     g_estimatorTime = -1.0;

@@ -1,5 +1,14 @@
 #include "feature_manager.h"
 
+#include <cmath>
+
+static uint64_t invalidDepthResetCount = 0;
+
+uint64_t featureManagerInvalidDepthResetCount()
+{
+    return invalidDepthResetCount;
+}
+
 int FeaturePerId::endFrame()
 {
     return start_frame + feature_per_frame.size() - 1;
@@ -147,14 +156,29 @@ void FeatureManager::setDepth(const VectorXd &x)
         if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
             continue;
 
-        it_per_id.estimated_depth = 1.0 / x(++feature_index);
-        //ROS_INFO("feature id %d , start_frame %d, depth %f ", it_per_id->feature_id, it_per_id-> start_frame, it_per_id->estimated_depth);
-        if (it_per_id.estimated_depth < 0)
+        const double invDepth = x(++feature_index);
+
+        if (!std::isfinite(invDepth) || invDepth <= 1e-6)
         {
+            it_per_id.estimated_depth = INIT_DEPTH;
             it_per_id.solve_flag = 2;
+            invalidDepthResetCount++;
+            continue;
+        }
+
+        const double depth = 1.0 / invDepth;
+
+        if (!std::isfinite(depth) || depth < 0.1 || depth > 100.0)
+        {
+            it_per_id.estimated_depth = INIT_DEPTH;
+            it_per_id.solve_flag = 2;
+            invalidDepthResetCount++;
         }
         else
+        {
+            it_per_id.estimated_depth = depth;
             it_per_id.solve_flag = 1;
+        }
     }
 }
 
@@ -190,11 +214,16 @@ VectorXd FeatureManager::getDepthVector()
         it_per_id.used_num = it_per_id.feature_per_frame.size();
         if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
             continue;
-#if 1
-        dep_vec(++feature_index) = 1. / it_per_id.estimated_depth;
-#else
-        dep_vec(++feature_index) = it_per_id->estimated_depth;
-#endif
+        double depth = it_per_id.estimated_depth;
+
+        if (!std::isfinite(depth) || depth < 0.1 || depth > 100.0)
+        {
+            depth = INIT_DEPTH;
+            it_per_id.estimated_depth = INIT_DEPTH;
+            invalidDepthResetCount++;
+        }
+
+        dep_vec(++feature_index) = 1.0 / depth;
     }
     return dep_vec;
 }

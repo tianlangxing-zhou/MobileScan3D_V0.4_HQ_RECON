@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "vins/vins_bridge.h"
+#include "vins/estimator/feature_manager.h"
 #include "gaussian_engine.h"
 #include "vio_engine.h"
 #include "depth_fusion.h"
@@ -593,7 +594,8 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << "VINS last step: " << lastVinsStep << "\n"
       << "VINS reject count: " << vinsRejectCount << "\n"
       << "VINS reject reason: " << vinsRejectReason << "\n"
-      << "VINS lost latch: " << (vinsLostAfterInit ? "true" : "false") << "\n";
+      << "VINS lost latch: " << (vinsLostAfterInit ? "true" : "false") << "\n"
+      << "VINS invalid feature depth resets: " << featureManagerInvalidDepthResetCount() << "\n";
 
     VinsHealth health;
     if (vinsGetHealth(&health)) {

@@ -15,6 +15,8 @@ using namespace Eigen;
 
 #include "parameters.h"
 
+uint64_t featureManagerInvalidDepthResetCount();
+
 class FeaturePerFrame
 {
   public:

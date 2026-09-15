@@ -1,6 +1,6 @@
 #include "parameters.h"
 
-double INIT_DEPTH = 0.0;
+double INIT_DEPTH = 5.0;
 double MIN_PARALLAX = 10.0 / 460.0;
 // ESTIMATE_EXTRINSIC=2 的在线标定只有在旋转激励足够并成功收敛后才会放行初始化；
 // 否则会一直停留在 INITIAL，界面表现为“定位失锁”。当前 ric 暂用单位阵，
