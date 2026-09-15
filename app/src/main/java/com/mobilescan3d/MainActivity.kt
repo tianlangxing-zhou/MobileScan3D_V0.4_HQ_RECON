@@ -142,6 +142,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var lastCropRegion: android.graphics.Rect? = null
     private var lastDistortionCorrectionMode: Int? = null
     private var lensDistortion: FloatArray? = null
+    private var lastAfState: Int? = null
+    private var lastLensFocusDistance: Float? = null
+    private var targetFocusDistance: Float? = null
+    private var targetFocusLocked = false
+    private var focusRelockCount = 0
     private var aeLockAvailable = false
     private var awbLockAvailable = false
     private var manualFocusAvailable = false
@@ -186,6 +191,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 result.get(android.hardware.camera2.CaptureResult.SCALER_CROP_REGION)
             lastDistortionCorrectionMode =
                 result.get(android.hardware.camera2.CaptureResult.DISTORTION_CORRECTION_MODE)
+            lastAfState =
+                result.get(android.hardware.camera2.CaptureResult.CONTROL_AF_STATE)
+            lastLensFocusDistance =
+                result.get(android.hardware.camera2.CaptureResult.LENS_FOCUS_DISTANCE)
 
             val sensorTs = result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP)
             if (sensorTs != null) {
@@ -819,12 +828,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 if (aeLockAvailable) set(CaptureRequest.CONTROL_AE_LOCK, aeLock)
                 if (awbLockAvailable) set(CaptureRequest.CONTROL_AWB_LOCK, awbLock)
 
-                val afMode = when {
+                val afMode = if (targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
+                    CaptureRequest.CONTROL_AF_MODE_OFF
+                } else when {
                     fixedFocus -> CaptureRequest.CONTROL_AF_MODE_OFF
                     focusTriggered -> CaptureRequest.CONTROL_AF_MODE_AUTO
                     else -> bestContinuousAfMode()
                 }
                 set(CaptureRequest.CONTROL_AF_MODE, afMode)
+                if (targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
+                    set(CaptureRequest.LENS_FOCUS_DISTANCE, targetFocusDistance!!)
+                }
                 focusRegion?.let { region ->
                     set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
                     set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
@@ -880,12 +894,33 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         else -> CaptureRequest.CONTROL_AF_MODE_AUTO
     }
 
+    private fun viewToCameraNorm(x: Float, y: Float): android.graphics.PointF? {
+        if (texture.width <= 0 || texture.height <= 0) return null
+        val viewMatrix = android.graphics.Matrix()
+        texture.getTransform(viewMatrix)
+        val inverse = android.graphics.Matrix()
+        if (!viewMatrix.invert(inverse)) return null
+        val p = floatArrayOf(x, y)
+        inverse.mapPoints(p)
+        var u = (p[0] / texture.width.toFloat()).coerceIn(0f, 1f)
+        var v = (p[1] / texture.height.toFloat()).coerceIn(0f, 1f)
+        if (hasStAffine) {
+            val a = stAffine
+            val uu = a[0] * u + a[1] * v + a[2]
+            val vv = a[3] * u + a[4] * v + a[5]
+            u = uu
+            v = vv
+        }
+        return android.graphics.PointF(u.coerceIn(0f, 1f), v.coerceIn(0f, 1f))
+    }
+
     private fun focusAt(x: Float, y: Float) {
         if (fixedFocus) return
         val rect = activeArray
         if (rect.isEmpty) return
-        var nx = (x / texture.width).coerceIn(0f, 1f)
-        var ny = (y / texture.height).coerceIn(0f, 1f)
+        val norm = viewToCameraNorm(x, y) ?: return
+        var nx = norm.x
+        var ny = norm.y
         val rot = previewRotationDegrees()
         if (rot == 90 || rot == 270) {
             val t = nx

@@ -12,6 +12,7 @@ add_library(mobilescan3d SHARED
     ai_quality.cpp
     ai_backend.cpp
     tsdf_engine.cpp
+    object_tracker.cpp
     vins_prelude.cpp
     vins_ceres_check.cpp
     vins_opencv_check.cpp

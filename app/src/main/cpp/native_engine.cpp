@@ -22,6 +22,7 @@
 #include "tsdf_engine.h"
 #include "ai_backend.h"
 #include "keyframe_engine.h"
+#include "object_tracker.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MobileScan3D", __VA_ARGS__)
 
@@ -37,6 +38,7 @@ static DepthFusion df;
 static AiQualityEngine ai;
 static TsdfEngine tsdf;
 static KeyframeEngine kf;
+static ObjectTracker objectTracker;
 static bool vk = false;
 static int mode = 0;
 static uint64_t frames = 0;
@@ -514,6 +516,13 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     e->GetFloatArrayRegion(depth, 0, w * h, d.data());
 
     std::lock_guard<std::mutex> lk(gStateMutex);
+    if (objectTracker.isEnabled()) {
+        if (!objectTracker.isTracking()) {
+            return;
+        }
+        objectTracker.filterDepth(d.data(), w, h, (uint64_t)t);
+    }
+
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
     haveExternalDepth = true;
     depthFrames++;
@@ -706,4 +715,43 @@ extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetPointCount(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(gStateMutex);
     return (jint)g.count();
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSelectTarget(JNIEnv*, jobject, jfloat u, jfloat v) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    objectTracker.select(u, v, 0.0f, 0);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeClearTarget(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    objectTracker.clear();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jfloatArray out) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    const TargetTrackInfo info = objectTracker.info();
+    if (out != nullptr) {
+        jfloat* dst = env->GetFloatArrayElements(out, nullptr);
+        if (dst != nullptr) {
+            const jsize n = env->GetArrayLength(out);
+            if (n >= 10) {
+                dst[0] = static_cast<float>(static_cast<int>(info.state));
+                dst[1] = info.x0;
+                dst[2] = info.y0;
+                dst[3] = info.x1;
+                dst[4] = info.y1;
+                dst[5] = info.confidence;
+                dst[6] = info.medianDepth;
+                dst[7] = info.roiSharpness;
+                dst[8] = static_cast<float>(info.trackedPoints);
+                dst[9] = info.inlierRatio;
+            }
+            env->ReleaseFloatArrayElements(out, dst, 0);
+        }
+    }
+    return static_cast<jint>(info.state);
 }
