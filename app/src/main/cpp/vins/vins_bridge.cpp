@@ -22,6 +22,8 @@ static FeatureTracker g_tracker[NUM_OF_CAM];
 static Estimator g_estimator;
 static bool g_vinsReady = false;
 static double g_lastImuTimestamp = -1.0;
+static double g_lastFeaturePubTimestamp = -1.0;
+static bool g_firstFeaturePublish = true;
 // IMU（传感器线程）与图像（相机线程）并发进入 estimator，
 // VINS-Mono 原版靠带锁缓冲队列串行化，移植时被删掉了，这里用互斥锁补上。
 static std::mutex g_vinsMutex;
@@ -178,12 +180,16 @@ void vinsInit(
     g_camera = camodocal::CameraPtr(
         new camodocal::PinholeCamera("cam0", w, h, 0.0, 0.0, 0.0, 0.0, fx, fy, cx, cy));
     std::lock_guard<std::mutex> lk(g_vinsMutex);
+    g_tracker[0] = FeatureTracker();
+    FeatureTracker::n_id = 0;
     g_tracker[0].setCamera(g_camera);
     // 重复初始化（如重开相机/二次扫描）时清掉滑窗与预积分的残留状态，
     // 否则旧内参/旧时刻的滑窗会与新会话混跑。clearState 后必须重新 setParameter。
     g_estimator.clearState();
     g_estimator.setParameter();
     g_lastImuTimestamp = -1.0;
+    g_lastFeaturePubTimestamp = -1.0;
+    g_firstFeaturePublish = true;
     g_vinsReady = true;
 }
 
@@ -219,34 +225,63 @@ void vinsInputImage(double t, const std::uint8_t* gray, int w, int h, int stride
     if (!g_vinsReady || gray == nullptr) {
         return;
     }
-    // VINS-Mono 原版由 feature_tracker 节点按发布频率设置该标志；
-    // 移植时这段逻辑丢失，导致 goodFeaturesToTrack 永远不执行、
-    // 特征集恒为空、初始化永远失败。这里按 10Hz 重新补上门控。
-    static double lastPubT = -1.0;
-    const double pubPeriod = 1.0 / 10.0;
-    PUB_THIS_FRAME = (lastPubT < 0.0) || (t - lastPubT >= pubPeriod);
-    if (PUB_THIS_FRAME) {
-        lastPubT = t;
-    }
 
     std::lock_guard<std::mutex> lk(g_vinsMutex);
+
+    constexpr double FEATURE_FREQ = 10.0;
+    constexpr double FEATURE_PERIOD = 1.0 / FEATURE_FREQ;
+
+    if (g_lastFeaturePubTimestamp < 0.0 ||
+        t - g_lastFeaturePubTimestamp >= FEATURE_PERIOD) {
+        PUB_THIS_FRAME = true;
+    } else {
+        PUB_THIS_FRAME = false;
+    }
+
     cv::Mat img(h, w, CV_8UC1, const_cast<std::uint8_t*>(gray), static_cast<size_t>(stride));
     g_tracker[0].readImage(img, t);
 
+    for (unsigned int i = 0;; ++i) {
+        if (!g_tracker[0].updateID(i)) {
+            break;
+        }
+    }
+
+    if (!PUB_THIS_FRAME) {
+        return;
+    }
+
+    g_lastFeaturePubTimestamp = t;
+
+    if (g_firstFeaturePublish) {
+        g_firstFeaturePublish = false;
+        return;
+    }
+
     map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> image;
     for (unsigned int j = 0; j < g_tracker[0].ids.size(); j++) {
-        if (g_tracker[0].track_cnt[j] > 1) {
-            const int feature_id = g_tracker[0].ids[j];
-            Eigen::Matrix<double, 7, 1> xyz_uv_velocity;
-            xyz_uv_velocity << g_tracker[0].cur_un_pts[j].x,
-                               g_tracker[0].cur_un_pts[j].y,
-                               1.0,
-                               g_tracker[0].cur_pts[j].x,
-                               g_tracker[0].cur_pts[j].y,
-                               g_tracker[0].pts_velocity[j].x,
-                               g_tracker[0].pts_velocity[j].y;
-            image[feature_id].emplace_back(0, xyz_uv_velocity);
+        if (g_tracker[0].track_cnt[j] <= 1) {
+            continue;
         }
+
+        const int feature_id = g_tracker[0].ids[j];
+        if (feature_id < 0) {
+            continue;
+        }
+
+        Eigen::Matrix<double, 7, 1> xyz_uv_velocity;
+        xyz_uv_velocity << g_tracker[0].cur_un_pts[j].x,
+                           g_tracker[0].cur_un_pts[j].y,
+                           1.0,
+                           g_tracker[0].cur_pts[j].x,
+                           g_tracker[0].cur_pts[j].y,
+                           g_tracker[0].pts_velocity[j].x,
+                           g_tracker[0].pts_velocity[j].y;
+        image[feature_id].emplace_back(0, xyz_uv_velocity);
+    }
+
+    if (image.size() < 20) {
+        return;
     }
 
     std_msgs::Header header;

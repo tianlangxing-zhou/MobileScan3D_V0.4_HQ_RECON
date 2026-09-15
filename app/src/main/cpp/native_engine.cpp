@@ -442,7 +442,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
     std::ostringstream s;
     s.setf(std::ios::fixed);
     s.precision(3);
-    s << "V0.4 HQ Reconstruction\n"
+    s << "V0.5.1 HQ Reconstruction\n"
       << "Tracking frames: " << vio.frames() << "  features: " << vio.features() << "\n"
       << "VINS: " << (vinsInitialized() ? "nonlinear initialized" : "initializing")
       << "  poseSource: " << (vinsPoseOk ? "vins" : "vio") << "\n"
