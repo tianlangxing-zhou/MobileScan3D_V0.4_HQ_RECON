@@ -831,9 +831,12 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "prevPointCount=" << i.prevPointCount << "\n"
       << "bboxWidthPx=" << i.bboxWidthPx << "\n"
       << "bboxHeightPx=" << i.bboxHeightPx << "\n"
+      << "fullBBox=" << i.fullBBoxWidthPx << "x" << i.fullBBoxHeightPx << "\n"
+      << "visibleBBox=" << i.visibleBBoxWidthPx << "x" << i.visibleBBoxHeightPx << "\n"
       << "lastAffineScale=" << i.lastAffineScale << "\n"
       << "affineScaleEMA=" << i.affineScaleEMA << "\n"
       << "reseedCount=" << i.reseedCount << "\n"
+      << "lastEvent=" << i.lastEvent << "\n"
       << "depthFilterCalls=" << i.depthFilterCalls << "\n"
       << "depthFilterSkipped=" << i.depthFilterSkipped << "\n"
       << "lastError=" << i.lastError;

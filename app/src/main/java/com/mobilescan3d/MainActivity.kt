@@ -177,6 +177,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var lastPlyVertexCount: Int? = null
     private var lastPlyFileBytes: Long? = null
     private var lastPlyExportTs: Long? = null
+    private var lastPlySessionId: String? = null
 
     private data class TargetUiState(
         val visible: Boolean = false,
@@ -1055,6 +1056,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("plyVertexCount=${lastPlyVertexCount ?: "unknown"}")
         sb.appendLine("plyFileBytes=${lastPlyFileBytes ?: "unknown"}")
         sb.appendLine("plyExportTimestamp=${lastPlyExportTs ?: "unknown"}")
+        sb.appendLine("plySessionId=${lastPlySessionId ?: "unknown"}")
+        sb.appendLine("plySessionMatch=${lastPlySessionId != null && lastPlySessionId == sessionId}")
         sb.appendLine()
         sb.appendLine("[SELF-CHECK SUMMARY]")
         val warns = mutableListOf<String>()
@@ -1274,6 +1277,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sessionStartTs = System.currentTimeMillis()
         val formatter = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
         sessionId = formatter.format(java.util.Date()) + "_" + (sessionStartTs % 100000L)
+        lastPlyFilename = null
+        lastPlyVertexCount = null
+        lastPlyFileBytes = null
+        lastPlyExportTs = null
+        lastPlySessionId = null
         stabilization = false
         aeLock = aeLockAvailable
         awbLock = awbLockAvailable
@@ -1308,6 +1316,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (ok) {
             val plyFile = java.io.File(path)
             lastPlyFilename = filename
+            lastPlySessionId = sessionId
             lastPlyVertexCount = readPlyVertexCount(plyFile)
             lastPlyFileBytes = plyFile.length()
             lastPlyExportTs = System.currentTimeMillis()

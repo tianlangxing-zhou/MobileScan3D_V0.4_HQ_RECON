@@ -101,6 +101,15 @@ void ObjectTracker::setError(const std::string& msg)
     info_.lastError = msg;
 }
 
+void ObjectTracker::markLost(const std::string& reason)
+{
+    if (info_.state != TargetState::LOST) {
+        info_.trackLost++;
+    }
+    info_.state = TargetState::LOST;
+    info_.lastError = reason;
+}
+
 bool ObjectTracker::selectTarget(float u, float v)
 {
     (void)u;
@@ -144,6 +153,10 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         const cv::Rect bounds(0, 0, width, height);
         cv::Rect roi = wanted & bounds;
         if (roi.width >= 64 && roi.height >= 64) {
+            trackCx_ = static_cast<float>(cx);
+            trackCy_ = static_cast<float>(cy);
+            trackHalfW_ = ROI_W * 0.5f;
+            trackHalfH_ = ROI_H * 0.5f;
             info_.x0 = static_cast<float>(roi.x) / width;
             info_.y0 = static_cast<float>(roi.y) / height;
             info_.x1 = static_cast<float>(roi.x + roi.width) / width;
@@ -165,10 +178,6 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         const int y1 = std::min(height - 1, static_cast<int>(info_.y1 * height));
         cv::Rect roi(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
         roi &= cv::Rect(0, 0, width, height);
-        trackCx_ = roi.x + roi.width * 0.5f;
-        trackCy_ = roi.y + roi.height * 0.5f;
-        trackHalfW_ = roi.width * 0.5f;
-        trackHalfH_ = roi.height * 0.5f;
         if (roi.width < 48 || roi.height < 48) {
             info_.acquireFail++;
             info_.lastError = "acquire: ROI too small";
@@ -243,9 +252,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     }
 
     if (!havePrev_ || prevGray_.empty() || prevGray_.size() != owned.size() || prevGray_.type() != owned.type() || prevPoints_.empty()) {
-        info_.trackLost++;
-        info_.state = TargetState::LOST;
-        info_.lastError = "track: invalid previous frame";
+        markLost("track: invalid previous frame");
         return;
     }
 
@@ -256,8 +263,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     try {
         cv::calcOpticalFlowPyrLK(prevGray_, owned, prevPoints_, next, status, error, cv::Size(21, 21), 3);
     } catch (const cv::Exception& e) {
-        info_.state = TargetState::LOST;
-        info_.lastError = std::string("LK exception: ") + e.what();
+        markLost(std::string("LK exception: ") + e.what());
         return;
     }
 
@@ -272,11 +278,9 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     }
 
     if (goodPrev.size() < 15) {
-        info_.trackLost++;
-        info_.state = TargetState::LOST;
         info_.trackedPoints = static_cast<int>(goodPrev.size());
         info_.inlierRatio = 0.0f;
-        info_.lastError = "track: too few LK points";
+        markLost("track: too few LK points");
         return;
     }
 
@@ -285,15 +289,12 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     try {
         affine = cv::estimateAffinePartial2D(goodPrev, goodNext, inliers, cv::RANSAC, 3.0);
     } catch (const cv::Exception& e) {
-        info_.state = TargetState::LOST;
-        info_.lastError = std::string("affine exception: ") + e.what();
+        markLost(std::string("affine exception: ") + e.what());
         return;
     }
 
     if (affine.empty()) {
-        info_.trackLost++;
-        info_.state = TargetState::LOST;
-        info_.lastError = "track: affine failed";
+        markLost("track: affine failed");
         return;
     }
 
@@ -311,8 +312,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         std::abs(dx) > width * 0.5 ||
         std::abs(dy) > height * 0.5)
     {
-        info_.state = TargetState::LOST;
-        info_.lastError = "track: insane affine";
+        markLost("track: insane affine");
         return;
     }
 
@@ -335,6 +335,10 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     const int bboxH = visibleBox.height;
     info_.bboxWidthPx = bboxW;
     info_.bboxHeightPx = bboxH;
+    info_.fullBBoxWidthPx = fullBox.width;
+    info_.fullBBoxHeightPx = fullBox.height;
+    info_.visibleBBoxWidthPx = visibleBox.width;
+    info_.visibleBBoxHeightPx = visibleBox.height;
     info_.lastAffineScale = scale;
     info_.affineScaleEMA = 0.7f * info_.affineScaleEMA + 0.3f * scale;
 
@@ -380,7 +384,8 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                 info_.reseedCount++;
                 info_.trackedPoints = static_cast<int>(prevPoints_.size());
                 info_.prevPointCount = info_.trackedPoints;
-                info_.lastError = "reseeded features";
+                info_.lastEvent = "reseeded " + std::to_string(info_.trackedPoints) + " features";
+                info_.lastError.clear();
             }
         }
     }
