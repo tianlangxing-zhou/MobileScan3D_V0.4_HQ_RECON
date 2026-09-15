@@ -147,6 +147,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var targetFocusDistance: Float? = null
     private var targetFocusLocked = false
     private var focusRelockCount = 0
+    private var targetTapX = 0f
+    private var targetTapY = 0f
+    private var targetRelockFrames = 0
     private var aeLockAvailable = false
     private var awbLockAvailable = false
     private var manualFocusAvailable = false
@@ -946,6 +949,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun selectTarget(x: Float, y: Float) {
         val norm = viewToCameraNorm(x, y) ?: return
+        targetTapX = x
+        targetTapY = y
         NativeBridge.nativeSelectTarget(norm.x, norm.y)
         focusAt(x, y)
         targetFocusLocked = true
@@ -967,6 +972,24 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             medianDepth = out.getOrElse(6) { 0f }
         )
         targetOverlay.invalidate()
+        maybeRelockTargetFocus()
+    }
+
+    private fun maybeRelockTargetFocus() {
+        if (!objectLockEnabled || !targetFocusLocked || !manualFocusAvailable) return
+        val af = lastAfState ?: return
+        val focused = af == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+            af == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+        if (focused) {
+            targetRelockFrames = 0
+            return
+        }
+        targetRelockFrames++
+        if (targetRelockFrames >= 5) {
+            targetRelockFrames = 0
+            focusRelockCount++
+            focusAt(targetTapX, targetTapY)
+        }
     }
 
     private fun focusAt(x: Float, y: Float) {

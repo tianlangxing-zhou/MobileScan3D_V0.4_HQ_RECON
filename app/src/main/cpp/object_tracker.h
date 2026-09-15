@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
+#include <opencv2/opencv.hpp>
 
 enum class TargetState
 {
@@ -32,6 +34,8 @@ public:
     void select(float u, float v, float medianDepth, uint64_t timestamp);
     void clear();
     void update(float medianDepth, float sharpness, uint64_t timestamp);
+    void updateFromDepth(const float* depth, int width, int height, uint64_t timestamp);
+    void track(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp);
     bool isEnabled() const;
     bool isTracking() const;
     void filterDepth(float* depth, int width, int height, uint64_t timestamp);
@@ -40,4 +44,7 @@ public:
 private:
     TargetTrackInfo info_;
     bool enabled_ = false;
+    cv::Mat prevGray_;
+    std::vector<cv::Point2f> prevPoints_;
+    bool havePrev_ = false;
 };

@@ -338,6 +338,8 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
     const auto vinsEnd = std::chrono::steady_clock::now();
     const double vinsMs = std::chrono::duration<double, std::milli>(vinsEnd - vinsStart).count();
 
+    objectTracker.track(yy, w, h, rs, (uint64_t)frameTs);
+
     float vp[7];
     const bool poseOk = vinsGetPose(vp);
     if (poseOk) {
@@ -521,6 +523,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             return;
         }
         objectTracker.filterDepth(d.data(), w, h, (uint64_t)t);
+        objectTracker.updateFromDepth(d.data(), w, h, (uint64_t)t);
     }
 
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
