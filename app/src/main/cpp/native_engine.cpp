@@ -45,6 +45,9 @@ static bool haveExternalDepth = false;
 static float vinsT[3] = {0, 0, 0};
 static float vinsQ[4] = {0, 0, 0, 1};
 static bool vinsPoseOk = false;
+static bool haveLastGoodVinsPose = false;
+static float lastGoodVinsT[3] = {0.f, 0.f, 0.f};
+static bool vinsLostAfterInit = false;
 static uint64_t vinsFrames = 0;
 static uint64_t depthFrames = 0;
 static double lastVinsMs = 0.0;
@@ -211,6 +214,11 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     lastKF = 0;
     haveExternalDepth = false;
     vinsPoseOk = false;
+    haveLastGoodVinsPose = false;
+    vinsLostAfterInit = false;
+    lastGoodVinsT[0] = 0.f;
+    lastGoodVinsT[1] = 0.f;
+    lastGoodVinsT[2] = 0.f;
     vinsT[0] = vinsT[1] = vinsT[2] = 0;
     vinsQ[0] = vinsQ[1] = vinsQ[2] = 0;
     vinsQ[3] = 1;
@@ -305,26 +313,67 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
         std::lock_guard<std::mutex> lk(gStateMutex);
         lastVinsMs = vinsMs;
         vinsFrames++;
-        if (poseOk) {
-            vinsT[0] = vp[0];
-            vinsT[1] = vp[1];
-            vinsT[2] = vp[2];
-            vinsQ[0] = vp[3];
-            vinsQ[1] = vp[4];
-            vinsQ[2] = vp[5];
-            vinsQ[3] = vp[6];
-            vinsPoseOk = true;
-        }
-        makePose(R, T);
+        if (poseOk &&
+            std::isfinite(vp[0]) &&
+            std::isfinite(vp[1]) &&
+            std::isfinite(vp[2]) &&
+            std::isfinite(vp[3]) &&
+            std::isfinite(vp[4]) &&
+            std::isfinite(vp[5]) &&
+            std::isfinite(vp[6])) {
+            bool sane = true;
+            if (haveLastGoodVinsPose) {
+                const float dx = vp[0] - lastGoodVinsT[0];
+                const float dy = vp[1] - lastGoodVinsT[1];
+                const float dz = vp[2] - lastGoodVinsT[2];
+                const float step = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (step > 0.5f) {
+                    sane = false;
+                }
+            }
 
-        bool accept = kf.consider((uint64_t)t, ai.q().sharpness, ai.q().exposure,
-                                  vio.visualNovelty(), vio.features(),
-                                  T[0], T[1], T[2]);
-        if (accept) {
-            lastKF++;
+            if (sane && !vinsLostAfterInit) {
+                vinsT[0] = vp[0];
+                vinsT[1] = vp[1];
+                vinsT[2] = vp[2];
+                vinsQ[0] = vp[3];
+                vinsQ[1] = vp[4];
+                vinsQ[2] = vp[5];
+                vinsQ[3] = vp[6];
+
+                lastGoodVinsT[0] = vp[0];
+                lastGoodVinsT[1] = vp[1];
+                lastGoodVinsT[2] = vp[2];
+
+                haveLastGoodVinsPose = true;
+                vinsPoseOk = true;
+            } else {
+                vinsPoseOk = false;
+                if (haveLastGoodVinsPose) {
+                    vinsLostAfterInit = true;
+                    snaps.clear();
+                }
+            }
+        } else {
+            if (haveLastGoodVinsPose) {
+                vinsLostAfterInit = true;
+                snaps.clear();
+            }
+            vinsPoseOk = false;
         }
 
-        storeSnap((uint64_t)t, w, h, rs, urs, ups, yy, uu, vv, R, T);
+        if (vinsPoseOk && !vinsLostAfterInit) {
+            makePose(R, T);
+
+            bool accept = kf.consider((uint64_t)t, ai.q().sharpness, ai.q().exposure,
+                                      vio.visualNovelty(), vio.features(),
+                                      T[0], T[1], T[2]);
+            if (accept) {
+                lastKF++;
+            }
+
+            storeSnap((uint64_t)t, w, h, rs, urs, ups, yy, uu, vv, R, T);
+        }
         frames++;
     }
 

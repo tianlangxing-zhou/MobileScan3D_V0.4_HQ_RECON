@@ -926,6 +926,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             sb.appendLine("    焦距候选: ${focalLengths.joinToString(", ") { "%.3f".format(it) }}")
             sb.appendLine("    光圈候选: ${apertures.joinToString(", ") { "%.3f".format(it) }}")
             sb.appendLine("    LOGICAL_MULTI_CAMERA: ${capabilities?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) == true}")
+            val timestampSource = ch.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE)
+            sb.appendLine(
+                "    Camera timestamp source: " +
+                    when (timestampSource) {
+                        CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME -> "REALTIME"
+                        CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_UNKNOWN -> "UNKNOWN"
+                        else -> "UNKNOWN_VALUE($timestampSource)"
+                    }
+            )
         } catch (_: Throwable) {
             sb.appendLine("    摄像头硬件参数读取失败")
         }
