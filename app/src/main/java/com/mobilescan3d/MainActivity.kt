@@ -74,7 +74,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var viewHeight = 0
     private var sensorOrientation = 90
     private var fixedFocus = false
-    private var stabilization = true
+    private var stabilization = false
     private var deviceModel = ""
     private var oisSupported = false
     private var afModes = intArrayOf()
@@ -192,7 +192,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         renderer = PointCloudRenderer()
         glView.setRenderer(renderer)
-        glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
         glView.setZOrderOnTop(true)
         setupPointCloudTouch()
         root.addView(glView, android.widget.FrameLayout.LayoutParams(
@@ -348,6 +348,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val scaleDetector = android.view.ScaleGestureDetector(this, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: android.view.ScaleGestureDetector): Boolean {
                 renderer.zoom = (renderer.zoom * detector.scaleFactor).coerceIn(0.3f, 4f)
+                glView.requestRender()
                 return true
             }
         })
@@ -355,6 +356,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             override fun onScroll(e1: android.view.MotionEvent?, e2: android.view.MotionEvent, distanceX: Float, distanceY: Float): Boolean {
                 renderer.rotY += distanceX * 0.4f
                 renderer.rotX = (renderer.rotX + distanceY * 0.4f).coerceIn(-80f, 80f)
+                glView.requestRender()
                 return true
             }
         })
@@ -367,16 +369,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun startSystem() {
         cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        cameraIds = cameraManager.cameraIdList.toList()
+        val allCameraIds = cameraManager.cameraIdList.toList()
+        val rearCameraIds = allCameraIds.filter { cameraId ->
+            cameraManager.getCameraCharacteristics(cameraId)
+                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+        }
+        cameraIds = rearCameraIds.ifEmpty { allCameraIds }
         currentCameraId = cameraIds.firstOrNull { cameraId ->
             val ch = cameraManager.getCameraCharacteristics(cameraId)
             ch.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
                 ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
                     ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) == true
-        } ?: cameraIds.firstOrNull { cameraId ->
-            cameraManager.getCameraCharacteristics(cameraId)
-                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
         } ?: cameraIds.first()
+        cameraIndex = cameraIds.indexOf(currentCameraId).coerceAtLeast(0)
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         cameraThread = HandlerThread("CameraCapture").also { it.start() }
         sensorThread = HandlerThread("IMU").also { it.start() }
@@ -459,8 +464,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         val acc = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         val sensorHandler = Handler(sensorThread!!.looper)
-        sensorManager.registerListener(this, gyro, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler)
-        sensorManager.registerListener(this, acc, SensorManager.SENSOR_DELAY_FASTEST, sensorHandler)
+        val periodUs = 5_000
+        gyro?.let { sensorManager.registerListener(this, it, periodUs, 0, sensorHandler) }
+        acc?.let { sensorManager.registerListener(this, it, periodUs, 0, sensorHandler) }
     }
 
     private fun openCamera() {
@@ -500,8 +506,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val outputSizes = streamConfig.getOutputSizes(ImageFormat.YUV_420_888)
             val previewSizes = streamConfig.getOutputSizes(android.graphics.SurfaceTexture::class.java)
             val dm = resources.displayMetrics
-            val size = chooseOptimalSize(outputSizes, dm.widthPixels, dm.heightPixels)
-            val pSize = choosePreviewSize(previewSizes, viewWidth, viewHeight)
+            val size = chooseOptimalSize(outputSizes)
+            val pSize = choosePreviewSize(previewSizes, size)
             supportedSizes = outputSizes.joinToString(", ") { "${it.width}x${it.height}" }
             screenW = dm.widthPixels
             screenH = dm.heightPixels
@@ -627,50 +633,39 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun choosePreviewSize(
         choices: Array<android.util.Size>,
-        viewW: Int,
-        viewH: Int
+        processingSize: android.util.Size
     ): android.util.Size {
-        if (choices.isEmpty()) return android.util.Size(1280, 720)
-        val w = viewW.coerceAtLeast(1).toFloat()
-        val h = viewH.coerceAtLeast(1).toFloat()
-        val targetRatio = maxOf(w, h) / minOf(w, h)
-        // 长边封顶 1920：一加 15 等机型对"屏幕同款"奇异尺寸（如 2772x1272）
-        // 的 HAL 交付路径异常（内容被按方形采样/附带非标准变换），
-        // 常规尺寸走最成熟稳定的 HAL 路径。封顶后会选中 1568x720，
-        // 与 YUV 捕获尺寸一致，预览视野 = 处理视野。
-        val maxLongEdge = maxOf(viewW, viewH).coerceAtMost(1920)
-        val filtered = choices.filter {
-            it.width >= it.height && maxOf(it.width, it.height) <= maxLongEdge
-        }
-        val candidates = filtered.ifEmpty {
-            choices.filter { it.width >= it.height && it.width * it.height <= 1920 * 1080 }
-        }
+        if (choices.isEmpty()) return processingSize
+        val targetRatio = processingSize.width.toFloat() / processingSize.height.toFloat()
+        val targetArea = processingSize.width.toLong() * processingSize.height
+        val candidates = choices.filter {
+            it.width >= it.height && it.width <= 1920 && it.height <= 1440
+        }.ifEmpty { choices.toList() }
         return candidates.sortedWith(
-            compareBy<android.util.Size> { s ->
-                val ratio = maxOf(s.width, s.height).toFloat() / minOf(s.width, s.height)
-                kotlin.math.abs(ratio - targetRatio)
-            }.thenByDescending { it.width * it.height }
-        ).firstOrNull() ?: choices.first()
+            compareBy<android.util.Size> {
+                kotlin.math.abs(it.width.toFloat() / it.height - targetRatio)
+            }.thenBy {
+                kotlin.math.abs(it.width.toLong() * it.height - targetArea)
+            }
+        ).first()
     }
 
     private fun chooseOptimalSize(
-        choices: Array<android.util.Size>,
-        textureViewWidth: Int,
-        textureViewHeight: Int
+        choices: Array<android.util.Size>
     ): android.util.Size {
-        if (choices.isEmpty()) return android.util.Size(1280, 720)
-        // 相机输出通常是横屏，旋转到竖屏后，等效宽高比 = 相机 height / width。
-        // 目标是让它尽量接近屏幕的 width / height，避免 4:3 被过度裁剪成“放大”。
-        val target = textureViewWidth.toFloat() / textureViewHeight.toFloat()
-        return choices
+        if (choices.isEmpty()) return android.util.Size(1280, 960)
+        val targetRatio = 4f / 3f
+        val targetArea = 1280L * 960L
+        val candidates = choices
             .filter { it.width >= it.height && it.width <= 1920 && it.height <= 1440 }
-            .sortedWith(
-                compareBy<android.util.Size> {
-                    kotlin.math.abs(it.height.toFloat() / it.width - target)
-                }.thenByDescending { it.width * it.height }
-            )
-            .firstOrNull()
-            ?: choices.first()
+            .ifEmpty { choices.toList() }
+        return candidates.sortedWith(
+            compareBy<android.util.Size> {
+                kotlin.math.abs(it.width.toFloat() / it.height - targetRatio)
+            }.thenBy {
+                kotlin.math.abs(it.width.toLong() * it.height - targetArea)
+            }
+        ).first()
     }
 
     private class CompareSizesByArea : java.util.Comparator<android.util.Size> {
@@ -683,29 +678,38 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val size = previewSize ?: captureSize ?: return
         if (viewW == 0 || viewH == 0) return
 
+        val surfaceRotationDegrees = displayRotationDegrees()
         val rot = previewRotationDegrees()
-        val bw = size.width.toFloat()
-        val bh = size.height.toFloat()
+        val rotationRequired = rot % 180 != 0
         val viewWf = viewW.toFloat()
         val viewHf = viewH.toFloat()
-
-        val matrix = android.graphics.Matrix()
-        if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) {
-            matrix.preScale(-1f, 1f, bw / 2f, bh / 2f)
+        var scaleX: Float
+        var scaleY: Float
+        if (sensorOrientation == 0) {
+            scaleX = if (!rotationRequired) viewWf / size.height else viewWf / size.width
+            scaleY = if (!rotationRequired) viewHf / size.width else viewHf / size.height
+        } else {
+            scaleX = if (rotationRequired) viewWf / size.height else viewWf / size.width
+            scaleY = if (rotationRequired) viewHf / size.width else viewHf / size.height
         }
-        matrix.postRotate(rot.toFloat(), bw / 2f, bh / 2f)
-
-        val bufferRect = android.graphics.RectF(0f, 0f, bw, bh)
-        val mapped = android.graphics.RectF()
-        matrix.mapRect(mapped, bufferRect)
-
-        val scale = maxOf(viewWf / mapped.width(), viewHf / mapped.height())
-        matrix.postScale(scale, scale, mapped.centerX(), mapped.centerY())
-        matrix.mapRect(mapped, bufferRect)
-        matrix.postTranslate(
-            viewWf / 2f - mapped.centerX(),
-            viewHf / 2f - mapped.centerY()
-        )
+        val scale = maxOf(scaleX, scaleY)
+        val halfW = viewWf / 2f
+        val halfH = viewHf / 2f
+        val matrix = android.graphics.Matrix()
+        if (rotationRequired) {
+            matrix.setScale(scale / scaleX, scale / scaleY, halfW, halfH)
+        } else {
+            matrix.setScale(
+                viewHf / viewWf / scaleY * scale,
+                viewWf / viewHf / scaleX * scale,
+                halfW,
+                halfH
+            )
+        }
+        matrix.postRotate(-surfaceRotationDegrees.toFloat(), halfW, halfH)
+        if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) {
+            matrix.postScale(-1f, 1f, halfW, halfH)
+        }
 
         texture.setTransform(matrix)
         previewScale = scale
@@ -730,17 +734,23 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     @Suppress("DEPRECATION")
-    private fun previewRotationDegrees(): Int {
+    private fun displayRotationDegrees(): Int {
         val displayRotation = if (Build.VERSION.SDK_INT >= 30) {
             display?.rotation ?: Surface.ROTATION_0
         } else {
             windowManager.defaultDisplay.rotation
         }
-        return if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) {
-            (sensorOrientation + displayRotation) % 360
-        } else {
-            (sensorOrientation - displayRotation + 360) % 360
+        return when (displayRotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
         }
+    }
+    private fun previewRotationDegrees(): Int {
+        val surfaceRotationDegrees = displayRotationDegrees()
+        val sign = if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) 1 else -1
+        return (sensorOrientation - surfaceRotationDegrees * sign + 360) % 360
     }
 
     private fun applyCaptureSettings() {
@@ -945,6 +955,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (scanning) {
                 NativeBridge.nativeOnCameraFrame(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts)
                 scheduleDepth(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts)
+                glView.requestRender()
             }
         } catch (_: Throwable) {
         } finally {
@@ -961,6 +972,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 val depth = FloatArray(w * h)
                 depthProvider.estimate(y, u, v, w, h, rowStride, uRowStride, uPixelStride, depth)
                 NativeBridge.nativeOnDepthMap(depth, w, h, 0.5f, t)
+                glView.requestRender()
             } catch (_: Throwable) {
             } finally {
                 depthBusy = false
@@ -981,6 +993,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun startScan() {
         scanning = true
+        stabilization = false
         aeLock = aeLockAvailable
         awbLock = awbLockAvailable
         applyCaptureSettings()
@@ -1106,7 +1119,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             .setItems(items) { _, which ->
                 when (which) {
                     0 -> fixedFocus = !fixedFocus
-                    1 -> stabilization = !stabilization
+                    1 -> {
+                        if (scanning) {
+                            stabilization = false
+                            toast("VIO 扫描中强制关闭 EIS/OIS")
+                        } else {
+                            stabilization = !stabilization
+                        }
+                    }
                     2 -> aeLock = aeLockAvailable && !aeLock
                     3 -> awbLock = awbLockAvailable && !awbLock
                 }
@@ -1198,21 +1218,45 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             .show()
     }
 
+    private fun remapDeviceToCamera(x: Float, y: Float, z: Float, out: FloatArray, offset: Int) {
+        if (lensFacing != CameraCharacteristics.LENS_FACING_BACK) {
+            out[offset] = x; out[offset + 1] = y; out[offset + 2] = z
+            return
+        }
+        when ((sensorOrientation % 360 + 360) % 360) {
+            0 -> { out[offset] = x; out[offset + 1] = -y; out[offset + 2] = -z }
+            90 -> { out[offset] = -y; out[offset + 1] = -x; out[offset + 2] = -z }
+            180 -> { out[offset] = -x; out[offset + 1] = y; out[offset + 2] = -z }
+            270 -> { out[offset] = y; out[offset + 1] = x; out[offset + 2] = -z }
+            else -> {
+                val r = Math.toRadians(sensorOrientation.toDouble())
+                val c = kotlin.math.cos(r).toFloat()
+                val s = kotlin.math.sin(r).toFloat()
+                out[offset] = c * x - s * y
+                out[offset + 1] = -(s * x + c * y)
+                out[offset + 2] = -z
+            }
+        }
+    }
+
     override fun onSensorChanged(e: SensorEvent) {
         when (e.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> {
-                lastImu[0] = e.values[0]; lastImu[1] = e.values[1]; lastImu[2] = e.values[2]
+                remapDeviceToCamera(e.values[0], e.values[1], e.values[2], lastImu, 0)
                 lastAccNs = e.timestamp
                 hasAcc = true
+                return
             }
             Sensor.TYPE_GYROSCOPE -> {
-                lastImu[3] = e.values[0]; lastImu[4] = e.values[1]; lastImu[5] = e.values[2]
+                remapDeviceToCamera(e.values[0], e.values[1], e.values[2], lastImu, 3)
                 lastGyrNs = e.timestamp
                 hasGyr = true
             }
+            else -> return
         }
         if (!hasAcc || !hasGyr) return
-        val pairedNs = maxOf(lastAccNs, lastGyrNs)
+        val pairedNs = lastGyrNs
+        if (kotlin.math.abs(lastAccNs - pairedNs) > 20_000_000L) return
         if (lastImuOutNs == 0L || pairedNs - lastImuOutNs >= 5_000_000L) {
             NativeBridge.nativeOnImu(pairedNs, lastImu[0], lastImu[1], lastImu[2], lastImu[3], lastImu[4], lastImu[5])
             lastImuOutNs = pairedNs

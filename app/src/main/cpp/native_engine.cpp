@@ -240,6 +240,7 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeDestroy(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
     g.reset();
     vio.reset();
     df.reset();
@@ -399,11 +400,13 @@ Java_com_mobilescan3d_NativeBridge_nativeExportPly(JNIEnv* e, jobject, jstring p
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeSetMode(JNIEnv*, jobject, jint m) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
     mode = m;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
     float R[9], T[3];
     makePose(R, T);
 
@@ -484,6 +487,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetGuidance(JNIEnv* e, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
     return e->NewStringUTF(kf.guidance().c_str());
 }
 
@@ -494,7 +498,11 @@ Java_com_mobilescan3d_NativeBridge_nativeGetGaussians(JNIEnv* e, jobject,
     if (!dst) {
         return 0;
     }
-    size_t n = g.copyPoints(dst, (size_t)maxPoints);
+    size_t n;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        n = g.copyPoints(dst, (size_t)maxPoints);
+    }
     e->ReleaseFloatArrayElements(out, dst, 0);
     return (jint)n;
 }
@@ -506,6 +514,7 @@ Java_com_mobilescan3d_NativeBridge_nativeVinsInitialized(JNIEnv*, jobject) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetHudMetrics(JNIEnv* e, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
     std::ostringstream s;
     s.setf(std::ios::fixed);
     s.precision(1);
