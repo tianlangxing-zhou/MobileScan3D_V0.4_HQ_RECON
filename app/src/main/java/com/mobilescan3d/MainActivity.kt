@@ -1165,6 +1165,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    poseSource=accepted_vins")
         sb.appendLine("    renderPoseValid=$renderPoseValid")
         sb.appendLine("    cameraT=(${renderPose[9]}, ${renderPose[10]}, ${renderPose[11]})")
+        val r00 = renderPose[0]
+        val r01 = renderPose[1]
+        val r02 = renderPose[2]
+        val r10 = renderPose[3]
+        val r11 = renderPose[4]
+        val r12 = renderPose[5]
+        val r20 = renderPose[6]
+        val r21 = renderPose[7]
+        val r22 = renderPose[8]
+        sb.appendLine("    cameraRight=($r00, $r10, $r20)")
+        sb.appendLine("    cameraDown=($r01, $r11, $r21)")
+        sb.appendLine("    cameraForward=($r02, $r12, $r22)")
+        sb.appendLine("    displayRotationApplied=false")
+        sb.appendLine("    actualPreviewRot=$previewRot")
         sb.appendLine("    autoYaw=false")
         sb.appendLine("    touchOrbit=false")
 
