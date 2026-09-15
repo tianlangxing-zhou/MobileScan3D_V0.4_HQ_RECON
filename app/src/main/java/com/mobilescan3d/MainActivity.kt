@@ -171,6 +171,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var objectLockEnabled = false
     private lateinit var targetOverlay: TargetLockOverlay
     @Volatile private var resumed = false
+    private var sessionId = "unknown"
+    private var sessionStartTs = 0L
+    private var lastPlyFilename: String? = null
+    private var lastPlyVertexCount: Int? = null
 
     private data class TargetUiState(
         val visible: Boolean = false,
@@ -1041,6 +1045,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("MobileScan3D 配置反馈报告")
         sb.appendLine("时间戳: ${System.currentTimeMillis()}")
         sb.appendLine()
+        sb.appendLine("[SESSION]")
+        sb.appendLine("sessionId=$sessionId")
+        sb.appendLine("scanStartTimestamp=$sessionStartTs")
+        sb.appendLine("reportTimestamp=${System.currentTimeMillis()}")
+        sb.appendLine("lastPlyFilename=${lastPlyFilename ?: "unknown"}")
+        sb.appendLine("plyVertexCount=${lastPlyVertexCount ?: "unknown"}")
+        sb.appendLine()
         sb.appendLine("[SELF-CHECK SUMMARY]")
         val warns = mutableListOf<String>()
         if (NativeBridge.nativeVinsInitialized()) sb.appendLine("PASS VINS") else warns.add("VINS not initialized")
@@ -1197,7 +1208,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    touchOrbit=false")
 
         pendingReport = sb.toString()
-        createReportLauncher.launch("config_report_${System.currentTimeMillis()}.txt")
+        createReportLauncher.launch("config_${sessionId}.txt")
     }
 
     private fun processImage(image: Image) {
@@ -1251,6 +1262,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun startScan() {
         scanning = true
+        sessionStartTs = System.currentTimeMillis()
+        val formatter = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+        sessionId = formatter.format(java.util.Date()) + "_" + (sessionStartTs % 100000L)
         stabilization = false
         aeLock = aeLockAvailable
         awbLock = awbLockAvailable
@@ -1279,8 +1293,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun exportModel() {
         val dir = getExternalFilesDir(null) ?: filesDir
-        val path = "${dir.absolutePath}/scan_${System.currentTimeMillis()}.ply"
+        val filename = "scan_${sessionId}.ply"
+        val path = "${dir.absolutePath}/$filename"
         val ok = NativeBridge.nativeExportPly(path)
+        if (ok) {
+            lastPlyFilename = filename
+            lastPlyVertexCount = null
+        }
         android.widget.Toast.makeText(
             this,
             if (ok) "模型已导出：$path" else "导出失败（模型数据不足）",
