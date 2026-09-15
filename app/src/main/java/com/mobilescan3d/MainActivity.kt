@@ -161,7 +161,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var hudExpanded = false
     private var hudShownPoints = 0f
     private var modeLabel = "连续单帧点云"
+    private var objectLockEnabled = false
+    private lateinit var targetOverlay: TargetLockOverlay
     @Volatile private var resumed = false
+
+    private data class TargetUiState(
+        val visible: Boolean = false,
+        val state: Int = 0,
+        val x0: Float = 0f,
+        val y0: Float = 0f,
+        val x1: Float = 0f,
+        val y1: Float = 0f,
+        val confidence: Float = 0f,
+        val medianDepth: Float = 0f
+    )
 
     private data class FrameMeta(
         val exposureNs: Long,
@@ -220,6 +233,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         texture = TextureView(this)
         root.addView(texture, ViewGroup.LayoutParams(-1, -1))
+        targetOverlay = TargetLockOverlay(this)
+        targetOverlay.isClickable = false
+        targetOverlay.isFocusable = false
+        root.addView(targetOverlay, ViewGroup.LayoutParams(-1, -1))
         texture.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
             if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
                 configureTransform(right - left, bottom - top)
@@ -237,7 +254,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     val dx = event.x - downX
                     val dy = event.y - downY
                     if (dx * dx + dy * dy < 48f * 48f) {
-                        focusAt(event.x, event.y)
+                        if (objectLockEnabled) {
+                            selectTarget(event.x, event.y)
+                        } else {
+                            focusAt(event.x, event.y)
+                        }
                     }
                     true
                 }
@@ -380,6 +401,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 setOnClickListener { onClick() }
             }
         toolbar.addView(toolButton("镜头") { switchCamera() },
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
+        toolbar.addView(toolButton("物体锁定") {
+            objectLockEnabled = !objectLockEnabled
+            if (!objectLockEnabled) {
+                NativeBridge.nativeClearTarget()
+                targetOverlay.state = TargetUiState()
+            }
+            toast(if (objectLockEnabled) "点击画面中的目标物体" else "已退出物体锁定")
+        },
             android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
         toolbar.addView(toolButton("对焦/防抖") { showFocusStabDialog() },
             android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -914,6 +944,31 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         return android.graphics.PointF(u.coerceIn(0f, 1f), v.coerceIn(0f, 1f))
     }
 
+    private fun selectTarget(x: Float, y: Float) {
+        val norm = viewToCameraNorm(x, y) ?: return
+        NativeBridge.nativeSelectTarget(norm.x, norm.y)
+        focusAt(x, y)
+        targetFocusLocked = true
+        targetFocusDistance = lastLensFocusDistance
+        updateTargetOverlay()
+    }
+
+    private fun updateTargetOverlay() {
+        val out = FloatArray(10)
+        val state = NativeBridge.nativeGetTargetState(out)
+        targetOverlay.state = TargetUiState(
+            visible = state != 0,
+            state = state,
+            x0 = out.getOrElse(1) { 0f },
+            y0 = out.getOrElse(2) { 0f },
+            x1 = out.getOrElse(3) { 0f },
+            y1 = out.getOrElse(4) { 0f },
+            confidence = out.getOrElse(5) { 0f },
+            medianDepth = out.getOrElse(6) { 0f }
+        )
+        targetOverlay.invalidate()
+    }
+
     private fun focusAt(x: Float, y: Float) {
         if (fixedFocus) return
         val rect = activeArray
@@ -1057,6 +1112,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 sb.appendLine("    镜头[$cid] $face ${orient}° f=${"%.3f".format(focal)}mm f/${"%.3f".format(ap)}" + if (cid == currentCameraId) "  ✓当前" else "")
             } catch (_: Throwable) {}
         }
+        sb.appendLine()
+        sb.appendLine("[7] Object Lock:")
+        sb.appendLine("    enabled=$objectLockEnabled")
+        val out = FloatArray(10)
+        val state = NativeBridge.nativeGetTargetState(out)
+        sb.appendLine("    state=$state")
+        sb.appendLine("    bboxCamera=(${out.getOrElse(1) { 0f }}, ${out.getOrElse(2) { 0f }}, ${out.getOrElse(3) { 0f }}, ${out.getOrElse(4) { 0f }})")
+        sb.appendLine("    confidence=${out.getOrElse(5) { 0f }}")
+        sb.appendLine("    medianDepth=${out.getOrElse(6) { 0f }}")
+        sb.appendLine("    roiSharpness=${out.getOrElse(7) { 0f }}")
+        sb.appendLine("    trackedPoints=${out.getOrElse(8) { 0f }.toInt()}")
+        sb.appendLine("    inlierRatio=${out.getOrElse(9) { 0f }}")
+        sb.appendLine("    AF state=$lastAfState lensFocusDistance=$lastLensFocusDistance focusLocked=$targetFocusLocked relockCount=$focusRelockCount")
 
         pendingReport = sb.toString()
         createReportLauncher.launch("config_report_${System.currentTimeMillis()}.txt")
@@ -1172,6 +1240,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun updateHeader() {
         val vinsOk = NativeBridge.nativeVinsInitialized()
         headerStatus.text = "FPS %.1f · %s".format(fps, if (scanning) "扫描中" else "空闲")
+        if (objectLockEnabled) {
+            updateTargetOverlay()
+        }
         warningBanner.visibility =
             if (scanning && !vinsOk) android.view.View.VISIBLE else android.view.View.GONE
         val target = NativeBridge.nativeGetPointCount().toFloat()
@@ -1423,5 +1494,32 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sensorThread?.quitSafely()
         depthThread?.quitSafely()
         super.onDestroy()
+    }
+
+    private inner class TargetLockOverlay(context: android.content.Context) : android.view.View(context) {
+        var state: TargetUiState = TargetUiState()
+        private val paint = android.graphics.Paint().apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 3f * resources.displayMetrics.density
+            color = android.graphics.Color.GREEN
+        }
+
+        override fun onDraw(canvas: android.graphics.Canvas) {
+            super.onDraw(canvas)
+            val s = state
+            if (!s.visible || width <= 0 || height <= 0) return
+
+            paint.color = when {
+                s.state == 3 -> android.graphics.Color.RED
+                s.confidence < 0.5f -> android.graphics.Color.YELLOW
+                else -> android.graphics.Color.GREEN
+            }
+
+            val left = s.x0 * width
+            val top = s.y0 * height
+            val right = s.x1 * width
+            val bottom = s.y1 * height
+            canvas.drawRect(left, top, right, bottom, paint)
+        }
     }
 }
