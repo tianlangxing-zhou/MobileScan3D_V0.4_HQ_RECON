@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <deque>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -25,8 +26,22 @@ static double g_lastImuTimestamp = -1.0;
 static double g_lastImuDt = 0.0;
 static double g_lastFeaturePubTimestamp = -1.0;
 static bool g_firstFeaturePublish = true;
-// IMU（传感器线程）与图像（相机线程）并发进入 estimator，
-// VINS-Mono 原版靠带锁缓冲队列串行化，移植时被删掉了，这里用互斥锁补上。
+
+struct ImuSample {
+    double t = 0.0;
+    Eigen::Vector3d acc = Eigen::Vector3d::Zero();
+    Eigen::Vector3d gyr = Eigen::Vector3d::Zero();
+};
+
+static std::deque<ImuSample> g_imuBuffer;
+static std::mutex g_imuBufferMutex;
+
+static double g_estimatorTime = -1.0;
+static Eigen::Vector3d g_lastEstimatorAcc = Eigen::Vector3d::Zero();
+static Eigen::Vector3d g_lastEstimatorGyr = Eigen::Vector3d::Zero();
+static bool g_haveEstimatorImu = false;
+
+// 保护 tracker + estimator。
 static std::mutex g_vinsMutex;
 
 extern "C" JNIEXPORT void JNICALL
@@ -181,6 +196,11 @@ void vinsInit(
     g_camera = camodocal::CameraPtr(
         new camodocal::PinholeCamera("cam0", w, h, 0.0, 0.0, 0.0, 0.0, fx, fy, cx, cy));
     std::lock_guard<std::mutex> lk(g_vinsMutex);
+    {
+        std::lock_guard<std::mutex> blk(g_imuBufferMutex);
+        g_imuBuffer.clear();
+    }
+
     g_tracker[0] = FeatureTracker();
     FeatureTracker::n_id = 0;
     g_tracker[0].setCamera(g_camera);
@@ -188,6 +208,11 @@ void vinsInit(
     // 否则旧内参/旧时刻的滑窗会与新会话混跑。clearState 后必须重新 setParameter。
     g_estimator.clearState();
     g_estimator.setParameter();
+    g_estimatorTime = -1.0;
+    g_lastEstimatorAcc.setZero();
+    g_lastEstimatorGyr.setZero();
+    g_haveEstimatorImu = false;
+    g_lastImuDt = 0.0;
     g_lastImuTimestamp = -1.0;
     g_lastFeaturePubTimestamp = -1.0;
     g_firstFeaturePublish = true;
@@ -198,30 +223,115 @@ void vinsInputImu(double timestamp, double ax, double ay, double az, double gx, 
     if (!g_vinsReady) {
         return;
     }
-    std::lock_guard<std::mutex> lk(g_vinsMutex);
-    Eigen::Vector3d acc(ax, ay, az);
-    Eigen::Vector3d gyr(gx, gy, gz);
 
-    if (g_lastImuTimestamp < 0.0) {
-        g_lastImuTimestamp = timestamp;
-        g_estimator.processIMU(0.0, acc, gyr);
+    ImuSample sample;
+    sample.t = timestamp;
+    sample.acc = Eigen::Vector3d(ax, ay, az);
+    sample.gyr = Eigen::Vector3d(gx, gy, gz);
+
+    std::lock_guard<std::mutex> lk(g_imuBufferMutex);
+
+    if (!g_imuBuffer.empty() && timestamp <= g_imuBuffer.back().t) {
         return;
     }
 
-    const double dt = timestamp - g_lastImuTimestamp;
-    g_lastImuTimestamp = timestamp;
+    g_imuBuffer.push_back(sample);
 
-    if (dt <= 0.0) {
-        return;
+    while (g_imuBuffer.size() > 4000) {
+        g_imuBuffer.pop_front();
+    }
+}
+
+static bool processImuUntil(double imageTime) {
+    std::vector<ImuSample> samples;
+    ImuSample futureSample;
+    bool haveFuture = false;
+
+    {
+        std::lock_guard<std::mutex> lk(g_imuBufferMutex);
+
+        if (g_imuBuffer.empty()) {
+            return false;
+        }
+
+        if (g_imuBuffer.back().t <= imageTime) {
+            return false;
+        }
+
+        while (!g_imuBuffer.empty() && g_imuBuffer.front().t <= imageTime) {
+            samples.push_back(g_imuBuffer.front());
+            g_imuBuffer.pop_front();
+        }
+
+        if (!g_imuBuffer.empty()) {
+            futureSample = g_imuBuffer.front();
+            haveFuture = true;
+        }
     }
 
-    if (dt > 0.1) {
-        return;
+    if (!haveFuture) {
+        return false;
     }
 
-    g_lastImuDt = dt;
+    size_t index = 0;
 
-    g_estimator.processIMU(dt, acc, gyr);
+    if (!g_haveEstimatorImu) {
+        if (samples.empty()) {
+            return false;
+        }
+
+        const auto& s = samples[0];
+        g_estimatorTime = s.t;
+        g_lastEstimatorAcc = s.acc;
+        g_lastEstimatorGyr = s.gyr;
+        g_estimator.processIMU(0.0, s.acc, s.gyr);
+        g_haveEstimatorImu = true;
+        index = 1;
+    }
+
+    for (; index < samples.size(); ++index) {
+        const auto& s = samples[index];
+        const double dt = s.t - g_estimatorTime;
+
+        if (dt <= 0.0) {
+            continue;
+        }
+
+        if (dt > 0.1) {
+            return false;
+        }
+
+        g_estimator.processIMU(dt, s.acc, s.gyr);
+        g_lastImuDt = dt;
+        g_estimatorTime = s.t;
+        g_lastEstimatorAcc = s.acc;
+        g_lastEstimatorGyr = s.gyr;
+    }
+
+    if (g_estimatorTime < imageTime) {
+        const double dt1 = imageTime - g_estimatorTime;
+        const double dt2 = futureSample.t - imageTime;
+
+        if (dt1 < 0.0 || dt2 < 0.0 || dt1 + dt2 <= 0.0) {
+            return false;
+        }
+
+        const double w1 = dt2 / (dt1 + dt2);
+        const double w2 = dt1 / (dt1 + dt2);
+
+        const Eigen::Vector3d acc =
+            w1 * g_lastEstimatorAcc + w2 * futureSample.acc;
+        const Eigen::Vector3d gyr =
+            w1 * g_lastEstimatorGyr + w2 * futureSample.gyr;
+
+        g_estimator.processIMU(dt1, acc, gyr);
+        g_lastImuDt = dt1;
+        g_estimatorTime = imageTime;
+        g_lastEstimatorAcc = acc;
+        g_lastEstimatorGyr = gyr;
+    }
+
+    return true;
 }
 
 void vinsInputImage(double t, const std::uint8_t* gray, int w, int h, int stride) {
@@ -284,6 +394,10 @@ void vinsInputImage(double t, const std::uint8_t* gray, int w, int h, int stride
     }
 
     if (image.size() < 20) {
+        return;
+    }
+
+    if (!processImuUntil(t)) {
         return;
     }
 
