@@ -15,7 +15,12 @@ enum class TargetState
     ARMED = 1,
     ACQUIRING = 2,
     TRACKING = 3,
-    LOST = 4
+    LOST = 4,
+    // 目标短暂滑出画面时的中间态。旧行为是直接进 LOST，而 track() 开头
+    // 就 `state != TRACKING -> return`，连 NanoTrack 都不会再跑 ——
+    // 用户把物体移回画面也必须重新点一次。REACQUIRING 给 Nanotrack 一个
+    // 约 1.5s 的找回窗口，窗口内自己找回来就无缝回到 TRACKING，超时才判 LOST。
+    REACQUIRING = 5
 };
 
 struct TargetTrackInfo
@@ -95,6 +100,15 @@ struct TargetTrackInfo
     int visibleBBoxWidthPx = 0;
     int visibleBBoxHeightPx = 0;
     float visibleFraction = 1.0f;
+    // 目标中心的相机归一化坐标，**不裁剪**。
+    // 为什么不复用 bbox：目标整块滑出画面时 visibleBox 会退化成空矩形，
+    // UI 连「目标往哪个方向去了」都无从判断，只能干等。中心点即使跑到
+    // [0,1] 之外也仍然保留方向信息，UI 才能给出「向左移动手机找回目标」。
+    float centerXNorm = 0.f;
+    float centerYNorm = 0.f;
+    // 连续「可见比例 < 12%」的帧数，native 用它判定是否进入 REACQUIRING。
+    // 上报给 UI 是为了让报告能区分「刚出界」和「出界很久了」。
+    int edgeLostFrames = 0;
     float lastAffineScale = 1.0f;
     float affineScaleEMA = 1.0f;
     uint64_t reseedCount = 0;
@@ -112,6 +126,12 @@ public:
     void setEnabled(bool enabled);
     bool configureNano(const std::string& backbone, const std::string& head);
     bool requestTarget(float u, float v);
+    // 用户手指拖出的矩形（相机归一化坐标，允许任意方向）。
+    // 固定 240x240 的点选 ROI 与目标真实形状无关：点一个细长瓶子时会把
+    // 周围背景一起塞进 ROI，KLT 追的其实是「物体 + 墙 + 桌子」的混合纹理，
+    // 绿色框自然贴不住目标。拖框让用户直接把 bbox 告诉 tracker，
+    // 比立刻上 SAM/YOLO 更实用，而且几乎没有额外算力。
+    bool requestTargetRect(float x0, float y0, float x1, float y1);
     bool selectTarget(float u, float v);
     void updateFrame(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp);
     void track(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp);
@@ -140,6 +160,10 @@ private:
     float trackHalfH_ = 120.f;
     int framesSinceLastReseed_ = 0;
     int edgeLostFrames_ = 0;
+    // REACQUIRING 已经持续的帧数；超过 kReacquireTimeoutFrames 才判 LOST。
+    // 刻意不用「时间」，因为 track() 的调用频率由相机帧率决定，
+    // 帧数计数在掉帧时反而更保守（不急于判死）。
+    int reacquireFrames_ = 0;
     cv::Ptr<cv::TrackerNano> nano_;
     bool nanoLoaded_ = false;
     bool nanoNeedInit_ = false;
@@ -167,6 +191,14 @@ private:
     std::atomic<bool> pendingSelect_{false};
     std::atomic<float> pendingU_{0.5f};
     std::atomic<float> pendingV_{0.5f};
+
+    // 拖框选择。与 pendingSelect_ 互相排斥：后设的那一个生效
+    // （requestTarget 清 rect 标志，requestTargetRect 清 tap 标志）。
+    std::atomic<bool> pendingRectSelect_{false};
+    std::atomic<float> pendingRectX0_{0.f};
+    std::atomic<float> pendingRectY0_{0.f};
+    std::atomic<float> pendingRectX1_{1.f};
+    std::atomic<float> pendingRectY1_{1.f};
 
     void setError(const std::string& msg);
     void markLost(const std::string& reason);

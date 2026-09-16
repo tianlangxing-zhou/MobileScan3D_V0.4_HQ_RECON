@@ -14,7 +14,38 @@ object NativeBridge {
      * 新增诊断字段时只改这里 + 对应的 native 常量，调用方一律用这些常量建数组。
      */
     const val DEPTH_DIAGNOSTIC_SLOTS = 7
-    const val TARGET_STATE_SLOTS = 10
+    /**
+     * 10 -> 14：新增 4 个字段给 UI 做「目标离屏」提示与方向引导。
+     *
+     *   0  state            1  x0        2  y0        3  x1        4  y1
+     *   5  confidence       6  medianDepth   7  roiSharpness
+     *   8  trackedPoints    9  inlierRatio
+     *   10 visibleFraction  11 centerXNorm 12 centerYNorm 13 edgeLostFrames
+     *
+     * 为什么必须有 11/12（中心点）：目标整块滑出画面时 1..4 的 bbox 会被
+     * 裁剪成空矩形，UI 连「目标往哪个方向去了」都无从判断，只能干等。
+     * 中心点即使跑出 [0,1] 也仍然保留方向信息。
+     */
+    const val TARGET_STATE_SLOTS = 14
+    /** [nativeGetTargetState] 输出的下标，避免调用方再手写数字。 */
+    const val TARGET_STATE_INDEX_STATE = 0
+    const val TARGET_STATE_INDEX_VISIBLE_FRACTION = 10
+    const val TARGET_STATE_INDEX_CENTER_X = 11
+    const val TARGET_STATE_INDEX_CENTER_Y = 12
+    const val TARGET_STATE_INDEX_EDGE_LOST_FRAMES = 13
+
+    /**
+     * 与 C++ `TargetState` 枚举逐项对应（顺序即数值）。
+     * 新增了 REACQUIRING = 5：目标短暂出屏时的中间态，
+     * 约 1.5s 内由 NanoTrack 自己找回来，超时才转 LOST。
+     */
+    const val TARGET_STATE_OFF = 0
+    const val TARGET_STATE_ARMED = 1
+    const val TARGET_STATE_ACQUIRING = 2
+    const val TARGET_STATE_TRACKING = 3
+    const val TARGET_STATE_LOST = 4
+    const val TARGET_STATE_REACQUIRING = 5
+
     const val RENDER_POSE_SLOTS = 12
 
     /** 点云/调试层每个点 6 个浮点：x, y, z, r, g, b */
@@ -54,6 +85,16 @@ object NativeBridge {
     external fun nativeGetHudMetrics(): String
     external fun nativeGetPointCount(): Int
     external fun nativeSelectTarget(u: Float, v: Float): Boolean
+    /**
+     * 用户手指拖出的矩形（相机归一化坐标，允许任意方向）。
+     *
+     * 对比单点 [nativeSelectTarget]：点按只能回退到固定 240x240 的方块，
+     * 点一个细长瓶子时会把周围背景一起锁进 ROI，KLT 追的是
+     * 「物体 + 墙 + 桌子」的混合纹理，绿框自然贴不住目标。
+     */
+    external fun nativeSelectTargetRect(
+        x0: Float, y0: Float, x1: Float, y1: Float
+    ): Boolean
     external fun nativeClearTarget()
     external fun nativeSetObjectLockEnabled(enabled: Boolean)
     external fun nativeGetTargetState(out: FloatArray): Int

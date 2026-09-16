@@ -1024,6 +1024,17 @@ Java_com_mobilescan3d_NativeBridge_nativeGetHudMetrics(JNIEnv* e, jobject) {
 // 又按新槽数索引，越界会发生在 Kotlin 侧（「导出反馈报告」闪退那次就是这个形态）。
 static constexpr int kDepthDiagSlots = 7;
 
+// nativeGetTargetState 的槽数。
+// **必须与 Kotlin 侧 NativeBridge.TARGET_STATE_SLOTS 保持一致。**
+// 0..9 是原有字段，10..13 是本轮新增：
+//   10 visibleFraction  目标可见比例（<0.12 连续 3 帧 -> REACQUIRING）
+//   11 centerXNorm      目标中心 X（相机归一化，未裁剪，可越界）
+//   12 centerYNorm      目标中心 Y
+//   13 edgeLostFrames   连续「可见比例 < 12%」的帧数
+// UI 靠 10..13 才能给出「目标接近边缘 / 已离开画面」的持续提示和方向箭头；
+// 旧协议只给裁剪后的 bbox，目标完全出界时 bbox 退化成空矩形，UI 只能干等。
+static constexpr int kTargetStateSlots = 14;
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetPointCount(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(gStateMutex);
@@ -1036,6 +1047,25 @@ Java_com_mobilescan3d_NativeBridge_nativeSelectTarget(JNIEnv*, jobject, jfloat u
     if (!objectTracker) return JNI_FALSE;
     try {
         return objectTracker->requestTarget(u, v) ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+// 用户手指拖出的矩形（相机归一化坐标，允许任意方向）。
+// 走 gStateMutex 只是为了安全拿到 shared_ptr；真正的工作在 ObjectTracker
+// 自己的 mutex_ 里完成，所以这里持锁时间很短，不会挡住相机/深度线程。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSelectTargetRect(
+        JNIEnv*, jobject, jfloat x0, jfloat y0, jfloat x1, jfloat y1) {
+    std::shared_ptr<ObjectTracker> tracker;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        tracker = objectTracker;
+    }
+    if (!tracker) return JNI_FALSE;
+    try {
+        return tracker->requestTargetRect(x0, y0, x1, y1) ? JNI_TRUE : JNI_FALSE;
     } catch (...) {
         return JNI_FALSE;
     }
@@ -1057,29 +1087,43 @@ Java_com_mobilescan3d_NativeBridge_nativeSetObjectLockEnabled(JNIEnv*, jobject, 
     if (objectTracker) objectTracker->setEnabled(enabled);
 }
 
+// UI 侧的绿色目标框现在以 30Hz 拉取本接口（原来是 1Hz，肉眼看起来
+// 「追踪很慢」其实就是刷新率问题，不是 tracker 算得慢）。
+// 所以这里**不能**像以前那样整段持有 gStateMutex：
+// gStateMutex 同时保护 VINS / Depth / Camera 主链，长期占用会直接拖慢它们。
+// 正确做法是只在取 shared_ptr 的瞬间持锁，info() 靠 ObjectTracker 自己的 mutex_。
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jfloatArray out) {
-    std::lock_guard<std::mutex> lk(gStateMutex);
-    if (!objectTracker) return 0;
-    const TargetTrackInfo info = objectTracker->info();
-    if (out != nullptr) {
-        jfloat* dst = env->GetFloatArrayElements(out, nullptr);
-        if (dst != nullptr) {
-            const jsize n = env->GetArrayLength(out);
-            if (n >= 10) {
-                dst[0] = static_cast<float>(static_cast<int>(info.state));
-                dst[1] = info.x0;
-                dst[2] = info.y0;
-                dst[3] = info.x1;
-                dst[4] = info.y1;
-                dst[5] = info.confidence;
-                dst[6] = info.medianDepth;
-                dst[7] = info.roiSharpness;
-                dst[8] = static_cast<float>(info.trackedPoints);
-                dst[9] = info.inlierRatio;
-            }
-            env->ReleaseFloatArrayElements(out, dst, 0);
-        }
+    std::shared_ptr<ObjectTracker> tracker;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        tracker = objectTracker;
+    }
+    if (!tracker) {
+        return 0;
+    }
+    if (out == nullptr || env->GetArrayLength(out) < kTargetStateSlots) {
+        return static_cast<jint>(tracker->info().state);
+    }
+
+    const TargetTrackInfo info = tracker->info();
+    jfloat* dst = env->GetFloatArrayElements(out, nullptr);
+    if (dst != nullptr) {
+        dst[0] = static_cast<float>(static_cast<int>(info.state));
+        dst[1] = info.x0;
+        dst[2] = info.y0;
+        dst[3] = info.x1;
+        dst[4] = info.y1;
+        dst[5] = info.confidence;
+        dst[6] = info.medianDepth;
+        dst[7] = info.roiSharpness;
+        dst[8] = static_cast<float>(info.trackedPoints);
+        dst[9] = info.inlierRatio;
+        dst[10] = info.visibleFraction;
+        dst[11] = info.centerXNorm;
+        dst[12] = info.centerYNorm;
+        dst[13] = static_cast<float>(info.edgeLostFrames);
+        env->ReleaseFloatArrayElements(out, dst, 0);
     }
     return static_cast<jint>(info.state);
 }

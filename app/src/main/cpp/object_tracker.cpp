@@ -14,6 +14,35 @@ constexpr int kWeakKltPatience = 3;
 // 弱 KLT 场景下采纳 Nano 结果所需的最低分数
 constexpr float kNanoWeakScore = 0.35f;
 
+// ---------- REACQUIRING（短暂出屏后自动找回） ----------
+// 重捕获期间采纳 Nano 框所需的最低分数。比 kNanoWeakScore 高得多：
+// 此时 KLT 已经完全失效，唯一依据就是 Nano 的外观判别，宁可超时判 LOST，
+// 也不能把一个错误位置当成目标找回来（假锁定比丢失更难排查）。
+constexpr float kNanoReacquireScore = 0.65f;
+// 重捕获尝试的帧数上限。track() 每帧调一次，约 1.5s @30fps。
+// 用帧数而非时间：掉帧时帧数计数更保守，不会因为卡顿就提前判死。
+constexpr int kReacquireTimeoutFrames = 45;
+// 重捕获期间每 2 帧跑一次 Nano（正常态是每 5 帧）—— 危险态需要更快的节奏。
+constexpr int kReacquireNanoPeriod = 2;
+
+// ---------- NanoTrack 自适应节奏 / 纠偏权重 ----------
+// 健康时沿用原来的每 5 帧（约 4Hz @20fps）省算力；
+// confidence / 点数 / 可见比例任一项变差就提到每 2 帧（约 10Hz）。
+constexpr int kNanoPeriodHealthy = 5;
+constexpr int kNanoPeriodStressed = 2;
+// 纠偏权重：正常 0.20 的慢融合，避免把 KLT 的精细结果拽向 CNN 的粗框；
+// 危险状态最多提到 0.55，让屏幕上的框明显跟得上目标。
+constexpr float kNanoWeightBase = 0.20f;
+constexpr float kNanoWeightLowConfidence = 0.55f;
+constexpr float kNanoWeightNearEdge = 0.50f;
+// 参与自适应判定的阈值
+constexpr float kNanoStressConfidence = 0.75f;
+constexpr int   kNanoStressPoints = 40;
+constexpr float kNanoStressVisible = 0.70f;
+// bbox 尺寸融合必须比中心慢得多。尺寸更新的权重一旦放大，
+// 以前出现过的 bbox collapse 就会回来 —— 那个问题比「框大小略滞后」严重得多。
+constexpr float kNanoSizeWeight = 0.15f;
+
 } // namespace
 
 void ObjectTracker::reset()
@@ -24,6 +53,7 @@ void ObjectTracker::reset()
     pendingV_.store(0.5f);
     enabled_ = false;
     info_ = TargetTrackInfo{};
+    pendingRectSelect_.store(false, std::memory_order_release);
     lastGray_.release();
     targetTemplate_.release();
     mask_.release();
@@ -32,6 +62,7 @@ void ObjectTracker::reset()
     havePrev_ = false;
     weakKltFrames_ = 0;
     edgeLostFrames_ = 0;
+    reacquireFrames_ = 0;
     framesSinceLastReseed_ = 0;
     nanoNeedInit_ = false;
     nanoFrameCounter_ = 0;
@@ -81,6 +112,7 @@ void ObjectTracker::clearTarget()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     pendingSelect_.store(false, std::memory_order_release);
+    pendingRectSelect_.store(false, std::memory_order_release);
 
     targetTemplate_.release();
     mask_.release();
@@ -114,6 +146,12 @@ void ObjectTracker::clearTarget()
     info_.prevPointCount = 0;
     weakKltFrames_ = 0;
     info_.weakKltFrames = 0;
+    edgeLostFrames_ = 0;
+    reacquireFrames_ = 0;
+    info_.edgeLostFrames = 0;
+    info_.centerXNorm = 0.f;
+    info_.centerYNorm = 0.f;
+    info_.visibleFraction = 1.0f;
     info_.state = enabled_ ? TargetState::ARMED : TargetState::OFF;
 }
 
@@ -127,6 +165,10 @@ void ObjectTracker::setEnabled(bool enabled)
         }
     } else {
         pendingSelect_.store(false, std::memory_order_release);
+        pendingRectSelect_.store(false, std::memory_order_release);
+        edgeLostFrames_ = 0;
+        reacquireFrames_ = 0;
+        info_.edgeLostFrames = 0;
         info_.state = TargetState::OFF;
         targetTemplate_.release();
         mask_.release();
@@ -174,7 +216,47 @@ bool ObjectTracker::requestTarget(float u, float v)
 
     pendingU_.store(std::clamp(u, 0.0f, 1.0f));
     pendingV_.store(std::clamp(v, 0.0f, 1.0f));
+    // 点按与拖框互斥：后设的那个生效
+    pendingRectSelect_.store(false, std::memory_order_release);
     pendingSelect_.store(true, std::memory_order_release);
+    info_.targetRequestAccepted++;
+    return true;
+}
+
+bool ObjectTracker::requestTargetRect(float x0, float y0, float x1, float y1)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    info_.targetRequestCalls++;
+
+    if (!std::isfinite(x0) || !std::isfinite(y0) ||
+        !std::isfinite(x1) || !std::isfinite(y1)) {
+        info_.targetRequestRejected++;
+        info_.lastError = "requestTargetRect: invalid coordinate";
+        return false;
+    }
+    if (!enabled_) {
+        info_.targetRequestRejected++;
+        info_.lastError = "requestTargetRect: not enabled";
+        return false;
+    }
+
+    // 允许任意方向拖动：统一成 min/max，不假设 x0 < x1
+    const float lx = std::clamp(std::min(x0, x1), 0.0f, 1.0f);
+    const float ly = std::clamp(std::min(y0, y1), 0.0f, 1.0f);
+    const float hx = std::clamp(std::max(x0, x1), 0.0f, 1.0f);
+    const float hy = std::clamp(std::max(y0, y1), 0.0f, 1.0f);
+    if (hx - lx <= 0.0f || hy - ly <= 0.0f) {
+        info_.targetRequestRejected++;
+        info_.lastError = "requestTargetRect: empty rect";
+        return false;
+    }
+
+    pendingRectX0_.store(lx);
+    pendingRectY0_.store(ly);
+    pendingRectX1_.store(hx);
+    pendingRectY1_.store(hy);
+    pendingSelect_.store(false, std::memory_order_release);
+    pendingRectSelect_.store(true, std::memory_order_release);
     info_.targetRequestAccepted++;
     return true;
 }
@@ -192,6 +274,8 @@ void ObjectTracker::markLost(const std::string& reason)
     info_.state = TargetState::LOST;
     info_.confidence = 0.f;
     info_.inlierRatio = 0.f;
+    info_.edgeLostFrames = edgeLostFrames_;
+    reacquireFrames_ = 0;
     info_.lastError = reason;
 }
 
@@ -227,31 +311,59 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
     info_.lastFrameTs = timestamp;
     info_.cameraUpdateCalls++;
 
-    if (pendingSelect_.exchange(false, std::memory_order_acq_rel)) {
+    // 目标初始化区域有两种来源，拖框优先：
+    //   1) requestTargetRect —— 用户明确框选，直接采用他给的矩形；
+    //   2) requestTarget    —— 单点回退到固定 240x240。
+    //
+    // 第 2 条只是兜底：固定 240x240 与目标真实形状无关，点一个细长瓶子时
+    // 会把周围背景一起放进 ROI，KLT 追的其实是「物体 + 墙 + 桌子」的混合
+    // 纹理 —— 这才是「框没有完全跟着物体」的真正原因，不是 KLT 算得慢。
+    constexpr int kMinRoiPx = 32;
+    bool haveNewRoi = false;
+    cv::Rect roi;
+    if (pendingRectSelect_.exchange(false, std::memory_order_acq_rel)) {
+        const float lx = pendingRectX0_.load();
+        const float ly = pendingRectY0_.load();
+        const float hx = pendingRectX1_.load();
+        const float hy = pendingRectY1_.load();
+        roi = normToRect(lx, ly, hx, hy, width, height);
+        haveNewRoi = roi.width >= kMinRoiPx && roi.height >= kMinRoiPx;
+        if (!haveNewRoi) {
+            info_.targetRequestRejected++;
+            info_.lastError = "select: drag rect too small";
+        }
+    } else if (pendingSelect_.exchange(false, std::memory_order_acq_rel)) {
         const float u = pendingU_.load();
         const float v = pendingV_.load();
         const int cx = std::clamp(static_cast<int>(u * (width - 1)), 0, width - 1);
         const int cy = std::clamp(static_cast<int>(v * (height - 1)), 0, height - 1);
         constexpr int ROI_W = 240;
         constexpr int ROI_H = 240;
-        cv::Rect wanted(cx - ROI_W / 2, cy - ROI_H / 2, ROI_W, ROI_H);
-        const cv::Rect bounds(0, 0, width, height);
-        cv::Rect roi = wanted & bounds;
-        if (roi.width >= 64 && roi.height >= 64) {
-            trackCx_ = static_cast<float>(cx);
-            trackCy_ = static_cast<float>(cy);
-            trackHalfW_ = ROI_W * 0.5f;
-            trackHalfH_ = ROI_H * 0.5f;
-            info_.x0 = static_cast<float>(roi.x) / width;
-            info_.y0 = static_cast<float>(roi.y) / height;
-            info_.x1 = static_cast<float>(roi.x + roi.width) / width;
-            info_.y1 = static_cast<float>(roi.y + roi.height) / height;
-            info_.state = TargetState::ACQUIRING;
-            targetTemplate_.release();
-            prevGray_.release();
-            prevPoints_.clear();
-            havePrev_ = false;
-        }
+        roi = cv::Rect(cx - ROI_W / 2, cy - ROI_H / 2, ROI_W, ROI_H) &
+              cv::Rect(0, 0, width, height);
+        haveNewRoi = roi.width >= kMinRoiPx && roi.height >= kMinRoiPx;
+    }
+
+    if (haveNewRoi) {
+        trackCx_ = static_cast<float>(roi.x) + static_cast<float>(roi.width) * 0.5f;
+        trackCy_ = static_cast<float>(roi.y) + static_cast<float>(roi.height) * 0.5f;
+        trackHalfW_ = static_cast<float>(roi.width) * 0.5f;
+        trackHalfH_ = static_cast<float>(roi.height) * 0.5f;
+        info_.x0 = static_cast<float>(roi.x) / width;
+        info_.y0 = static_cast<float>(roi.y) / height;
+        info_.x1 = static_cast<float>(roi.x + roi.width) / width;
+        info_.y1 = static_cast<float>(roi.y + roi.height) / height;
+        info_.centerXNorm = trackCx_ / width;
+        info_.centerYNorm = trackCy_ / height;
+        info_.visibleFraction = 1.0f;
+        info_.edgeLostFrames = 0;
+        edgeLostFrames_ = 0;
+        reacquireFrames_ = 0;
+        info_.state = TargetState::ACQUIRING;
+        targetTemplate_.release();
+        prevGray_.release();
+        prevPoints_.clear();
+        havePrev_ = false;
     }
 
     if (info_.state == TargetState::ACQUIRING) {
@@ -263,7 +375,10 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         const int y1 = std::min(height - 1, static_cast<int>(info_.y1 * height));
         cv::Rect roi(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
         roi &= cv::Rect(0, 0, width, height);
-        if (roi.width < 48 || roi.height < 48) {
+        // 由 48 放宽到 32：拖框选择让用户能给出贴合目标的窄框，
+        // 太小的 ROI 本来就凑不出 15 个特征点，会走下面的
+        // "acquire: too few features" 分支如实报错。
+        if (roi.width < 32 || roi.height < 32) {
             info_.acquireFail++;
             info_.lastError = "acquire: ROI too small";
             return;
@@ -311,6 +426,13 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         info_.lastError.clear();
         havePrev_ = true;
         nanoNeedInit_ = true;
+        edgeLostFrames_ = 0;
+        reacquireFrames_ = 0;
+        info_.edgeLostFrames = 0;
+        info_.visibleFraction = 1.0f;
+        info_.centerXNorm = trackCx_ / width;
+        info_.centerYNorm = trackCy_ / height;
+        info_.lastEvent = "target acquired";
         clearWeakKlt();
     }
 }
@@ -330,7 +452,54 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     std::lock_guard<std::mutex> lock(mutex_);
     info_.trackerUpdateCalls++;
 
-    if (!enabled_ || info_.state != TargetState::TRACKING) {
+    if (!enabled_) {
+        return;
+    }
+
+    // REACQUIRING：目标短暂出屏后由 NanoTrack 自己找回。
+    //
+    // 旧实现在这里就 `state != TRACKING -> return` 了，连 Nano 都不会跑，
+    // 用户把物体移回画面也毫无反应 —— 必须重新点一次，这对手机扫描体验
+    // 明显不够好。这里给约 1.5s 的找回窗口。
+    if (info_.state == TargetState::REACQUIRING) {
+        reacquireFrames_++;
+        // 只有 Nano 模板已经存在时才尝试找回。
+        //
+        // 刻意不允许这里重新 init：目标刚出界时 info_.x0..y1 是被裁剪过的
+        // 残片，拿它当模板初始化等于让 Nano 只记住「物体的一条边」，
+        // 之后很可能把别的相似纹理认成目标 —— 比超时判 LOST 更糟。
+        // 保留出界前那份完整模板、直接在整帧里 update() 才是我们要的。
+        if (nanoLoaded_ && !nanoNeedInit_ &&
+            (reacquireFrames_ % kReacquireNanoPeriod) == 0) {
+            bool usedColor = false;
+            const cv::Mat nanoFrame = resolveNanoFrame(owned, &usedColor);
+            if (!nanoFrame.empty()) {
+                info_.nanoUsedRealColor = usedColor;
+                cv::Rect nanoRect;
+                if (runNanoUpdate(nanoFrame, nanoFrame.cols, nanoFrame.rows, nanoRect) &&
+                    nanoScore_ >= kNanoReacquireScore) {
+                    adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp);
+                    ++nanoRecoveries_;
+                    info_.nanoRecoveries = nanoRecoveries_;
+                    info_.state = TargetState::TRACKING;
+                    info_.lastEvent = "target reacquired";
+                    info_.lastError.clear();
+                    info_.trackSuccess++;
+                    reacquireFrames_ = 0;
+                    info_.timestamp = timestamp;
+                    return;
+                }
+            }
+        }
+        if (reacquireFrames_ > kReacquireTimeoutFrames) {
+            markLost("target reacquire timeout");
+        } else {
+            info_.lastEvent = "target left frame, reacquiring";
+        }
+        return;
+    }
+
+    if (info_.state != TargetState::TRACKING) {
         return;
     }
 
@@ -482,6 +651,12 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.y0 = std::clamp(static_cast<float>(visibleBox.y) / height, 0.0f, 1.0f);
     info_.x1 = std::clamp(static_cast<float>(visibleBox.x + visibleBox.width) / width, 0.0f, 1.0f);
     info_.y1 = std::clamp(static_cast<float>(visibleBox.y + visibleBox.height) / height, 0.0f, 1.0f);
+    // 中心点用**未裁剪**的 trackCx_/trackCy_，并允许跑出 [0,1]：
+    // 目标完全出界时 visibleBox 会退化成空矩形，只有中心点还保留
+    // 「目标往哪个方向去了」的信息，UI 才能给出正确的找回提示。
+    info_.centerXNorm = std::clamp(trackCx_ / static_cast<float>(width), -1.0f, 2.0f);
+    info_.centerYNorm = std::clamp(trackCy_ / static_cast<float>(height), -1.0f, 2.0f);
+    info_.edgeLostFrames = edgeLostFrames_;
 
     const int bboxW = visibleBox.width;
     const int bboxH = visibleBox.height;
@@ -492,8 +667,14 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.visibleBBoxWidthPx = visibleBox.width;
     info_.visibleBBoxHeightPx = visibleBox.height;
 
+    // 目标整块滑出画面：不再直接判 LOST，先进 REACQUIRING 给 Nano 一个
+    // 约 1.5s 的找回窗口。这样「扫出去再扫回来」不需要用户重新点一次。
+    // 真正的终态 LOST 只留给「窗口内没找回来」这一种情况。
     if (edgeLostFrames_ >= 3) {
-        markLost("track: target left frame");
+        info_.state = TargetState::REACQUIRING;
+        reacquireFrames_ = 0;
+        info_.lastEvent = "target left frame, reacquiring";
+        info_.lastError = "track: target left frame";
         return;
     }
 
@@ -533,7 +714,17 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
 
     if (nanoLoaded_ && info_.state == TargetState::TRACKING) {
         nanoFrameCounter_++;
-        if (nanoNeedInit_ || (nanoFrameCounter_ % 5) == 0) {
+
+        // 自适应节奏：健康时维持原来的每 5 帧（约 4Hz @20fps）省算力；
+        // 一旦 confidence / 点数 / 可见比例任一项变差就提到每 2 帧（约 10Hz）。
+        // 不是「干脆每帧都跑」—— 那会把算力全花在正常情况下最不需要纠偏的时候。
+        const bool stressed =
+            info_.confidence < kNanoStressConfidence ||
+            info_.trackedPoints < kNanoStressPoints ||
+            info_.visibleFraction < kNanoStressVisible;
+        const int nanoPeriod = stressed ? kNanoPeriodStressed : kNanoPeriodHealthy;
+
+        if (nanoNeedInit_ || (nanoFrameCounter_ % nanoPeriod) == 0) {
             bool usedColor = false;
             const cv::Mat nanoFrame = resolveNanoFrame(owned, &usedColor);
             info_.nanoUsedRealColor = usedColor;
@@ -545,9 +736,35 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                         (nanoRect.x + nanoRect.width * 0.5f) / nanoFrame.cols * width;
                     const float nanoCy =
                         (nanoRect.y + nanoRect.height * 0.5f) / nanoFrame.rows * height;
+                    const float nanoHalfW =
+                        nanoRect.width * 0.5f / nanoFrame.cols * width;
+                    const float nanoHalfH =
+                        nanoRect.height * 0.5f / nanoFrame.rows * height;
+
+                    // 动态纠偏权重：从 0.20 的慢融合起步，危险状态最多 0.55。
+                    // 固定 0.25 在危险的 10Hz 前看起来就是「拖尾」。
+                    float nanoWeight = kNanoWeightBase;
+                    if (info_.confidence < 0.65f) {
+                        nanoWeight = kNanoWeightLowConfidence;
+                    }
+                    if (info_.visibleFraction < 0.60f) {
+                        nanoWeight = std::max(nanoWeight, kNanoWeightNearEdge);
+                    }
+
                     if (nanoScore_ > 0.45f && info_.confidence > 0.45f) {
-                        trackCx_ = trackCx_ * 0.75f + nanoCx * 0.25f;
-                        trackCy_ = trackCy_ * 0.75f + nanoCy * 0.25f;
+                        trackCx_ = trackCx_ * (1.f - nanoWeight) + nanoCx * nanoWeight;
+                        trackCy_ = trackCy_ * (1.f - nanoWeight) + nanoCy * nanoWeight;
+                        // 尺寸也要纠，但必须比中心慢得多：0.85/0.15。
+                        // 放大尺寸权重会把以前出现过的 bbox collapse 带回来。
+                        trackHalfW_ = trackHalfW_ * (1.f - kNanoSizeWeight) +
+                                      nanoHalfW * kNanoSizeWeight;
+                        trackHalfH_ = trackHalfH_ * (1.f - kNanoSizeWeight) +
+                                      nanoHalfH * kNanoSizeWeight;
+                        const float minHalf = 8.f;
+                        trackHalfW_ = std::clamp(trackHalfW_, minHalf,
+                                                 static_cast<float>(width) * 0.5f);
+                        trackHalfH_ = std::clamp(trackHalfH_, minHalf,
+                                                 static_cast<float>(height) * 0.5f);
                     } else if (nanoScore_ > 0.60f && prevPoints_.size() < 20) {
                         adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp);
                         ++nanoRecoveries_;
@@ -858,7 +1075,9 @@ void ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
     havePrev_ = !prevGray_.empty();
     framesSinceLastReseed_ = 0;
     edgeLostFrames_ = 0;
+    reacquireFrames_ = 0;
     nanoNeedInit_ = false;
+    info_.edgeLostFrames = 0;
 
     info_.x0 = std::clamp(static_cast<float>(box.x) / width, 0.0f, 1.0f);
     info_.y0 = std::clamp(static_cast<float>(box.y) / height, 0.0f, 1.0f);
@@ -871,6 +1090,8 @@ void ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
     info_.visibleBBoxWidthPx = box.width;
     info_.visibleBBoxHeightPx = box.height;
     info_.visibleFraction = 1.0f;
+    info_.centerXNorm = trackCx_ / static_cast<float>(width);
+    info_.centerYNorm = trackCy_ / static_cast<float>(height);
     info_.trackedPoints = static_cast<int>(prevPoints_.size());
     info_.kltGoodPoints = info_.trackedPoints;
     info_.prevPointCount = info_.trackedPoints;

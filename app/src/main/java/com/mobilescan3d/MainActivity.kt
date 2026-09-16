@@ -142,6 +142,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
      * 报告里的 displayRotationApplied 现在反映的就是它。
      */
     @Volatile private var cameraToViewReady = false
+    /**
+     * camera-normalized UV -> view-normalized 的 2x3 仿射 (a,b,c, d,e,f)。
+     *
+     * 点云 Renderer 用它做世界点云投影；绿色目标框也**必须共用这一套**。
+     * 旧实现画框时直接 `s.x0 * width`，等于假设「相机归一化坐标 == 竖屏
+     * 视图归一化坐标」，而实际中间隔着 sensorOrientation 90° +
+     * SurfaceTexture transform + TextureView center crop —— 于是 native
+     * 明明跟住了目标，屏幕上的框却画在错误位置，看起来就像「追踪不准」。
+     */
+    @Volatile private var cameraToView = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f)
     /** Preview 当前帧的时间戳（SurfaceTexture.getTimestamp），AR 用它反查那一刻的 pose */
     @Volatile private var previewTimestampNs = 0L
     /** AR 图层切换按钮 */
@@ -171,6 +181,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var targetState = 0
     private var targetConfidence = 0f
     private var targetTrackedPoints = 0
+    private var targetVisibleFraction = 1f
+    private var targetCenterX = 0.5f
+    private var targetCenterY = 0.5f
+    // 「TRACKING -> 离开画面」边沿检测，用于只震一次
+    private var lastTargetUiState = 0
+    private var vibrator: android.os.Vibrator? = null
     private val targetAfLockEnabled = false
     private var aeLockAvailable = false
     private var awbLockAvailable = false
@@ -199,6 +215,21 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var modeLabel = "连续单帧点云"
     private var objectLockEnabled = false
     private lateinit var targetOverlay: TargetLockOverlay
+    /** 目标接近边缘 / 已离开画面的**持续**提示（不是 Toast，Toast 一闪就没了） */
+    private lateinit var targetWarningText: TextView
+    // 拖框选择状态（view 像素）
+    private var dragSelecting = false
+    private var dragStartX = 0f
+    private var dragStartY = 0f
+    /**
+     * 目标 Overlay 的刷新周期：33ms ≈ 30Hz。
+     *
+     * 旧实现把 updateTargetOverlay() 挂在 updateHeader() 里，而后者只在
+     * `dt >= 1.0` 时调用 —— 于是 native tracker 每帧都在跑，肉眼看到的
+     * 绿框却 1 秒才跳一次，直接产生「追踪卡、追不上物体」的观感。
+     */
+    private val targetUiPeriodNs = 33_000_000L
+    private var targetUiLastNs = 0L
     @Volatile private var resumed = false
     private var sessionId = "unknown"
     private var sessionStartTs = 0L
@@ -217,7 +248,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val x1: Float = 0f,
         val y1: Float = 0f,
         val confidence: Float = 0f,
-        val medianDepth: Float = 0f
+        val medianDepth: Float = 0f,
+        // 新增（协议 10->14）。visibleFraction < 0.40 画黄框；
+        // centerX/centerY 未裁剪，目标完全出界时仍能指示找回方向。
+        val visibleFraction: Float = 1f,
+        val centerX: Float = 0.5f,
+        val centerY: Float = 0.5f
     )
 
     private data class FrameMeta(
@@ -300,18 +336,52 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 android.view.MotionEvent.ACTION_DOWN -> {
                     downX = event.x
                     downY = event.y
+                    // 物体锁定打开时才进入「可能拖框」状态；否则维持原来的点按对焦。
+                    if (objectLockEnabled) {
+                        dragSelecting = true
+                        dragStartX = event.x
+                        dragStartY = event.y
+                    }
                     true
                 }
-                android.view.MotionEvent.ACTION_UP -> {
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    if (dragSelecting) {
+                        // 实时反馈：让用户看到自己框的是哪一块。
+                        // 只在超过最小拖拽距离后才显示，避免点按时闪一下黄框。
+                        val dx = event.x - dragStartX
+                        val dy = event.y - dragStartY
+                        if (dx * dx + dy * dy >=
+                            dragSelectMinPx() * dragSelectMinPx()) {
+                            targetOverlay.dragRect = android.graphics.RectF(
+                                minOf(dragStartX, event.x), minOf(dragStartY, event.y),
+                                maxOf(dragStartX, event.x), maxOf(dragStartY, event.y)
+                            )
+                            targetOverlay.invalidate()
+                        }
+                    }
+                    true
+                }
+                android.view.MotionEvent.ACTION_UP,
+                android.view.MotionEvent.ACTION_CANCEL -> {
                     val dx = event.x - downX
                     val dy = event.y - downY
-                    if (dx * dx + dy * dy < 48f * 48f) {
+                    val wasDrag = dragSelecting
+                    dragSelecting = false
+                    targetOverlay.dragRect = null
+                    if (event.actionMasked == android.view.MotionEvent.ACTION_UP &&
+                        wasDrag &&
+                        dx * dx + dy * dy >= dragSelectMinPx() * dragSelectMinPx()) {
+                        // 拖动 -> 精确框选
+                        selectTargetRect(downX, downY, event.x, event.y)
+                    } else if (dx * dx + dy * dy < 48f * 48f) {
+                        // 轻点 -> 快速自动框
                         if (objectLockEnabled) {
                             selectTarget(event.x, event.y)
                         } else {
                             focusAt(event.x, event.y)
                         }
                     }
+                    targetOverlay.invalidate()
                     true
                 }
                 else -> false
@@ -347,6 +417,25 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.START
         ).apply { leftMargin = 12; topMargin = (135 * density).toInt() })
+
+        // 目标离屏提示。刻意做成**常驻**文案而不是 Toast：
+        // 目标整块滑出画面时 bbox 退化成空矩形，连红框都画不出来，
+        // 用 Toast 一闪而过就等于「什么都没发生」。
+        targetWarningText = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 15f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            setBackgroundColor(android.graphics.Color.argb(225, 210, 40, 40))
+            setPadding((16 * density).toInt(), (10 * density).toInt(),
+                       (16 * density).toInt(), (10 * density).toInt())
+            gravity = Gravity.CENTER
+            visibility = android.view.View.GONE
+        }
+        root.addView(targetWarningText, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER
+        ))
 
         statusBarText = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
@@ -460,6 +549,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             } else {
                 NativeBridge.nativeClearTarget()
                 targetOverlay.state = TargetUiState()
+                targetOverlay.dragRect = null
+                dragSelecting = false
+                lastTargetUiState = NativeBridge.TARGET_STATE_OFF
+                targetWarningText.visibility = android.view.View.GONE
             }
             toast(if (objectLockEnabled) "点击需要扫描的物体" else "已退出物体锁定")
         },
@@ -492,6 +585,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         renderer.drawMode = arDrawMode
         // 点大小按屏幕密度缩放：固定 3px 在高 DPI 屏上细得几乎看不见
         renderer.setPointSizes(3f * density, 5f * density)
+
+        // 目标离开画面时震一下。取不到（无马达 / 无权限）就静默降级，
+        // 绝不因为震动失败影响追踪。
+        vibrator = try {
+            getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator
+        } catch (_: Throwable) {
+            null
+        }
 
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), 100)
@@ -978,12 +1079,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
             val x0 = p[0]
             val y0 = p[1]
-            renderer.setCameraToView(
-                floatArrayOf(
-                    p[2] - x0, p[4] - x0, x0,
-                    p[3] - y0, p[5] - y0, y0
-                )
+            val m = floatArrayOf(
+                p[2] - x0, p[4] - x0, x0,
+                p[3] - y0, p[5] - y0, y0
             )
+            renderer.setCameraToView(m)
+            // 目标框也要用同一套变换，所以在这里一并留存。
+            // 只有一个真源，就不会出现「点云对了、绿框还是错的」。
+            cameraToView = m
             cameraToViewReady = true
         } catch (t: Throwable) {
             cameraToViewReady = false
@@ -1164,24 +1267,181 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         updateTargetOverlay()
     }
 
+    /** 拖框的最小边长（view 像素）。低于它就当成点按。 */
+    private fun dragSelectMinPx(): Float = 24f * resources.displayMetrics.density
+
+    /**
+     * camera-normalized UV -> view-normalized UV 的**正**映射。
+     *
+     * 与 [viewToCameraNorm] 严格互逆，和点云 Renderer 共用同一个 [cameraToView]。
+     * 这里刻意不写任何「90° / 裁剪 / 镜像」逻辑 —— 那些细节已经被
+     * updateCameraToViewTransform() 吸收进这个 2x3 矩阵里了。
+     */
+    private fun cameraNormToView(u: Float, v: Float): android.graphics.PointF {
+        val a = cameraToView
+        return android.graphics.PointF(
+            a[0] * u + a[1] * v + a[2],
+            a[3] * u + a[4] * v + a[5]
+        )
+    }
+
+    /**
+     * 手指拖框选择目标。
+     *
+     * 解决的是「固定 240x240 ROI 把背景一起锁进去」：单点只能给一个与目标
+     * 形状无关的方块，点一个细长瓶子时 KLT 实际追的是
+     * 「物体 + 墙 + 桌子」的混合纹理，框当然贴不住目标。
+     * 拖框让用户直接把 bbox 告诉 tracker，几乎没有额外算力。
+     */
+    private fun selectTargetRect(vx0: Float, vy0: Float, vx1: Float, vy1: Float) {
+        val a = viewToCameraNorm(vx0, vy0)
+        val b = viewToCameraNorm(vx1, vy1)
+        if (a == null || b == null) {
+            toast("无法换算框选坐标")
+            return
+        }
+        // 允许任意方向拖动；相机坐标系下取轴对齐包围盒
+        val lx = minOf(a.x, b.x)
+        val ly = minOf(a.y, b.y)
+        val hx = maxOf(a.x, b.x)
+        val hy = maxOf(a.y, b.y)
+        val ok = try {
+            NativeBridge.nativeSelectTargetRect(lx, ly, hx, hy)
+        } catch (t: Throwable) {
+            false
+        }
+        if (!ok) {
+            targetOverlay.state = TargetUiState(
+                visible = true, state = NativeBridge.TARGET_STATE_ARMED
+            )
+            toast("框选无效，请重新框选（框太小或未开启物体锁定）")
+            return
+        }
+        targetTapX = (vx0 + vx1) * 0.5f
+        targetTapY = (vy0 + vy1) * 0.5f
+        targetOverlay.state = TargetUiState(
+            visible = true, state = NativeBridge.TARGET_STATE_ACQUIRING
+        )
+        targetFocusLocked = false
+        targetFocusDistance = null
+        updateTargetOverlay()
+    }
+
     private fun updateTargetOverlay() {
         val out = FloatArray(NativeBridge.TARGET_STATE_SLOTS)
-        val state = NativeBridge.nativeGetTargetState(out)
+        val state = try {
+            NativeBridge.nativeGetTargetState(out)
+        } catch (t: Throwable) {
+            0
+        }
         targetState = state
         targetConfidence = out.getOrElse(5) { 0f }
         targetTrackedPoints = out.getOrElse(8) { 0f }.toInt()
+        val visibleFraction =
+            out.getOrElse(NativeBridge.TARGET_STATE_INDEX_VISIBLE_FRACTION) { 1f }
+        val centerX = out.getOrElse(NativeBridge.TARGET_STATE_INDEX_CENTER_X) { 0.5f }
+        val centerY = out.getOrElse(NativeBridge.TARGET_STATE_INDEX_CENTER_Y) { 0.5f }
+        targetVisibleFraction = visibleFraction
+        targetCenterX = centerX
+        targetCenterY = centerY
         targetOverlay.state = TargetUiState(
-            visible = state != 0,
+            visible = state != NativeBridge.TARGET_STATE_OFF,
             state = state,
             x0 = out.getOrElse(1) { 0f },
             y0 = out.getOrElse(2) { 0f },
             x1 = out.getOrElse(3) { 0f },
             y1 = out.getOrElse(4) { 0f },
             confidence = out.getOrElse(5) { 0f },
-            medianDepth = out.getOrElse(6) { 0f }
+            medianDepth = out.getOrElse(6) { 0f },
+            visibleFraction = visibleFraction,
+            centerX = centerX,
+            centerY = centerY
         )
         targetOverlay.invalidate()
-        maybeRelockTargetFocus()
+        updateTargetWarning(state, visibleFraction, centerX, centerY)
+    }
+
+    /**
+     * 目标 Overlay 的 30Hz 节拍。
+     *
+     * **刻意不从 updateHeader() 里调**：updateHeader 只在 `dt >= 1.0` 时
+     * 触发，那样绿框一秒才跳一次。native tracker 其实每帧都在跑，
+     * 只是 UI 没把结果画出来。
+     */
+    private fun updateTargetUiTick(ts: Long) {
+        if (!objectLockEnabled) return
+        if (targetUiLastNs != 0L && ts - targetUiLastNs < targetUiPeriodNs) return
+        targetUiLastNs = ts
+        runOnUiThread { updateTargetOverlay() }
+    }
+
+    /**
+     * 目标接近边缘 / 已离开画面的**持续**提示。
+     *
+     * native 早就有 `visibleFraction < 0.40 -> near frame edge` 和
+     * `< 0.12 x 3 帧 -> 出界`，但旧的 UI 只把 state==4 画成红框 —— 而目标
+     * 完全出界时 bbox 是 0x0，红框也画不出来，用户看到的就是「什么都没发生」。
+     */
+    private fun updateTargetWarning(state: Int, visibleFraction: Float, cx: Float, cy: Float) {
+        val prev = lastTargetUiState
+        lastTargetUiState = state
+        // 只在「跟得好好的 -> 目标离开画面」这个边沿震一次。
+        // 每帧震会变成持续嗡嗡声，比不震还烦。
+        if (prev == NativeBridge.TARGET_STATE_TRACKING &&
+            (state == NativeBridge.TARGET_STATE_REACQUIRING ||
+                state == NativeBridge.TARGET_STATE_LOST)) {
+            vibrateOnce()
+        }
+
+        val text = when {
+            state == NativeBridge.TARGET_STATE_LOST ->
+                "目标已离开画面" + edgeHint(cx, cy)
+
+            state == NativeBridge.TARGET_STATE_REACQUIRING ->
+                "目标暂时离开画面，正在自动找回…"
+
+            state == NativeBridge.TARGET_STATE_TRACKING && visibleFraction < 0.40f ->
+                "⚠ 目标接近边缘" + edgeHint(cx, cy)
+
+            else -> null
+        }
+
+        if (text == null) {
+            targetWarningText.visibility = android.view.View.GONE
+        } else {
+            targetWarningText.text = text
+            targetWarningText.visibility = android.view.View.VISIBLE
+        }
+    }
+
+    /**
+     * 根据目标中心（相机归一化，可能已被夹到 [0,1] 之外）给出找回方向。
+     * 返回空串表示中心还在画面中部，不需要指方向。
+     */
+    private fun edgeHint(cx: Float, cy: Float): String = when {
+        cx < 0.20f -> "\n← 向左移动手机找回目标"
+        cx > 0.80f -> "\n→ 向右移动手机找回目标"
+        cy < 0.20f -> "\n↑ 向上移动手机找回目标"
+        cy > 0.80f -> "\n↓ 向下移动手机找回目标"
+        else -> ""
+    }
+
+    private fun vibrateOnce() {
+        try {
+            val v = vibrator ?: return
+            if (!v.hasVibrator()) return
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                v.vibrate(
+                    android.os.VibrationEffect.createOneShot(
+                        100, android.os.VibrationEffect.DEFAULT_AMPLITUDE
+                    )
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                v.vibrate(100)
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     private fun maybeRelockTargetFocus() {
@@ -1412,6 +1672,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    roiSharpness=${out.getOrElse(7) { 0f }}")
         sb.appendLine("    trackedPoints=${out.getOrElse(8) { 0f }.toInt()}")
         sb.appendLine("    inlierRatio=${out.getOrElse(9) { 0f }}")
+        sb.appendLine("    visibleFraction=${out.getOrElse(NativeBridge.TARGET_STATE_INDEX_VISIBLE_FRACTION) { 1f }}")
+        sb.appendLine("    centerNorm=(${out.getOrElse(NativeBridge.TARGET_STATE_INDEX_CENTER_X) { 0.5f }}, ${out.getOrElse(NativeBridge.TARGET_STATE_INDEX_CENTER_Y) { 0.5f }})")
+        sb.appendLine("    edgeLostFrames=${out.getOrElse(NativeBridge.TARGET_STATE_INDEX_EDGE_LOST_FRAMES) { 0f }.toInt()}")
+        sb.appendLine("    overlayPeriodNs=$targetUiPeriodNs (30Hz)")
+        sb.appendLine("    centerTransform=(fx ${cameraToViewReady} via cameraToView)")
         sb.appendLine("    AF state=$lastAfState lensFocusDistance=$lastLensFocusDistance focusLocked=$targetFocusLocked relockCount=$focusRelockCount")
         sb.appendLine(NativeBridge.nativeGetTargetDiagnostics())
         sb.appendLine()
@@ -1747,6 +2012,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun onFrameTick(ts: Long) {
+        // 目标框自成一个 30Hz 节拍，与 Header 的 1Hz 解耦。
+        updateTargetUiTick(ts)
         if (::hqCapture.isInitialized) {
             hqCapture.onFrameTick(ts, scanning, cameraDevice, captureSession)
             syncCaptureStateFromController()
@@ -1773,7 +2040,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val vinsOk = NativeBridge.nativeVinsInitialized()
         headerStatus.text = "FPS %.1f · %s".format(fps, if (scanning) "扫描中" else "空闲")
         if (objectLockEnabled) {
-            updateTargetOverlay()
+            // Overlay 的刷新已移到 30Hz 的 updateTargetUiTick()，这里只保留
+            // AF 重锁 —— 而且**必须**留在这条 1Hz 路径上。
+            //
+            // maybeRelockTargetFocus() 内部有「连续 5 帧未合焦就重新 focusAt」
+            // 的逻辑：1Hz 下是 5 秒的重试间隔，一旦跟着 overlay 提到 30Hz
+            // 就变成 0.17 秒，会把相机 AF 打成持续抖动。
+            maybeRelockTargetFocus()
         }
         warningBanner.visibility =
             if (scanning && !vinsOk) android.view.View.VISIBLE else android.view.View.GONE
@@ -2096,29 +2369,70 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private inner class TargetLockOverlay(context: android.content.Context) : android.view.View(context) {
         var state: TargetUiState = TargetUiState()
+
+        /** 手指拖框时的实时选框（view 像素）。null = 不显示（点按也会清掉）。 */
+        var dragRect: android.graphics.RectF? = null
+
         private val paint = android.graphics.Paint().apply {
             style = android.graphics.Paint.Style.STROKE
             strokeWidth = 3f * resources.displayMetrics.density
             color = android.graphics.Color.GREEN
         }
 
+        private val dragPaint = android.graphics.Paint().apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 2f * resources.displayMetrics.density
+            color = android.graphics.Color.YELLOW
+        }
+
         override fun onDraw(canvas: android.graphics.Canvas) {
             super.onDraw(canvas)
-            val s = state
-            if (!s.visible || width <= 0 || height <= 0) return
+            if (width <= 0 || height <= 0) return
 
-            paint.color = when {
-                s.state == 3 -> android.graphics.Color.GREEN
-                s.state == 4 -> android.graphics.Color.RED
-                s.confidence < 0.5f -> android.graphics.Color.YELLOW
-                else -> android.graphics.Color.GREEN
+            val s = state
+            if (s.visible) {
+                paint.color = when {
+                    s.state == NativeBridge.TARGET_STATE_LOST ->
+                        android.graphics.Color.RED
+                    s.state == NativeBridge.TARGET_STATE_REACQUIRING ->
+                        android.graphics.Color.rgb(255, 160, 0)
+                    s.state == NativeBridge.TARGET_STATE_TRACKING &&
+                        s.visibleFraction < 0.40f ->
+                        android.graphics.Color.YELLOW
+                    s.confidence < 0.5f ->
+                        android.graphics.Color.YELLOW
+                    else ->
+                        android.graphics.Color.GREEN
+                }
+
+                // bbox 是**相机归一化**坐标，canvas 是 **view** 坐标系。
+                // 两者之间隔着 sensorOrientation 90° + SurfaceTexture transform
+                // + TextureView center crop，直接 `x0 * width` 是错的。
+                // 这里复用 Renderer 那套已验证的 cameraToView：四个角都映射，
+                // 再取轴对齐包围盒 —— 旋转/翻转/裁剪全部被这套变换吸收，
+                // 画框处不需要知道任何屏幕方向细节。
+                val p0 = cameraNormToView(s.x0, s.y0)
+                val p1 = cameraNormToView(s.x1, s.y0)
+                val p2 = cameraNormToView(s.x1, s.y1)
+                val p3 = cameraNormToView(s.x0, s.y1)
+                val w = width.toFloat()
+                val h = height.toFloat()
+                val left = minOf(p0.x, p1.x, p2.x, p3.x) * w
+                val right = maxOf(p0.x, p1.x, p2.x, p3.x) * w
+                val top = minOf(p0.y, p1.y, p2.y, p3.y) * h
+                val bottom = maxOf(p0.y, p1.y, p2.y, p3.y) * h
+                // 目标整块出界时 bbox 退化成 0x0，此时不画框，
+                // 由常驻的 targetWarningText 负责提示。
+                if (right - left >= 2f && bottom - top >= 2f) {
+                    canvas.drawRect(left, top, right, bottom, paint)
+                }
             }
 
-            val left = s.x0 * width
-            val top = s.y0 * height
-            val right = s.x1 * width
-            val bottom = s.y1 * height
-            canvas.drawRect(left, top, right, bottom, paint)
+            dragRect?.let { r ->
+                if (r.width() >= 2f && r.height() >= 2f) {
+                    canvas.drawRect(r, dragPaint)
+                }
+            }
         }
     }
 }
