@@ -29,6 +29,8 @@ struct TargetTrackInfo
     int trackedPoints = 0;
     float inlierRatio = 0.f;
     float medianDepth = 0.f;
+    float depthP10 = 0.f;
+    float depthP90 = 0.f;
     float roiSharpness = 0.f;
     uint64_t timestamp = 0;
 
@@ -53,6 +55,15 @@ struct TargetTrackInfo
     uint64_t nanoRecoveries = 0;
     float nanoScore = 0.f;
     double nanoLastMs = 0.0;
+    // KLT 弱帧连续计数；以及 NanoTrack 恢复/彩色输入诊断
+    int weakKltFrames = 0;
+    uint64_t nanoWeakRecoveries = 0;
+    uint64_t nanoWeakAttempts = 0;
+    bool nanoUsedRealColor = false;
+    bool colorFrameValid = false;
+    int colorFrameWidth = 0;
+    int colorFrameHeight = 0;
+    uint64_t colorFrameCalls = 0;
     uint64_t depthFilterCalls = 0;
     uint64_t depthFilterSkipped = 0;
     bool maskAllocated = false;
@@ -92,6 +103,9 @@ public:
     bool selectTarget(float u, float v);
     void updateFrame(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp);
     void track(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp);
+    // 由 YUV420 生成的真实 BGR 帧（不需要与灰度帧同尺寸）。
+    // 供 NanoTrack 做外观判别；调用方可每 N 帧才喂一次以省算力。
+    void setColorFrame(const uint8_t* bgr, int width, int height, int stride, uint64_t timestamp);
     void updateFromDepth(const float* depth, int width, int height, uint64_t timestamp);
     bool filterDepth(float* depth, int width, int height, uint64_t timestamp);
     bool isEnabled() const;
@@ -125,6 +139,16 @@ private:
     uint64_t nanoRecoveries_ = 0;
     uint64_t nanoFailures_ = 0;
     double nanoLastMs_ = 0.0;
+    int weakKltFrames_ = 0;
+    uint64_t nanoWeakAttempts_ = 0;
+    uint64_t nanoWeakRecoveries_ = 0;
+    float lastNanoScore_ = 0.f;
+
+    // 真实彩色帧（YUV420 -> BGR），保护在 mutex_ 之下
+    cv::Mat colorFrame_;
+    bool colorFrameValid_ = false;
+    uint64_t colorFrameTs_ = 0;
+    uint64_t colorFrameCalls_ = 0;
 
     std::atomic<bool> pendingSelect_{false};
     std::atomic<float> pendingU_{0.5f};
@@ -132,4 +156,12 @@ private:
 
     void setError(const std::string& msg);
     void markLost(const std::string& reason);
+
+    // NanoTrack 辅助：取输入帧 / 归一化框互转 / 强制更新 / 采纳 Nano 框并重播种
+    cv::Mat resolveNanoFrame(const cv::Mat& grayOwned, bool* usedColor) const;
+    static cv::Rect normToRect(float x0, float y0, float x1, float y1, int w, int h);
+    bool runNanoUpdate(const cv::Mat& frame, int width, int height, cv::Rect& outRect);
+    void adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
+                      const cv::Mat& grayOwned, uint64_t timestamp);
+    void clearWeakKlt();
 };

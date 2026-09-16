@@ -43,3 +43,7 @@ bool vinsReady();
 bool vinsInitialized();
 
 bool vinsGetHealth(VinsHealth* out);
+
+// 当前滑窗内成功三角化的特征深度中位数（VINS 自身尺度）。
+// 仅作深度尺度诊断使用；没有任何有效特征时返回 0。
+float vinsFeatureDepthMedian();

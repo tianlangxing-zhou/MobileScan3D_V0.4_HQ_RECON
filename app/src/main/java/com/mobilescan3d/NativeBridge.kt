@@ -18,6 +18,7 @@ object NativeBridge {
     external fun nativeClearTarget()
     external fun nativeSetObjectLockEnabled(enabled: Boolean)
     external fun nativeGetTargetState(out: FloatArray): Int
+    external fun nativeGetDepthDiagnostics(out: FloatArray): Int
     external fun nativeGetTargetDiagnostics(): String
     external fun nativeGetRenderPose(out: FloatArray): Boolean
     external fun nativeConfigureTrackerModels(backbonePath: String, headPath: String): Boolean

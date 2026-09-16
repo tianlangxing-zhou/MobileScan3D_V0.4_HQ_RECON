@@ -164,6 +164,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var aeLock = false
     private var awbLock = false
     private var captureState = "IDLE"
+    private var lockRequestedMirror = false
     private var scanLockedExposureNs = 0L
     private var scanLockedIso = 0
     private var scanLockedFocusDiopters = 0f
@@ -237,7 +238,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (::hqCapture.isInitialized) {
                 hqCapture.onCaptureResult(result)
             }
-            maybeLockScanParameters()
 
             val sensorTs = result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP)
             if (sensorTs != null) {
@@ -879,27 +879,35 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         return (sensorOrientation - surfaceRotationDegrees * sign + 360) % 360
     }
 
-    private fun maybeLockScanParameters() {
-        if (!scanning || captureState != "CONVERGING" || !::hqCapture.isInitialized) return
-        val ae = lastAeState
-        val awb = lastAwbState
-        val af = lastAfState
-        val aeOk = ae == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_CONVERGED ||
-            ae == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_LOCKED
-        val awbOk = awb == android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE_CONVERGED ||
-            awb == android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE_LOCKED
-        val afOk = af == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
-            af == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
-        if (!aeOk || !awbOk || !afOk) return
+    /**
+     * 3A 锁定决策由 HqCaptureController 的状态机持有：
+     * WAIT_3A -> APPLY_LOCK -> VERIFY_LOCK -> SCAN_LOCKED -> CAPTURE，
+     * 只有 CaptureResult 真正确认锁定（AE/AWB/AF 全部 LOCKED）才会进入 SCAN_LOCKED。
+     * 这里只做状态镜像，并在「锁定生效 / 解除」的边沿重新下发 capture request。
+     */
+    private fun syncCaptureStateFromController() {
+        if (!::hqCapture.isInitialized) return
+        val st = hqCapture.stats
+        val phaseChanged = st.captureState != captureState
+        val lockEdge = st.lockRequested != lockRequestedMirror
+        if (!phaseChanged && !lockEdge) return
 
-        scanLockedExposureNs = exposureTimeNs ?: 0L
-        scanLockedIso = hqCapture.stats.iso
-        scanLockedFocusDiopters = lastLensFocusDistance ?: 0f
-        captureState = "SCAN_LOCKED"
-        hqCapture.stats.captureState = "SCAN_LOCKED"
-        aeLock = aeLockAvailable
-        awbLock = awbLockAvailable
-        applyCaptureSettings()
+        captureState = st.captureState
+        if (st.lockRequested && !lockRequestedMirror) {
+            // 锁定生效：冻结已经验证过的曝光/ISO/焦距
+            scanLockedExposureNs = st.exposureNs
+            scanLockedIso = st.iso
+            scanLockedFocusDiopters = st.focusDiopters
+            aeLock = aeLockAvailable
+            awbLock = awbLockAvailable
+        } else if (!st.lockRequested && lockRequestedMirror) {
+            aeLock = false
+            awbLock = false
+        }
+        lockRequestedMirror = st.lockRequested
+        if (scanning) {
+            applyCaptureSettings()
+        }
     }
 
     private fun applyCaptureSettings() {
@@ -911,9 +919,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                 addTarget(ps)
                 addTarget(readerSurface)
-                val manualLocked = ::hqCapture.isInitialized &&
+                // lockActive 由 HqCaptureController 的 3A 状态机决定（真锁定确认后才为 true）
+                val lockActive = ::hqCapture.isInitialized && hqCapture.stats.lockRequested
+                val manualLocked = lockActive &&
                     hqCapture.caps.manualSensor &&
-                    captureState == "SCAN_LOCKED" &&
                     scanLockedExposureNs > 0L
                 if (manualLocked) {
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
@@ -926,7 +935,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 }
                 if (awbLockAvailable) set(CaptureRequest.CONTROL_AWB_LOCK, awbLock)
 
-                val scanFocusLocked = captureState == "SCAN_LOCKED" &&
+                val scanFocusLocked = lockActive &&
                     manualFocusAvailable &&
                     scanLockedFocusDiopters > 0f
                 val afMode = if (scanFocusLocked) {
@@ -1284,6 +1293,38 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    AF state=$lastAfState lensFocusDistance=$lastLensFocusDistance focusLocked=$targetFocusLocked relockCount=$focusRelockCount")
         sb.appendLine(NativeBridge.nativeGetTargetDiagnostics())
         sb.appendLine()
+        // ---- 深度尺度诊断：只上报可观测量，不自动乘 scale ----
+        val dd = FloatArray(4)
+        NativeBridge.nativeGetDepthDiagnostics(dd)
+        val targetDepthP10 = dd[0]
+        val targetDepthMedian = if (dd[1] > 0f) dd[1] else out.getOrElse(6) { 0f }
+        val targetDepthP90 = dd[2]
+        val vinsTriangulatedDepthMedian = dd[3]
+        val focusDiopters = if (::hqCapture.isInitialized) {
+            hqCapture.stats.focusDiopters
+        } else {
+            lastLensFocusDistance ?: 0f
+        }
+        val focusApproxMeters = if (focusDiopters > 0.01f) 1f / focusDiopters else 0f
+        val depthScaleCandidateFocus = if (focusApproxMeters > 0.01f && targetDepthMedian > 0f) {
+            targetDepthMedian / focusApproxMeters
+        } else {
+            0f
+        }
+        val depthScaleCandidateVins = if (vinsTriangulatedDepthMedian > 0.01f && targetDepthMedian > 0f) {
+            targetDepthMedian / vinsTriangulatedDepthMedian
+        } else {
+            0f
+        }
+        sb.appendLine("[7.1] 深度尺度诊断（暂不自动施加修正）:")
+        sb.appendLine("    targetDepthP10=$targetDepthP10")
+        sb.appendLine("    targetDepthMedian=$targetDepthMedian")
+        sb.appendLine("    targetDepthP90=$targetDepthP90")
+        sb.appendLine("    focusApproxMeters=$focusApproxMeters")
+        sb.appendLine("    vinsTriangulatedDepthMedian=$vinsTriangulatedDepthMedian")
+        sb.appendLine("    depthScaleCandidateFocus=$depthScaleCandidateFocus")
+        sb.appendLine("    depthScaleCandidateVins=$depthScaleCandidateVins")
+        sb.appendLine()
         sb.appendLine("[8] World-Locked Render:")
         val renderPose = FloatArray(12)
         val renderPoseValid = NativeBridge.nativeGetRenderPose(renderPose)
@@ -1320,6 +1361,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val u = extractPlane(p[1])
             val v = extractPlane(p[2])
             if (scanning) {
+                // 曝光直方图预检：clipping 过高时不要发 still capture
+                if (::hqCapture.isInitialized) {
+                    hqCapture.onPreviewLuma(y, image.width, image.height, p[0].rowStride)
+                }
                 val meta = synchronized(frameMetaLock) { frameMeta.remove(ts) }
                 if (meta != null) frameMetaHit++ else frameMetaMiss++
                 val vinsTs = ts
@@ -1374,12 +1419,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         stabilization = false
         aeLock = false
         awbLock = false
-        captureState = "CONVERGING"
+        captureState = "IDLE"
         scanLockedExposureNs = 0L
         scanLockedIso = 0
         scanLockedFocusDiopters = 0f
+        lockRequestedMirror = false
         if (::hqCapture.isInitialized) {
             hqCapture.beginScan(sessionId)
+            // 状态机由 HqCaptureController 持有，这里只做镜像
+            captureState = hqCapture.stats.captureState
         }
         applyCaptureSettings()
         // 与相机帧处理线程串行化，避免 reset 期间相机线程正在遍历这些容器（native 崩溃）
@@ -1403,6 +1451,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         aeLock = false
         awbLock = false
         captureState = "IDLE"
+        lockRequestedMirror = false
         if (::hqCapture.isInitialized) {
             hqCapture.endScan()
         }
@@ -1467,13 +1516,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun onFrameTick(ts: Long) {
         if (::hqCapture.isInitialized) {
-            hqCapture.onFrameTick(
-                ts,
-                scanning,
-                captureState == "SCAN_LOCKED",
-                cameraDevice,
-                captureSession
-            )
+            hqCapture.onFrameTick(ts, scanning, cameraDevice, captureSession)
+            syncCaptureStateFromController()
         }
         fpsFrames++
         if (fpsLastNs == 0L) fpsLastNs = ts

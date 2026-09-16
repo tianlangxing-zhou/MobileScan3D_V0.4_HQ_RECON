@@ -86,6 +86,9 @@ static const int SNAP_H = 120;
 static int gVinsW = 640;
 static int gVinsH = 480;
 
+// NanoTrack 真实彩色输入的节流计数：每 5 帧生成一张 BGR 缩略图
+static uint64_t gTrackerColorFrameCounter = 0;
+
 static void quatToR(float qx, float qy, float qz, float qw, float R[9]) {
     R[0] = 1 - 2 * (qy * qy + qz * qz);
     R[1] = 2 * (qx * qy - qz * qw);
@@ -189,8 +192,53 @@ static void downscaleGray(const uint8_t* src, int w, int h, int stride,
     }
 }
 
-static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence) {
-    if (!depth || w < 4 || h < 4 || s.rgb.empty()) {
+// YUV_420_888 -> 缩小后的 BGR（供 NanoTrack 做真实彩色外观输入）。
+// y/u/v 三个平面可能带行填充，uv 的 pixelStride 在 semi-planar 设备上为 2。
+static void downscaleYuvToBgr(const uint8_t* y, const uint8_t* u, const uint8_t* v,
+                              int w, int h, int rs, int urs, int ups,
+                              size_t uSize, size_t vSize,
+                              uint8_t* dst, int dw, int dh) {
+    if (!y || !u || !v || !dst || w <= 0 || h <= 0 || dw <= 0 || dh <= 0) {
+        return;
+    }
+    if (ups <= 0) {
+        ups = 1;
+    }
+    if (urs <= 0) {
+        urs = 1;
+    }
+    const int cw = std::max(1, w / 2);
+
+    for (int dy = 0; dy < dh; dy++) {
+        const int sy = std::min(h - 1, dy * h / dh);
+        const uint8_t* yRow = y + (size_t)sy * rs;
+        const size_t cRowOff = std::min((size_t)(sy / 2) * urs,
+                                        uSize > 0 ? uSize - 1 : (size_t)0);
+        uint8_t* out = dst + (size_t)dy * dw * 3;
+        for (int dx = 0; dx < dw; dx++) {
+            const int sx = std::min(w - 1, dx * w / dw);
+            const int cx = std::min(cw - 1, sx / 2);
+            const size_t cIdx = cRowOff + (size_t)cx * ups;
+
+            const uint8_t uu = (uSize > 0 && cIdx < uSize) ? u[cIdx] : 128;
+            const uint8_t vv = (vSize > 0 && cIdx < vSize) ? v[cIdx] : 128;
+
+            const int Y = std::max(0, (int)yRow[sx] - 16);
+            const int U = (int)uu - 128;
+            const int V = (int)vv - 128;
+
+            const int r = (298 * Y + 409 * V + 128) >> 8;
+            const int g = (298 * Y - 100 * U - 208 * V + 128) >> 8;
+            const int b = (298 * Y + 516 * U + 128) >> 8;
+
+            out[dx * 3 + 0] = (uint8_t)std::clamp(b, 0, 255);
+            out[dx * 3 + 1] = (uint8_t)std::clamp(g, 0, 255);
+            out[dx * 3 + 2] = (uint8_t)std::clamp(r, 0, 255);
+        }
+    }
+}
+
+static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence) {    if (!depth || w < 4 || h < 4 || s.rgb.empty()) {
         return;
     }
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
@@ -351,6 +399,24 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
         try {
             tracker->updateFrame(yy, w, h, rs, static_cast<uint64_t>(frameTs));
             tracker->track(yy, w, h, rs, static_cast<uint64_t>(frameTs));
+
+            // 每 5 帧喂一张由 YUV420 直接生成的真实彩色缩略图给 NanoTrack。
+            // 原实现把灰度复制成三通道（COLOR_GRAY2BGR），NanoTrack 的外观
+            // 判别能力实际上被浪费了；这里让它拿到真正的 RGB 信息。
+            if (++gTrackerColorFrameCounter % 5ULL == 0ULL) {
+                constexpr int kColorMaxDim = 640;
+                const double cScale = std::min(
+                    1.0, static_cast<double>(kColorMaxDim) /
+                             static_cast<double>(std::max(1, std::max(w, h))));
+                const int cw = std::max(16, static_cast<int>(std::lround(w * cScale)));
+                const int ch = std::max(16, static_cast<int>(std::lround(h * cScale)));
+                std::vector<uint8_t> color((size_t)cw * (size_t)ch * 3u);
+                downscaleYuvToBgr(yy, uu, vv, w, h, rs, urs, ups,
+                                  ubuf.size(), vbuf.size(),
+                                  color.data(), cw, ch);
+                tracker->setColorFrame(color.data(), cw, ch, cw * 3,
+                                       static_cast<uint64_t>(frameTs));
+            }
         } catch (const cv::Exception& ex) {
             __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Target", "OpenCV tracker exception: %s", ex.what());
         } catch (const std::exception& ex) {
@@ -813,6 +879,36 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jf
     return static_cast<jint>(info.state);
 }
 
+// 深度尺度诊断：只上报可观测量，不自动施加任何 scale 修正。
+// out[0]=targetDepthP10 out[1]=targetDepthMedian out[2]=targetDepthP90
+// out[3]=vinsTriangulatedDepthMedian
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetDepthDiagnostics(JNIEnv* env, jobject, jfloatArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 4) {
+        return 0;
+    }
+
+    float vals[4] = {0.f, 0.f, 0.f, 0.f};
+
+    std::shared_ptr<ObjectTracker> tracker;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        tracker = objectTracker;
+    }
+    if (tracker) {
+        const TargetTrackInfo info = tracker->info();
+        vals[0] = info.depthP10;
+        vals[1] = info.medianDepth;
+        vals[2] = info.depthP90;
+    }
+
+    // vinsFeatureDepthMedian 内部持有自己的 vins 锁，必须在 gStateMutex 之外调用
+    vals[3] = vinsFeatureDepthMedian();
+
+    env->SetFloatArrayRegion(out, 0, 4, vals);
+    return 1;
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobject) {
     std::shared_ptr<ObjectTracker> tracker;
@@ -846,6 +942,16 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "nanoRecoveries=" << i.nanoRecoveries << "\n"
       << "nanoScore=" << i.nanoScore << "\n"
       << "nanoLastMs=" << i.nanoLastMs << "\n"
+      << "weakKltFrames=" << i.weakKltFrames << "\n"
+      << "nanoWeakAttempts=" << i.nanoWeakAttempts << "\n"
+      << "nanoWeakRecoveries=" << i.nanoWeakRecoveries << "\n"
+      << "nanoUsedRealColor=" << (i.nanoUsedRealColor ? "true" : "false") << "\n"
+      << "colorFrameValid=" << (i.colorFrameValid ? "true" : "false") << "\n"
+      << "colorFrameSize=" << i.colorFrameWidth << "x" << i.colorFrameHeight << "\n"
+      << "colorFrameCalls=" << i.colorFrameCalls << "\n"
+      << "depthP10=" << i.depthP10 << "\n"
+      << "depthMedian=" << i.medianDepth << "\n"
+      << "depthP90=" << i.depthP90 << "\n"
       << "templateAllocated=" << (i.targetTemplateAllocated ? "true" : "false") << "\n"
       << "templateSize=" << i.templateWidth << "x" << i.templateHeight << "\n"
       << "prevGrayValid=" << (i.prevGrayValid ? "true" : "false") << "\n"

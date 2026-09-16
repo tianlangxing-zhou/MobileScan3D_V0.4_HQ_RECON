@@ -5,6 +5,17 @@
 #include <cstring>
 #include <chrono>
 
+namespace {
+
+// KLT 有效点下限：低于该值视为弱跟踪，需要 NanoTrack 介入
+constexpr int kMinKltPoints = 15;
+// 弱 KLT 连续帧容忍次数：超过且 Nano 也救不回来才判 LOST
+constexpr int kWeakKltPatience = 3;
+// 弱 KLT 场景下采纳 Nano 结果所需的最低分数
+constexpr float kNanoWeakScore = 0.35f;
+
+} // namespace
+
 void ObjectTracker::reset()
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -19,6 +30,50 @@ void ObjectTracker::reset()
     prevGray_.release();
     prevPoints_.clear();
     havePrev_ = false;
+    weakKltFrames_ = 0;
+    edgeLostFrames_ = 0;
+    framesSinceLastReseed_ = 0;
+    nanoNeedInit_ = false;
+    nanoFrameCounter_ = 0;
+    nanoScore_ = 0.f;
+    lastNanoScore_ = 0.f;
+    nanoBoxFull_ = cv::Rect2f();
+    colorFrame_.release();
+    colorFrameValid_ = false;
+    colorFrameTs_ = 0;
+    colorFrameCalls_ = 0;
+    nanoWeakAttempts_ = 0;
+    nanoWeakRecoveries_ = 0;
+    info_.colorFrameValid = false;
+    info_.colorFrameWidth = 0;
+    info_.colorFrameHeight = 0;
+}
+
+void ObjectTracker::clearWeakKlt()
+{
+    weakKltFrames_ = 0;
+    info_.weakKltFrames = 0;
+}
+
+void ObjectTracker::setColorFrame(const uint8_t* bgr, int width, int height, int stride, uint64_t timestamp)
+{
+    if (!bgr || width <= 0 || height <= 0 || stride < width * 3) {
+        return;
+    }
+    cv::Mat src(height, width, CV_8UC3, const_cast<uint8_t*>(bgr), static_cast<size_t>(stride));
+    cv::Mat owned = src.clone();
+    if (owned.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    colorFrame_ = std::move(owned);
+    colorFrameValid_ = true;
+    colorFrameTs_ = timestamp;
+    colorFrameCalls_++;
+    info_.colorFrameValid = true;
+    info_.colorFrameWidth = width;
+    info_.colorFrameHeight = height;
+    info_.colorFrameCalls = colorFrameCalls_;
 }
 
 void ObjectTracker::clearTarget()
@@ -40,6 +95,8 @@ void ObjectTracker::clearTarget()
     info_.trackedPoints = 0;
     info_.inlierRatio = 0.f;
     info_.medianDepth = 0.f;
+    info_.depthP10 = 0.f;
+    info_.depthP90 = 0.f;
     info_.roiSharpness = 0.f;
     info_.targetTemplateAllocated = false;
     info_.templateWidth = 0;
@@ -51,6 +108,8 @@ void ObjectTracker::clearTarget()
     info_.prevGrayWidth = 0;
     info_.prevGrayHeight = 0;
     info_.prevPointCount = 0;
+    weakKltFrames_ = 0;
+    info_.weakKltFrames = 0;
     info_.state = enabled_ ? TargetState::ARMED : TargetState::OFF;
 }
 
@@ -248,6 +307,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         info_.lastError.clear();
         havePrev_ = true;
         nanoNeedInit_ = true;
+        clearWeakKlt();
     }
 }
 
@@ -307,12 +367,50 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         goodNext.push_back(p);
     }
 
-    if (goodPrev.size() < 15) {
+    if (goodPrev.size() < kMinKltPoints) {
         info_.trackedPoints = static_cast<int>(goodPrev.size());
         info_.inlierRatio = 0.0f;
-        markLost("track: too few LK points");
+        ++weakKltFrames_;
+        info_.weakKltFrames = weakKltFrames_;
+
+        // KLT 变弱时立刻强制运行 NanoTrack 抢救，不等 every-5-frame 节奏。
+        // 修复点：原实现先 markLost() 再更新 Nano，等于最需要救场时函数已经 return，
+        // 导致 nanoUpdateCalls=45 / nanoFailures=0 却 nanoRecoveries=0。
+        if (nanoLoaded_) {
+            bool usedColor = false;
+            const cv::Mat nanoFrame = resolveNanoFrame(owned, &usedColor);
+            if (!nanoFrame.empty()) {
+                cv::Rect nanoRect;
+                ++nanoWeakAttempts_;
+                info_.nanoWeakAttempts = nanoWeakAttempts_;
+                if (runNanoUpdate(nanoFrame, nanoFrame.cols, nanoFrame.rows, nanoRect)) {
+                    info_.nanoUsedRealColor = usedColor;
+                    if (nanoScore_ >= kNanoWeakScore) {
+                        adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp);
+                        ++nanoRecoveries_;
+                        ++nanoWeakRecoveries_;
+                        info_.nanoRecoveries = nanoRecoveries_;
+                        info_.nanoWeakRecoveries = nanoWeakRecoveries_;
+                        clearWeakKlt();
+                        info_.lastError.clear();
+                        info_.lastEvent = "Nano recovered weak KLT";
+                        info_.trackSuccess++;
+                        info_.timestamp = timestamp;
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (weakKltFrames_ < kWeakKltPatience) {
+            info_.lastEvent = "KLT weak, waiting for recovery";
+            return;
+        }
+        markLost("track: KLT+Nano recovery failed");
         return;
     }
+
+    clearWeakKlt();
 
     cv::Mat inliers;
     cv::Mat affine;
@@ -420,59 +518,29 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
 
     if (nanoLoaded_ && info_.state == TargetState::TRACKING) {
         nanoFrameCounter_++;
-        cv::Mat bgr;
-        try {
-            cv::cvtColor(owned, bgr, cv::COLOR_GRAY2BGR);
-            if (nanoNeedInit_) {
-                cv::Rect initRect(
-                    static_cast<int>(info_.x0 * width),
-                    static_cast<int>(info_.y0 * height),
-                    std::max(1, static_cast<int>((info_.x1 - info_.x0) * width)),
-                    std::max(1, static_cast<int>((info_.y1 - info_.y0) * height))
-                );
-                nano_->init(bgr, initRect);
-                nanoNeedInit_ = false;
-                nanoInitCalls_++;
-                info_.nanoInitCalls = nanoInitCalls_;
-            } else if ((nanoFrameCounter_ % 5) == 0) {
-                const auto start = std::chrono::steady_clock::now();
+        if (nanoNeedInit_ || (nanoFrameCounter_ % 5) == 0) {
+            bool usedColor = false;
+            const cv::Mat nanoFrame = resolveNanoFrame(owned, &usedColor);
+            info_.nanoUsedRealColor = usedColor;
+            if (!nanoFrame.empty()) {
                 cv::Rect nanoRect;
-                const bool ok = nano_->update(bgr, nanoRect);
-                const auto end = std::chrono::steady_clock::now();
-                nanoLastMs_ = std::chrono::duration<double, std::milli>(end - start).count();
-                nanoUpdateCalls_++;
-                info_.nanoUpdateCalls = nanoUpdateCalls_;
-                info_.nanoLastMs = nanoLastMs_;
-                if (ok) {
-                    nanoScore_ = nano_->getTrackingScore();
-                    nanoBoxFull_ = nanoRect;
-                    info_.nanoScore = nanoScore_;
-                    const float nanoCx = nanoRect.x + nanoRect.width * 0.5f;
-                    const float nanoCy = nanoRect.y + nanoRect.height * 0.5f;
+                if (runNanoUpdate(nanoFrame, nanoFrame.cols, nanoFrame.rows, nanoRect)) {
+                    // Nano 输入与灰度帧尺寸/长宽比可能不同，统一换算回灰度帧坐标
+                    const float nanoCx =
+                        (nanoRect.x + nanoRect.width * 0.5f) / nanoFrame.cols * width;
+                    const float nanoCy =
+                        (nanoRect.y + nanoRect.height * 0.5f) / nanoFrame.rows * height;
                     if (nanoScore_ > 0.45f && info_.confidence > 0.45f) {
                         trackCx_ = trackCx_ * 0.75f + nanoCx * 0.25f;
                         trackCy_ = trackCy_ * 0.75f + nanoCy * 0.25f;
                     } else if (nanoScore_ > 0.60f && prevPoints_.size() < 20) {
-                        trackCx_ = nanoCx;
-                        trackCy_ = nanoCy;
-                        nanoRecoveries_++;
+                        adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp);
+                        ++nanoRecoveries_;
                         info_.nanoRecoveries = nanoRecoveries_;
+                        info_.lastEvent = "Nano reseeded KLT";
                     }
-                } else {
-                    nanoFailures_++;
-                    info_.nanoFailures = nanoFailures_;
                 }
             }
-        } catch (const cv::Exception& e) {
-            nanoFailures_++;
-            info_.nanoFailures = nanoFailures_;
-            info_.lastError = std::string("NanoTrack: ") + e.what();
-            nanoNeedInit_ = false;
-        } catch (const std::exception& e) {
-            nanoFailures_++;
-            info_.nanoFailures = nanoFailures_;
-            info_.lastError = std::string("NanoTrack: ") + e.what();
-            nanoNeedInit_ = false;
         }
     }
 
@@ -540,7 +608,17 @@ void ObjectTracker::updateFromDepth(const float* depth, int width, int height, u
     }
     if (!values.empty()) {
         std::sort(values.begin(), values.end());
-        info_.medianDepth = values[values.size() / 2];
+        const size_t n = values.size();
+        const auto pick = [&values, n](double p) -> float {
+            if (n == 0) return 0.f;
+            const double pos = p * static_cast<double>(n - 1);
+            size_t i = static_cast<size_t>(std::lround(pos));
+            if (i >= n) i = n - 1;
+            return values[i];
+        };
+        info_.depthP10 = pick(0.10);
+        info_.medianDepth = pick(0.50);
+        info_.depthP90 = pick(0.90);
     }
     info_.timestamp = timestamp;
 }
@@ -609,4 +687,175 @@ TargetTrackInfo ObjectTracker::info() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return info_;
+}
+
+cv::Mat ObjectTracker::resolveNanoFrame(const cv::Mat& grayOwned, bool* usedColor) const
+{
+    // 优先使用由 YUV420 生成的真实彩色帧：NanoTrack 的外观判别依赖真实颜色，
+    // 原来的 GRAY2BGR 只是把灰度复制成三通道，等于放弃了这个能力。
+    if (colorFrameValid_ && !colorFrame_.empty() && colorFrame_.type() == CV_8UC3) {
+        if (usedColor) *usedColor = true;
+        return colorFrame_;
+    }
+    cv::Mat bgr;
+    try {
+        cv::cvtColor(grayOwned, bgr, cv::COLOR_GRAY2BGR);
+    } catch (const cv::Exception&) {
+        if (usedColor) *usedColor = false;
+        return cv::Mat();
+    }
+    if (usedColor) *usedColor = false;
+    return bgr;
+}
+
+cv::Rect ObjectTracker::normToRect(float x0, float y0, float x1, float y1, int w, int h)
+{
+    if (w <= 0 || h <= 0) {
+        return cv::Rect();
+    }
+    const int px0 = std::clamp(static_cast<int>(std::floor(x0 * w)), 0, w - 1);
+    const int py0 = std::clamp(static_cast<int>(std::floor(y0 * h)), 0, h - 1);
+    const int px1 = std::clamp(static_cast<int>(std::ceil(x1 * w)), px0 + 1, w);
+    const int py1 = std::clamp(static_cast<int>(std::ceil(y1 * h)), py0 + 1, h);
+    return cv::Rect(px0, py0, px1 - px0, py1 - py0);
+}
+
+bool ObjectTracker::runNanoUpdate(const cv::Mat& frame, int width, int height, cv::Rect& outRect)
+{
+    if (!nanoLoaded_ || frame.empty() || width <= 0 || height <= 0) {
+        return false;
+    }
+    try {
+        if (nanoNeedInit_) {
+            const cv::Rect initRect =
+                normToRect(info_.x0, info_.y0, info_.x1, info_.y1, width, height);
+            if (initRect.width < 8 || initRect.height < 8) {
+                return false;
+            }
+            nano_->init(frame, initRect);
+            nanoNeedInit_ = false;
+            ++nanoInitCalls_;
+            info_.nanoInitCalls = nanoInitCalls_;
+            return false; // 初始化帧不产生分数
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        cv::Rect rect;
+        const bool ok = nano_->update(frame, rect);
+        const auto end = std::chrono::steady_clock::now();
+        nanoLastMs_ = std::chrono::duration<double, std::milli>(end - start).count();
+        ++nanoUpdateCalls_;
+        info_.nanoUpdateCalls = nanoUpdateCalls_;
+        info_.nanoLastMs = nanoLastMs_;
+
+        if (!ok) {
+            ++nanoFailures_;
+            info_.nanoFailures = nanoFailures_;
+            return false;
+        }
+
+        lastNanoScore_ = static_cast<float>(nano_->getTrackingScore());
+        nanoScore_ = lastNanoScore_;
+        info_.nanoScore = nanoScore_;
+        outRect = rect;
+        nanoBoxFull_ = cv::Rect2f(
+            static_cast<float>(rect.x) / width,
+            static_cast<float>(rect.y) / height,
+            static_cast<float>(rect.width) / width,
+            static_cast<float>(rect.height) / height);
+        return true;
+    } catch (const cv::Exception& e) {
+        ++nanoFailures_;
+        info_.nanoFailures = nanoFailures_;
+        info_.lastError = std::string("NanoTrack: ") + e.what();
+        nanoNeedInit_ = false;
+        return false;
+    } catch (const std::exception& e) {
+        ++nanoFailures_;
+        info_.nanoFailures = nanoFailures_;
+        info_.lastError = std::string("NanoTrack: ") + e.what();
+        nanoNeedInit_ = false;
+        return false;
+    }
+}
+
+void ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
+                                 const cv::Mat& grayOwned, uint64_t timestamp)
+{
+    if (nanoW <= 0 || nanoH <= 0 || grayOwned.empty() || nanoBox.width <= 0 ||
+        nanoBox.height <= 0) {
+        return;
+    }
+
+    const int width = grayOwned.cols;
+    const int height = grayOwned.rows;
+
+    // Nano 框（Nano 输入坐标系）-> 归一化 -> 灰度帧像素坐标
+    const float cxNorm =
+        (static_cast<float>(nanoBox.x) + nanoBox.width * 0.5f) / static_cast<float>(nanoW);
+    const float cyNorm =
+        (static_cast<float>(nanoBox.y) + nanoBox.height * 0.5f) / static_cast<float>(nanoH);
+    const float hwNorm = std::max(0.02f, 0.5f * nanoBox.width / static_cast<float>(nanoW));
+    const float hhNorm = std::max(0.02f, 0.5f * nanoBox.height / static_cast<float>(nanoH));
+
+    trackCx_ = std::clamp(cxNorm * width, 0.f, static_cast<float>(std::max(0, width - 1)));
+    trackCy_ = std::clamp(cyNorm * height, 0.f, static_cast<float>(std::max(0, height - 1)));
+    trackHalfW_ = std::max(8.f, std::min(hwNorm * width, width * 0.5f));
+    trackHalfH_ = std::max(8.f, std::min(hhNorm * height, height * 0.5f));
+
+    // 用 Nano 框重新播种 KLT 特征：恢复后仍由 KLT 做精细跟踪，
+    // Nano 只在 KLT 失效时兜底，避免长期依赖 CNN 导致漂移。
+    const int left = std::max(0, static_cast<int>(std::floor(trackCx_ - trackHalfW_)));
+    const int top = std::max(0, static_cast<int>(std::floor(trackCy_ - trackHalfH_)));
+    const int right = std::min(width, static_cast<int>(std::ceil(trackCx_ + trackHalfW_)));
+    const int bottom = std::min(height, static_cast<int>(std::ceil(trackCy_ + trackHalfH_)));
+    cv::Rect box(left, top, std::max(1, right - left), std::max(1, bottom - top));
+    box &= cv::Rect(0, 0, width, height);
+
+    std::vector<cv::Point2f> pts;
+    if (box.width >= 16 && box.height >= 16) {
+        try {
+            cv::Mat roiGray = grayOwned(box).clone();
+            cv::goodFeaturesToTrack(roiGray, pts, 120, 0.01, 5.0);
+        } catch (const cv::Exception&) {
+            pts.clear();
+        }
+    }
+
+    prevPoints_.clear();
+    if (pts.size() >= 10) {
+        prevPoints_.reserve(pts.size());
+        for (auto p : pts) {
+            p.x += static_cast<float>(box.x);
+            p.y += static_cast<float>(box.y);
+            prevPoints_.push_back(p);
+        }
+    }
+    prevGray_ = grayOwned.clone();
+    havePrev_ = !prevGray_.empty();
+    framesSinceLastReseed_ = 0;
+    edgeLostFrames_ = 0;
+    nanoNeedInit_ = false;
+
+    info_.x0 = std::clamp(static_cast<float>(box.x) / width, 0.0f, 1.0f);
+    info_.y0 = std::clamp(static_cast<float>(box.y) / height, 0.0f, 1.0f);
+    info_.x1 = std::clamp(static_cast<float>(box.x + box.width) / width, 0.0f, 1.0f);
+    info_.y1 = std::clamp(static_cast<float>(box.y + box.height) / height, 0.0f, 1.0f);
+    info_.bboxWidthPx = box.width;
+    info_.bboxHeightPx = box.height;
+    info_.fullBBoxWidthPx = box.width;
+    info_.fullBBoxHeightPx = box.height;
+    info_.visibleBBoxWidthPx = box.width;
+    info_.visibleBBoxHeightPx = box.height;
+    info_.visibleFraction = 1.0f;
+    info_.trackedPoints = static_cast<int>(prevPoints_.size());
+    info_.prevPointCount = info_.trackedPoints;
+    info_.prevGrayValid = !prevGray_.empty();
+    info_.prevGrayWidth = prevGray_.cols;
+    info_.prevGrayHeight = prevGray_.rows;
+    info_.inlierRatio = 1.0f;
+    info_.confidence = std::clamp(0.5f + 0.5f * lastNanoScore_, 0.f, 1.f);
+    info_.lastAffineScale = 1.0f;
+    info_.affineScaleEMA = 1.0f;
+    info_.lastError.clear();
 }

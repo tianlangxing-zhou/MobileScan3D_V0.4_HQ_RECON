@@ -9,6 +9,12 @@
 
 namespace {
 
+// 严格对齐门限：不满足就丢弃该帧，不再为了凑满 5 张强行融合。
+// 18px 级的残余误差在 HQ texture 上会造成明显重影和糊边。
+constexpr int kMinAlignInliers = 30;
+constexpr double kMaxAlignRmsePx = 1.5;
+constexpr double kMinAlignEcc = 0.95;
+
 double medianAbsDeviation(const cv::Mat& a, const cv::Mat& b)
 {
     if (a.empty() || b.empty() || a.size() != b.size()) {
@@ -183,19 +189,21 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
 
     accumulateFrame(reference);
 
-    int accepted = 1;
-    int rejected = static_cast<int>(nInputs) - 1;
+    int accepted = 1; // 参考帧自身
+    int rejected = 0;
     int alignedCount = 0;
     double inlierSum = 0.0;
     double rmseSum = 0.0;
+    double eccSum = 0.0;
+    int eccCount = 0;
     bool haveNoise = false;
 
     for (jsize i = 1; i < nInputs; ++i) {
         cv::Mat cur = cv::imread(paths[i], cv::IMREAD_COLOR);
         if (cur.empty()) {
+            rejected++;
             continue;
         }
-        rejected--;
 
         cv::Mat curGray;
         cv::cvtColor(cur, curGray, cv::COLOR_BGR2GRAY);
@@ -203,6 +211,7 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         bool good = false;
         double frameInliers = 0.0;
         double frameRmse = 0.0;
+        double frameEcc = 0.0;
 
         try {
             if (refPoints.size() >= 20) {
@@ -235,7 +244,7 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                     gNext.push_back(p);
                 }
 
-                if (gPrev.size() >= 8) {
+                if (gPrev.size() >= static_cast<size_t>(kMinAlignInliers)) {
                     cv::Mat inliers;
                     cv::Mat affine = cv::estimateAffinePartial2D(
                         gPrev, gNext, inliers, cv::RANSAC, 3.0);
@@ -254,12 +263,16 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                         frameInliers = inlierCount;
                         frameRmse = inlierCount > 0
                             ? std::sqrt(sumSq / inlierCount)
-                            : 0.0;
+                            : 1e9;
 
-                        cv::warpAffine(
-                            cur, warped, affine, reference.size(),
-                            cv::INTER_LINEAR, cv::BORDER_REPLICATE);
-                        good = inlierCount >= 8;
+                        // 第一道门：RANSAC 内点数量与残差同时达标才继续
+                        if (inlierCount >= kMinAlignInliers &&
+                            frameRmse <= kMaxAlignRmsePx) {
+                            cv::warpAffine(
+                                cur, warped, affine, reference.size(),
+                                cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+                            good = true;
+                        }
                     }
                 }
             }
@@ -269,8 +282,10 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                 cv::Mat warpedGray;
                 cv::cvtColor(warped, warpedGray, cv::COLOR_BGR2GRAY);
                 cv::Mat warpedSmall = downscaleGray(warpedGray);
-                if (!refSmall.empty() && !warpedSmall.empty() &&
-                    refSmall.size() == warpedSmall.size()) {
+                if (refSmall.empty() || warpedSmall.empty() ||
+                    refSmall.size() != warpedSmall.size()) {
+                    good = false;
+                } else {
                     cv::Mat ecc = cv::Mat::eye(2, 3, CV_32F);
                     cv::TermCriteria criteria(
                         cv::TermCriteria::COUNT + cv::TermCriteria::EPS,
@@ -278,7 +293,10 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                     const double eccScore = cv::findTransformECC(
                         refSmall, warpedSmall, ecc, cv::MOTION_EUCLIDEAN,
                         criteria);
-                    if (std::isfinite(eccScore) && eccScore > -2.0) {
+                    // 第二道门：ECC 相关性不足同样视为不可融合的帧
+                    if (!std::isfinite(eccScore) || eccScore < kMinAlignEcc) {
+                        good = false;
+                    } else {
                         const double scaleX =
                             static_cast<double>(reference.cols) / refSmall.cols;
                         const double scaleY =
@@ -292,7 +310,7 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                             warped, refined, ecc, reference.size(),
                             cv::INTER_LINEAR, cv::BORDER_REPLICATE);
                         warped = refined;
-                        stats[8] = static_cast<float>(eccScore);
+                        frameEcc = eccScore;
                     }
                 }
             }
@@ -320,6 +338,8 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         alignedCount++;
         inlierSum += frameInliers;
         rmseSum += frameRmse;
+        eccSum += frameEcc;
+        eccCount++;
     }
 
     stats[10] = static_cast<float>(accepted);
@@ -328,14 +348,19 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         stats[6] = static_cast<float>(inlierSum / alignedCount);
         stats[7] = static_cast<float>(rmseSum / alignedCount);
     }
+    if (eccCount > 0) {
+        stats[8] = static_cast<float>(eccSum / eccCount);
+    }
     if (noiseSigma < 0.5 || !std::isfinite(noiseSigma)) {
         noiseSigma = std::max(2.0, static_cast<double>(iso) / 20.0);
     }
     stats[3] = static_cast<float>(noiseSigma);
 
     if (accepted < 2) {
+        // 没有任何帧通过严格对齐门限：如实上报统计，
+        // 由上层给出具体拒绝原因（acceptedFrames 等），而不是笼统的 "fusion failed"。
         env->SetFloatArrayRegion(statsOut, 0, 12, stats);
-        return JNI_FALSE;
+        return JNI_TRUE;
     }
 
     const double inv3 = 1.0 / (3.0 * noiseSigma / 255.0 + 1e-6);

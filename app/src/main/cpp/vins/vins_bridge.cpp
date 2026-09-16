@@ -1,5 +1,7 @@
 #include <jni.h>
 
+#include <algorithm>
+#include <cmath>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -484,4 +486,33 @@ bool vinsGetHealth(VinsHealth* out) {
     out->tic[2] = static_cast<float>(T.z());
 
     return true;
+}
+
+float vinsFeatureDepthMedian() {
+    std::lock_guard<std::mutex> lk(g_vinsMutex);
+
+    if (g_estimator.solver_flag != Estimator::NON_LINEAR) {
+        return 0.0f;
+    }
+
+    std::vector<double> depths;
+    depths.reserve(g_estimator.f_manager.feature.size());
+    for (const auto &it_per_id : g_estimator.f_manager.feature) {
+        // 只看三角化成功的特征，初始化占位值(INIT_DEPTH)会污染中位数
+        if (it_per_id.solve_flag != 1) {
+            continue;
+        }
+        const double d = it_per_id.estimated_depth;
+        if (std::isfinite(d) && d > 0.1) {
+            depths.push_back(d);
+        }
+    }
+
+    if (depths.empty()) {
+        return 0.0f;
+    }
+
+    const size_t n = depths.size();
+    std::nth_element(depths.begin(), depths.begin() + n / 2, depths.end());
+    return static_cast<float>(depths[n / 2]);
 }
