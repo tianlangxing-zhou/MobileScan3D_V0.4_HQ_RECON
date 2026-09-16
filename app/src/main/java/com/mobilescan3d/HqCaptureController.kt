@@ -62,6 +62,9 @@ data class HqCaptureStats(
     var readyAwbStreak: Int = 0,
     var readyAfStreak: Int = 0,
     var readyBlockReason: String = "",
+    // 参数稳定性兜底：状态枚举不合格、但曝光/焦距实际已经稳住了
+    var aeParamsStable: Boolean = false,
+    var afParamsStable: Boolean = false,
     var threeAReady: Boolean = false,
     var exposureNs: Long = 0L,
     var iso: Int = 0,
@@ -100,11 +103,19 @@ data class HqCaptureStats(
     var rawExpired: Long = 0L,
     var pairDeferredMatched: Long = 0L,
     var rawSkipped: Long = 0L,
-    var gyroRms: Float = 0f,
+    // 陀螺两个指标必须分开：magnitude 是真实角速度幅值（用于稳定门），
+    // jitter 是旧算法（减均值后的 RMS，只反映抖动，仅作诊断保留）。
+    var gyroMagnitudeRms: Float = 0f,
+    var gyroJitterRms: Float = 0f,
     var vinsDisplacement200ms: Float = 0f,
     var translationDuringBurst: Float = 0f,
-    var lastBurstPoseDelta: Float = 0f,
-    var lastBurstAngleDeltaDeg: Float = 0f,
+    // 新视角变化 = 上一次关键帧 -> 当前（不是 burst 内部运动）
+    var viewpointDeltaMeters: Float = 0f,
+    var viewpointDeltaDeg: Float = 0f,
+    // burst 内部运动 = 第 0 帧 -> 最后一帧
+    var burstTranslationMeters: Float = 0f,
+    var burstRotationDeg: Float = 0f,
+    var burstDurationMs: Long = 0L,
     var previewClippedPercent: Float = 0f,
     var previewUnderexposedPercent: Float = 0f,
     var previewLumaSamples: Int = 0,
@@ -123,6 +134,8 @@ data class HqCaptureStats(
     var rejectedAlignment: Int = 0,
     var rejectedEcc: Int = 0,
     var rejectedDecode: Int = 0,
+    /** 参考帧（burst 第 0 张）自己解码失败：native 在 imread 之后就返回了 */
+    var referenceDecodeFail: Int = 0,
     /** burst 内最清晰帧的下标与清晰度（降级交付时选的就是它） */
     var sharpestIndex: Int = -1,
     var sharpestScore: Float = 0f,
@@ -159,8 +172,67 @@ private data class HqImuSample(
 
 private data class PoseSample(val timestampNs: Long, val pose: FloatArray)
 
-/** 等待与 CaptureResult 配对的 Image（双向配对用，Image 直到配对成功或超时才关闭） */
-private class PendingImage(val image: Image, val isRaw: Boolean, val arrivedNs: Long)
+/**
+ * 一次 burst 的上下文。
+ *
+ * 每个 burst 有自己独立的 token 目录，融合只删自己的目录。
+ * 旧实现所有 burst 共用 `hq_capture/<session>/tmp_burst/`，而 cleanupBurstTmp()
+ * 会删掉整个目录 —— 上一组还在读 12MP JPEG 时，下一组已经把新文件写进同一目录，
+ * 前一组清理时把后一组的照片一起删了，于是 fusion 的 imread(paths[0]) 返回空图。
+ * 这正好解释了实机「10 张 JPEG 都收到，但 fusion 第一张就读不到」。
+ */
+private class BurstContext(
+    val token: Long,
+    val sessionId: String,
+    val tempDir: File
+) {
+    /** 本组已落盘的 JPEG 路径，读写都持 [jpegLock] */
+    val jpegPaths = mutableListOf<String>()
+    val jpegLock = Any()
+    /** 本组期望的帧数 */
+    var expectedFrames = 0
+    /** 正常模式只保留一张参考 RAW */
+    var rawSaved = false
+    var startPose: FloatArray? = null
+    var startNs = 0L
+}
+
+/**
+ * 一次 still capture 的请求 tag。
+ *
+ * 用它把 HQ 的 still result 与每秒 30 条 preview result 区分开：
+ * preview result 的 request.tag 不是 BurstFrameTag，配对逻辑直接忽略，
+ * 不会挤占配对表、也不会造成误配。
+ */
+private data class BurstFrameTag(
+    val ctx: BurstContext,
+    val index: Int,
+    val expectsRaw: Boolean
+)
+
+/**
+ * 一次 capture 的「配对桶」。
+ *
+ * Camera2 规定：同一次 capture 的所有输出 buffer 与它的 CaptureResult
+ * 使用同一个 SENSOR_TIMESTAMP。第 0 帧同时输出 JPEG + RAW，于是
+ * **JPEG.timestamp == RAW.timestamp == result.timestamp**。
+ * 旧实现是「result 从 pendingResults 里 remove 一次就没了」＋
+ * 「pendingImages 一个时间戳只能挂一张 Image」，第 0 帧的 RAW 因此永远
+ * 拿不到 Result —— 实机 rawReceived=2 而 rawMatched=1 正是这么来的。
+ * 改成一个时间戳一个桶，三样东西各自到位后整体消费。
+ */
+private class PendingCapture {
+    var result: TotalCaptureResult? = null
+    var jpeg: Image? = null
+    var raw: Image? = null
+    var ctx: BurstContext? = null
+    var expectsRaw = false
+    var frameIndex = -1
+    val arrivedNs = System.nanoTime()
+}
+
+/** 3A 参数历史样本（用于「参数实际稳定」兜底判据） */
+private class ThreeASample(val exposureNs: Long, val iso: Int, val focusD: Float)
 
 /**
  * 一次 burst 使用的「冻结 3A」参数快照。
@@ -208,18 +280,29 @@ class HqCaptureController(
          * 互相矛盾，于是 1366 次拍摄机会全部超时，一张 HQ 都没拍到。
          */
         private const val READY_STREAK = 2
+
+        /**
+         * 参数稳定性兜底的窗口与门限（见 exposureStable / focusStable）。
+         * 6 帧 @30fps ≈ 200ms，足够判断「曝光/焦距还在不在动」。
+         */
+        private const val THREE_A_HISTORY = 6
+        /** EV 代理 log2(exposure * iso) 的极差上限：0.12 EV ≈ 肉眼不可见 */
+        private const val MAX_EV_SPREAD = 0.12
+        /** focus diopter 的极差上限 */
+        private const val MAX_FOCUS_SPREAD_DIOPTER = 0.04f
         /** burst 冷却区间 0.8~1.2s */
         private const val BURST_COOLDOWN_MIN_NS = 800_000_000L
         private const val BURST_COOLDOWN_MAX_NS = 1_200_000_000L
         private const val RETRY_COOLDOWN_NS = 1_500_000_000L
         /**
-         * 稳定窗口门限：gyroRms ≤ 0.08 rad/s 且 VINS 200ms 位移 ≤ 0.015。
+         * 稳定窗口门限：角速度**幅值** ≤ 0.08 rad/s 且 VINS 200ms 位移 ≤ 0.015。
          *
-         * 陀螺门限从 0.05 放宽到 0.08 —— 实机报告里 gyroRms=0.3368 是在用户
-         * 主动移动手机时采到的，0.05 对「边走边扫」的场景过严。
-         * 位移门限反而收紧到 0.015：转视角和位移要区分对待，HQ burst 怕的是平移。
+         * 角速度必须用 magnitude，不能用「减均值后的抖动」：手机以 0.3 rad/s
+         * 平滑匀速扫过物体时，每个陀螺样本都≈0.3，减均值后≈0，
+         * 旧算法会把「一直在匀速转」判成「很稳定」——恰恰是最该拒绝的场景。
+         * 位移门限保持 0.015：HQ burst 最怕平移（视差直接让对齐失败）。
          */
-        private const val MAX_GYRO_RMS = 0.08f
+        private const val MAX_GYRO_MAGNITUDE_RMS = 0.08f
         private const val MAX_VINS_DISP_200MS = 0.015f
         /**
          * 稳定窗口长度：4 帧 ≈ 130ms @30fps，落在评审建议的 100~200ms 区间。
@@ -269,6 +352,12 @@ class HqCaptureController(
         /** 还没有任何 CaptureResult 到达时的墙钟兜底，防止 Image 永久占着缓冲 */
         private const val IMAGE_RESULT_HOLD_NS = 1_200_000_000L
         private const val BURST_TMP_DIR = "tmp_burst"
+        /**
+         * 融合兜底延迟。正常路径是「5 张 JPEG 全部落盘」立刻触发融合，
+         * 这个定时器只负责在个别 Image 迟迟不到时把已到的部分送去融合，
+         * 取代了旧的无条件固定 700ms 等待。
+         */
+        private const val FUSION_FALLBACK_DELAY_MS = 1500L
     }
 
     val caps: HqCameraCaps
@@ -280,10 +369,14 @@ class HqCaptureController(
     private var rawSize: Size? = null
     private var active = false
 
-    // Image 与 CaptureResult 的双向配对表，共用一把锁，避免锁序反转
+    // HQ still capture 的配对表：一个 SENSOR_TIMESTAMP 一个桶，共用一把锁避免锁序反转。
+    // 桶里同时容纳 result / jpeg / raw（三者时间戳相同）。
     private val matcherLock = Any()
-    private val pendingResults = LinkedHashMap<Long, TotalCaptureResult>()
-    private val pendingImages = LinkedHashMap<Long, PendingImage>()
+    private val pendingCaptures = LinkedHashMap<Long, PendingCapture>()
+
+    // 3A 参数稳定性历史
+    private val historyLock = Any()
+    private val threeAHistory = ArrayDeque<ThreeASample>()
 
     private val imuLock = Any()
     private val imuSamples = ArrayDeque<HqImuSample>()
@@ -319,15 +412,24 @@ class HqCaptureController(
 
     // burst
     private var burstInFlight = false
+    /**
+     * 融合正在进行（或正在等最后几张 JPEG 落盘）。
+     *
+     * onFrameTick 用 `burstInFlight || processingInFlight` 作为触发门：
+     * 一次 burst 从「开始拍摄」到「融合结束 + 临时目录清理完」之间不允许再开新的，
+     * 否则上一组还在读 12MP JPEG 时下一组已经在改文件系统了。
+     */
+    @Volatile
+    private var processingInFlight = false
+    /** 当前这一组的上下文；融合结束并清理后置 null */
+    private var activeBurst: BurstContext? = null
+    /** 本组融合是否已经启动（保证只启动一次：要么凑齐、要么兜底超时） */
+    private var fusionStarted = false
     private var nextBurstAtNs = 0L
     private var currentSessionId = "unknown"
-    private var currentBurstJpegs = mutableListOf<String>()
-    private var currentBurstToken = 0L
     private var burstExpectedFrames = 0
     private var burstCompletedThisRound = 0
     private var burstFailedThisRound = 0
-    private var burstRawSavedThisRound = 0
-    private var fusionScheduled = false
 
     // 新视角判定
     private var haveLastBurstPose = false
@@ -409,9 +511,8 @@ class HqCaptureController(
         jpegReader?.close(); jpegReader = null
         rawReader?.close(); rawReader = null
         synchronized(matcherLock) {
-            pendingImages.values.forEach { runCatching { it.image.close() } }
-            pendingImages.clear()
-            pendingResults.clear()
+            pendingCaptures.values.forEach { discardCapture(it) }
+            pendingCaptures.clear()
         }
     }
 
@@ -471,24 +572,30 @@ class HqCaptureController(
         synchronized(imuLock) { imuSamples.clear() }
         synchronized(poseLock) { poseHistory.clear() }
         synchronized(matcherLock) {
-            pendingResults.clear()
-            pendingImages.values.forEach { runCatching { it.image.close() } }
-            pendingImages.clear()
+            pendingCaptures.values.forEach { discardCapture(it) }
+            pendingCaptures.clear()
         }
+        synchronized(historyLock) { threeAHistory.clear() }
         burstExpectedFrames = 0
-        fusionScheduled = false
-        cleanupBurstTmp()
+        processingInFlight = false
+        activeBurst = null
+        fusionStarted = false
+        stats.aeParamsStable = false
+        stats.afParamsStable = false
+        cleanupAllBurstTmp(currentSessionId)
     }
 
     fun endScan() {
         setPhase(STATE_IDLE)
         burstInFlight = false
-        fusionScheduled = false
+        processingInFlight = false
+        activeBurst = null
+        fusionStarted = false
     }
 
     fun close() {
         detachSurfaces()
-        cleanupBurstTmp()
+        cleanupAllBurstTmp(currentSessionId)
     }
 
     // ---------------------------------------------------------------- metadata
@@ -503,12 +610,28 @@ class HqCaptureController(
         stats.iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
         stats.focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
 
+        // 参数稳定性兜底：OnePlus 这类 HAL 会长时间停留在 AE_SEARCHING /
+        // AF_PASSIVE_SCAN，但实际曝光/焦距早就没动了。只看状态枚举会把这种
+        // 「其实已经稳了」的机会全部拒掉（上一版实机 readyAeStreak=0、
+        // readyAfStreak=0，2207 次机会只成功 2 次）。
+        // 所以额外维护一份参数历史：「严格状态合格」OR「参数实际稳定」，二者取或。
+        synchronized(historyLock) {
+            threeAHistory.addLast(
+                ThreeASample(stats.exposureNs, stats.iso, stats.focusDiopters)
+            )
+            while (threeAHistory.size > THREE_A_HISTORY) threeAHistory.removeFirst()
+        }
+        val aeParamsStable = exposureStable()
+        val afParamsStable = focusStable()
+        stats.aeParamsStable = aeParamsStable
+        stats.afParamsStable = afParamsStable
+
         // 只判「收敛」，不判「锁定」。锁定请求本身会把 preview 的 AE/AF 关成 OFF，
         // 关掉之后 AE_STATE/AF_STATE 只会报 INACTIVE —— 校验条件和它自己的副作用
         // 互相矛盾，那正是上一版 1366 次机会全部卡死的原因。
-        val aeOk = aeReady(result)
+        val aeOk = aeReady(result) || aeParamsStable
         val awbOk = awbReady(result)
-        val afOk = afReady(result)
+        val afOk = afReady(result) || afParamsStable
         stats.afLocked = result.get(CaptureResult.CONTROL_AF_STATE) ==
             CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
 
@@ -541,23 +664,71 @@ class HqCaptureController(
 
         advanceStateMachine(System.nanoTime())
 
-        val ts = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
-        // 配对超时统一在 SENSOR_TIMESTAMP 时间域上判断，基准就是这里维护的最大值
-        if (ts > lastResultSensorTs) lastResultSensorTs = ts
-        var held: PendingImage? = null
+        // 配对超时统一在 SENSOR_TIMESTAMP 时间域上判断，基准是这里维护的最大值。
+        // 注意：它必须跟踪**所有** result（包括每秒 30 条的 preview），否则两组
+        // burst 之间基准会冻结，超时判据退化成固定比较，凑不齐的桶永远不会过期。
+        val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
+        if (ts != null && ts > lastResultSensorTs) lastResultSensorTs = ts
+
+        // ---- 以下只处理 HQ still capture ----
+        // preview result 每秒来 30 条，且 JPEG/RAW reader 根本没有对应的 Image。
+        // 用 request.tag 把它们挡在配对表之外：旧实现让它们和 still result 抢
+        // LinkedHashMap 的 256 条上限，还会造成误配。
+        val tag = result.request.tag as? BurstFrameTag ?: return
+        if (ts == null) return
         synchronized(matcherLock) {
-            pendingResults[ts] = result
-            while (pendingResults.size > 256) {
-                pendingResults.remove(pendingResults.entries.iterator().next().key)
+            val bucket = pendingCaptures.getOrPut(ts) { PendingCapture() }
+            bucket.result = result
+            bucket.ctx = tag.ctx
+            bucket.expectsRaw = tag.expectsRaw
+            bucket.frameIndex = tag.index
+            while (pendingCaptures.size > 256) {
+                val oldest = pendingCaptures.entries.iterator().next()
+                discardCapture(oldest.value)
+                pendingCaptures.remove(oldest.key)
             }
-            // 双向配对：Image 若先到，这里立刻把它消费掉
-            held = pendingImages.remove(ts)
         }
-        val pending = held
-        if (pending != null) {
-            stats.pairDeferredMatched++
-            consumeImage(pending, ts, result)
+        tryConsumeCapture(ts)
+    }
+
+    /**
+     * 曝光是否「实际稳定」：EV 代理 log2(exposure * iso) 在最近 6 帧的极差。
+     * 用 log2 是因为曝光量本身是对数量纲，线性域上的差值不可比。
+     */
+    private fun exposureStable(): Boolean {
+        val samples = synchronized(historyLock) { threeAHistory.toList() }
+        if (samples.size < THREE_A_HISTORY) return false
+        var mn = Double.MAX_VALUE
+        var mx = -Double.MAX_VALUE
+        for (s in samples) {
+            if (s.exposureNs <= 0L || s.iso <= 0) return false
+            val ev = Math.log(s.exposureNs.toDouble() * s.iso.toDouble()) / Math.log(2.0)
+            if (!ev.isFinite()) return false
+            if (ev < mn) mn = ev
+            if (ev > mx) mx = ev
         }
+        return (mx - mn) < MAX_EV_SPREAD
+    }
+
+    /**
+     * 对焦是否「实际稳定」：LENS_FOCUS_DISTANCE 在最近 6 帧的极差。
+     *
+     * 只在设备真的会报焦距时才用它 —— 报不出焦距的机型 caps.manualFocus 为 false，
+     * 那种情况下 afReady() 里的 AF_MODE_OFF / 固定对焦分支已经覆盖了。
+     */
+    private fun focusStable(): Boolean {
+        if (!caps.manualFocus) return false
+        val samples = synchronized(historyLock) { threeAHistory.toList() }
+        if (samples.size < THREE_A_HISTORY) return false
+        var mn = Float.MAX_VALUE
+        var mx = -Float.MAX_VALUE
+        for (s in samples) {
+            val f = s.focusD
+            if (!f.isFinite()) return false
+            if (f < mn) mn = f
+            if (f > mx) mx = f
+        }
+        return (mx - mn) < MAX_FOCUS_SPREAD_DIOPTER
     }
 
     /** AE 是否已收敛（WAIT_3A 用；SEARCHING 不算） */
@@ -646,9 +817,16 @@ class HqCaptureController(
      * [includeRaw] 只对第 0 帧为 true：JPEG+RAW 各一份，其余帧只出 JPEG。
      * 5 张 RAW 纯属浪费带宽和存储，而 DNG 只需要一张作为色彩/线性参考。
      */
-    private fun buildLockedStillRequest(camera: CameraDevice, includeRaw: Boolean): CaptureRequest {
+    private fun buildLockedStillRequest(
+        camera: CameraDevice,
+        includeRaw: Boolean,
+        tag: BurstFrameTag
+    ): CaptureRequest {
         val frozen = locked3a ?: snapshot3A()
         val b = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+        // 打 tag：只有带 BurstFrameTag 的结果才进 HQ 配对表，
+        // preview result 会被 onCaptureResult 直接忽略。
+        b.setTag(tag)
         jpegReader?.surface?.let { b.addTarget(it) }
         if (includeRaw) {
             rawReader?.surface?.let { b.addTarget(it) }
@@ -893,7 +1071,8 @@ class HqCaptureController(
         camera: CameraDevice?,
         session: CameraCaptureSession?
     ) {
-        stats.gyroRms = computeMotionRms(nowNs)
+        stats.gyroMagnitudeRms = computeGyroMagnitudeRms(nowNs)
+        stats.gyroJitterRms = computeGyroJitterRms(nowNs)
         stats.vinsDisplacement200ms = computeTranslationDisplacement200ms(nowNs)
 
         // 稳定窗口每帧都要更新，包括冷却期：用户停稳的动作不能被冷却期吞掉，
@@ -904,16 +1083,18 @@ class HqCaptureController(
             if (currentPhase != STATE_IDLE) {
                 setPhase(STATE_IDLE)
             }
-            sweepPendingImages(nowNs)
+            sweepPendingCaptures(nowNs)
             return
         }
 
-        sweepPendingImages(nowNs)
+        sweepPendingCaptures(nowNs)
         if (currentPhase == STATE_IDLE) {
             setPhase(STATE_WAIT_3A)
         }
 
-        if (burstInFlight) {
+        // 一次 burst 从拍摄到「融合结束 + 临时目录清理完」之间不允许再开新的：
+        // 否则上一组还在读 12MP JPEG，下一组已经开始改文件系统了。
+        if (burstInFlight || processingInFlight) {
             return
         }
 
@@ -950,7 +1131,9 @@ class HqCaptureController(
             stats.rejectMotion++
             stats.triggerRejectReason =
                 "stable=${stableFrames}/$STABLE_WINDOW_FRAMES " +
-                    "(gyro=${"%.3f".format(stats.gyroRms)}, disp=${"%.4f".format(stats.vinsDisplacement200ms)})"
+                    "(gyroAbs=${"%.3f".format(stats.gyroMagnitudeRms)}, " +
+                    "gyroJit=${"%.3f".format(stats.gyroJitterRms)}, " +
+                    "disp=${"%.4f".format(stats.vinsDisplacement200ms)})"
             stats.burstSkipCount++
             return
         }
@@ -959,7 +1142,7 @@ class HqCaptureController(
         if (!novelViewpoint()) {
             stats.rejectMotion++
             stats.triggerRejectReason =
-                "viewpoint 未变化(dT=${"%.4f".format(stats.lastBurstPoseDelta)}, dR=${"%.1f".format(stats.lastBurstAngleDeltaDeg)}°)"
+                "viewpoint 未变化(dT=${"%.4f".format(stats.viewpointDeltaMeters)}, dR=${"%.1f".format(stats.viewpointDeltaDeg)}°)"
             stats.burstSkipCount++
             return
         }
@@ -993,10 +1176,11 @@ class HqCaptureController(
      * 更新稳定窗口计数。
      *
      * 「连续」是关键：只要有一帧不达标就归零重数，避免把「抖一下又稳一下」
-     * 误判成稳定。门限见 MAX_GYRO_RMS / MAX_VINS_DISP_200MS。
+     * 误判成稳定。门限见 MAX_GYRO_MAGNITUDE_RMS / MAX_VINS_DISP_200MS。
      */
     private fun updateStableWindow() {
-        val stable = stats.gyroRms <= MAX_GYRO_RMS &&
+        // 用角速度幅值，不是抖动：匀速扫视时抖动≈0，但手机其实一直在转。
+        val stable = stats.gyroMagnitudeRms <= MAX_GYRO_MAGNITUDE_RMS &&
             stats.vinsDisplacement200ms <= MAX_VINS_DISP_200MS
         stableFrames = if (stable) stableFrames + 1 else 0
         stats.stableFrames = stableFrames
@@ -1036,33 +1220,55 @@ class HqCaptureController(
         stats.schedulerAccepted++
         stats.captureCycles++
         setPhase(STATE_CAPTURE)
-        synchronized(currentBurstJpegs) { currentBurstJpegs.clear() }
-        currentBurstToken = System.nanoTime()
+
+        // 每一组 burst 一份独立上下文 + 独立临时目录。
+        // 绝不能再共用 hq_capture/<session>/tmp_burst/ —— 上一组还在读 12MP JPEG 时
+        // 下一组已经往里写新文件，任意一方清理时就会把对方的照片删掉，
+        // fusion 的 imread(paths[0]) 于是返回空图。
+        val token = System.nanoTime()
+        val ctx = BurstContext(
+            token = token,
+            sessionId = currentSessionId,
+            tempDir = File(burstTmpDir(currentSessionId), token.toString()).apply { mkdirs() }
+        )
+        ctx.expectedFrames = count
+        ctx.startNs = token
+        activeBurst = ctx
+        fusionStarted = false
+        // 从这里到融合结束、临时目录清理完，都不允许再开新的 burst
+        processingInFlight = true
         burstExpectedFrames = count
         burstCompletedThisRound = 0
         burstFailedThisRound = 0
-        burstRawSavedThisRound = 0
-        fusionScheduled = false
 
-        // 记录本次拍摄的位姿，用于「新视角」判定
+        // 记录本次拍摄的位姿：既用于「新视角」判定，也用于 burst 内部运动统计
         val pose = FloatArray(12)
         if (NativeBridge.nativeGetRenderPose(pose)) {
             System.arraycopy(pose, 0, lastBurstPose, 0, 12)
             haveLastBurstPose = true
+            ctx.startPose = pose.copyOf()
         }
 
         try {
             // 只有第 0 帧需要 RAW：一张 DNG 足够做线性/色彩参考，
             // 5 张 RAW 会把 burst 的带宽和落盘时间翻好几倍。
             val requests = (0 until count).map { i ->
-                buildLockedStillRequest(camera, includeRaw = (i == 0) && rawReader != null)
+                val expectsRaw = (i == 0) && rawReader != null
+                buildLockedStillRequest(
+                    camera,
+                    includeRaw = expectsRaw,
+                    tag = BurstFrameTag(ctx, i, expectsRaw)
+                )
             }
             burstInFlight = true
             session.captureBurst(requests, burstCallback, handler)
         } catch (e: Exception) {
             burstInFlight = false
             stats.burstDropped += count
-            // 下发失败也回到 READY，下一帧稳定窗口到了可以立刻重试
+            // 下发失败必须放掉这一组，否则 processingInFlight 会把后续 burst 永久卡死
+            processingInFlight = false
+            if (activeBurst === ctx) activeBurst = null
+            cleanupBurstDir(ctx)
             setPhase(STATE_READY)
             stats.lastCaptureRejectReason = "burst: ${e.message}"
         }
@@ -1099,16 +1305,42 @@ class HqCaptureController(
         burstInFlight = false
         // 采完一组就回到 READY：3A 仍保持自动收敛，只是重新攒稳定窗口
         setPhase(STATE_READY)
-        // 已经不再需要那么频繁，给下一次 burst 留出 0.8~1.2s 的冷却
+        // 给下一次 burst 留出 0.8~1.2s 的冷却
         val span = (BURST_COOLDOWN_MAX_NS - BURST_COOLDOWN_MIN_NS).toDouble()
         val cd = (BURST_COOLDOWN_MIN_NS + (Math.random() * span).toLong())
         stats.burstCooldownMs = cd / 1_000_000L
         nextBurstAtNs = System.nanoTime() + cd
-        if (!fusionScheduled) {
-            fusionScheduled = true
-            // 等 Image 也到齐（最多 700ms）再做融合
-            handler.postDelayed({ fuseCurrentBurst() }, 700L)
+
+        val ctx = activeBurst
+        if (ctx == null) {
+            processingInFlight = false
+            return
         }
+
+        // burst 内部运动：第 0 帧 -> 最后一帧。
+        // 旧的 lastBurstPoseDelta/lastBurstAngleDeltaDeg 其实是「上一关键帧 -> 当前」
+        // 的新视角变化，和 burst 内部运动不是一回事，所以拆开单独统计。
+        val endPose = FloatArray(12)
+        val startPose = ctx.startPose
+        if (startPose != null && NativeBridge.nativeGetRenderPose(endPose)) {
+            val dx = endPose[9] - startPose[9]
+            val dy = endPose[10] - startPose[10]
+            val dz = endPose[11] - startPose[11]
+            stats.burstTranslationMeters = hypot(hypot(dx, dy), dz)
+            stats.burstRotationDeg = rotationAngleDeg(startPose, endPose)
+        }
+        stats.burstDurationMs = (System.nanoTime() - ctx.startNs) / 1_000_000L
+
+        // 正常路径：第 N 张 JPEG 全部落盘后由 tryConsumeCapture 立刻启动融合。
+        // 这里只挂一个兜底定时器，防止个别 Image 迟到导致永远不融合，
+        // 取代了旧的无条件固定 700ms 等待。
+        handler.postDelayed({
+            if (!fusionStarted && processingInFlight && activeBurst === ctx) {
+                fusionStarted = true
+                startFusion(ctx)
+            }
+        }, FUSION_FALLBACK_DELAY_MS)
+        maybeStartFusion(ctx)
     }
 
     // ------------------------------------------------- Image / CaptureResult 配对
@@ -1123,152 +1355,189 @@ class HqCaptureController(
         }
     }
 
+    /**
+     * 桶里 result / jpeg / raw 都到位后整体消费并移除。
+     *
+     * 判定条件：result 已到、jpeg 已到、只有 expectsRaw 时才额外等 raw。
+     * 这样一个 Result 可以同时服务 JPEG、RAW 和 DNG metadata 三件事。
+     */
+    private fun tryConsumeCapture(ts: Long) {
+        var bucket: PendingCapture? = null
+        synchronized(matcherLock) {
+            val b = pendingCaptures[ts]
+            val ready = b != null && b.result != null && b.jpeg != null &&
+                (!b.expectsRaw || b.raw != null)
+            if (ready) {
+                bucket = b
+                pendingCaptures.remove(ts)
+            }
+        }
+        val b = bucket ?: return
+        val result = b.result
+        val ctx = b.ctx
+        val jpeg = b.jpeg
+        if (jpeg != null) {
+            stats.jpegMatched++
+            if (ctx != null) runCatching { saveJpeg(jpeg, ts, ctx) }
+            runCatching { jpeg.close() }
+        }
+        val raw = b.raw
+        if (raw != null) {
+            if (result != null && ctx != null) {
+                stats.rawMatched++
+                runCatching { saveDng(raw, ts, result, ctx) }
+            } else {
+                // RAW 没有 TotalCaptureResult 就无法生成合法 DNG
+                stats.rawExpired++
+            }
+            runCatching { raw.close() }
+        }
+        b.jpeg = null
+        b.raw = null
+        // JPEG 落盘后立刻检查能不能融合（不再死等固定延迟）
+        if (ctx != null) maybeStartFusion(ctx)
+    }
+
+    /** 关掉桶里还没消费的 Image，不落盘不计数（整场重置 / 配对表裁剪用） */
+    private fun discardCapture(b: PendingCapture) {
+        runCatching { b.jpeg?.close() }
+        runCatching { b.raw?.close() }
+        b.jpeg = null
+        b.raw = null
+    }
+
+    /** 桶超时：JPEG 本身是好的，能落盘就落盘；RAW 没有 Result 只能作废 */
+    private fun expireCapture(b: PendingCapture) {
+        val jpeg = b.jpeg
+        val raw = b.raw
+        val ctx = b.ctx
+        if (jpeg != null) {
+            val ts = jpeg.timestamp
+            if (ctx != null) {
+                stats.jpegMatched++
+                runCatching { saveJpeg(jpeg, ts, ctx) }
+            } else {
+                stats.jpegExpired++
+            }
+            runCatching { jpeg.close() }
+        }
+        if (raw != null) {
+            stats.rawExpired++
+            runCatching { raw.close() }
+        }
+        b.jpeg = null
+        b.raw = null
+    }
+
     private fun onJpegAvailable(reader: ImageReader) {
         val image = acquireNext(reader) ?: return
         stats.jpegReceived++
-        var deferred = false
+        val ts = image.timestamp
+        var retained = false
         try {
             if (!active) {
                 stats.jpegExpired++
                 return
             }
-            val ts = image.timestamp
-            var result: TotalCaptureResult? = null
             synchronized(matcherLock) {
-                result = pendingResults.remove(ts)
-                if (result == null) {
-                    // Result 还没到：先挂起 Image，等 Result 到达后再配对
-                    pendingImages[ts] = PendingImage(image, isRaw = false, arrivedNs = System.nanoTime())
-                    deferred = true
-                }
-            }
-            if (!deferred) {
-                stats.jpegMatched++
-                saveJpeg(image, ts)
+                val b = pendingCaptures.getOrPut(ts) { PendingCapture() }
+                // Image 先于 Result 到达：记一笔「挂起后配对成功」的统计
+                if (b.result == null) stats.pairDeferredMatched++
+                val old = b.jpeg
+                if (old != null) runCatching { old.close() }
+                b.jpeg = image
+                retained = true
             }
         } catch (e: Exception) {
             stats.jpegExpired++
             stats.lastCaptureRejectReason = "jpeg: ${e.message}"
         } finally {
-            if (!deferred) {
-                runCatching { image.close() }
-            }
+            if (!retained) runCatching { image.close() }
         }
+        if (retained) tryConsumeCapture(ts)
     }
 
     private fun onRawAvailable(reader: ImageReader) {
         val image = acquireNext(reader) ?: return
         stats.rawReceived++
-        var deferred = false
+        val ts = image.timestamp
+        var retained = false
         try {
             if (!active) {
                 stats.rawExpired++
                 return
             }
-            val ts = image.timestamp
-            var result: TotalCaptureResult? = null
             synchronized(matcherLock) {
-                result = pendingResults.remove(ts)
-                if (result == null) {
-                    pendingImages[ts] = PendingImage(image, isRaw = true, arrivedNs = System.nanoTime())
-                    deferred = true
-                }
-            }
-            if (!deferred) {
-                stats.rawMatched++
-                saveDng(image, ts, result)
+                val b = pendingCaptures.getOrPut(ts) { PendingCapture() }
+                if (b.result == null) stats.pairDeferredMatched++
+                val old = b.raw
+                if (old != null) runCatching { old.close() }
+                b.raw = image
+                retained = true
             }
         } catch (e: Exception) {
             stats.rawExpired++
             stats.lastCaptureRejectReason = "raw: ${e.message}"
         } finally {
-            if (!deferred) {
-                runCatching { image.close() }
-            }
+            if (!retained) runCatching { image.close() }
         }
-    }
-
-    private fun consumeImage(pending: PendingImage, ts: Long, result: TotalCaptureResult?) {
-        try {
-            if (pending.isRaw) {
-                if (result == null) stats.rawExpired++ else stats.rawMatched++
-                saveDng(pending.image, ts, result)
-            } else {
-                if (result == null) stats.jpegExpired++ else stats.jpegMatched++
-                saveJpeg(pending.image, ts)
-            }
-        } catch (e: Exception) {
-            stats.lastCaptureRejectReason =
-                (if (pending.isRaw) "raw: " else "jpeg: ") + e.message
-        } finally {
-            runCatching { pending.image.close() }
-        }
+        if (retained) tryConsumeCapture(ts)
     }
 
     /**
-     * 超时兜底：Result 始终没来的 Image 不能一直占着缓冲。
+     * 超时兜底：迟迟凑不齐（或根本没有 HQ 请求对应）的桶不能一直占着 ImageReader 缓冲。
      *
-     * 判据优先走 SENSOR_TIMESTAMP 时间域 —— 用「当前最新结果的 sensor 时间戳」减去
-     * 「这张 Image 自己的 sensor 时间戳」。两块时间来自同一个 sensor 时钟，直接相减
-     * 才有意义；混进 System.currentTimeMillis() 会因为时钟域不同而误判。
-     * 只有在一条 Result 都还没回来（没有基准）时，才退回墙钟兜底。
+     * 判据优先走 SENSOR_TIMESTAMP 时间域 —— 用「已知的最新 result sensor 时间戳」减去
+     * 「这张 Image 自己的 sensor 时间戳」。两个数来自同一个 sensor 时钟，直接相减才有意义；
+     * 掺进 System.currentTimeMillis() 会因为时钟域不同而误判。
+     * 只有在一条 HQ result 都还没回来（没有基准）时，才退回墙钟兜底。
      */
-    private fun sweepPendingImages(nowNs: Long) {
-        if (pendingImages.isEmpty()) {
-            return
-        }
-        val stale = mutableListOf<PendingImage>()
-        val sensorNow = lastResultSensorTs
+    private fun sweepPendingCaptures(nowNs: Long) {
+        val expired = mutableListOf<PendingCapture>()
         synchronized(matcherLock) {
-            val it = pendingImages.entries.iterator()
+            val sensorNow = lastResultSensorTs
+            val it = pendingCaptures.entries.iterator()
             while (it.hasNext()) {
                 val entry = it.next()
-                val expired = if (sensorNow > 0L && entry.key > 0L && sensorNow >= entry.key) {
+                val b = entry.value
+                val timedOut = if (sensorNow > 0L && entry.key > 0L && sensorNow >= entry.key) {
                     sensorNow - entry.key > PAIR_TIMEOUT_NS
                 } else {
-                    nowNs - entry.value.arrivedNs > IMAGE_RESULT_HOLD_NS
+                    nowNs - b.arrivedNs > IMAGE_RESULT_HOLD_NS
                 }
-                if (expired) {
-                    stale.add(entry.value)
+                if (timedOut) {
+                    expired.add(b)
                     it.remove()
                 }
             }
         }
-        for (p in stale) {
-            if (p.isRaw) {
-                // RAW 没有 TotalCaptureResult 就无法生成合法 DNG
-                stats.rawExpired++
-                runCatching { p.image.close() }
-            } else {
-                consumeImage(p, p.image.timestamp, null)
-            }
-        }
+        for (b in expired) expireCapture(b)
     }
 
-    private fun saveJpeg(image: Image, ts: Long) {
+    private fun saveJpeg(image: Image, ts: Long, ctx: BurstContext) {
         val bytes = ByteArray(image.planes[0].buffer.remaining())
         image.planes[0].buffer.get(bytes)
-        // burst 成员先落在临时目录，融合结束后只保留「参考帧 + 融合结果」
-        val file = File(burstTmpDir(currentSessionId), "burst_${ts}.jpg")
+        // burst 成员先落在「本组自己的」临时目录，融合结束后只保留参考帧 + 融合结果
+        val file = File(ctx.tempDir, "burst_${ts}.jpg")
         FileOutputStream(file).use { it.write(bytes) }
         stats.jpegSaved++
-        synchronized(currentBurstJpegs) {
-            currentBurstJpegs.add(file.absolutePath)
+        synchronized(ctx.jpegLock) {
+            ctx.jpegPaths.add(file.absolutePath)
         }
     }
 
-    private fun saveDng(image: Image, ts: Long, result: TotalCaptureResult?) {
+    private fun saveDng(image: Image, ts: Long, result: TotalCaptureResult?, ctx: BurstContext) {
         if (result == null) {
-            // 计数由调用方（consumeImage）统一负责，这里只负责不生成非法 DNG
+            // 计数由调用方（tryConsumeCapture）统一负责，这里只负责不生成非法 DNG
             return
         }
-        if (burstRawSavedThisRound > 0) {
+        if (ctx.rawSaved) {
             // 正常模式只保留一张参考 RAW，其余不落盘
             stats.rawSkipped++
             return
         }
-        burstRawSavedThisRound++
-        val dir = captureDir(currentSessionId)
+        ctx.rawSaved = true
+        val dir = captureDir(ctx.sessionId)
         val file = File(dir, "reference_${ts}.dng")
         val dng = DngCreator(characteristics, result)
         try {
@@ -1282,18 +1551,28 @@ class HqCaptureController(
 
     // ------------------------------------------------------------------- fusion
 
-    private fun fuseCurrentBurst() {
-        val paths = synchronized(currentBurstJpegs) { currentBurstJpegs.toList() }
+    /** 到齐就立刻融合；没到齐就等兜底定时器。fusionStarted 保证只启动一次。 */
+    private fun maybeStartFusion(ctx: BurstContext) {
+        if (fusionStarted || !processingInFlight) return
+        if (activeBurst !== ctx) return
+        val n = synchronized(ctx.jpegLock) { ctx.jpegPaths.size }
+        if (n < ctx.expectedFrames) return
+        fusionStarted = true
+        startFusion(ctx)
+    }
+
+    private fun startFusion(ctx: BurstContext) {
+        // 融合读的是不可变快照：之后谁再往 ctx 里加/删都不影响这一趟
+        val paths = synchronized(ctx.jpegLock) { ctx.jpegPaths.toList() }
         if (paths.size < 2) {
             stats.lastCaptureRejectReason = "burst images < 2"
-            fusionScheduled = false
-            cleanupBurstTmp()
+            finishFusion(ctx)
             scheduleRetake()
             return
         }
 
-        val outDir = captureDir(currentSessionId)
-        val out = File(outDir, "fused_${currentBurstToken}.jpg")
+        val outDir = captureDir(ctx.sessionId)
+        val out = File(outDir, "fused_${ctx.token}.jpg")
         // 参考帧 / 单帧降级的落盘都放到 applyFusionStats 里按结果决定，
         // 避免出现「reference_*.jpg」和「single_*.jpg」两份重复交付物。
         val statsOut = FloatArray(20)
@@ -1314,12 +1593,31 @@ class HqCaptureController(
                 false
             }
             handler.post {
-                applyFusionStats(ok, out, statsOut, paths)
+                applyFusionStats(ctx, ok, out, statsOut, paths)
+                finishFusion(ctx)
             }
         }.start()
     }
 
-    private fun applyFusionStats(ok: Boolean, out: File, statsOut: FloatArray, paths: List<String>) {
+    /**
+     * 融合收尾：只删自己这一组的临时目录，绝不碰别的 burst。
+     * processingInFlight 在这里才清零 —— 它同时是「下一组 burst 的准入条件」。
+     */
+    private fun finishFusion(ctx: BurstContext) {
+        cleanupBurstDir(ctx)
+        synchronized(ctx.jpegLock) { ctx.jpegPaths.clear() }
+        if (activeBurst === ctx) activeBurst = null
+        fusionStarted = false
+        processingInFlight = false
+    }
+
+    private fun applyFusionStats(
+        ctx: BurstContext,
+        ok: Boolean,
+        out: File,
+        statsOut: FloatArray,
+        paths: List<String>
+    ) {
         stats.inputFrames = if (statsOut.size > 9 && statsOut[9] > 0f) statsOut[9].toInt() else paths.size
         stats.sharpness = statsOut[0]
         stats.clippedPercent = statsOut[1]
@@ -1352,6 +1650,10 @@ class HqCaptureController(
         // sharpestIndex < 0 表示连参考帧都没解码成功（native 提前返回），
         // 这时 sharpestScore 必然是 0，不能再把它当成「整组都糊」来解释。
         val decodeFailed = sharpestIndex < 0
+        // 专门的「参考帧解码失败」计数：旧报告里错误信息说解码失败、
+        // 但 rejectedDecode 却是 0，两处自相矛盾。现在 native 也会为
+        // 参考帧失败记一次 rejectedDecode，这里再单独暴露出来。
+        stats.referenceDecodeFail = if (decodeFailed) stats.rejectedDecode.coerceAtLeast(1) else 0
         val tooBlurry = !decodeFailed && sharpestScore < MIN_SHARPEST_SCORE
         // 帧数是第一判据：评审要求 acceptedFrames < 3 就不融合。
         // 先判帧数，下面那些内点/残差/ECC 只有在帧数够了却依然不达标时才有解释力。
@@ -1391,7 +1693,7 @@ class HqCaptureController(
             alignReject.isNotEmpty() -> {
                 if (out.exists()) out.delete()
                 val picked = if (sharpestIndex in paths.indices) sharpestIndex else 0
-                if (saveFallbackSingle(paths[picked])) {
+                if (saveFallbackSingle(ctx, paths[picked])) {
                     stats.fusionFallbackSingle++
                     stats.lastCaptureRejectReason = "$alignReject -> 已降级交付最清晰单帧"
                 } else {
@@ -1402,7 +1704,7 @@ class HqCaptureController(
             else -> {
                 val refSrc = File(paths.first())
                 if (refSrc.exists()) {
-                    val refDst = File(captureDir(currentSessionId), "reference_${currentBurstToken}.jpg")
+                    val refDst = File(captureDir(ctx.sessionId), "reference_${ctx.token}.jpg")
                     runCatching {
                         refSrc.copyTo(refDst, overwrite = true)
                         stats.referenceJpeg = refDst.absolutePath
@@ -1414,8 +1716,6 @@ class HqCaptureController(
             }
         }
 
-        fusionScheduled = false
-        cleanupBurstTmp()
         if (retake) {
             scheduleRetake()
         }
@@ -1427,10 +1727,10 @@ class HqCaptureController(
      * 评审要求「acceptedFrames < 3 不要融合，直接选最清晰的一张」——
      * 一张干净的单帧对重建的价值，高于一张重影糊边的伪融合图。
      */
-    private fun saveFallbackSingle(srcPath: String): Boolean {
+    private fun saveFallbackSingle(ctx: BurstContext, srcPath: String): Boolean {
         val src = File(srcPath)
         if (!src.exists()) return false
-        val dst = File(captureDir(currentSessionId), "single_${currentBurstToken}.jpg")
+        val dst = File(captureDir(ctx.sessionId), "single_${ctx.token}.jpg")
         return runCatching {
             src.copyTo(dst, overwrite = true)
             stats.fallbackSingleJpeg = dst.absolutePath
@@ -1438,11 +1738,18 @@ class HqCaptureController(
         }.getOrDefault(false)
     }
 
-    private fun cleanupBurstTmp() {
-        runCatching {
-            val dir = burstTmpDir(currentSessionId)
-            dir.listFiles()?.forEach { it.delete() }
-        }
+    /**
+     * 只删某一组自己的临时目录。
+     * 旧实现 cleanupBurstTmp() 会删掉整个共享 tmp_burst —— 那正是
+     * 「A 组融合时把 B 组的照片删掉」的根因，所以它被彻底去掉了。
+     */
+    private fun cleanupBurstDir(ctx: BurstContext) {
+        runCatching { ctx.tempDir.deleteRecursively() }
+    }
+
+    /** 整场扫描开始/结束时的兜底清理：此时不可能有 burst 在飞 */
+    private fun cleanupAllBurstTmp(sessionId: String) {
+        runCatching { burstTmpDir(sessionId).deleteRecursively() }
     }
 
     private fun scheduleRetake() {
@@ -1461,18 +1768,54 @@ class HqCaptureController(
 
     // ------------------------------------------------------------------ motion
 
-    private fun computeMotionRms(nowNs: Long): Float {
+    /** 最近 250ms 的 IMU 样本；不足 6 个说明数据还不够，返回 null */
+    private fun recentImu(nowNs: Long): List<HqImuSample>? {
         val cutoff = nowNs - 250_000_000L
         val recent = synchronized(imuLock) { imuSamples.filter { it.timestampNs >= cutoff } }
-        if (recent.size < 6) return 999f
+        return if (recent.size < 6) null else recent
+    }
+
+    /**
+     * 真实角速度幅值：sqrt(mean(gx² + gy² + gz²))。**稳定门用这个。**
+     *
+     * 旧实现 computeMotionRms() 算的是「陀螺减均值后的 RMS」，那其实是抖动/方差：
+     * 手机以 0.3 rad/s 平滑匀速旋转时，每个样本都≈0.3，减均值后≈0，
+     * 于是「一直在匀速转」会被判成「很稳定」—— 恰恰是最该拒绝的场景。
+     */
+    private fun computeGyroMagnitudeRms(nowNs: Long): Float {
+        val recent = recentImu(nowNs) ?: return 999f
+        var sum = 0.0
+        for (s in recent) {
+            sum += (s.gyroX * s.gyroX + s.gyroY * s.gyroY + s.gyroZ * s.gyroZ).toDouble()
+        }
+        return sqrt((sum / recent.size).toFloat())
+    }
+
+    /** 旧算法原样保留，重命名为 jitter，只作为诊断输出（不再参与稳定门） */
+    private fun computeGyroJitterRms(nowNs: Long): Float {
+        val recent = recentImu(nowNs) ?: return 999f
         val gx = recent.map { it.gyroX }.average().toFloat()
         val gy = recent.map { it.gyroY }.average().toFloat()
         val gz = recent.map { it.gyroZ }.average().toFloat()
-        val g = sqrt(recent.map { val dx = it.gyroX - gx; val dy = it.gyroY - gy; val dz = it.gyroZ - gz; dx * dx + dy * dy + dz * dz }.average().toFloat())
+        val g = sqrt(
+            recent.map {
+                val dx = it.gyroX - gx
+                val dy = it.gyroY - gy
+                val dz = it.gyroZ - gz
+                dx * dx + dy * dy + dz * dz
+            }.average().toFloat()
+        )
         val ax = recent.map { it.accelX }.average().toFloat()
         val ay = recent.map { it.accelY }.average().toFloat()
         val az = recent.map { it.accelZ }.average().toFloat()
-        val a = sqrt(recent.map { val dx = it.accelX - ax; val dy = it.accelY - ay; val dz = it.accelZ - az; dx * dx + dy * dy + dz * dz }.average().toFloat())
+        val a = sqrt(
+            recent.map {
+                val dx = it.accelX - ax
+                val dy = it.accelY - ay
+                val dz = it.accelZ - az
+                dx * dx + dy * dy + dz * dz
+            }.average().toFloat()
+        )
         return maxOf(g, a * 0.1f)
     }
 
@@ -1502,10 +1845,10 @@ class HqCaptureController(
         val dx = pose[9] - lastBurstPose[9]
         val dy = pose[10] - lastBurstPose[10]
         val dz = pose[11] - lastBurstPose[11]
-        stats.lastBurstPoseDelta = hypot(hypot(dx, dy), dz)
-        stats.lastBurstAngleDeltaDeg = rotationAngleDeg(lastBurstPose, pose)
-        return stats.lastBurstPoseDelta >= MIN_NEW_VIEW_TRANSLATION ||
-            stats.lastBurstAngleDeltaDeg >= MIN_NEW_VIEW_ANGLE_DEG
+        stats.viewpointDeltaMeters = hypot(hypot(dx, dy), dz)
+        stats.viewpointDeltaDeg = rotationAngleDeg(lastBurstPose, pose)
+        return stats.viewpointDeltaMeters >= MIN_NEW_VIEW_TRANSLATION ||
+            stats.viewpointDeltaDeg >= MIN_NEW_VIEW_ANGLE_DEG
     }
 
     /** trace(R_a^T · R_b) -> 旋转角 */
@@ -1538,6 +1881,8 @@ class HqCaptureController(
         sb.appendLine("readyAwbStreak=${stats.readyAwbStreak}")
         sb.appendLine("readyAfStreak=${stats.readyAfStreak}")
         sb.appendLine("readyBlockReason=${stats.readyBlockReason}")
+        sb.appendLine("aeParamsStable=${stats.aeParamsStable}")
+        sb.appendLine("afParamsStable=${stats.afParamsStable}")
         sb.appendLine("AE state=${stats.aeState}")
         sb.appendLine("AE locked=${stats.aeLocked}")
         sb.appendLine("AWB state=${stats.awbState}")
@@ -1576,13 +1921,19 @@ class HqCaptureController(
         sb.appendLine("rawExpired=${stats.rawExpired}")
         sb.appendLine("pairDeferredMatched=${stats.pairDeferredMatched}")
         sb.appendLine("rawSkipped=${stats.rawSkipped}")
-        sb.appendLine("gyroRms=${stats.gyroRms}")
+        // 稳定门的输入是 gyroMagnitudeRms（真实角速度幅值）；
+        // gyroJitterRms 是旧算法，只留作对比，方便下一轮实机标定门限。
+        sb.appendLine("gyroMagnitudeRms=${stats.gyroMagnitudeRms}")
+        sb.appendLine("gyroJitterRms=${stats.gyroJitterRms}")
         sb.appendLine("vinsDisplacement200ms=${stats.vinsDisplacement200ms}")
         sb.appendLine("stableFrames=${stats.stableFrames}")
         sb.appendLine("realUnderexposed=${stats.realUnderexposed}")
         sb.appendLine("translationDuringBurst=${stats.translationDuringBurst}")
-        sb.appendLine("lastBurstPoseDelta=${stats.lastBurstPoseDelta}")
-        sb.appendLine("lastBurstAngleDeltaDeg=${stats.lastBurstAngleDeltaDeg}")
+        sb.appendLine("viewpointDeltaMeters=${stats.viewpointDeltaMeters}")
+        sb.appendLine("viewpointDeltaDeg=${stats.viewpointDeltaDeg}")
+        sb.appendLine("burstTranslationMeters=${stats.burstTranslationMeters}")
+        sb.appendLine("burstRotationDeg=${stats.burstRotationDeg}")
+        sb.appendLine("burstDurationMs=${stats.burstDurationMs}")
         sb.appendLine("previewClippedPercent=${stats.previewClippedPercent}")
         sb.appendLine("previewUnderexposedPercent=${stats.previewUnderexposedPercent}")
         sb.appendLine("previewLumaP05=${stats.lumaP05}")
@@ -1596,6 +1947,7 @@ class HqCaptureController(
         sb.appendLine("rejectedAlignment=${stats.rejectedAlignment}")
         sb.appendLine("rejectedEcc=${stats.rejectedEcc}")
         sb.appendLine("rejectedDecode=${stats.rejectedDecode}")
+        sb.appendLine("referenceDecodeFail=${stats.referenceDecodeFail}")
         sb.appendLine("inputFrames=${stats.inputFrames}")
         sb.appendLine("acceptedFrames=${stats.acceptedFrames}")
         sb.appendLine("rejectedFrames=${stats.rejectedFrames}")

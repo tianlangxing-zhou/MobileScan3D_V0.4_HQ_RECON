@@ -469,15 +469,12 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         edgeLostFrames_ = 0;
     }
 
-    if (edgeLostFrames_ >= 3) {
-        markLost("track: target left frame");
-        return;
-    }
-
-    if (info_.visibleFraction < 0.40f) {
-        info_.lastEvent = "target near frame edge";
-    }
-
+    // 诊断字段必须在「出界 return」之前更新。
+    // 旧顺序是：先算 visibleFraction -> 累计边缘丢失 -> 出界就 return，
+    // 而 bbox 相关的字段在 return 之后才写。于是报告里会出现
+    // 「visibleBBox=241x7（最新一帧）+ visibleFraction=0（也来自最新一帧）」
+    // 这种看似矛盾的组合 —— 其实是混用了两个不同帧的数据。
+    // 这里只是把同一帧的诊断信息写在一起，不动 tracker 主算法。
     info_.x0 = std::clamp(static_cast<float>(visibleBox.x) / width, 0.0f, 1.0f);
     info_.y0 = std::clamp(static_cast<float>(visibleBox.y) / height, 0.0f, 1.0f);
     info_.x1 = std::clamp(static_cast<float>(visibleBox.x + visibleBox.width) / width, 0.0f, 1.0f);
@@ -491,6 +488,15 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.fullBBoxHeightPx = fullBox.height;
     info_.visibleBBoxWidthPx = visibleBox.width;
     info_.visibleBBoxHeightPx = visibleBox.height;
+
+    if (edgeLostFrames_ >= 3) {
+        markLost("track: target left frame");
+        return;
+    }
+
+    if (info_.visibleFraction < 0.40f) {
+        info_.lastEvent = "target near frame edge";
+    }
     info_.lastAffineScale = scale;
     info_.affineScaleEMA = 0.7f * info_.affineScaleEMA + 0.3f * scale;
 

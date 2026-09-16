@@ -141,6 +141,10 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
 
     cv::Mat reference = cv::imread(paths[0], cv::IMREAD_COLOR);
     if (reference.empty()) {
+        // 参考帧自己解不开：这是一次 decode 失败，必须计入 rejectedDecode，
+        // 否则报告里会同时出现「reference frame decode failed」和 rejectedDecode=0
+        // 这种自相矛盾的组合（旧版本就是这样）。
+        stats[18] = 1.f;
         env->SetFloatArrayRegion(statsOut, 0, 20, stats);
         return JNI_FALSE;
     }
@@ -303,28 +307,51 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                     cv::Mat affine = cv::estimateAffinePartial2D(
                         gPrev, gNext, inliers, cv::RANSAC, 3.0);
                     if (!affine.empty()) {
+                        // RMSE 必须是「affine 模型拟合之后还剩多少误差」，
+                        // 而不是「特征从上一帧移动了多少像素」。
+                        // 旧实现算的是后者：手机轻微平移 5px 时，即使模型完全正确，
+                        // RMSE 也会是 5px，然后被 1.5px 的门限误杀。这是把好帧
+                        // 成片拒掉的一个重要原因。
+                        const double m00 = affine.at<double>(0, 0);
+                        const double m01 = affine.at<double>(0, 1);
+                        const double m02 = affine.at<double>(0, 2);
+                        const double m10 = affine.at<double>(1, 0);
+                        const double m11 = affine.at<double>(1, 1);
+                        const double m12 = affine.at<double>(1, 2);
                         int inlierCount = 0;
                         double sumSq = 0.0;
                         for (int k = 0; k < inliers.rows; ++k) {
                             if (inliers.at<uchar>(k)) {
+                                const cv::Point2f& src = gPrev[k];
+                                const cv::Point2f& dst = gNext[k];
+                                const double px = m00 * src.x + m01 * src.y + m02;
+                                const double py = m10 * src.x + m11 * src.y + m12;
+                                const double ex = px - dst.x;
+                                const double ey = py - dst.y;
+                                sumSq += ex * ex + ey * ey;
                                 inlierCount++;
-                                const cv::Point2f& a = gPrev[k];
-                                const cv::Point2f& b = gNext[k];
-                                sumSq += (a.x - b.x) * (a.x - b.x) +
-                                         (a.y - b.y) * (a.y - b.y);
                             }
                         }
                         frameInliers = inlierCount;
                         frameRmse = inlierCount > 0
                             ? std::sqrt(sumSq / inlierCount)
                             : 1e9;
+                        // 旧 bug：rmseMax 声明后从未更新过，stats[12] 永远是 0，
+                        // 报告里 alignmentRmseMax 因此毫无意义。
+                        rmseMax = std::max(rmseMax, frameRmse);
 
                         // 第一道门：RANSAC 内点数量与残差同时达标才继续
                         if (inlierCount >= kMinAlignInliers &&
                             frameRmse <= kMaxAlignRmsePx) {
+                            // affine 由 estimateAffinePartial2D(gPrev=ref, gNext=cur)
+                            // 解出，方向是 reference -> current；而 warpAffine 的
+                            // dst 是 reference、src 是 cur，方向恰好相反。
+                            // 必须用 WARP_INVERSE_MAP 告诉 OpenCV「按 dst->src 使用这个矩阵」，
+                            // 否则 OpenCV 会再求一次逆，把图像往反方向拉。
                             cv::warpAffine(
                                 cur, warped, affine, reference.size(),
-                                cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+                                cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
+                                cv::BORDER_REPLICATE);
                             good = true;
                         }
                     }
@@ -362,9 +389,13 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                         ecc.at<float>(1, 2) =
                             static_cast<float>(ecc.at<float>(1, 2) * scaleY);
                         cv::Mat refined;
+                        // findTransformECC 的矩阵同样是 template -> input 方向
+                        // （template=refSmall, input=warpedSmall），把 warped 拉回
+                        // reference 坐标系同样需要 WARP_INVERSE_MAP。
                         cv::warpAffine(
                             warped, refined, ecc, reference.size(),
-                            cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+                            cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
+                            cv::BORDER_REPLICATE);
                         warped = refined;
                         frameEcc = eccScore;
                     }
@@ -378,6 +409,14 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
 
         if (!good || warped.empty() || warped.size() != reference.size()) {
             rejected++;
+            // rejectedAlign / rejectedEcc 之前声明了却从来没累加过，
+            // 所以报告里它们恒为 0 —— 并不代表没有失败，只是没统计。
+            // 按失败发生在哪一道门归类，这两个数才有诊断价值。
+            if (rejectKind == 2) {
+                rejectedEcc++;
+            } else {
+                rejectedAlign++;
+            }
             continue;
         }
 

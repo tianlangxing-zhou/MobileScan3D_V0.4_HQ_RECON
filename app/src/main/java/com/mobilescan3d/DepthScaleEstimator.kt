@@ -240,6 +240,7 @@ class DepthScaleEstimator {
      * `depthScaleSamples` / `depthScaleMedian` / `depthScaleMAD` / `depthScaleStable`。
      */
     fun report(sb: StringBuilder, indent: String = "") {
+        sb.appendLine("${indent}depthScaleDirection=vins/raw (=depthCorrectionScaleVins)")
         sb.appendLine("${indent}depthScaleSamples=$sampleCount")
         sb.appendLine("${indent}depthScaleMedian=$median")
         sb.appendLine("${indent}depthScaleMAD=$mad")

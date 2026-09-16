@@ -1289,29 +1289,38 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             lastLensFocusDistance ?: 0f
         }
         val focusApproxMeters = if (focusDiopters > 0.01f) 1f / focusDiopters else 0f
-        val depthScaleCandidateFocus = if (focusApproxMeters > 0.01f && targetDepthMedian > 0f) {
+        // 命名必须自带方向。raw/vins 与 vins/raw 互为倒数，历史上就因为把
+        // depthScaleCandidateVins(= raw/vins) 和 estimator 的
+        // depthScaleMedian(= vins/raw) 并列在同一份报告里，很容易把修正方向读反。
+        val depthOverFocusRatio = if (focusApproxMeters > 0.01f && targetDepthMedian > 0f) {
             targetDepthMedian / focusApproxMeters
         } else {
             0f
         }
-        val depthScaleCandidateVins = if (vinsTriangulatedDepthMedian > 0.01f && targetDepthMedian > 0f) {
+        val depthOverVinsRatio = if (vinsTriangulatedDepthMedian > 0.01f && targetDepthMedian > 0f) {
             targetDepthMedian / vinsTriangulatedDepthMedian
         } else {
             0f
         }
+        // 真正会乘到 raw depth 上、把它拉到 VINS 尺度的那个系数方向
+        val depthCorrectionScaleVins =
+            if (depthOverVinsRatio > 0f) 1f / depthOverVinsRatio else 0f
         sb.appendLine("[7.1] 深度尺度诊断（暂不自动施加修正）:")
         sb.appendLine("    targetDepthP10=$targetDepthP10")
         sb.appendLine("    targetDepthMedian=$targetDepthMedian")
         sb.appendLine("    targetDepthP90=$targetDepthP90")
         sb.appendLine("    focusApproxMeters=$focusApproxMeters")
         sb.appendLine("    vinsTriangulatedDepthMedian=$vinsTriangulatedDepthMedian")
-        // 下面两个是同一比例的两种取法，保留旧字段避免报告历史断裂：
-        // depthScaleCandidateFocus = raw/focus，depthScaleCandidateVins = raw/vins
-        sb.appendLine("    depthScaleCandidateFocus=$depthScaleCandidateFocus")
-        sb.appendLine("    depthScaleCandidateVins=$depthScaleCandidateVins")
-        // [7.2] 深度尺度估计器：scale = vins/raw，只统计不施加（samples ≥ 30 且 MAD/median < 0.12
-        // 且秒级窗口无漂移才算稳定；这一轮绝不把它乘回深度/点云）
-        sb.appendLine("[7.2] DepthScaleEstimator (scale = vinsDepthMedian / targetRawDepthMedian，只记录):")
+        // 三个字段名字自带方向，不会再读反：
+        //   depthOverFocusRatio / depthOverVinsRatio  —— raw / 参考量（>1 说明 raw 偏大）
+        //   depthCorrectionScaleVins                  —— vins / raw（<1，乘到 raw 上才变米制）
+        sb.appendLine("    depthOverFocusRatio=$depthOverFocusRatio")
+        sb.appendLine("    depthOverVinsRatio=$depthOverVinsRatio")
+        sb.appendLine("    depthCorrectionScaleVins=$depthCorrectionScaleVins")
+        // [7.2] DepthScaleEstimator 统计的就是 depthCorrectionScaleVins 方向的 scale
+        // （vins / raw），只统计不施加：samples ≥ 30 且 MAD/median < 0.12 且秒级窗口
+        // 无漂移才算 stable；这一轮绝不把它乘回深度/点云。
+        sb.appendLine("[7.2] DepthScaleEstimator (scale 方向 = vins/raw = depthCorrectionScaleVins，只记录):")
         depthScaleEstimator.report(sb, "    ")
         sb.appendLine()
         sb.appendLine()
