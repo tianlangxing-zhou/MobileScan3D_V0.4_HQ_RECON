@@ -527,6 +527,75 @@ float vinsFeatureDepthMedian() {
     return static_cast<float>(depths[n / 2]);
 }
 
+// ------------------------------------------------------- V0.5 anchor-frame 修正
+//
+// FeaturePerId::estimated_depth 由 FeatureManager::triangulate() 解出，而它第一个
+// 投影矩阵是 P0 = [I | 0] —— 也就是说这个深度是 **start_frame（anchor）那一帧的
+// camera 坐标系**下的 z。但 feature_per_frame.back().uv 是**最新观测帧**的像素
+// 坐标。相机在 anchor 与观测帧之间发生了平移/旋转，同一个 3D 点的 z 会变，所以
+// 两者**不能直接配对**。
+//
+// 正确做法：先在 anchor camera 系还原 3D 点（FeaturePerFrame::point 的 z 分量恒
+// 为 1，见 vins_bridge 里 xyz_uv_velocity 的构造），经 world 变换到观测帧 camera
+// 系，再取 z 作为该 uv 的米制深度。
+//
+// 注意：这里不用 FeaturePerId::endFrame() —— 它是非 const 成员函数，而循环变量是
+// const 引用，直接调用会因丢掉 const 限定而编译失败。等价地手算索引即可。
+//
+// 调用方必须已持有 g_vinsMutex。
+static bool vinsAnchorDepthPair(const FeaturePerId& f, Eigen::Vector2d* outUv,
+                                double* outDepth) {
+    if (f.solve_flag != 1 || f.feature_per_frame.empty()) {
+        return false;
+    }
+    const double anchorDepth = f.estimated_depth;
+    if (!std::isfinite(anchorDepth) || anchorDepth <= 0.1) {
+        return false;
+    }
+
+    const int anchorFrame = f.start_frame;
+    const int obsFrame = anchorFrame + (int)f.feature_per_frame.size() - 1;
+    if (anchorFrame < 0 || anchorFrame > WINDOW_SIZE ||
+        obsFrame < 0 || obsFrame > WINDOW_SIZE) {
+        return false;
+    }
+
+    const Eigen::Vector2d& uv = f.feature_per_frame.back().uv;
+    if (!std::isfinite(uv.x()) || !std::isfinite(uv.y())) {
+        return false;
+    }
+
+    // anchor 帧 camera 系 -> world -> 观测帧 camera 系
+    const Eigen::Vector3d pAnchor =
+        f.feature_per_frame.front().point * anchorDepth;
+    const Eigen::Matrix3d RwcAnchor =
+        g_estimator.Rs[anchorFrame] * g_estimator.ric[0];
+    const Eigen::Vector3d twcAnchor =
+        g_estimator.Ps[anchorFrame] +
+        g_estimator.Rs[anchorFrame] * g_estimator.tic[0];
+    const Eigen::Vector3d pWorld = RwcAnchor * pAnchor + twcAnchor;
+
+    const Eigen::Matrix3d RwcObs =
+        g_estimator.Rs[obsFrame] * g_estimator.ric[0];
+    const Eigen::Vector3d twcObs =
+        g_estimator.Ps[obsFrame] +
+        g_estimator.Rs[obsFrame] * g_estimator.tic[0];
+    const Eigen::Vector3d pObs = RwcObs.transpose() * (pWorld - twcObs);
+
+    const double z = pObs.z();
+    if (!std::isfinite(z) || z <= 0.1) {
+        return false;
+    }
+
+    if (outUv != nullptr) {
+        *outUv = uv;
+    }
+    if (outDepth != nullptr) {
+        *outDepth = z;
+    }
+    return true;
+}
+
 float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
                                   int* outSampleCount) {
     if (outSampleCount != nullptr) {
@@ -558,20 +627,15 @@ float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
         if (it_per_id.solve_flag != 1) {
             continue;
         }
-        const double d = it_per_id.estimated_depth;
-        if (!std::isfinite(d) || d <= 0.1) {
-            continue;
-        }
-        if (it_per_id.feature_per_frame.empty()) {
+        // V0.5：estimated_depth 在 anchor camera 系，必须先投到观测帧再取 z。
+        Eigen::Vector2d uv;
+        double d = 0.0;
+        if (!vinsAnchorDepthPair(it_per_id, &uv, &d)) {
             continue;
         }
         // 用最近一次观测的像素位置判断它是否落在目标 ROI 内。
         // uv 是 VINS 输入图像像素（feature_tracker 里 cur_pts 直接写入），
         // 不是归一化坐标 —— 这也是必须保存 g_vinsImageW/H 的原因。
-        const Eigen::Vector2d &uv = it_per_id.feature_per_frame.back().uv;
-        if (!std::isfinite(uv.x()) || !std::isfinite(uv.y())) {
-            continue;
-        }
         if (uv.x() < px0 || uv.x() > px1 || uv.y() < py0 || uv.y() > py1) {
             continue;
         }
@@ -615,15 +679,11 @@ int vinsFeatureSamples(float* out, int maxSamples) {
         if (it_per_id.solve_flag != 1) {
             continue;
         }
-        const double d = it_per_id.estimated_depth;
-        if (!std::isfinite(d) || d <= 0.1) {
-            continue;
-        }
-        if (it_per_id.feature_per_frame.empty()) {
-            continue;
-        }
-        const Eigen::Vector2d &uv = it_per_id.feature_per_frame.back().uv;
-        if (!std::isfinite(uv.x()) || !std::isfinite(uv.y())) {
+        // V0.5：estimated_depth 在 anchor camera 系，必须先投到观测帧再取 z。
+        // 否则 vinsFeatureSamples() 交给深度标定器的 (uv, z) 对是错配的。
+        Eigen::Vector2d uv;
+        double d = 0.0;
+        if (!vinsAnchorDepthPair(it_per_id, &uv, &d)) {
             continue;
         }
         const float nu = static_cast<float>(uv.x()) * invW;

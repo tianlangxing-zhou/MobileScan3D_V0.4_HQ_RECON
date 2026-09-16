@@ -20,7 +20,7 @@ import java.util.concurrent.Executors
  *
  * 现在最终产物是 `scan_<session>.glb`：带索引三角面 + 逐顶点法线 + 逐顶点颜色。
  * PLY 保留（改名带 `_points` 后缀更诚实，但为了不破坏既有报告字段仍沿用
- * `scan_<session>.ply`），只作为「点云级」的中间产物。
+ * `scan_<session>_debug.ply`），只作为诊断产物。
  *
  * ## 线程
  *
@@ -84,7 +84,8 @@ class ExportManager(context: Context) {
      * 导出点云 PLY。native 侧只写顶点，**没有三角面**，所以它只是中间产物。
      */
     fun exportPly(sessionId: String): PlyResult {
-        val file = File(outputDir, "scan_$sessionId.ply")
+        // V0.5：正式产物是 scan_<session>.glb；PLY 只是诊断用的点云 dump。
+        val file = File(outputDir, "scan_${sessionId}_debug.ply")
         val ok = try {
             NativeBridge.nativeExportPly(file.absolutePath)
         } catch (t: Throwable) {
@@ -97,7 +98,7 @@ class ExportManager(context: Context) {
             file = file,
             vertexCount = verts,
             fileBytes = if (ok) file.length() else 0L,
-            message = if (ok) "点云已导出：${file.absolutePath}" else "点云导出失败（数据不足）"
+            message = if (ok) "调试点云已导出：${file.absolutePath}" else "调试点云导出失败（数据不足）"
         )
     }
 

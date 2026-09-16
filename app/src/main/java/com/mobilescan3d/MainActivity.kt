@@ -92,6 +92,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     @Volatile
     private var depthBusy = false
+    // V0.5：会话世代号。停止/重开扫描时自增，用来丢弃「晚到达」的深度推理
+    // 结果 —— 否则上一轮会话的深度会喂进已经被 reset 的 TSDF。
+    @Volatile private var depthGeneration = 0L
 
     private var captureSize: android.util.Size? = null
     private var previewSize: android.util.Size? = null
@@ -132,7 +135,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
     private var previewSurface: Surface? = null
-    private var scanning = false
+    @Volatile private var scanning = false
+    // V0.5：native 会话（nativeCreate 及体素/标定配置）就绪后置 true。
+    // nativeCreate 之前就把帧送进 native 会写进尚未初始化的状态。
+    @Volatile private var scanNativeReady = false
+    // V0.5：停扫后进入「AR 查看」态 —— 只继续跑 VINS 拿位姿（模型才能钉在
+    // 真实世界里），深度推理与 TSDF 融合都停掉。
+    @Volatile private var arMeshViewing = false
     @Volatile private var sessionCreated = false
     @Volatile private var openingCamera = false
     @Volatile private var abandonedOpen = false
@@ -1927,16 +1936,26 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val y = extractPlane(p[0])
             val u = extractPlane(p[1])
             val v = extractPlane(p[2])
-            if (scanning) {
-                // 曝光直方图预检：clipping 过高时不要发 still capture
-                if (::hqCapture.isInitialized) {
-                    hqCapture.onPreviewLuma(y, image.width, image.height, p[0].rowStride)
+            // V0.5：相机管线有两种状态 ——
+            //   1) 扫描中：VINS + 目标追踪 + 相对深度推理 + TSDF 融合
+            //   2) 停扫后的 AR 查看：**只**继续喂 VINS 拿位姿（否则 cameraToView
+            //      不再更新，生成的网格不会跟随手机），深度与 TSDF 全部停下。
+            val nativeFrameActive = (scanning && scanNativeReady) || arMeshViewing
+
+            if (nativeFrameActive) {
+                if (scanning && scanNativeReady) {
+                    // 曝光直方图预检：clipping 过高时不要发 still capture
+                    if (::hqCapture.isInitialized) {
+                        hqCapture.onPreviewLuma(y, image.width, image.height, p[0].rowStride)
+                    }
+                    val meta = synchronized(frameMetaLock) { frameMeta.remove(ts) }
+                    if (meta != null) frameMetaHit++ else frameMetaMiss++
                 }
-                val meta = synchronized(frameMetaLock) { frameMeta.remove(ts) }
-                if (meta != null) frameMetaHit++ else frameMetaMiss++
                 val vinsTs = ts
                 NativeBridge.nativeOnCameraFrame(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts, vinsTs)
-                scheduleDepth(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts)
+                if (scanning && scanNativeReady) {
+                    scheduleDepth(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts)
+                }
                 glView.requestRender()
             }
         } catch (_: Throwable) {
@@ -1966,6 +1985,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             return
         }
         depthBusy = true
+        // V0.5：记下派发时的会话世代；推理是异步的，回来时可能已经停扫/重开。
+        val generation = depthGeneration
         handler.post {
             try {
                 val provider = depthProvider
@@ -1975,8 +1996,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     )
                     val res = if (produced) provider.latest() else null
                     if (res != null && res.depth.isNotEmpty()) {
-                        NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height, 0.5f, t)
-                        glView.requestRender()
+                        // 世代不一致说明这帧属于上一轮会话，必须丢弃。
+                        if (generation == depthGeneration) {
+                            NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height, 0.5f, t)
+                            glView.requestRender()
+                        }
                     }
                 }
             } catch (_: Throwable) {
@@ -1999,6 +2023,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun startScan() {
         scanning = true
+        // V0.5：新一轮扫描 —— 在 native 会话就绪前不喂帧，并进入世代。
+        scanNativeReady = false
+        arMeshViewing = false
+        depthGeneration++
         sessionStartTs = System.currentTimeMillis()
         val formatter = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
         sessionId = formatter.format(java.util.Date()) + "_" + (sessionStartTs % 100000L)
@@ -2050,6 +2078,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val head = materializeAsset("nanotrack_head_sim.onnx")
             NativeBridge.nativeConfigureTrackerModels(backbone, head)
             sessionCreated = true
+            // V0.5：native 侧全部配置完成，从这里起相机帧才允许进入 native。
+            scanNativeReady = true
         }
         primaryButton.text = "停止实验扫描"
         updateHeader()
@@ -2057,6 +2087,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun stopScan() {
         scanning = false
+        // V0.5：停扫后不再派发深度推理 / TSDF 融合（见 processImage 的
+        // nativeFrameActive），但 **VINS 必须继续跑** —— cameraToView 靠它更新，
+        // 网格才会钉在真实世界里。所以这里先把 arMeshViewing 打开，网格若构建
+        // 失败会在回调里关回去。
+        scanNativeReady = false
+        depthGeneration++
+        arMeshViewing = true
         aeLock = false
         awbLock = false
         captureState = "IDLE"
@@ -2114,8 +2151,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     lastGlbBytes = r.fileBytes
                     lastMeshSummary =
                         "${r.triangles} 面 / ${r.vertices} 顶点 · ${r.fileBytes / 1024} KB · $label"
+                    // V0.5：网格一出来就自动切到「网格」图层 —— 用户刚拍完就直接
+                    // 看到结果，不必自己去翻图层按钮。
+                    arMeshViewing = true
+                    arDrawMode = PointCloudRenderer.DRAW_MESH
+                    renderer.drawMode = arDrawMode
+                    arLayerButton?.text = arDrawModeLabel()
+                    try {
+                        NativeBridge.nativeSetTargetDebugEnabled(false)
+                    } catch (_: Throwable) {
+                    }
                 } else {
                     renderer.clearMesh()
+                    // 没有网格可看，就不要再让 VINS 空转。
+                    arMeshViewing = false
                     lastMeshSummary = "失败：${r.message}"
                 }
                 glView.requestRender()
