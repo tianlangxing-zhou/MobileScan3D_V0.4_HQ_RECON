@@ -24,6 +24,7 @@
 #include "ai_backend.h"
 #include "keyframe_engine.h"
 #include "object_tracker.h"
+#include "target_mask_engine.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MobileScan3D", __VA_ARGS__)
 #define TARGET_DEPTH_FILTER_ENABLED 0
@@ -39,6 +40,29 @@ static VioEngine vio;
 static DepthFusion df;
 static AiQualityEngine ai;
 static TsdfEngine tsdf;
+// ---------------------------------------------------------------- 目标专用模型
+// 与全场景的 g / tsdf **物理隔离**：天花板、墙、地面根本没有进入这两个容器的
+// 代码路径。比「给 g 加一个过滤标志」强得多 —— 后者只要有一个调用点漏掉，
+// 背景就又会漏进来，而且很难在实机上发现。
+// Renderer 只读 targetG，PLY 只导 targetTsdf。
+static GaussianEngine targetG;
+static TsdfEngine targetTsdf;
+static TargetMaskEngine targetMaskEngine;
+static cv::Mat targetMaskMat;        // 与 depth 同尺寸的 CV_8U，目标内 255
+static TargetMaskStats targetMaskStats;
+// PresenceGate 连续失败帧数（只在 gStateMutex 下访问）
+static int presenceFailStreak = 0;
+// 目标专属深度尺度：scaleTarget = vinsRoiMedian / rawDepthMedian，EMA 平滑。
+// 全局「全场 VINS median ÷ 目标 raw median」会把墙/地面/天花板的深度混进来，
+// 只有目标 ROI 内的 VINS 三角化特征才是这个物体自己的尺度。
+static float targetDepthScaleEma = 0.f;
+static int targetDepthScaleSamples = 0;
+static float lastTargetVinsMedian = 0.f;
+static float lastTargetRawMedian = 0.f;
+static int lastTargetVinsFeatureCount = 0;
+static uint64_t targetMaskFrames = 0;
+static uint64_t targetFuseFrames = 0;
+static uint64_t presenceLostFrames = 0;
 static KeyframeEngine kf;
 static std::shared_ptr<ObjectTracker> objectTracker;
 static bool vk = false;
@@ -88,6 +112,10 @@ static int gVinsH = 480;
 
 // NanoTrack 真实彩色输入的节流计数：每 5 帧生成一张 BGR 缩略图
 static uint64_t gTrackerColorFrameCounter = 0;
+
+// tracker 的灰度输入缓冲（640 长边）。nativeOnCameraFrame 只由相机线程串行调用，
+// 所以这个缓冲不需要额外加锁。
+static std::vector<uint8_t> gTrackerGray;
 
 // ---------------------------------------------------------------- AR pose 历史
 /**
@@ -314,6 +342,169 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     }
 }
 
+// ------------------------------------------------------------- 目标专用融合
+/**
+ * 清空目标专用模型与它的全部诊断状态。
+ * 调用点：新建会话 / 销毁 / 选中新目标 / 清除目标。
+ * 必须在 gStateMutex 下调用。
+ */
+static void resetTargetModel() {
+    targetG.reset();
+    targetTsdf.reset();
+    targetMaskMat.release();
+    targetMaskStats = TargetMaskStats{};
+    presenceFailStreak = 0;
+    targetDepthScaleEma = 0.f;
+    targetDepthScaleSamples = 0;
+    lastTargetVinsMedian = 0.f;
+    lastTargetRawMedian = 0.f;
+    lastTargetVinsFeatureCount = 0;
+}
+
+/** 目标专属深度尺度的最小样本数：样本太少就先用原始深度，不猜。 */
+static constexpr int kTargetScaleMinSamples = 10;
+/** 目标专属尺度的合理区间，挡住 vins/raw 同时偏小时产生的野值。 */
+static constexpr float kTargetScaleMin = 0.01f;
+static constexpr float kTargetScaleMax = 20.f;
+
+/** 当前生效的目标深度尺度（vins/raw）。样本不足时返回 1（即不修正）。 */
+static float currentTargetDepthScale() {
+    if (targetDepthScaleSamples < kTargetScaleMinSamples) {
+        return 1.f;
+    }
+    if (!std::isfinite(targetDepthScaleEma) || !(targetDepthScaleEma > 0.f)) {
+        return 1.f;
+    }
+    return std::clamp(targetDepthScaleEma, kTargetScaleMin, kTargetScaleMax);
+}
+
+/**
+ * 只把 **mask 内** 的深度融进目标专用模型。
+ *
+ * 与 fuseDepth() 的两点区别：
+ *   1. mask 外的 depth 一律置 0 —— TSDF 与 Gaussian 都看不到背景，
+ *      这是「墙/天花板/桌子物理上不可能进入目标点云」的落地点；
+ *   2. mask 内深度先乘**目标专属尺度**（vins/raw）再转 3D。累计模型是米制的，
+ *      必须用目标自己的尺度；当前帧 live 层不需要（它直接用相机坐标投影，
+ *      完全不依赖 depth 的绝对准确性）。
+ */
+static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s,
+                            const cv::Mat& maskIn, float confidence) {
+    if (!depth || w < 4 || h < 4 || s.rgb.empty() || maskIn.empty()) {
+        return;
+    }
+    if (maskIn.cols != w || maskIn.rows != h || maskIn.type() != CV_8U) {
+        return;
+    }
+    cv::Mat mask = maskIn; // 浅拷贝，只为拿到非 const 的 ptr()
+
+    const float scale = currentTargetDepthScale();
+
+    std::vector<float> masked(static_cast<size_t>(w) * h, 0.f);
+    for (int y = 0; y < h; y++) {
+        const float* srcRow = depth + static_cast<size_t>(y) * w;
+        const uint8_t* mRow = mask.ptr<uint8_t>(y);
+        float* dstRow = masked.data() + static_cast<size_t>(y) * w;
+        for (int x = 0; x < w; x++) {
+            if (!mRow[x]) {
+                continue;
+            }
+            const float z = srcRow[x];
+            if (!std::isfinite(z) || z <= 0.f) {
+                continue;
+            }
+            dstRow[x] = z * scale;
+        }
+    }
+
+    targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
+                              gFx, gFy, gCx, gCy, s.R, s.t, confidence);
+
+    for (int yy = 0; yy < s.h; yy++) {
+        const int y = std::min(h - 1, yy * h / s.h);
+        const uint8_t* mRow = mask.ptr<uint8_t>(y);
+        for (int xx = 0; xx < s.w; xx++) {
+            const int x = std::min(w - 1, xx * w / s.w);
+            if (!mRow[x]) {
+                continue;
+            }
+            const float z = masked[static_cast<size_t>(y) * w + x];
+            if (!(z > 0.08f && z < 8.f)) {
+                continue;
+            }
+            const float Xc = (x - gCx) * z / gFx;
+            const float Yc = (y - gCy) * z / gFy;
+            float Xw, Yw, Zw;
+            rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
+            const size_t o = (static_cast<size_t>(yy) * s.w + xx) * 3;
+            targetG.ingestPoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2], confidence);
+        }
+    }
+    targetFuseFrames++;
+}
+
+// ---------------------------------------------------------------- PresenceGate
+/** 外观分数下限（NanoTrack score）。 */
+static constexpr float kPresenceAppearanceScore = 0.55f;
+/** 没有外观后端时的替代下限：用 KLT 侧的 confidence，而不是直接判 false。 */
+static constexpr float kPresenceConfidenceFallback = 0.35f;
+/** mask 面积下限，与 TargetMaskEngine::kMinMaskArea 一致。 */
+static constexpr int kPresenceMinMaskArea = 100;
+/** KLT 运动判据：内点率或跟踪点数任一达标即可。 */
+static constexpr float kPresenceMinInlierRatio = 0.45f;
+static constexpr int kPresenceMinPoints = 25;
+/** tracker 中心与 mask 质心的不一致上限（按 bbox 对角线归一化）。 */
+static constexpr float kPresenceMaxCenterOffset = 0.20f;
+/** 连续多少帧判定失败才认为「目标不在」。1 帧太敏感、3 帧太慢 —— 取 2。 */
+static constexpr int kPresenceFailFrames = 2;
+
+struct PresenceDecision {
+    bool valid = false;
+    bool appearanceOk = false;
+    bool motionOk = false;
+    bool maskOk = false;
+    bool centerOk = false;
+    float centerOffsetRatio = 0.f;
+};
+
+/**
+ * 「目标真的还在吗？」
+ *
+ * 核心认知转变：**box 还在画面里 != 物体还在**。
+ * 真实目标离开后，tracker 往往会在背景纹理上找到一个「看起来正常」的框并
+ * 继续输出（OpenCV tracking #619 / NanoTrack issue 都有记录）。所以判定依据
+ * 必须是外观 + Mask + 运动 + 中心一致四项合成，而不是 bbox 的几何位置。
+ *
+ * presenceOk = appearanceOk && maskOk && (motionOk || centerOk)
+ */
+static PresenceDecision evaluatePresence(const TargetTrackInfo& ti,
+                                        const TargetMaskStats& ms,
+                                        int depthW, int depthH) {
+    PresenceDecision d;
+    // 外观：有 Nano 就用它的分数；模型没加载时退回 KLT 置信度，
+    // 否则没有 NanoTrack 的设备会永远被判「目标不在」。
+    d.appearanceOk = ti.nanoLoaded
+        ? (ti.nanoScore >= kPresenceAppearanceScore)
+        : (ti.confidence >= kPresenceConfidenceFallback);
+    d.motionOk = (ti.inlierRatio >= kPresenceMinInlierRatio) ||
+                 (ti.trackedPoints >= kPresenceMinPoints);
+    d.maskOk = ms.valid && ms.area >= kPresenceMinMaskArea;
+    if (d.maskOk) {
+        const float bw = (ti.x1 - ti.x0) * static_cast<float>(depthW);
+        const float bh = (ti.y1 - ti.y0) * static_cast<float>(depthH);
+        const float diag = std::sqrt(bw * bw + bh * bh);
+        const float tcx = 0.5f * (ti.x0 + ti.x1) * static_cast<float>(depthW);
+        const float tcy = 0.5f * (ti.y0 + ti.y1) * static_cast<float>(depthH);
+        const float dx = ms.centerX - tcx;
+        const float dy = ms.centerY - tcy;
+        const float dist = std::sqrt(dx * dx + dy * dy);
+        d.centerOffsetRatio = diag > 1.f ? dist / diag : 0.f;
+        d.centerOk = d.centerOffsetRatio < kPresenceMaxCenterOffset;
+    }
+    d.valid = d.appearanceOk && d.maskOk && (d.motionOk || d.centerOk);
+    return d;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h,
                                                 jfloat fx, jfloat fy, jfloat cx, jfloat cy) {
@@ -327,6 +518,21 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     df.reset();
     ai.reset();
     tsdf.reset();
+    // 目标专用模型与诊断：新会话必须从头开始，否则会残留上一轮的目标点云
+    targetG.reset();
+    targetTsdf.reset();
+    targetMaskMat.release();
+    targetMaskStats = TargetMaskStats{};
+    targetMaskEngine = TargetMaskEngine();
+    presenceFailStreak = 0;
+    targetDepthScaleEma = 0.f;
+    targetDepthScaleSamples = 0;
+    lastTargetVinsMedian = 0.f;
+    lastTargetRawMedian = 0.f;
+    lastTargetVinsFeatureCount = 0;
+    targetMaskFrames = 0;
+    targetFuseFrames = 0;
+    presenceLostFrames = 0;
     kf.reset();
     objectTracker = std::make_shared<ObjectTracker>();
     aiBackend.initialize(w, h);
@@ -390,6 +596,13 @@ Java_com_mobilescan3d_NativeBridge_nativeDestroy(JNIEnv*, jobject) {
     df.reset();
     ai.reset();
     tsdf.reset();
+    targetG.reset();
+    targetTsdf.reset();
+    targetMaskMat.release();
+    targetMaskStats = TargetMaskStats{};
+    presenceFailStreak = 0;
+    targetDepthScaleSamples = 0;
+    targetDepthScaleEma = 0.f;
     kf.reset();
     objectTracker.reset();
     snaps.clear();
@@ -449,8 +662,25 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
     }
     if (tracker) {
         try {
-            tracker->updateFrame(yy, w, h, rs, static_cast<uint64_t>(frameTs));
-            tracker->track(yy, w, h, rs, static_cast<uint64_t>(frameTs));
+            // ---- tracking 主分辨率降到 640 长边 ----
+            // 原来 KLT 直接在 1280x960 的 Y 平面上跑（1,228,800 px）；降到 640 长边
+            // 之后只剩约 307,200 px（约四分之一），LK 金字塔的搜索压力降一个量级。
+            //
+            // 注意：这里**不需要**把 tracker 输出的 bbox 再乘以缩放系数 ——
+            // ObjectTracker 的 x0/y0/x1/y1 全部是按图像尺寸归一化后输出的，
+            // 归一化坐标天然与分辨率无关（depth 侧也是用同一套归一化乘它的 w/h）。
+            constexpr int kTrackMaxDim = 640;
+            const double tScale = std::min(
+                1.0, static_cast<double>(kTrackMaxDim) /
+                         static_cast<double>(std::max(1, std::max(w, h))));
+            const int tw = std::max(16, static_cast<int>(std::lround(w * tScale)));
+            const int th = std::max(16, static_cast<int>(std::lround(h * tScale)));
+            gTrackerGray.resize(static_cast<size_t>(tw) * static_cast<size_t>(th));
+            downscaleGray(yy, w, h, rs, gTrackerGray.data(), tw, th);
+            tracker->updateFrame(gTrackerGray.data(), tw, th, tw,
+                                 static_cast<uint64_t>(frameTs));
+            tracker->track(gTrackerGray.data(), tw, th, tw,
+                           static_cast<uint64_t>(frameTs));
 
             // 每 5 帧喂一张由 YUV420 直接生成的真实彩色缩略图给 NanoTrack。
             // 原实现把灰度复制成三通道（COLOR_GRAY2BGR），NanoTrack 的外观
@@ -657,27 +887,38 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
 }
 
 /**
- * 用「当前 depth 帧 + 当前 target ROI + 该帧 pose」重建一小片世界点。
+ * 当前帧 live 目标点：**只取本次 depth + 本次目标 Mask**，直接存相机坐标。
  *
- * ROI 用 ObjectTracker 的归一化 bbox，它和 depth 帧、相机帧共用同一套
- * 归一化坐标（updateFromDepth 就是按 depth 的 w/h 归一化的），
- * 所以这里直接乘 w/h 即可，不需要再做任何旋转/裁剪。
+ * ## 为什么去掉了 world 变换
  *
- * 必须放在 rotatePoint() 之后 —— 它依赖那个函数。
+ * 旧实现走的是
+ * `Xc,Yc,Zc -> rotatePoint(R,T) -> Xw,Yw,Zw -> 再用另一个时刻的相机 pose 投回屏幕`。
+ * 而实机上 `arPoseFromTimestamp=false`（按 Preview 时间戳压根查不到对应时刻的
+ * pose），于是本该贴着当前目标的点，被另一个时刻的 pose 投到了屏幕外面。
+ *
+ * 而当前帧的 AR **根本没必要经过 world**：这一帧的 depth 就是这台相机在
+ * 这一刻拍的，点和像素本来就在同一个相机坐标系里。直接存 (Xc, Yc, Z) 之后，
+ * Renderer 用 `pc = aPosition` 就画完了，**完全不依赖 VINS 位姿与时间戳**。
+ *
+ * 这一步的诊断价值也最大：只要 Depth Mask 是对的，绿色点就一定落在绿色目标
+ * 区域里；如果点到别处去了，那问题一定在 Mask 而不在 pose 链上。
+ *
+ * ROI 用 ObjectTracker 的归一化 bbox（和 depth 帧共用同一套归一化坐标），
+ * 再叠加本次的 Mask 过滤：**Mask 外的像素一个都不取**。
  */
 static void buildTargetDebugLayer(const float* d, int w, int h,
                                  const TargetTrackInfo& ti,
-                                 const float R[9], const float T[3],
-                                 bool poseOk) {
+                                 const cv::Mat& mask) {
     targetDebugPointCount = 0;
     targetDebugRoiPixels = 0;
     targetDebugValidPixels = 0;
-    targetDebugPoseOk = poseOk;
+    // live 层不再依赖位姿，恒为「可用」；报告里的字段名同步改成 liveSpaceOk
+    targetDebugPoseOk = true;
     targetDebugTs = 0;
     if (!targetDebugEnabled) {
         return;
     }
-    if (!poseOk || d == nullptr || w < 4 || h < 4) {
+    if (d == nullptr || w < 4 || h < 4) {
         return;
     }
     if (ti.state != TargetState::TRACKING && ti.state != TargetState::ACQUIRING) {
@@ -700,6 +941,9 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
     const int roiH = y1 - y0 + 1;
     targetDebugRoiPixels = roiW * roiH;
 
+    const bool useMask = !mask.empty() && mask.cols == w && mask.rows == h &&
+                         mask.type() == CV_8U;
+
     int step = 1;
     while ((roiW / step) * (roiH / step) > kTargetDebugMaxPoints) {
         step++;
@@ -707,6 +951,9 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
 
     for (int y = y0; y <= y1; y += step) {
         for (int x = x0; x <= x1; x += step) {
+            if (useMask && !mask.at<uint8_t>(y, x)) {
+                continue;
+            }
             const float z = d[static_cast<size_t>(y) * w + x];
             if (!(z > 0.08f && z < 8.f)) {
                 continue;
@@ -717,13 +964,12 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
             }
             const float Xc = (x - gCx) * z / gFx;
             const float Yc = (y - gCy) * z / gFy;
-            float Xw, Yw, Zw;
-            rotatePoint(R, T, Xc, Yc, z, Xw, Yw, Zw);
             float* p = targetDebugPoints.data() +
                        static_cast<size_t>(targetDebugPointCount) * 6;
-            p[0] = Xw;
-            p[1] = Yw;
-            p[2] = Zw;
+            // **相机坐标**：Renderer 侧用 uPointSpace=0 时 pc = aPosition。
+            p[0] = Xc;
+            p[1] = Yc;
+            p[2] = z;
             // 固定绿色：这一层的用途是「和真实画面比对」，颜色必须一眼可辨，
             // 不能和累计点云的真实颜色混在一起。
             p[3] = 0.20f;
@@ -760,28 +1006,49 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         }
     }
 
-#if TARGET_DEPTH_FILTER_ENABLED
+    // ---- 目标专属深度尺度：目标 ROI 内的 VINS 三角化特征中位数 ----
+    //
+    // 为什么放在**进入 gStateMutex 之前**：vinsFeatureDepthMedianInRoi() 内部持
+    // g_vinsMutex。若把它嵌进本函数主段的临界区，就会形成
+    // gStateMutex -> g_vinsMutex 的嵌套锁序，而 nativeOnCameraFrame 是
+    // 「先拿 gStateMutex 做统计、VINS 计算放到锁外」——两者锁序不一致，
+    // 迟早会互相等。这里刻意让它独立成段。
     {
-        std::shared_ptr<ObjectTracker> tracker;
+        std::shared_ptr<ObjectTracker> probe;
         {
             std::lock_guard<std::mutex> lk(gStateMutex);
-            tracker = objectTracker;
+            probe = objectTracker;
         }
-        if (!tracker || !tracker->isEnabled() || !tracker->isTracking()) {
-            return;
-        }
-        if (!tracker->filterDepth(d.data(), w, h, (uint64_t)t)) {
-            return;
+        if (probe && probe->isTracking()) {
+            const TargetTrackInfo t0 = probe->info();
+            if (t0.depthRoiArea >= kPresenceMinMaskArea) {
+                int vinsSamples = 0;
+                const float vinsRoiMedian =
+                    vinsFeatureDepthMedianInRoi(t0.x0, t0.y0, t0.x1, t0.y1, &vinsSamples);
+                const float rawMedian = t0.medianDepth;
+                if (vinsSamples >= 8 && rawMedian > 0.05f && vinsRoiMedian > 0.05f) {
+                    const float s = vinsRoiMedian / rawMedian;
+                    if (std::isfinite(s) && s > kTargetScaleMin && s < kTargetScaleMax) {
+                        std::lock_guard<std::mutex> lk(gStateMutex);
+                        targetDepthScaleEma = (targetDepthScaleSamples == 0)
+                            ? s
+                            : (0.9f * targetDepthScaleEma + 0.1f * s);
+                        targetDepthScaleSamples++;
+                        lastTargetVinsMedian = vinsRoiMedian;
+                        lastTargetRawMedian = rawMedian;
+                        lastTargetVinsFeatureCount = vinsSamples;
+                    }
+                }
+            }
         }
     }
-#endif
 
     std::lock_guard<std::mutex> lk(gStateMutex);
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
     haveExternalDepth = true;
     depthFrames++;
 
-    // 先抓一份当前 target 状态：调试层和 fuseDepth 都要用。
+    // 先抓一份当前 target 状态：mask / presence / 调试层都要用。
     //
     // 注意：本函数在这一段之前**已经持有 gStateMutex**（见上面的 lock_guard lk），
     // 所以这里只能直接读全局 objectTracker，绝不能再 lock 一次 ——
@@ -794,17 +1061,72 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         haveTi = true;
     }
 
+    // ---- 目标分割 Mask + PresenceGate ----
+    bool presenceOk = false;
+    bool maskOk = false;
+    if (haveTi) {
+        const int bx0 = std::max(0, static_cast<int>(ti.x0 * w));
+        const int by0 = std::max(0, static_cast<int>(ti.y0 * h));
+        const int bx1 = std::min(w - 1, static_cast<int>(ti.x1 * w));
+        const int by1 = std::min(h - 1, static_cast<int>(ti.y1 * h));
+        if (bx1 > bx0 && by1 > by0) {
+            const cv::Rect searchBox(bx0, by0, bx1 - bx0 + 1, by1 - by0 + 1);
+            const cv::Point seed((bx0 + bx1) / 2, (by0 + by1) / 2);
+            targetMaskEngine.build(d.data(), w, h, searchBox, seed,
+                                   targetMaskMat, targetMaskStats);
+            targetMaskFrames++;
+            maskOk = targetMaskStats.valid &&
+                     targetMaskStats.area >= kPresenceMinMaskArea;
+        } else {
+            // 目标整块出界：searchBox 退化成空矩形，无从建 mask
+            targetMaskStats = TargetMaskStats{};
+            targetMaskStats.rejectReason = "target bbox off screen";
+            targetMaskMat.release();
+        }
+
+        const PresenceDecision pd = evaluatePresence(ti, targetMaskStats, w, h);
+        presenceOk = pd.valid;
+        if (presenceOk) {
+            presenceFailStreak = 0;
+        } else {
+            presenceFailStreak++;
+            if (presenceFailStreak >= kPresenceFailFrames) {
+                // 连续两帧判「目标不在」：立刻退回 REACQUIRING 并清 confidence。
+                // UI 同一帧就会把绿框收掉 —— 绝不能等 bbox 滑出画面才反应，
+                // 因为「物体走了但 tracker 停在墙上」时 bbox 永远不会出界。
+                objectTracker->markPresenceLost();
+                presenceLostFrames++;
+            }
+        }
+        // 只更新诊断位（不参与状态机）：连续 1 帧失败就已经不该再画绿框了。
+        objectTracker->setPresenceValid(presenceFailStreak == 0);
+    } else {
+        targetMaskStats = TargetMaskStats{};
+        targetMaskMat.release();
+        presenceFailStreak = 0;
+    }
+
     for (const auto& s : snaps) {
         int64_t diff = (int64_t)s.ts - (int64_t)t;
         if (diff < 0) {
             diff = -diff;
         }
         if (diff < 50000000LL) {
+            // 全场景地图照旧（保持既有行为，不动既有能力）
             fuseDepth(d.data(), w, h, s, confidence);
-            // 调试层用的必须是**这一帧**的 depth 与**这一帧的** pose，
+
+            // 目标专用模型：**只有 presenceOk 且 mask 有效才允许融合**。
+            // 这是「墙/天花板/桌子进不了目标点云」的落地点。
+            if (haveTi && presenceOk && maskOk) {
+                fuseTargetDepth(d.data(), w, h, s, targetMaskMat, confidence);
+            }
+
+            // live 层用的是**这一帧**的 depth 与**这一帧**的 mask，
             // 所以放在同一个 snap 匹配分支里，而不是另找一次。
-            if (haveTi) {
-                buildTargetDebugLayer(d.data(), w, h, ti, s.R, s.t, true);
+            // 只有 mask 有效才建：验收要求「绿色 live 点只存在于目标轮廓内」，
+            // mask 建不出来时宁可一个点都不画，也不要把整个 bbox 里的点放出去。
+            if (haveTi && maskOk) {
+                buildTargetDebugLayer(d.data(), w, h, ti, targetMaskMat);
                 targetDebugTs = static_cast<uint64_t>(t);
             }
             break;
@@ -820,7 +1142,9 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeExportPly(JNIEnv* e, jobject, jstring path) {
     const char* p = e->GetStringUTFChars(path, nullptr);
     std::lock_guard<std::mutex> lk(gStateMutex);
-    bool ok = tsdf.exportPly(p);
+    // 有目标模型时**只导目标**（验收要求：PLY 只含目标，不再有墙、天花板、桌子）。
+    // 还没锁定过目标时退回全场景 TSDF，否则导出会是一个空文件。
+    bool ok = targetTsdf.voxels() > 0 ? targetTsdf.exportPly(p) : tsdf.exportPly(p);
     e->ReleaseStringUTFChars(path, p);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
@@ -947,9 +1271,34 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " roiPixels=" << targetDebugRoiPixels
       << " validPixels=" << targetDebugValidPixels
       << " ts=" << targetDebugTs
-      << " poseOk=" << (targetDebugPoseOk ? 1 : 0)
+      // live 层现在直接存相机坐标，不再经过 world pose，所以这里恒为 1；
+      // 字段名同步改成 liveSpaceOk，免得以后被误读成「pose 有效」
+      << " liveSpaceOk=" << (targetDebugPoseOk ? 1 : 0)
+      << " space=camera"
       << " builds=" << targetDebugBuilds
       << " queries=" << targetDebugQueries << "\n"
+      << "TargetMask: frames=" << targetMaskFrames
+      << " valid=" << (targetMaskStats.valid ? 1 : 0)
+      << " area=" << targetMaskStats.area
+      << " candidatePixels=" << targetMaskStats.candidatePixels
+      << " searchPixels=" << targetMaskStats.searchPixels
+      << " seedDepth=" << targetMaskStats.seedDepth
+      << " tolerance=" << targetMaskStats.tolerance
+      << " center=(" << targetMaskStats.centerX << ", " << targetMaskStats.centerY << ")"
+      << " reason=" << targetMaskStats.rejectReason << "\n"
+      << "TargetModel: gaussians=" << targetG.count()
+      << " confirmed2=" << targetG.confirmedCount(2)
+      << " stable=" << targetG.confirmedCount(3)
+      << " tsdfVoxels=" << targetTsdf.voxels()
+      << " fuseFrames=" << targetFuseFrames << "\n"
+      << "TargetPresence: failStreak=" << presenceFailStreak
+      << " lostFrames=" << presenceLostFrames << "\n"
+      << "TargetDepthScale: samples=" << targetDepthScaleSamples
+      << " ema=" << targetDepthScaleEma
+      << " applied=" << currentTargetDepthScale()
+      << " vinsRoiMedian=" << lastTargetVinsMedian
+      << " rawMedian=" << lastTargetRawMedian
+      << " vinsFeatures=" << lastTargetVinsFeatureCount << "\n"
       << "PointCloud bbox min=(" << pminX << ", " << pminY << ", " << pminZ << ")"
       << " max=(" << pmaxX << ", " << pmaxY << ", " << pmaxZ << ")\n"
       << "PointCloud centroid=(" << pcx << ", " << pcy << ", " << pcz << ")\n"
@@ -987,7 +1336,10 @@ Java_com_mobilescan3d_NativeBridge_nativeGetGaussians(JNIEnv* e, jobject,
         std::lock_guard<std::mutex> lk(gStateMutex);
         const int need = minHits > 0 ? minHits : 1;
         gArMinHits = need;
-        n = g.copyPoints(dst, (size_t)maxPoints, need);
+        // Renderer 只读**目标模型**：背景点云根本没有进入 targetG 的代码路径。
+        // 还没有目标（用户没锁定过）时退回全场景 g，避免一上来屏幕全空。
+        GaussianEngine& src = (targetG.count() > 0) ? targetG : g;
+        n = src.copyPoints(dst, (size_t)maxPoints, need);
         gArDrawnPoints = n;
     }
     e->ReleaseFloatArrayElements(out, dst, 0);
@@ -1011,10 +1363,16 @@ Java_com_mobilescan3d_NativeBridge_nativeGetHudMetrics(JNIEnv* e, jobject) {
       << " · 深度 " << depthFrames << " 帧";
     // 只报一个「总量」没有意义：实机出现过 600000 总点里 stable 只有 28，
     // 那种情况下屏幕上几乎全是一次性噪声，而总数看起来却很壮观。
-    s << " · 地图 " << g.count()
-      << " 确认 " << g.confirmedCount(2)
-      << " 稳定 " << g.confirmedCount(3)
-      << " 绘制 " << gArDrawnPoints;
+    if (targetG.count() > 0) {
+        s << " · 目标 " << targetG.count()
+          << " 确认 " << targetG.confirmedCount(2)
+          << " 绘制 " << gArDrawnPoints;
+    } else {
+        s << " · 地图 " << g.count()
+          << " 确认 " << g.confirmedCount(2)
+          << " 稳定 " << g.confirmedCount(3)
+          << " 绘制 " << gArDrawnPoints;
+    }
     return e->NewStringUTF(s.str().c_str());
 }
 
@@ -1031,14 +1389,19 @@ static constexpr int kDepthDiagSlots = 7;
 //   11 centerXNorm      目标中心 X（相机归一化，未裁剪，可越界）
 //   12 centerYNorm      目标中心 Y
 //   13 edgeLostFrames   连续「可见比例 < 12%」的帧数
+//   14 presenceValid    PresenceGate 结论（0/1）：UI 据此决定绿框画不画
+//   15 appearanceOk     外观后端是否可用（0/1，仅诊断）
 // UI 靠 10..13 才能给出「目标接近边缘 / 已离开画面」的持续提示和方向箭头；
 // 旧协议只给裁剪后的 bbox，目标完全出界时 bbox 退化成空矩形，UI 只能干等。
-static constexpr int kTargetStateSlots = 14;
+// 14/15 是这一轮新增：**box 还在画面里 != 物体还在**，绿框的可见性必须由
+// presenceValid 决定，而不是 bbox 的几何位置。
+static constexpr int kTargetStateSlots = 16;
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetPointCount(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(gStateMutex);
-    return (jint)g.count();
+    // 目标模型优先：UI 上的「点数」应该反映将要导出的东西
+    return (jint)((targetG.count() > 0) ? targetG.count() : g.count());
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1046,7 +1409,12 @@ Java_com_mobilescan3d_NativeBridge_nativeSelectTarget(JNIEnv*, jobject, jfloat u
     std::lock_guard<std::mutex> lk(gStateMutex);
     if (!objectTracker) return JNI_FALSE;
     try {
-        return objectTracker->requestTarget(u, v) ? JNI_TRUE : JNI_FALSE;
+        const bool ok = objectTracker->requestTarget(u, v);
+        if (ok) {
+            // 新目标：目标专用模型必须清零重建，否则新旧目标会混在同一个点云里
+            resetTargetModel();
+        }
+        return ok ? JNI_TRUE : JNI_FALSE;
     } catch (...) {
         return JNI_FALSE;
     }
@@ -1065,7 +1433,13 @@ Java_com_mobilescan3d_NativeBridge_nativeSelectTargetRect(
     }
     if (!tracker) return JNI_FALSE;
     try {
-        return tracker->requestTargetRect(x0, y0, x1, y1) ? JNI_TRUE : JNI_FALSE;
+        const bool ok = tracker->requestTargetRect(x0, y0, x1, y1);
+        if (ok) {
+            // 新目标：目标专用模型清零重建
+            std::lock_guard<std::mutex> lk(gStateMutex);
+            resetTargetModel();
+        }
+        return ok ? JNI_TRUE : JNI_FALSE;
     } catch (...) {
         return JNI_FALSE;
     }
@@ -1079,6 +1453,11 @@ Java_com_mobilescan3d_NativeBridge_nativeClearTarget(JNIEnv*, jobject) {
         tracker = objectTracker;
     }
     if (tracker) tracker->clearTarget();
+    if (tracker) {
+        // 清目标 = 清目标模型：否则下一次锁定会继承上一轮的点云
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        resetTargetModel();
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1123,6 +1502,8 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jf
         dst[11] = info.centerXNorm;
         dst[12] = info.centerYNorm;
         dst[13] = static_cast<float>(info.edgeLostFrames);
+        dst[14] = info.presenceValid ? 1.f : 0.f;
+        dst[15] = info.appearanceAvailable ? 1.f : 0.f;
         env->ReleaseFloatArrayElements(out, dst, 0);
     }
     return static_cast<jint>(info.state);
@@ -1230,6 +1611,10 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "lastEvent=" << i.lastEvent << "\n"
       << "depthFilterCalls=" << i.depthFilterCalls << "\n"
       << "depthFilterSkipped=" << i.depthFilterSkipped << "\n"
+      << "presenceValid=" << (i.presenceValid ? "true" : "false") << "\n"
+      << "presenceLostCount=" << i.presenceLostCount << "\n"
+      << "appearanceAvailable=" << (i.appearanceAvailable ? "true" : "false") << "\n"
+      << "appearanceBackend=" << i.appearanceBackend << "\n"
       << "lastError=" << i.lastError;
     return env->NewStringUTF(s.str().c_str());
 }
@@ -1356,6 +1741,9 @@ Java_com_mobilescan3d_NativeBridge_nativeConfigureTrackerModels(JNIEnv* env, job
     }
 
     const bool ok = tracker->configureNano(b, h);
+    // 外观后端接缝：工厂当前只会返回 nanotrack（LightTrack-ncnn 需要 ncnn 运行库，
+    // 本工程没有链接），这里如实配置并把后端名写进诊断报告。
+    tracker->configureAppearance(std::string(), std::string(), b, h);
     env->ReleaseStringUTFChars(backbone, b);
     env->ReleaseStringUTFChars(head, h);
     return ok ? JNI_TRUE : JNI_FALSE;

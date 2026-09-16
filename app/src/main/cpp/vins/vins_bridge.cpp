@@ -29,6 +29,12 @@ static double g_lastImuDt = 0.0;
 static double g_lastFeaturePubTimestamp = -1.0;
 static bool g_firstFeaturePublish = true;
 
+// VINS 输入图像的尺寸（nativeVinsInit 里由 Kotlin 下发，通常是 640 长边）。
+// vinsFeatureDepthMedianInRoi() 需要它把归一化 ROI 换算成像素坐标 ——
+// FeaturePerFrame::uv 存的是 VINS 图像像素，不是归一化坐标。
+static int g_vinsImageW = 0;
+static int g_vinsImageH = 0;
+
 struct ImuSample {
     double t = 0.0;
     Eigen::Vector3d acc = Eigen::Vector3d::Zero();
@@ -63,6 +69,8 @@ Java_com_mobilescan3d_NativeBridge_nativeVinsInit(
         jfloat gyrN,
         jfloat gyrW) {
     setImageSize((double)h, (double)w);
+    g_vinsImageW = (int)w;
+    g_vinsImageH = (int)h;
     setFeatureTrackerParams(h, w, (int)fx, 0, 1, 30, 150, 1.0);
     setEstimatorParams(accN, accW, gyrN, gyrW, 5.0, 10.0 / 460.0, 8, 0.04);
 
@@ -184,6 +192,8 @@ void vinsInit(
         float gyrN,
         float gyrW) {
     setImageSize((double)h, (double)w);
+    g_vinsImageW = (int)w;
+    g_vinsImageH = (int)h;
     setFeatureTrackerParams(h, w, (int)fx, 0, 1, 30, 150, 1.0);
     setEstimatorParams(accN, accW, gyrN, gyrW, 5.0, 10.0 / 460.0, 8, 0.04);
 
@@ -514,5 +524,68 @@ float vinsFeatureDepthMedian() {
 
     const size_t n = depths.size();
     std::nth_element(depths.begin(), depths.begin() + n / 2, depths.end());
+    return static_cast<float>(depths[n / 2]);
+}
+
+float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
+                                  int* outSampleCount) {
+    if (outSampleCount != nullptr) {
+        *outSampleCount = 0;
+    }
+
+    std::lock_guard<std::mutex> lk(g_vinsMutex);
+
+    if (g_estimator.solver_flag != Estimator::NON_LINEAR) {
+        return 0.0f;
+    }
+    if (g_vinsImageW <= 0 || g_vinsImageH <= 0) {
+        return 0.0f;
+    }
+
+    // 归一化 ROI -> VINS 输入图像像素。范围统一成 min/max，允许调用方传任意方向。
+    const float lx = std::min(nx0, nx1);
+    const float ly = std::min(ny0, ny1);
+    const float hx = std::max(nx0, nx1);
+    const float hy = std::max(ny0, ny1);
+    const float px0 = lx * static_cast<float>(g_vinsImageW);
+    const float py0 = ly * static_cast<float>(g_vinsImageH);
+    const float px1 = hx * static_cast<float>(g_vinsImageW);
+    const float py1 = hy * static_cast<float>(g_vinsImageH);
+
+    std::vector<double> depths;
+    depths.reserve(g_estimator.f_manager.feature.size());
+    for (const auto &it_per_id : g_estimator.f_manager.feature) {
+        if (it_per_id.solve_flag != 1) {
+            continue;
+        }
+        const double d = it_per_id.estimated_depth;
+        if (!std::isfinite(d) || d <= 0.1) {
+            continue;
+        }
+        if (it_per_id.feature_per_frame.empty()) {
+            continue;
+        }
+        // 用最近一次观测的像素位置判断它是否落在目标 ROI 内。
+        // uv 是 VINS 输入图像像素（feature_tracker 里 cur_pts 直接写入），
+        // 不是归一化坐标 —— 这也是必须保存 g_vinsImageW/H 的原因。
+        const Eigen::Vector2d &uv = it_per_id.feature_per_frame.back().uv;
+        if (!std::isfinite(uv.x()) || !std::isfinite(uv.y())) {
+            continue;
+        }
+        if (uv.x() < px0 || uv.x() > px1 || uv.y() < py0 || uv.y() > py1) {
+            continue;
+        }
+        depths.push_back(d);
+    }
+
+    if (depths.empty()) {
+        return 0.0f;
+    }
+
+    const size_t n = depths.size();
+    std::nth_element(depths.begin(), depths.begin() + n / 2, depths.end());
+    if (outSampleCount != nullptr) {
+        *outSampleCount = static_cast<int>(n);
+    }
     return static_cast<float>(depths[n / 2]);
 }

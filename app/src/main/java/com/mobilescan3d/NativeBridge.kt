@@ -15,24 +15,33 @@ object NativeBridge {
      */
     const val DEPTH_DIAGNOSTIC_SLOTS = 7
     /**
-     * 10 -> 14：新增 4 个字段给 UI 做「目标离屏」提示与方向引导。
+     * 14 -> 16：新增 PresenceGate 结论与外观后端状态。
      *
      *   0  state            1  x0        2  y0        3  x1        4  y1
      *   5  confidence       6  medianDepth   7  roiSharpness
      *   8  trackedPoints    9  inlierRatio
      *   10 visibleFraction  11 centerXNorm 12 centerYNorm 13 edgeLostFrames
+     *   14 presenceValid    15 appearanceAvailable
      *
      * 为什么必须有 11/12（中心点）：目标整块滑出画面时 1..4 的 bbox 会被
      * 裁剪成空矩形，UI 连「目标往哪个方向去了」都无从判断，只能干等。
      * 中心点即使跑出 [0,1] 也仍然保留方向信息。
+     *
+     * 为什么必须有 14（presenceValid）：**box 还在画面里 != 物体还在**。
+     * 真实目标离开后，tracker 常常在背景纹理上继续输出一个「看起来正常」的框，
+     * 所以绿框的可见性必须由 presenceValid 决定，而不是 bbox 的几何位置。
      */
-    const val TARGET_STATE_SLOTS = 14
+    const val TARGET_STATE_SLOTS = 16
     /** [nativeGetTargetState] 输出的下标，避免调用方再手写数字。 */
     const val TARGET_STATE_INDEX_STATE = 0
     const val TARGET_STATE_INDEX_VISIBLE_FRACTION = 10
     const val TARGET_STATE_INDEX_CENTER_X = 11
     const val TARGET_STATE_INDEX_CENTER_Y = 12
     const val TARGET_STATE_INDEX_EDGE_LOST_FRAMES = 13
+    /** PresenceGate 结论：1 = 目标确实还在（绿框才允许画） */
+    const val TARGET_STATE_INDEX_PRESENCE_VALID = 14
+    /** 外观后端是否可用（0/1，仅诊断） */
+    const val TARGET_STATE_INDEX_APPEARANCE_OK = 15
 
     /**
      * 与 C++ `TargetState` 枚举逐项对应（顺序即数值）。

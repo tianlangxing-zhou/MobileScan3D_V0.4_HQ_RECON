@@ -9,6 +9,10 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/video/tracking.hpp>
 
+// 外观跟踪后端接缝（抽象接口 + NanoTrack 适配 + LightTrack-ncnn 骨架）。
+// 放在这里而不是 cpp 里，是因为 ObjectTracker 持有一个 unique_ptr<AppearanceTracker>。
+#include "appearance_tracker.h"
+
 enum class TargetState
 {
     OFF = 0,
@@ -109,6 +113,19 @@ struct TargetTrackInfo
     // 连续「可见比例 < 12%」的帧数，native 用它判定是否进入 REACQUIRING。
     // 上报给 UI 是为了让报告能区分「刚出界」和「出界很久了」。
     int edgeLostFrames = 0;
+    // ---- PresenceGate（目标存在性判定）----
+    // **box 还在画面里 != 物体还在**。目标离开后 tracker 常常在背景纹理上继续
+    // 找到一个「看起来正常」的框（OpenCV tracking #619 / NanoTrack 均有记录），
+    // 所以判定依据必须是「外观 + Mask + 运动 + 中心一致」四项合成，
+    // 而不是「bbox 是否还在画面内」。
+    //   presenceValid      —— 本帧目标是否真的在（UI 据此决定绿框画不画）
+    //   presenceLostCount  —— 累计被判「目标不在」的次数
+    bool presenceValid = true;
+    uint64_t presenceLostCount = 0;
+    // 外观后端接缝（见 appearance_tracker.h）。当前实际生效的是 nanotrack，
+    // lighttrack-ncnn 因未链接 ncnn 而如实回退。
+    bool appearanceAvailable = false;
+    std::string appearanceBackend;
     float lastAffineScale = 1.0f;
     float affineScaleEMA = 1.0f;
     uint64_t reseedCount = 0;
@@ -143,6 +160,30 @@ public:
     bool isEnabled() const;
     bool isTracking() const;
     TargetTrackInfo info() const;
+
+    /**
+     * 由 native 的目标 Mask / PresenceGate 驱动：判定「目标已经不在画面里」。
+     *
+     * 与 edgeLostFrames_ 那条路径的区别：那条是「bbox 几何上滑出画面」，
+     * 要连续 3 帧才动作，而且物体走了、tracker 停在墙上时它**永远不会触发**。
+     * 这条是语义判定，连续两帧就能定，且和 bbox 位置无关。
+     * 行为：TRACKING -> REACQUIRING，confidence 清零，并清掉找回计数器，
+     * 让 track() 里那段 Nano 找回逻辑立刻接手。
+     */
+    void markPresenceLost();
+
+    /** 逐帧上报 PresenceGate 的结论（不改状态机，只更新诊断位）。 */
+    void setPresenceValid(bool valid);
+
+    /**
+     * 配置外观后端（接缝，见 appearance_tracker.h）。
+     * 当前工厂只会返回 nanotrack（LightTrack-ncnn 需要 ncnn 运行库，本工程未链接），
+     * 失败/不可用时保留 nullptr 并如实记录到 info_.appearanceBackend。
+     */
+    bool configureAppearance(const std::string& lighttrackParam,
+                             const std::string& lighttrackBin,
+                             const std::string& nanoBackbone,
+                             const std::string& nanoHead);
 
 private:
     mutable std::mutex mutex_;
@@ -181,6 +222,12 @@ private:
     uint64_t nanoWeakAttempts_ = 0;
     uint64_t nanoWeakRecoveries_ = 0;
     float lastNanoScore_ = 0.f;
+
+    // 外观后端接缝（见 appearance_tracker.h）。
+    // 当前工厂只会返回 nanotrack，lighttrack-ncnn 因本工程未链接 ncnn 而回退，
+    // 所以这里为 nullptr 时行为与改造前**完全一致**。
+    std::unique_ptr<AppearanceTracker> appearance_;
+    bool appearanceInit_ = false;
 
     // 真实彩色帧（YUV420 -> BGR），保护在 mutex_ 之下
     cv::Mat colorFrame_;

@@ -79,6 +79,12 @@ void ObjectTracker::reset()
     info_.colorFrameValid = false;
     info_.colorFrameWidth = 0;
     info_.colorFrameHeight = 0;
+    info_.presenceValid = true;
+    info_.presenceLostCount = 0;
+    appearanceInit_ = false;
+    if (appearance_) {
+        appearance_->reset();
+    }
 }
 
 void ObjectTracker::clearWeakKlt()
@@ -277,6 +283,61 @@ void ObjectTracker::markLost(const std::string& reason)
     info_.edgeLostFrames = edgeLostFrames_;
     reacquireFrames_ = 0;
     info_.lastError = reason;
+}
+
+/**
+ * PresenceGate 判定失败时的入口（由 native 的目标 Mask 引擎驱动）。
+ *
+ * 与 edgeLostFrames_ 那条路径的区别必须讲清楚，否则以后很容易被误"优化"掉：
+ *   - `edgeLostFrames_ >= 3` 判的是**几何**：bbox 已经滑出画面 3 帧以上。
+ *     物体走了、tracker 停在墙上时，这条**永远不会触发**，绿框会一直挂在墙上。
+ *   - 这里判的是**语义**：外观分数、目标 Mask、KLT 运动、中心一致性四项对不上。
+ *     它和 bbox 在不在画面里完全无关，所以才是"物体已经走了"的正确判据。
+ *
+ * 进 REACQUIRING（而不是直接 LOST）：track() 里的找回分支会拿**出界前那份完整
+ * 模板**在整帧上做 update，通常一两秒内能把目标找回来。
+ */
+void ObjectTracker::markPresenceLost()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (info_.state != TargetState::TRACKING) {
+        return;
+    }
+    info_.state = TargetState::REACQUIRING;
+    info_.confidence = 0.f;
+    info_.inlierRatio = 0.f;
+    reacquireFrames_ = 0;
+    info_.presenceValid = false;
+    ++info_.presenceLostCount;
+    info_.lastEvent = "presence gate: target left";
+    info_.lastError = "presence: appearance/mask disagree";
+}
+
+void ObjectTracker::setPresenceValid(bool valid)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    info_.presenceValid = valid;
+}
+
+bool ObjectTracker::configureAppearance(const std::string& lighttrackParam,
+                                        const std::string& lighttrackBin,
+                                        const std::string& nanoBackbone,
+                                        const std::string& nanoHead)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string reason;
+    auto tracker = createAppearanceTracker(lighttrackParam, lighttrackBin,
+                                           nanoBackbone, nanoHead, &reason);
+    info_.appearanceBackend = reason;
+    appearanceInit_ = false;
+    if (!tracker) {
+        appearance_.reset();
+        info_.appearanceAvailable = false;
+        return false;
+    }
+    appearance_ = std::move(tracker);
+    info_.appearanceAvailable = appearance_->ready();
+    return info_.appearanceAvailable;
 }
 
 bool ObjectTracker::selectTarget(float u, float v)
@@ -962,6 +1023,39 @@ cv::Rect ObjectTracker::normToRect(float x0, float y0, float x1, float y1, int w
 
 bool ObjectTracker::runNanoUpdate(const cv::Mat& frame, int width, int height, cv::Rect& outRect)
 {
+    // ---- 外观后端接缝 ----
+    // 如果工厂给了一个**真正可用且不是 nanotrack 的**后端（例如将来接入的
+    // LightTrack-ncnn），就优先用它做外观纠偏。当前工厂只会返回 nanotrack
+    // （LightTrack 需要 ncnn 运行库，本工程未链接），所以这一段今天不会执行，
+    // 下面的 NanoTrack 路径行为与改造前**完全一致**。
+    if (appearance_ && appearance_->ready() &&
+        std::string(appearance_->backendName()) != "nanotrack") {
+        if (!appearanceInit_) {
+            const cv::Rect2f initBox(static_cast<float>(info_.x0) * width,
+                                     static_cast<float>(info_.y0) * height,
+                                     static_cast<float>(info_.x1 - info_.x0) * width,
+                                     static_cast<float>(info_.y1 - info_.y0) * height);
+            appearance_->init(frame, initBox);
+            appearanceInit_ = true;
+            return false; // 初始化帧不产生分数
+        }
+        cv::Rect2f box;
+        float score = 0.f;
+        if (!appearance_->update(frame, box, score)) {
+            return false;
+        }
+        lastNanoScore_ = score;
+        nanoScore_ = score;
+        info_.nanoScore = score;
+        outRect = cv::Rect(static_cast<int>(std::lround(box.x)),
+                           static_cast<int>(std::lround(box.y)),
+                           static_cast<int>(std::lround(box.width)),
+                           static_cast<int>(std::lround(box.height)));
+        nanoBoxFull_ = cv::Rect2f(box.x / width, box.y / height,
+                                  box.width / width, box.height / height);
+        return true;
+    }
+
     if (!nanoLoaded_ || frame.empty() || width <= 0 || height <= 0) {
         return false;
     }

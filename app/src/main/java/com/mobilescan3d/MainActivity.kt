@@ -186,6 +186,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var targetCenterY = 0.5f
     // 「TRACKING -> 离开画面」边沿检测，用于只震一次
     private var lastTargetUiState = 0
+    // 最近一次 PresenceGate 结论（协议槽 14）：目标是否真的还在画面里
+    @Volatile private var targetPresenceValid = true
     private var vibrator: android.os.Vibrator? = null
     private val targetAfLockEnabled = false
     private var aeLockAvailable = false
@@ -253,7 +255,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         // centerX/centerY 未裁剪，目标完全出界时仍能指示找回方向。
         val visibleFraction: Float = 1f,
         val centerX: Float = 0.5f,
-        val centerY: Float = 0.5f
+        val centerY: Float = 0.5f,
+        /**
+         * PresenceGate 结论（协议槽 14）。
+         *
+         * **box 还在画面里 != 物体还在**：真实目标离开后，tracker 常常在背景
+         * 纹理上继续输出一个「看起来正常」的框（OpenCV tracking #619 /
+         * NanoTrack issue 均有记录）。所以绿框的可见性必须由这一位决定，
+         * 而不是 bbox 的几何位置。
+         */
+        val presenceValid: Boolean = true
     )
 
     private data class FrameMeta(
@@ -1344,8 +1355,25 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         targetVisibleFraction = visibleFraction
         targetCenterX = centerX
         targetCenterY = centerY
+        val presenceValid =
+            out.getOrElse(NativeBridge.TARGET_STATE_INDEX_PRESENCE_VALID) { 1f } > 0.5f
+        targetPresenceValid = presenceValid
+
+        // 绿框可见性：
+        //   TRACKING  —— 还必须 PresenceGate 也认可（外观 + Mask + 运动 + 中心一致），
+        //                否则「物体已经走了、框还挂在墙上」；
+        //   ARM/ACQUIRING —— 用户刚点/刚框完，还没有判定依据，照常显示；
+        //   LOST/REACQUIRING —— bbox 已经退化成残片/空矩形，画出来只会误导，
+        //                统一交给常驻的 targetWarningText 提示。
+        val showBox = when (state) {
+            NativeBridge.TARGET_STATE_OFF -> false
+            NativeBridge.TARGET_STATE_TRACKING -> presenceValid
+            NativeBridge.TARGET_STATE_ARMED,
+            NativeBridge.TARGET_STATE_ACQUIRING -> true
+            else -> false
+        }
         targetOverlay.state = TargetUiState(
-            visible = state != NativeBridge.TARGET_STATE_OFF,
+            visible = showBox,
             state = state,
             x0 = out.getOrElse(1) { 0f },
             y0 = out.getOrElse(2) { 0f },
@@ -1355,10 +1383,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             medianDepth = out.getOrElse(6) { 0f },
             visibleFraction = visibleFraction,
             centerX = centerX,
-            centerY = centerY
+            centerY = centerY,
+            presenceValid = presenceValid
         )
         targetOverlay.invalidate()
-        updateTargetWarning(state, visibleFraction, centerX, centerY)
+        updateTargetWarning(state, visibleFraction, centerX, centerY, presenceValid)
     }
 
     /**
@@ -1382,7 +1411,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
      * `< 0.12 x 3 帧 -> 出界`，但旧的 UI 只把 state==4 画成红框 —— 而目标
      * 完全出界时 bbox 是 0x0，红框也画不出来，用户看到的就是「什么都没发生」。
      */
-    private fun updateTargetWarning(state: Int, visibleFraction: Float, cx: Float, cy: Float) {
+    private fun updateTargetWarning(state: Int, visibleFraction: Float, cx: Float, cy: Float,
+                                    presenceValid: Boolean) {
         val prev = lastTargetUiState
         lastTargetUiState = state
         // 只在「跟得好好的 -> 目标离开画面」这个边沿震一次。
@@ -1398,7 +1428,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 "目标已离开画面" + edgeHint(cx, cy)
 
             state == NativeBridge.TARGET_STATE_REACQUIRING ->
-                "目标暂时离开画面，正在自动找回…"
+                "目标暂时丢失，正在自动找回…" + edgeHint(cx, cy)
+
+            // PresenceGate 在本帧就否掉了「目标还在」：bbox 可能仍然好好地
+            // 停在画面中间（tracker 失配到背景纹理上了），但语义上目标已经不在。
+            state == NativeBridge.TARGET_STATE_TRACKING && !presenceValid ->
+                "目标暂时丢失，正在自动找回…"
 
             state == NativeBridge.TARGET_STATE_TRACKING && visibleFraction < 0.40f ->
                 "⚠ 目标接近边缘" + edgeHint(cx, cy)
@@ -1675,6 +1710,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    visibleFraction=${out.getOrElse(NativeBridge.TARGET_STATE_INDEX_VISIBLE_FRACTION) { 1f }}")
         sb.appendLine("    centerNorm=(${out.getOrElse(NativeBridge.TARGET_STATE_INDEX_CENTER_X) { 0.5f }}, ${out.getOrElse(NativeBridge.TARGET_STATE_INDEX_CENTER_Y) { 0.5f }})")
         sb.appendLine("    edgeLostFrames=${out.getOrElse(NativeBridge.TARGET_STATE_INDEX_EDGE_LOST_FRAMES) { 0f }.toInt()}")
+        val reportPresence =
+            out.getOrElse(NativeBridge.TARGET_STATE_INDEX_PRESENCE_VALID) { 1f } > 0.5f
+        val reportAppearance =
+            out.getOrElse(NativeBridge.TARGET_STATE_INDEX_APPEARANCE_OK) { 0f } > 0.5f
+        sb.appendLine("    presenceValid=$reportPresence (box in frame != object present)")
+        sb.appendLine("    appearanceBackendOk=$reportAppearance")
         sb.appendLine("    overlayPeriodNs=$targetUiPeriodNs (30Hz)")
         sb.appendLine("    centerTransform=(fx ${cameraToViewReady} via cameraToView)")
         sb.appendLine("    AF state=$lastAfState lensFocusDistance=$lastLensFocusDistance focusLocked=$targetFocusLocked relockCount=$focusRelockCount")

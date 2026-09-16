@@ -13,6 +13,8 @@ add_library(mobilescan3d SHARED
     ai_backend.cpp
     tsdf_engine.cpp
     object_tracker.cpp
+    target_mask_engine.cpp
+    appearance_tracker.cpp
     hq_fusion.cpp
     vins_prelude.cpp
     vins_ceres_check.cpp

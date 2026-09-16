@@ -58,6 +58,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     private var uNearLoc = 0
     private var uFarLoc = 0
     private var uPointSizeLoc = 0
+    private var uPointSpaceLoc = 0
     private var viewportW = 1
     private var viewportH = 1
 
@@ -176,6 +177,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         uNearLoc = GLES20.glGetUniformLocation(program, "uNear")
         uFarLoc = GLES20.glGetUniformLocation(program, "uFar")
         uPointSizeLoc = GLES20.glGetUniformLocation(program, "uPointSize")
+        uPointSpaceLoc = GLES20.glGetUniformLocation(program, "uPointSpace")
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
         GLES20.glDepthFunc(GLES20.GL_LEQUAL)
@@ -274,14 +276,16 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
             accumBuffer.clear()
             accumBuffer.put(accumData, 0, accumCount * NativeBridge.POINT_SLOTS)
             accumBuffer.flip()
-            drawPoints(accumBuffer, accumCount, accumPointSize)
+            // 累计模型是 world 空间：需要 Rwc^T (Pw - twc) 换到相机系
+            drawPoints(accumBuffer, accumCount, accumPointSize, POINT_SPACE_WORLD)
             drawnAccumulated = accumCount
         }
         if (debugCount > 0) {
             debugBuffer.clear()
             debugBuffer.put(debugData, 0, debugCount * NativeBridge.POINT_SLOTS)
             debugBuffer.flip()
-            drawPoints(debugBuffer, debugCount, debugPointSize)
+            // 当前帧目标 live 点是**相机坐标**：直接投影，完全不经过 VINS 位姿
+            drawPoints(debugBuffer, debugCount, debugPointSize, POINT_SPACE_CAMERA)
             drawnDebug = debugCount
         }
 
@@ -289,8 +293,9 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         GLES20.glDisableVertexAttribArray(colorLoc)
     }
 
-    private fun drawPoints(buffer: FloatBuffer, count: Int, size: Float) {
+    private fun drawPoints(buffer: FloatBuffer, count: Int, size: Float, pointSpace: Float) {
         GLES20.glUniform1f(uPointSizeLoc, size)
+        GLES20.glUniform1f(uPointSpaceLoc, pointSpace)
         buffer.position(0)
         GLES20.glVertexAttribPointer(
             posLoc, 3, GLES20.GL_FLOAT, false, NativeBridge.POINT_SLOTS * 4, buffer
@@ -336,6 +341,23 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         private const val FAR_PLANE = 20f
 
         /**
+         * uPointSpace 取值：点的坐标到底在哪个空间里。
+         *
+         *   POINT_SPACE_CAMERA (0) —— aPosition 已经是**相机坐标** (Xc, Yc, Zc)。
+         *       当前帧的目标 live 点属于这一种。它和这一帧的 depth 同一个坐标系，
+         *       所以直接投影就行，**完全不需要 VINS 位姿**，也就不受
+         *       `arPoseFromTimestamp=false` 的影响。
+         *
+         *   POINT_SPACE_WORLD (1) —— aPosition 是世界坐标，需要
+         *       `pc = Rwc^T (Pw - twc)` 换到相机系。累计目标模型属于这一种。
+         *
+         * 这两条链以前混在一起（当前帧的点也先转 world 再用另一个时刻的 pose
+         * 投回去），所以「Mask 对不对」和「pose 链对不对」根本分不开。
+         */
+        private const val POINT_SPACE_CAMERA = 0f
+        private const val POINT_SPACE_WORLD = 1f
+
+        /**
          * 顶点着色器 —— 直接实现 Camera2 的相机模型投影。
          *
          * 关键点：**不要在这里猜屏幕旋转**。cameraU/cameraV 已经是
@@ -362,15 +384,23 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
             uniform float uNear;
             uniform float uFar;
             uniform float uPointSize;
+            uniform float uPointSpace;
             varying vec3 vColor;
             void main() {
                 vColor = aColor;
-                vec3 dw = aPosition - uCameraT;
-                vec3 pc = vec3(
-                    dot(dw, uCameraRight),
-                    dot(dw, uCameraDown),
-                    dot(dw, uCameraForward)
-                );
+                vec3 pc;
+                if (uPointSpace < 0.5) {
+                    // 相机空间：坐标本来就是 (Xc, Yc, Zc)，直接用
+                    pc = aPosition;
+                } else {
+                    // 世界空间：Pc = Rwc^T (Pw - twc)
+                    vec3 dw = aPosition - uCameraT;
+                    pc = vec3(
+                        dot(dw, uCameraRight),
+                        dot(dw, uCameraDown),
+                        dot(dw, uCameraForward)
+                    );
+                }
                 if (pc.z <= 0.05) {
                     // 相机背后的点：推出裁剪空间并让点尺寸归零
                     gl_Position = vec4(2.0, 2.0, 1.0, 1.0);
