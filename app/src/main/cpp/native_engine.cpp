@@ -28,6 +28,12 @@
 #include "depth_calib.h"
 #include "mesh/mesh_engine.h"
 #include "export/gltf_exporter.h"
+#include "v06/mesh_postprocess.h"
+#include "v06/uv_unwrap.h"
+#include "v06/texture_baker.h"
+#include "v06/textured_glb_exporter.h"
+#include <fstream>
+#include <opencv2/imgcodecs.hpp>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MobileScan3D", __VA_ARGS__)
 #define TARGET_DEPTH_FILTER_ENABLED 0
@@ -64,6 +70,20 @@ static uint64_t meshBuilds = 0;
 static uint64_t meshDirtyMarks = 0;
 /** 顶点交错布局：x,y,z, nx,ny,nz, r,g,b —— 9 个 float 一个顶点（与 Kotlin 契约一致）。 */
 static constexpr int MESH_VERTEX_FLOATS = 9;
+
+// ---------------------------------------------------------------- V0.6 纹理管线
+// 与 mesh 管线分开：这些东西只在「停扫导出」时用一次（几百毫秒到数秒），
+// 每帧路径完全不碰。HQ 关键帧由 HqCaptureController 在 HQ 合成 / 降级单帧
+// 成功后注册进来，和网格一样按会话清理。
+//
+// 锁：**统一用 gStateMutex，不再引入第二把 gTextureMutex**。resetMeshPipeline()
+// 是在 gStateMutex 下被调用的，再加一把纹理锁就形成 gStateMutex -> gTextureMutex
+// 的嵌套；而烘焙路径若反向取锁就是死锁。共用一把锁的代价可以忽略 ——
+// 纹理状态只在会话开始/结束与停扫导出时变化，不在每帧路径上。
+static MeshPostProcessStats meshCleanupStats;
+static std::vector<TextureKeyframe> gTextureKeyframes;
+static TextureBakeStats textureBakeStats;
+static UvUnwrapStats uvUnwrapStats;
 
 // --------------------------------------------------------------- 深度标定
 // 评审 P0-4：把「单一 median ratio」升级成 MAD 剔除 + Huber IRLS + EMA 的
@@ -403,6 +423,10 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
 static void resetMeshPipeline() {
     meshEngine = MeshEngine();
     meshStats = MeshBuildStats{};
+    meshCleanupStats = MeshPostProcessStats{};
+    gTextureKeyframes.clear();
+    textureBakeStats = TextureBakeStats{};
+    uvUnwrapStats = UvUnwrapStats{};
     meshDirty = true;
     depthCalibrator.reset();
     lastCalibScale = 1.f;
@@ -2255,4 +2279,311 @@ Java_com_mobilescan3d_NativeBridge_nativeExportGlb(JNIEnv* e, jobject, jstring p
     }
     e->ReleaseStringUTFChars(path, p);
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// ===========================================================================
+//  V0.6：HQ 多视角纹理 -> 自包含 textured GLB
+// ===========================================================================
+//
+// 数据流（只在「停扫导出」时跑一次，每帧路径零开销）：
+//
+//   meshEngine.mesh()（本工程 SoA 布局）
+//     -> toAosMesh()                 边界转换（见 v06/aos_mesh.h 的说明）
+//     -> MeshPostProcessor::run()    亚毫米 weld / 去漂浮分量 / ear-clipping 补小洞 / QEM
+//     -> UvUnwrapper::unwrap()       xatlas（已 vendor）或 triangle-atlas 回退
+//     -> TextureBaker::bake()        Z-buffer 可见性 + 视角评分 + 每 texel 前 3 视角混合
+//     -> cv::imencode(".jpg")        atlas 压成 JPEG
+//     -> TexturedGlbExporter::write()  内嵌 JPEG 的 glTF 2.0 二进制
+//
+// 任何一步失败都返回 JNI_FALSE，调用方（MainActivity）回退到 V0.5 的
+// vertex-color GLB —— 几何已经算好，不因为纹理失败就一起判废。
+//
+// 注意：**本工程不在 nativeBuildMesh 里跑 MeshPostProcessor**。nativeBuildMesh
+// 用的 MeshEngine 已自带去小分量 / 去孤立面 / Taubin / QEM 是一条已验收的链路，
+// 不动它；V0.6 的清理只作用在导出资产这份 AoS 副本上。因此屏幕上 AR overlay
+// 显示的仍是 V0.5 的 vertex-color 网格，而 GLB 是清理过、带纹理的资产。
+// ===========================================================================
+
+/** 本工程 SoA Mesh -> V0.6 模块使用的 AoS Mesh。 */
+static AosMesh toAosMesh(const Mesh& m) {
+    AosMesh out;
+    const std::size_t n = m.vertexCount();
+    if (n == 0 || m.indices.size() < 3) {
+        return out;
+    }
+    out.vertices.resize(n);
+    const bool haveNormals = (m.normals.size() >= n * 3);
+    const bool haveColors = (m.colors.size() >= n * 3);
+    for (std::size_t i = 0; i < n; ++i) {
+        AosVertex& v = out.vertices[i];
+        v.px = m.positions[i * 3 + 0];
+        v.py = m.positions[i * 3 + 1];
+        v.pz = m.positions[i * 3 + 2];
+        if (haveNormals) {
+            v.nx = m.normals[i * 3 + 0];
+            v.ny = m.normals[i * 3 + 1];
+            v.nz = m.normals[i * 3 + 2];
+        }
+        if (haveColors) {
+            v.r = m.colors[i * 3 + 0];
+            v.g = m.colors[i * 3 + 1];
+            v.b = m.colors[i * 3 + 2];
+        }
+    }
+    out.indices = m.indices;
+    return out;
+}
+
+/** 开始新一轮扫描时清空 HQ 关键帧登记表。 */
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeClearTextureKeyframes(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    gTextureKeyframes.clear();
+    textureBakeStats = TextureBakeStats{};
+    uvUnwrapStats = UvUnwrapStats{};
+}
+
+/**
+ * 登记一张 HQ still 作为纹理候选视角。
+ *
+ * pose12 = camera->world 的 12 个 float（R 行主序 9 个 + t 3 个），由 Kotlin
+ * 侧用 nativeGetRenderPoseAt(frameSensorTs) 拿到 —— 也就是**拍摄那一刻**的
+ * VINS 位姿，不是当前帧位姿。
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeRegisterTextureKeyframe(
+        JNIEnv* env, jobject,
+        jstring path, jint width, jint height,
+        jfloat fx, jfloat fy, jfloat cx, jfloat cy,
+        jfloatArray pose12, jfloat quality, jlong timestampNs) {
+    if (!path || !pose12 || width <= 0 || height <= 0 ||
+        fx <= 1.0f || fy <= 1.0f ||
+        env->GetArrayLength(pose12) < 12) {
+        return JNI_FALSE;
+    }
+
+    const char* p = env->GetStringUTFChars(path, nullptr);
+    if (p == nullptr) {
+        return JNI_FALSE;
+    }
+    std::string imagePath(p);
+    env->ReleaseStringUTFChars(path, p);
+
+    {
+        std::ifstream test(imagePath, std::ios::binary);
+        if (!test.good()) {
+            return JNI_FALSE;
+        }
+    }
+
+    jfloat values[12];
+    env->GetFloatArrayRegion(pose12, 0, 12, values);
+
+    TextureKeyframe k;
+    k.imagePath = std::move(imagePath);
+    k.width = width;
+    k.height = height;
+    k.fx = fx;
+    k.fy = fy;
+    k.cx = cx;
+    k.cy = cy;
+    for (int i = 0; i < 9; ++i) {
+        k.Rwc[i] = values[i];
+    }
+    k.twc[0] = values[9];
+    k.twc[1] = values[10];
+    k.twc[2] = values[11];
+    k.quality = std::clamp(static_cast<float>(quality), 0.05f, 3.0f);
+    k.timestampNs = timestampNs > 0 ? static_cast<std::uint64_t>(timestampNs) : 0u;
+
+    std::lock_guard<std::mutex> lk(gStateMutex);
+
+    // 同一个文件被回调重复投递时去重。
+    for (const auto& existing : gTextureKeyframes) {
+        if (existing.imagePath == k.imagePath) {
+            return JNI_TRUE;
+        }
+    }
+    gTextureKeyframes.push_back(std::move(k));
+
+    // 硬上限：元数据不能无界增长。烘焙时会另按 quality + 视角多样性挑选。
+    constexpr std::size_t kRegistryLimit = 96;
+    if (gTextureKeyframes.size() > kRegistryLimit) {
+        auto worst = std::min_element(
+            gTextureKeyframes.begin(), gTextureKeyframes.end(),
+            [](const TextureKeyframe& a, const TextureKeyframe& b) {
+                return a.quality < b.quality;
+            });
+        if (worst != gTextureKeyframes.end()) {
+            gTextureKeyframes.erase(worst);
+        }
+    }
+    return JNI_TRUE;
+}
+
+/** 清理几何 + 展开 UV + 多视角烘焙 + 写出内嵌 JPEG 的 textured GLB。 */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
+        JNIEnv* env, jobject,
+        jstring path, jint atlasResolution, jint maxKeyframes) {
+    if (path == nullptr) {
+        return JNI_FALSE;
+    }
+
+    AosMesh meshCopy;
+    std::vector<TextureKeyframe> keyframes;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        const Mesh& src = meshEngine.mesh();
+        if (src.empty()) {
+            return JNI_FALSE;
+        }
+        meshCopy = toAosMesh(src);
+        keyframes = gTextureKeyframes;
+    }
+    if (meshCopy.empty() || keyframes.empty()) {
+        LOGI("nativeBakeTexturedGlb skip: mesh=%zu keyframes=%zu",
+             meshCopy.triangleCount(), keyframes.size());
+        return JNI_FALSE;
+    }
+
+    const int resolution = std::clamp(static_cast<int>(atlasResolution), 512, 4096);
+
+    // ---- 几何清理：weld / 去漂浮分量 / ear-clipping 补小洞 / QEM ----
+    MeshPostProcessOptions cleanup;
+    cleanup.weldEpsilon = std::clamp(meshStats.voxelSize * 0.08f, 0.00030f, 0.00120f);
+    cleanup.minComponentTriangles = meshQuality >= 2 ? 24 : (meshQuality <= 0 ? 72 : 48);
+    cleanup.minComponentAreaRatio = meshQuality >= 2 ? 0.0020f : 0.0035f;
+    cleanup.maxHoleEdges = meshQuality >= 2 ? 72 : 56;
+    cleanup.maxHoleDiameterMeters = meshQuality >= 2 ? 0.060f : 0.075f;
+    cleanup.maxHoleDiameterBBoxRatio = meshQuality >= 2 ? 0.10f : 0.12f;
+    cleanup.targetTriangles = meshQuality >= 2 ? 180000 : (meshQuality <= 0 ? 30000 : 80000);
+    cleanup.qemMaxPasses = 10;
+    cleanup.qemMaxNormalFlipDeg = meshQuality >= 2 ? 65.0f : 72.0f;
+    cleanup.preserveBoundary = true;
+
+    MeshPostProcessStats cleanupStats;
+    if (!MeshPostProcessor::run(meshCopy, cleanup, &cleanupStats)) {
+        LOGI("nativeBakeTexturedGlb FAILED: mesh cleanup");
+        return JNI_FALSE;
+    }
+
+    UvMesh uvMesh;
+    UvUnwrapStats uvStats;
+    if (!UvUnwrapper::unwrap(meshCopy, resolution, 8, uvMesh, &uvStats)) {
+        LOGI("nativeBakeTexturedGlb FAILED: uv unwrap");
+        return JNI_FALSE;
+    }
+
+    TextureBakeOptions options;
+    options.atlasResolution = resolution;
+    options.maxKeyframes = std::clamp(static_cast<int>(maxKeyframes), 4, 24);
+    options.maxBlendFrames = 3;
+    options.sourceMaxSide = resolution >= 4096 ? 2200 : (resolution >= 2048 ? 1600 : 1280);
+    options.visibilityMaxSide = resolution >= 4096 ? 512 : 384;
+    options.gutterDilationPixels = resolution >= 4096 ? 10 : 6;
+    options.jpegQuality = resolution >= 4096 ? 94 : 92;
+
+    cv::Mat atlas;
+    TextureBakeStats bakeStats;
+    if (!TextureBaker::bake(uvMesh, keyframes, options, atlas, &bakeStats)) {
+        LOGI("nativeBakeTexturedGlb FAILED: texture bake");
+        return JNI_FALSE;
+    }
+
+    std::vector<std::uint8_t> jpeg;
+    const std::vector<int> params{cv::IMWRITE_JPEG_QUALITY, options.jpegQuality};
+    if (!cv::imencode(".jpg", atlas, jpeg, params) || jpeg.empty()) {
+        LOGI("nativeBakeTexturedGlb FAILED: jpeg encode");
+        return JNI_FALSE;
+    }
+
+    const char* p = env->GetStringUTFChars(path, nullptr);
+    if (p == nullptr) {
+        return JNI_FALSE;
+    }
+    const bool ok = TexturedGlbExporter::write(p, uvMesh, jpeg);
+    env->ReleaseStringUTFChars(path, p);
+
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        meshCleanupStats = cleanupStats;
+        if (ok) {
+            textureBakeStats = bakeStats;
+            uvUnwrapStats = uvStats;
+        }
+    }
+
+    LOGI("nativeBakeTexturedGlb ok=%d cleanTris=%zu->%zu weld=%zu compsRemoved=%zu "
+         "holes=%zu(+%zu tris) uv=%s atlas=%dx%d frames=%d/%d cov=%.1f%% jpeg=%zu",
+         ok ? 1 : 0,
+         cleanupStats.inputTriangles, cleanupStats.outputTriangles,
+         cleanupStats.weldedVertices, cleanupStats.removedComponents,
+         cleanupStats.filledHoles, cleanupStats.addedHoleTriangles,
+         uvStats.usedXatlas ? "xatlas" : "fallback",
+         uvStats.atlasWidth, uvStats.atlasHeight,
+         bakeStats.usedKeyframes, bakeStats.requestedKeyframes,
+         bakeStats.coveragePercent, jpeg.size());
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * 纹理统计（9 槽）。
+ *   0 已登记关键帧数 / 1 实际加载 / 2 实际使用 / 3 atlasW / 4 atlasH
+ *   5 有纹理的三角形 / 6 回退 vertex color 的三角形 / 7 覆盖率×10 / 8 是否 xatlas
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetTextureStats(
+        JNIEnv* env, jobject, jintArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 9) {
+        return JNI_FALSE;
+    }
+    jint values[9] = {0};
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        values[0] = static_cast<jint>(std::min<std::size_t>(
+            gTextureKeyframes.size(), static_cast<std::size_t>(std::numeric_limits<jint>::max())));
+        values[1] = textureBakeStats.loadedKeyframes;
+        values[2] = textureBakeStats.usedKeyframes;
+        values[3] = uvUnwrapStats.atlasWidth;
+        values[4] = uvUnwrapStats.atlasHeight;
+        values[5] = static_cast<jint>(std::min<std::size_t>(
+            textureBakeStats.texturedTriangles, static_cast<std::size_t>(std::numeric_limits<jint>::max())));
+        values[6] = static_cast<jint>(std::min<std::size_t>(
+            textureBakeStats.fallbackTriangles, static_cast<std::size_t>(std::numeric_limits<jint>::max())));
+        values[7] = static_cast<jint>(std::clamp(textureBakeStats.coveragePercent * 10.0f, 0.0f, 1000.0f));
+        values[8] = uvUnwrapStats.usedXatlas ? 1 : 0;
+    }
+    env->SetIntArrayRegion(out, 0, 9, values);
+    return JNI_TRUE;
+}
+
+/**
+ * 导出前几何清理统计（10 槽）。
+ *   0 输入三角形 / 1 输出三角形 / 2 weld 后顶点 / 3 去掉的分量
+ *   4 去掉的分量三角形 / 5 边界环 / 6 补的洞 / 7 补洞新增三角形
+ *   8 QEM 塌缩边 / 9 输出顶点
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetMeshCleanupStats(
+        JNIEnv* env, jobject, jintArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 10) {
+        return JNI_FALSE;
+    }
+    jint values[10] = {0};
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        values[0] = static_cast<jint>(meshCleanupStats.inputTriangles);
+        values[1] = static_cast<jint>(meshCleanupStats.outputTriangles);
+        values[2] = static_cast<jint>(meshCleanupStats.weldedVertices);
+        values[3] = static_cast<jint>(meshCleanupStats.removedComponents);
+        values[4] = static_cast<jint>(meshCleanupStats.removedComponentTriangles);
+        values[5] = static_cast<jint>(meshCleanupStats.boundaryLoops);
+        values[6] = static_cast<jint>(meshCleanupStats.filledHoles);
+        values[7] = static_cast<jint>(meshCleanupStats.addedHoleTriangles);
+        values[8] = static_cast<jint>(meshCleanupStats.qemCollapsedEdges);
+        values[9] = static_cast<jint>(meshCleanupStats.outputVertices);
+    }
+    env->SetIntArrayRegion(out, 0, 10, values);
+    return JNI_TRUE;
 }

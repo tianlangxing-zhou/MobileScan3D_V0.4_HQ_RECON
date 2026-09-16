@@ -1127,10 +1127,12 @@ class HqCaptureController(
         }
 
         b.set(CaptureRequest.JPEG_QUALITY, 100.toByte())
-        b.set(
-            CaptureRequest.JPEG_ORIENTATION,
-            characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-        )
+        // V0.6：纹理烘焙要求落盘的 JPEG 保持 sensor / native 朝向。
+        // 显示用的旋转属于查看器；资产投影必须与标定相机、VINS 位姿共用同一套
+        // 像素几何，否则 atlas 里的 UV 会整体转 90°。
+        // 注意：preview 走 SurfaceTexture，JPEG_ORIENTATION 对它不生效，
+        // 所以这里只影响 HQ still 的落盘像素。
+        b.set(CaptureRequest.JPEG_ORIENTATION, 0)
         return b.build()
     }
 
@@ -2141,6 +2143,14 @@ class HqCaptureController(
                 if (out.exists()) out.delete()
                 val picked = if (sharpestIndex in paths.indices) sharpestIndex else 0
                 if (saveFallbackSingle(ctx, paths[picked])) {
+                    // V0.6：降级交付的这一帧同样是 HQ 纹理候选视角。位姿取它
+                    // 自己那一帧（不是参考帧），清晰度用逐帧的最清晰分。
+                    registerTextureKeyframe(
+                        ctx,
+                        File(captureDir(ctx.sessionId), "single_${ctx.token}.jpg"),
+                        picked,
+                        sharpestScore
+                    )
                     stats.fusionFallbackSingle++
                     stats.lastCaptureRejectReason = "$alignReject -> 已降级交付最清晰单帧"
                 } else {
@@ -2157,6 +2167,15 @@ class HqCaptureController(
                         stats.referenceJpeg = refDst.absolutePath
                     }
                 }
+                // V0.6：把融合图登记为 HQ 纹理候选视角。合成结果是在
+                // paths[0]（native 的参考帧）视点上对齐的，所以位姿取第 0 帧，
+                // 而不是「当前帧」。
+                registerTextureKeyframe(
+                    ctx,
+                    out,
+                    0,
+                    maxOf(stats.sharpness, MIN_SHARPEST_SCORE)
+                )
                 stats.fusedImageSaved++
                 stats.fusionSuccess++
                 stats.lastCaptureRejectReason = ""
@@ -2219,6 +2238,114 @@ class HqCaptureController(
         5 -> "ecc low"
         6 -> "exception"
         else -> "unknown($code)"
+    }
+
+// ------------------------------------------------------------ V0.6 texture keyframes
+
+    /**
+     * 算出「落盘 JPEG 像素坐标系」下的 still 内参。
+     *
+     * LENS_INTRINSIC_CALIBRATION 给的是 **active array 局部坐标系**下的
+     * fx/fy/cx/cy；而落盘 JPEG 可能与 active array 宽高比不同（厂商会做居中裁剪），
+     * 所以这里按「居中 aspect crop」把它映射到 JPEG 像素，再整体缩放到 JPEG 尺寸。
+     *
+     * 这套约定与 MainActivity 现网已验证的实时 YUV 管线保持一致 ——
+     * 不一致的话纹理投射会整体偏移，且偏差随分辨率放大。
+     */
+    private fun textureIntrinsics(size: Size): FloatArray? {
+        if (size.width <= 0 || size.height <= 0) return null
+
+        val active = characteristics.get(
+            CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE
+        ) ?: return null
+
+        val arrW = active.width().toFloat()
+        val arrH = active.height().toFloat()
+        if (arrW <= 1f || arrH <= 1f) return null
+
+        val calibration = characteristics.get(
+            CameraCharacteristics.LENS_INTRINSIC_CALIBRATION
+        )
+
+        val fx0 = calibration?.getOrNull(0) ?: (arrW * 0.9f)
+        val fy0 = calibration?.getOrNull(1) ?: (arrW * 0.9f)
+        val cx0 = calibration?.getOrNull(2) ?: (arrW * 0.5f)
+        val cy0 = calibration?.getOrNull(3) ?: (arrH * 0.5f)
+
+        // 居中 aspect crop：JPEG 比 sensor 更「窄」就左右裁，更「宽」就上下裁。
+        val sensorAspect = arrW / arrH
+        val outputAspect = size.width.toFloat() / size.height.toFloat()
+
+        var cropLeft = 0f
+        var cropTop = 0f
+        var cropW = arrW
+        var cropH = arrH
+
+        if (sensorAspect > outputAspect) {
+            cropW = arrH * outputAspect
+            cropLeft = (arrW - cropW) * 0.5f
+        } else if (sensorAspect < outputAspect) {
+            cropH = arrW / outputAspect
+            cropTop = (arrH - cropH) * 0.5f
+        }
+
+        val sx = size.width.toFloat() / cropW
+        val sy = size.height.toFloat() / cropH
+
+        return floatArrayOf(
+            fx0 * sx,
+            fy0 * sy,
+            (cx0 - cropLeft) * sx,
+            (cy0 - cropTop) * sy
+        )
+    }
+
+    /**
+     * 把一张已落盘的 HQ 图登记为纹理候选视角。
+     *
+     * 三道守卫缺一不可：文件确实在盘上（烘焙时才读得到）、该帧有位姿（VINS 刚
+     * 初始化时前几帧是空的）、且能在位姿历史里查到**那一帧传感器时间戳**对应的
+     * pose（framePoseAtOk）。任一不满足就静静跳过 —— 纹理少一个视角只是覆盖率
+     * 低一点，用错的位姿则会把别人的像素糊到这块几何上。
+     */
+    private fun registerTextureKeyframe(
+        ctx: BurstContext,
+        file: File,
+        frameIndex: Int,
+        sharpness: Float
+    ) {
+        if (!file.exists() ||
+            frameIndex !in 0 until BURST_FRAME_SLOTS ||
+            !ctx.framePoseValid[frameIndex] ||
+            !ctx.framePoseAtOk[frameIndex]
+        ) {
+            return
+        }
+
+        val size = jpegSize ?: return
+        val intr = textureIntrinsics(size) ?: return
+        val pose = ctx.framePose[frameIndex].copyOf()
+
+        // Laplacian 方差跨度很大，压到 0.25..2.5 这个紧凑区间交给 native；
+        // 视角多样性由烘焙器负责，所以「最清晰」不等于「同一个角度」。
+        val quality = (sharpness / 80f).coerceIn(0.25f, 2.5f)
+
+        try {
+            NativeBridge.nativeRegisterTextureKeyframe(
+                file.absolutePath,
+                size.width,
+                size.height,
+                intr[0],
+                intr[1],
+                intr[2],
+                intr[3],
+                pose,
+                quality,
+                ctx.frameSensorTs[frameIndex]
+            )
+        } catch (t: Throwable) {
+            android.util.Log.w("HqTexture", "register keyframe failed: ${t.message}")
+        }
     }
 
     /**

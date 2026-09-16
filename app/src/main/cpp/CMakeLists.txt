@@ -18,6 +18,10 @@ add_library(mobilescan3d SHARED
     depth_calib.cpp
     mesh/mesh_engine.cpp
     export/gltf_exporter.cpp
+    v06/mesh_postprocess.cpp
+    v06/uv_unwrap.cpp
+    v06/texture_baker.cpp
+    v06/textured_glb_exporter.cpp
     hq_fusion.cpp
     vins_prelude.cpp
     vins_ceres_check.cpp
@@ -147,3 +151,23 @@ target_link_libraries(
     opencv_java
     ceres
 )
+
+
+# ---------------------------------------------------------------------------
+# V0.6 UV atlas 后端（可选）
+#
+# xatlas 官方说明集成只需要 xatlas.cpp + xatlas.h 两个源文件，MIT License。
+# 源码已 vendor 在 third_party/xatlas/。即使目录缺失也**不会**中断构建 ——
+# uv_unwrap.cpp 自带 dependency-free 的 triangle-atlas 回退路径，只是图谱
+# 利用率不如 xatlas（每三角形一个 chart）。
+# ---------------------------------------------------------------------------
+set(MOBILESCAN_XATLAS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xatlas")
+if(EXISTS "${MOBILESCAN_XATLAS_DIR}/xatlas.cpp"
+   AND EXISTS "${MOBILESCAN_XATLAS_DIR}/xatlas.h")
+    target_sources(mobilescan3d PRIVATE "${MOBILESCAN_XATLAS_DIR}/xatlas.cpp")
+    target_include_directories(mobilescan3d PRIVATE "${MOBILESCAN_XATLAS_DIR}")
+    target_compile_definitions(mobilescan3d PRIVATE MOBILESCAN_HAS_XATLAS=1)
+    message(STATUS "MobileScan3D V0.6: xatlas enabled")
+else()
+    message(WARNING "MobileScan3D V0.6: xatlas missing; using UV fallback")
+endif()

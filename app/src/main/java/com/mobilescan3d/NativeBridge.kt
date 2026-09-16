@@ -138,6 +138,36 @@ object NativeBridge {
      *   15 smoothIterations
      */
     const val MESH_STATS_SLOTS = 16
+
+    // ------------------------------------------------------------ V0.6
+    // 导出前几何清理统计（weld / 去漂浮分量 / ear-clipping 补小洞 / QEM）。
+    // 注意：这份统计**只对导出的 GLB 资产成立**，屏幕上的 AR overlay 走的是
+    // MeshEngine 自己那条已验收的清理链。
+    const val MESH_CLEANUP_STATS_SLOTS = 10
+    const val MESH_CLEANUP_INDEX_INPUT_TRIANGLES = 0
+    const val MESH_CLEANUP_INDEX_OUTPUT_TRIANGLES = 1
+    const val MESH_CLEANUP_INDEX_WELDED_VERTICES = 2
+    const val MESH_CLEANUP_INDEX_REMOVED_COMPONENTS = 3
+    const val MESH_CLEANUP_INDEX_REMOVED_COMPONENT_TRIANGLES = 4
+    const val MESH_CLEANUP_INDEX_BOUNDARY_LOOPS = 5
+    const val MESH_CLEANUP_INDEX_FILLED_HOLES = 6
+    const val MESH_CLEANUP_INDEX_ADDED_HOLE_TRIANGLES = 7
+    const val MESH_CLEANUP_INDEX_QEM_COLLAPSED_EDGES = 8
+    const val MESH_CLEANUP_INDEX_OUTPUT_VERTICES = 9
+
+    // HQ 多视角纹理烘焙统计。
+    const val TEXTURE_STATS_SLOTS = 9
+    const val TEXTURE_STATS_INDEX_REGISTERED_KEYFRAMES = 0
+    const val TEXTURE_STATS_INDEX_LOADED_KEYFRAMES = 1
+    const val TEXTURE_STATS_INDEX_USED_KEYFRAMES = 2
+    const val TEXTURE_STATS_INDEX_ATLAS_W = 3
+    const val TEXTURE_STATS_INDEX_ATLAS_H = 4
+    const val TEXTURE_STATS_INDEX_TEXTURED_TRIANGLES = 5
+    const val TEXTURE_STATS_INDEX_VERTEX_COLOR_TRIANGLES = 6
+    /** 覆盖率 × 10（整数槽）。 */
+    const val TEXTURE_STATS_INDEX_COVERAGE_X10 = 7
+    /** 1 = 用的 xatlas，0 = triangle-atlas 回退。 */
+    const val TEXTURE_STATS_INDEX_USED_XATLAS = 8
     const val MESH_STATS_INDEX_VERTICES = 0
     const val MESH_STATS_INDEX_TRIANGLES = 1
     const val MESH_STATS_INDEX_RAW_TRIANGLES = 3
@@ -255,4 +285,50 @@ object NativeBridge {
 
     /** 导出 glTF 2.0 二进制（GLB），逐顶点颜色。返回是否成功。 */
     external fun nativeExportGlb(path: String): Boolean
+
+    // ------------------------------------------------------------ V0.6
+    // HQ 多视角纹理 -> 自包含 textured GLB。
+    //
+    // nativeExportGlb 输出的是逐顶点颜色的网格，V0.6 起保留为**回退路径**；
+    // nativeBakeTexturedGlb 才是正式产物（内嵌 JPEG atlas），失败时调用方
+    // 自动退回逐顶点颜色版本 —— 几何已经算好，不该因为纹理失败一起判废。
+
+    /** 清空 HQ 纹理关键帧登记表（开始新一轮扫描时调用）。 */
+    external fun nativeClearTextureKeyframes()
+
+    /**
+     * 登记一张 HQ still 作为纹理候选视角。
+     *
+     * pose12 是 camera->world 的 12 个 float（R 行主序 9 个 + t 3 个），
+     * 由 nativeGetRenderPoseAt(timestampNs) 取**拍摄那一刻**的 VINS 位姿得到，
+     * 不是当前帧位姿。
+     */
+    external fun nativeRegisterTextureKeyframe(
+        path: String,
+        width: Int,
+        height: Int,
+        fx: Float,
+        fy: Float,
+        cx: Float,
+        cy: Float,
+        pose12: FloatArray,
+        quality: Float,
+        timestampNs: Long
+    ): Boolean
+
+    /**
+     * 几何清理 + UV 展开 + 多视角烘焙 + 写出内嵌 JPEG 的 textured GLB。
+     * 返回 false 时调用方应退回 nativeExportGlb。
+     */
+    external fun nativeBakeTexturedGlb(
+        path: String,
+        atlasResolution: Int,
+        maxKeyframes: Int
+    ): Boolean
+
+    /** 纹理烘焙统计（TEXTURE_STATS_SLOTS 槽）。 */
+    external fun nativeGetTextureStats(out: IntArray): Boolean
+
+    /** 导出前清理统计（MESH_CLEANUP_STATS_SLOTS 槽）。 */
+    external fun nativeGetMeshCleanupStats(out: IntArray): Boolean
 }

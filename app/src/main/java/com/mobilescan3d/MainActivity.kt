@@ -2040,6 +2040,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         lastGlbBytes = 0L
         lastMeshSummary = "n/a"
         renderer.clearMesh()
+        // V0.6：新一轮扫描要清掉上一轮的 HQ 纹理关键帧登记表，否则会把
+        // 上一场拍的照片烘到这一场的网格上（native 侧 nativeCreate 另有兜底）。
+        try {
+            NativeBridge.nativeClearTextureKeyframes()
+        } catch (_: Throwable) {
+        }
         if (::exportManager.isInitialized) {
             exportManager.resetMesh()
         }
@@ -2150,7 +2156,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     lastGlbTriangles = r.triangles
                     lastGlbBytes = r.fileBytes
                     lastMeshSummary =
-                        "${r.triangles} 面 / ${r.vertices} 顶点 · ${r.fileBytes / 1024} KB · $label"
+                        "${r.triangles} 面 / ${r.vertices} 顶点 · ${r.fileBytes / 1024} KB · $label" +
+                            textureNote(r.textured)
                     // V0.5：网格一出来就自动切到「网格」图层 —— 用户刚拍完就直接
                     // 看到结果，不必自己去翻图层按钮。
                     arMeshViewing = true
@@ -2246,7 +2253,57 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             " 体素${s[NativeBridge.MESH_STATS_INDEX_VOXEL_SIZE_UM] / 1000f}mm" +
             " 简化${if (s[NativeBridge.MESH_STATS_INDEX_DECIMATED] != 0) 1 else 0}" +
             " 质量${s[NativeBridge.MESH_STATS_INDEX_QUALITY]}" +
-            " ${s[NativeBridge.MESH_STATS_INDEX_TOTAL_MS]}ms"
+            " ${s[NativeBridge.MESH_STATS_INDEX_TOTAL_MS]}ms" +
+            cleanupSummary()
+    }
+
+    /**
+     * V0.6：GLB 是否带 HQ 纹理，以及烘焙统计一行摘要。
+     *
+     * 槽位含义见 NativeBridge.TEXTURE_STATS_* ：
+     *   2 = 实际使用视角数 / 0 = 已登记视角数 / 3,4 = atlas 宽高 / 7 = 覆盖率×10
+     */
+    private fun textureNote(textured: Boolean): String {
+        if (!textured) return " · vertex color"
+        val t = try {
+            exportManager.textureStats()
+        } catch (_: Throwable) {
+            IntArray(0)
+        }
+        if (t.size < NativeBridge.TEXTURE_STATS_SLOTS) return " · HQ 纹理"
+        val cov = String.format(
+            java.util.Locale.US,
+            "%.0f",
+            t[NativeBridge.TEXTURE_STATS_INDEX_COVERAGE_X10] / 10f
+        )
+        return " · HQ 纹理 ${t[NativeBridge.TEXTURE_STATS_INDEX_ATLAS_W]}² " +
+            "${t[NativeBridge.TEXTURE_STATS_INDEX_USED_KEYFRAMES]}/" +
+            "${t[NativeBridge.TEXTURE_STATS_INDEX_REGISTERED_KEYFRAMES]}视角 覆盖$cov%"
+    }
+
+    /**
+     * V0.6：导出前几何清理一行摘要（weld / 去漂浮分量 / 补洞 / QEM 塌缩边）。
+     *
+     * **这份统计只对导出资产成立** —— 屏幕上的 AR overlay 走的是 MeshEngine
+     * 自己那条已验收的清理链，两者刻意分开。
+     */
+    private fun cleanupSummary(): String {
+        if (!::exportManager.isInitialized) return ""
+        val c = try {
+            exportManager.meshCleanupStats()
+        } catch (_: Throwable) {
+            IntArray(0)
+        }
+        if (c.size < NativeBridge.MESH_CLEANUP_STATS_SLOTS ||
+            c[NativeBridge.MESH_CLEANUP_INDEX_INPUT_TRIANGLES] <= 0
+        ) {
+            return ""
+        }
+        return " 清理${c[NativeBridge.MESH_CLEANUP_INDEX_INPUT_TRIANGLES]}" +
+            "→${c[NativeBridge.MESH_CLEANUP_INDEX_OUTPUT_TRIANGLES]}" +
+            " 去分量${c[NativeBridge.MESH_CLEANUP_INDEX_REMOVED_COMPONENTS]}" +
+            " 补洞${c[NativeBridge.MESH_CLEANUP_INDEX_FILLED_HOLES]}" +
+            " 塌缩${c[NativeBridge.MESH_CLEANUP_INDEX_QEM_COLLAPSED_EDGES]}"
     }
 
     private fun materializeAsset(assetName: String): String {

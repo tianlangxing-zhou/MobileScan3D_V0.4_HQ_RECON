@@ -10,7 +10,10 @@ import java.io.RandomAccessFile
 import java.util.concurrent.Executors
 
 /**
- * 导出：PLY（兼容旧路径）与 **GLB（glTF 2.0，vertex color）**，以及网格拉取。
+ * 导出：PLY（兼容旧路径）与 **GLB（glTF 2.0）**，以及网格拉取。
+ *
+ * V0.6 起 GLB 是 **textured-first**：优先内嵌 JPEG atlas 的 HQ 纹理模型，
+ * 失败回退逐顶点颜色的版本（见 [buildAndExportGlb]）。
  *
  * ## 为什么 PLY 不再是最终结果
  *
@@ -60,7 +63,9 @@ class ExportManager(context: Context) {
         val triangles: Int,
         val fileBytes: Long,
         val quality: Int,
-        val message: String
+        val message: String,
+        /** V0.6：是否带 HQ 纹理（内嵌 JPEG atlas）。false = 退回 vertex color。 */
+        val textured: Boolean = false
     )
 
     private val outputDir: File = context.getExternalFilesDir(null) ?: context.filesDir
@@ -193,6 +198,22 @@ class ExportManager(context: Context) {
         IntArray(0)
     }
 
+    /** V0.6：导出前几何清理统计（[NativeBridge.MESH_CLEANUP_STATS_SLOTS] 槽）。 */
+    fun meshCleanupStats(): IntArray = try {
+        val buf = IntArray(NativeBridge.MESH_CLEANUP_STATS_SLOTS)
+        if (NativeBridge.nativeGetMeshCleanupStats(buf)) buf else IntArray(0)
+    } catch (t: Throwable) {
+        IntArray(0)
+    }
+
+    /** V0.6：HQ 纹理烘焙统计（[NativeBridge.TEXTURE_STATS_SLOTS] 槽）。 */
+    fun textureStats(): IntArray = try {
+        val buf = IntArray(NativeBridge.TEXTURE_STATS_SLOTS)
+        if (NativeBridge.nativeGetTextureStats(buf)) buf else IntArray(0)
+    } catch (t: Throwable) {
+        IntArray(0)
+    }
+
     fun resetMesh() {
         try {
             NativeBridge.nativeResetMesh()
@@ -205,7 +226,11 @@ class ExportManager(context: Context) {
     // ------------------------------------------------------------------ GLB
 
     /**
-     * 后台构建网格并导出 GLB（vertex color）。回调在主线程。
+     * 后台构建网格并导出 GLB。回调在主线程。
+     *
+     * **V0.6 起是 textured-first**：先试 nativeBakeTexturedGlb（几何清理 + UV 展开
+     * + HQ 多视角纹理 + 内嵌 JPEG atlas 的自包含 GLB），失败才退回 nativeExportGlb
+     * 的逐顶点颜色版本。
      *
      * 这是**扫描结束时的默认动作**：一次会话结束后端到端地给出可用的 AR 模型。
      */
@@ -216,6 +241,7 @@ class ExportManager(context: Context) {
             var verts = 0
             var tris = 0
             var ok = false
+            var textured = false
             var msg = ""
             try {
                 ok = NativeBridge.nativeBuildMesh(q)
@@ -227,12 +253,34 @@ class ExportManager(context: Context) {
                     ok = verts > 0 && tris > 0
                 }
                 if (ok) {
-                    ok = NativeBridge.nativeExportGlb(file.absolutePath)
+                    // V0.6：优先烘焙 HQ 多视角纹理，产出内嵌 JPEG atlas 的自包含
+                    // GLB。清理（weld / 去漂浮分量 / ear-clipping 补小洞 / QEM）
+                    // **只作用在这份导出副本上** —— 屏幕上的 AR overlay 仍是 V0.5
+                    // 的 vertex color 网格，由 MeshEngine 自己那条链产生。
+                    textured = try {
+                        NativeBridge.nativeBakeTexturedGlb(
+                            file.absolutePath,
+                            ATLAS_RESOLUTION,
+                            MAX_TEXTURE_KEYFRAMES
+                        )
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "nativeBakeTexturedGlb failed", t)
+                        false
+                    }
+                    // 纹理失败不能连几何一起判废 —— 退回 V0.5 的 vertex color GLB。
+                    ok = textured ||
+                        try {
+                            NativeBridge.nativeExportGlb(file.absolutePath)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "nativeExportGlb failed", t)
+                            false
+                        }
                 }
                 msg = when {
                     !ok && verts == 0 -> "网格构建失败（体素场不足以提取表面）"
                     !ok -> "GLB 写入失败"
-                    else -> "网格已导出：${file.absolutePath}"
+                    textured -> "HQ 纹理模型已导出：${file.absolutePath}"
+                    else -> "网格已导出（vertex color；纹理烘焙未生效）：${file.absolutePath}"
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "buildAndExportGlb failed", t)
@@ -246,7 +294,8 @@ class ExportManager(context: Context) {
                 triangles = tris,
                 fileBytes = if (file.exists()) file.length() else 0L,
                 quality = q,
-                message = msg
+                message = msg,
+                textured = textured
             )
             main.post { onDone(res) }
         }
@@ -278,5 +327,11 @@ class ExportManager(context: Context) {
 
     companion object {
         private const val TAG = "ExportManager"
+
+        /** V0.6：纹理 atlas 边长。2K 是手机端画质与内存的折中。 */
+        private const val ATLAS_RESOLUTION = 2048
+
+        /** V0.6：最多挑多少个 HQ 视角做烘焙（native 侧还会按质量+视角多样性再筛）。 */
+        private const val MAX_TEXTURE_KEYFRAMES = 12
     }
 }
