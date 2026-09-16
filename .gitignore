@@ -9,5 +9,6 @@ local.properties
 .DS_Store
 *.apk
 .v07_backup_*/
+.v071_backup_*/
 .v06_backup_*/
 *.bak_before_*

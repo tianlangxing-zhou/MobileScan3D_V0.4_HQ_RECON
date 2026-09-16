@@ -158,6 +158,13 @@ static bool vinsPoseOk = false;
 static bool haveLastGoodVinsPose = false;
 static float lastGoodVinsT[3] = {0.f, 0.f, 0.f};
 static bool vinsLostAfterInit = false;
+// V0.7.0.1: current loss state, no longer a permanent latch.
+static uint64_t vinsRecoveryCount = 0;
+static uint64_t vinsRejectStreak = 0;
+static uint64_t depthSnapMatches = 0;
+static uint64_t depthSnapMisses = 0;
+static int64_t lastDepthSnapDiffNs = -1;
+static constexpr int64_t kDepthSnapMaxDiffNs = 80'000'000LL;
 static float rawVinsT[3] = {0.f, 0.f, 0.f};
 static float rawVinsQ[4] = {0.f, 0.f, 0.f, 1.f};
 static float acceptedVinsT[3] = {0.f, 0.f, 0.f};
@@ -966,7 +973,14 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 }
             }
 
-            if (sane && !vinsLostAfterInit) {
+            // V0.7.0.1: a transient bad pose must not permanently kill the session.
+            if (sane) {
+                if (vinsLostAfterInit) {
+                    ++vinsRecoveryCount;
+                }
+                vinsLostAfterInit = false;
+                vinsRejectStreak = 0;
+                vinsRejectReason = "";
                 vinsT[0] = vp[0];
                 vinsT[1] = vp[1];
                 vinsT[2] = vp[2];
@@ -1013,7 +1027,8 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 vinsPoseOk = true;
             } else {
                 vinsRejectCount++;
-                vinsRejectReason = "step_or_lost";
+                ++vinsRejectStreak;
+                vinsRejectReason = "step";
                 vinsPoseOk = false;
                 if (haveLastGoodVinsPose) {
                     if (!haveFirstReject) {
@@ -1040,6 +1055,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
         } else {
             if (poseOk) {
                 vinsRejectCount++;
+                ++vinsRejectStreak;
                 vinsRejectReason = "non_finite";
             }
             if (haveLastGoodVinsPose) {
@@ -1063,7 +1079,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
             vinsPoseOk = false;
         }
 
-        if (vinsPoseOk && !vinsLostAfterInit) {
+        if (vinsPoseOk) {
             makePose(R, T);
 
             bool accept = kf.consider((uint64_t)frameTs, ai.q().sharpness, ai.q().exposure,
@@ -1398,16 +1414,32 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         presenceFailStreak = 0;
     }
 
+    // V0.7.0.1 current-frame target debug:
+    // camera-space only; it must not depend on a VINS pose snapshot.
+    if (haveTi && maskOk) {
+        buildTargetDebugLayer(
+            depthForFusion, w, h, ti, targetMaskMat);
+        targetDebugTs = static_cast<uint64_t>(t);
+    }
+
     const FrameSnap* match = nullptr;
-    for (const auto& s : snaps) {
-        int64_t diff = (int64_t)s.ts - (int64_t)t;
-        if (diff < 0) {
-            diff = -diff;
+    int64_t bestSnapDiffNs = kDepthSnapMaxDiffNs;
+    for (const auto& snap : snaps) {
+        int64_t diff =
+            static_cast<int64_t>(snap.ts) -
+            static_cast<int64_t>(t);
+        if (diff < 0) diff = -diff;
+        if (diff < bestSnapDiffNs) {
+            bestSnapDiffNs = diff;
+            match = &snap;
         }
-        if (diff < 50000000LL) {
-            match = &s;
-            break;
-        }
+    }
+    if (match != nullptr) {
+        ++depthSnapMatches;
+        lastDepthSnapDiffNs = bestSnapDiffNs;
+    } else {
+        ++depthSnapMisses;
+        lastDepthSnapDiffNs = -1;
     }
 
     if (match != nullptr) {
@@ -1458,14 +1490,6 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             fuseTargetDepth(depthForFusion, w, h, *match, targetMaskMat, conf);
         }
 
-        // live 层用的是**这一帧**的 depth 与**这一帧**的 mask，
-        // 所以放在同一个 snap 匹配分支里，而不是另找一次。
-        // 只有 mask 有效才建：验收要求「绿色 live 点只存在于目标轮廓内」，
-        // mask 建不出来时宁可一个点都不画，也不要把整个 bbox 里的点放出去。
-        if (haveTi && maskOk) {
-            buildTargetDebugLayer(depthForFusion, w, h, ti, targetMaskMat);
-            targetDebugTs = static_cast<uint64_t>(t);
-        }
 
         // 记录本帧，供下一帧做时序一致性检查
         lastFusedDepth.assign(depthForFusion, depthForFusion + (size_t)w * h);
@@ -2002,6 +2026,16 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << "VINS reject count: " << vinsRejectCount << "\n"
       << "VINS reject reason: " << vinsRejectReason << "\n"
       << "VINS lost latch: " << (vinsLostAfterInit ? "true" : "false") << "\n"
+      << "VINS recoveries: " << vinsRecoveryCount
+      << " rejectStreak: " << vinsRejectStreak << "\n"
+      << "DepthPoseSnap: matches=" << depthSnapMatches
+      << " misses=" << depthSnapMisses
+      << " lastDiffMs="
+      << (lastDepthSnapDiffNs >= 0
+              ? (static_cast<double>(lastDepthSnapDiffNs) / 1e6)
+              : -1.0)
+      << " maxDiffMs=" << (static_cast<double>(kDepthSnapMaxDiffNs) / 1e6)
+      << "\n"
       << "VINS invalid feature depth resets: " << featureManagerInvalidDepthResetCount() << "\n";
 
     VinsHealth health;
@@ -2452,7 +2486,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPose(JNIEnv* env, jobject, jfl
     float pose[12];
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
-        if (!vinsPoseOk || vinsLostAfterInit || !haveLastGoodVinsPose) {
+        if (!vinsPoseOk || !haveLastGoodVinsPose) {
             return JNI_FALSE;
         }
         quatToR(acceptedVinsQ[0], acceptedVinsQ[1], acceptedVinsQ[2], acceptedVinsQ[3], pose);
