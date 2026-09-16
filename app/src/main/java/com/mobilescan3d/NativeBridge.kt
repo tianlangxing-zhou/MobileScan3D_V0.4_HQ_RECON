@@ -1,6 +1,21 @@
 package com.mobilescan3d
 object NativeBridge {
     init { System.loadLibrary("mobilescan3d") }
+
+    /**
+     * JNI 输出数组的槽数 —— **必须与 C++ 侧常量一致**。
+     *
+     * 把数字集中到一处，是因为「两边各写一个槽数」已经真实地造成过一次崩溃：
+     * 深度诊断从 4 槽扩到 7 槽时，native 侧 (`kDepthDiagSlots`) 和实时采样
+     * 都改了，`generateReport()` 里却还留着 `FloatArray(4)`。native 发现长度
+     * 不足会安全返回 0，但 Kotlin 继续访问 `dd[4]`，于是点「导出反馈报告」
+     * 直接 ArrayIndexOutOfBoundsException 退出。
+     *
+     * 新增诊断字段时只改这里 + 对应的 native 常量，调用方一律用这些常量建数组。
+     */
+    const val DEPTH_DIAGNOSTIC_SLOTS = 7
+    const val TARGET_STATE_SLOTS = 10
+    const val RENDER_POSE_SLOTS = 12
     external fun nativeCreate(w:Int,h:Int,fx:Float,fy:Float,cx:Float,cy:Float):Boolean
     external fun nativeDestroy()
     external fun nativeOnImu(t:Long,ax:Float,ay:Float,az:Float,gx:Float,gy:Float,gz:Float)

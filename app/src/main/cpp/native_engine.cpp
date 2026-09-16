@@ -819,7 +819,10 @@ Java_com_mobilescan3d_NativeBridge_nativeGetHudMetrics(JNIEnv* e, jobject) {
     return e->NewStringUTF(s.str().c_str());
 }
 
-// nativeGetDepthDiagnostics 的槽数（与 MainActivity 的 depthScaleDepthBuf 一致）
+// nativeGetDepthDiagnostics 的槽数。
+// **必须与 Kotlin 侧 NativeBridge.DEPTH_DIAGNOSTIC_SLOTS 保持一致。**
+// 这里做了长度检查、长度不足就安全返回 0；但如果调用方按旧槽数建数组、
+// 又按新槽数索引，越界会发生在 Kotlin 侧（「导出反馈报告」闪退那次就是这个形态）。
 static constexpr int kDepthDiagSlots = 7;
 
 extern "C" JNIEXPORT jint JNICALL

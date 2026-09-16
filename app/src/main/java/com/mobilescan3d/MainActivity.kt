@@ -97,8 +97,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     out.write(text.toByteArray())
                 }
                 android.widget.Toast.makeText(this, "报告已保存", android.widget.Toast.LENGTH_LONG).show()
-            } catch (e: Exception) {
-                android.widget.Toast.makeText(this, "保存失败：${e.message}", android.widget.Toast.LENGTH_LONG).show()
+            } catch (t: Throwable) {
+                android.util.Log.e("FeedbackReport", "write report failed", t)
+                android.widget.Toast.makeText(
+                    this,
+                    "报告写入失败：${t.javaClass.simpleName}: ${t.message ?: "unknown"}",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
             }
         }
     }
@@ -167,11 +172,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var captureState = "IDLE"
     // 深度尺度：只统计 raw↔VINS 的比例失配，绝不自动施加修正（见 DepthScaleEstimator）
     private val depthScaleEstimator = DepthScaleEstimator()
-    private val depthScaleTargetBuf = FloatArray(10)
-    // 槽位与 native_engine.cpp 的 kDepthDiagSlots 一致：
+    private val depthScaleTargetBuf = FloatArray(NativeBridge.TARGET_STATE_SLOTS)
+    // 槽位与 native_engine.cpp 的 kDepthDiagSlots（= NativeBridge.DEPTH_DIAGNOSTIC_SLOTS）一致：
     //   0 P10  1 median  2 P90  3 vinsMedian
     //   4 validPixels  5 sampleCount  6 roiArea
-    private val depthScaleDepthBuf = FloatArray(7)
+    private val depthScaleDepthBuf = FloatArray(NativeBridge.DEPTH_DIAGNOSTIC_SLOTS)
     private var lastAeState: Int? = null
     private var lastAwbState: Int? = null
     private var fps = 0f
@@ -1037,7 +1042,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun updateTargetOverlay() {
-        val out = FloatArray(10)
+        val out = FloatArray(NativeBridge.TARGET_STATE_SLOTS)
         val state = NativeBridge.nativeGetTargetState(out)
         targetState = state
         targetConfidence = out.getOrElse(5) { 0f }
@@ -1118,7 +1123,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         applyCaptureSettings()
     }
 
-    private fun generateReport() {
+    /**
+     * 只负责把报告拼成字符串，**不碰系统文件选择器**。
+     *
+     * 与 [exportFeedbackSafely] 拆开之后，失败原因能区分成两类：
+     *   - 这里抛异常   -> 「报告生成失败」（诊断字段/格式问题）
+     *   - launcher 抛  -> 「系统保存界面启动失败」（权限/URI 问题）
+     * 合在一起时只能看到一个笼统的 "保存失败"。
+     */
+    private fun buildFeedbackReport(): String {
         val sb = StringBuilder()
         sb.appendLine("MobileScan3D 配置反馈报告")
         sb.appendLine("时间戳: ${System.currentTimeMillis()}")
@@ -1267,7 +1280,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine()
         sb.appendLine("[7] Object Lock:")
         sb.appendLine("    enabled=$objectLockEnabled")
-        val out = FloatArray(10)
+        val out = FloatArray(NativeBridge.TARGET_STATE_SLOTS)
         val state = NativeBridge.nativeGetTargetState(out)
         sb.appendLine("    state=$state")
         sb.appendLine("    bboxCamera=(${out.getOrElse(1) { 0f }}, ${out.getOrElse(2) { 0f }}, ${out.getOrElse(3) { 0f }}, ${out.getOrElse(4) { 0f }})")
@@ -1280,12 +1293,34 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine(NativeBridge.nativeGetTargetDiagnostics())
         sb.appendLine()
         // ---- 深度尺度诊断：只上报可观测量，不自动乘 scale ----
-        val dd = FloatArray(4)
-        NativeBridge.nativeGetDepthDiagnostics(dd)
-        val targetDepthP10 = dd[0]
-        val targetDepthMedian = if (dd[1] > 0f) dd[1] else out.getOrElse(6) { 0f }
-        val targetDepthP90 = dd[2]
-        val vinsTriangulatedDepthMedian = dd[3]
+        // 缓冲区长度必须用常量，绝不手写数字。这里曾经写死 FloatArray(4)，
+        // 而 native 协议已经扩到 7 槽：native 发现长度不足会安全返回 0，
+        // Kotlin 却继续访问 dd[4]，于是点「导出反馈报告」直接
+        // ArrayIndexOutOfBoundsException 退出。另外 JNI 调用本身也包一层，
+        // 任何 native 侧异常都不应该让反馈流程把整个 APP 带走。
+        val dd = FloatArray(NativeBridge.DEPTH_DIAGNOSTIC_SLOTS)
+        val depthDiagOk = try {
+            NativeBridge.nativeGetDepthDiagnostics(dd) != 0
+        } catch (t: Throwable) {
+            android.util.Log.e("FeedbackReport", "nativeGetDepthDiagnostics failed", t)
+            false
+        }
+        // 一律走 getOrElse：即使 depthDiagOk 意外为 true，越界也不会崩。
+        val targetDepthP10 = if (depthDiagOk) dd.getOrElse(0) { 0f } else 0f
+        val targetDepthMedian = if (depthDiagOk && dd.getOrElse(1) { 0f } > 0f) {
+            dd.getOrElse(1) { 0f }
+        } else {
+            out.getOrElse(6) { 0f }
+        }
+        val targetDepthP90 = if (depthDiagOk) dd.getOrElse(2) { 0f } else 0f
+        val vinsTriangulatedDepthMedian =
+            if (depthDiagOk) dd.getOrElse(3) { 0f } else 0f
+        val targetDepthValidPixels =
+            if (depthDiagOk) dd.getOrElse(4) { 0f }.toInt() else 0
+        val targetDepthSampleCount =
+            if (depthDiagOk) dd.getOrElse(5) { 0f }.toInt() else 0
+        val targetDepthRoiArea =
+            if (depthDiagOk) dd.getOrElse(6) { 0f }.toInt() else 0
         val focusDiopters = if (::hqCapture.isInitialized) {
             hqCapture.stats.focusDiopters
         } else {
@@ -1314,9 +1349,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    targetDepthP90=$targetDepthP90")
         // 这三个是「上面的中位数到底可不可信」的前提。P10=P50=P90 且
         // validPixels 只有个位数时，说明 ROI 里几乎没有有效深度样本。
-        sb.appendLine("    targetDepthValidPixels=${dd[4].toInt()}")
-        sb.appendLine("    targetDepthSampleCount=${dd[5].toInt()}")
-        sb.appendLine("    targetDepthRoiArea=${dd[6].toInt()}")
+        sb.appendLine("    targetDepthValidPixels=$targetDepthValidPixels")
+        sb.appendLine("    targetDepthSampleCount=$targetDepthSampleCount")
+        sb.appendLine("    targetDepthRoiArea=$targetDepthRoiArea")
+        // 这一行必须留在报告里：下次再出现「报告里深度字段全是 0」时，
+        // 一眼就能区分是 native 没给数据，还是调用本身失败了。
+        sb.appendLine("    depthDiagnosticsOk=$depthDiagOk")
         sb.appendLine("    focusApproxMeters=$focusApproxMeters")
         sb.appendLine("    vinsTriangulatedDepthMedian=$vinsTriangulatedDepthMedian")
         // 三个字段名字自带方向，不会再读反：
@@ -1333,7 +1371,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine()
         sb.appendLine()
         sb.appendLine("[8] World-Locked Render:")
-        val renderPose = FloatArray(12)
+        val renderPose = FloatArray(NativeBridge.RENDER_POSE_SLOTS)
         val renderPoseValid = NativeBridge.nativeGetRenderPose(renderPose)
         sb.appendLine("    enabled=true")
         sb.appendLine("    poseSource=accepted_vins")
@@ -1356,8 +1394,36 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    autoYaw=false")
         sb.appendLine("    touchOrbit=false")
 
-        pendingReport = sb.toString()
-        createReportLauncher.launch("config_${sessionId}.txt")
+        return sb.toString()
+    }
+
+    /**
+     * 导出反馈报告的**安全入口**。
+     *
+     * 报告流程过去没有任何保护，任何一处写错（例如访问了长度不足的诊断数组）
+     * 都会让用户一点「导出反馈报告」就整个 APP 退出 —— 那正是我们需要
+     * 反馈报告的时刻，结果反而拿不到报告。
+     *
+     * 注意：`catch (Throwable)` 对 native 的 SIGSEGV 无效，但能挡住
+     * ArrayIndexOutOfBounds / 空状态 / 格式化异常这类 Java/Kotlin 错误。
+     */
+    private fun exportFeedbackSafely() {
+        val text = try {
+            buildFeedbackReport()
+        } catch (t: Throwable) {
+            android.util.Log.e("FeedbackReport", "buildFeedbackReport crashed", t)
+            pendingReport = null
+            toast("反馈报告生成失败：${t.javaClass.simpleName}: ${t.message ?: "unknown"}")
+            return
+        }
+        try {
+            pendingReport = text
+            createReportLauncher.launch("config_${sessionId}.txt")
+        } catch (t: Throwable) {
+            android.util.Log.e("FeedbackReport", "create document launcher failed", t)
+            pendingReport = null
+            toast("系统保存界面启动失败：${t.javaClass.simpleName}: ${t.message ?: "unknown"}")
+        }
     }
 
     private fun processImage(image: Image) {
@@ -1716,7 +1782,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         android.app.AlertDialog.Builder(this)
             .setTitle("导出")
             .setItems(arrayOf("导出反馈报告", "导出实验 PLY")) { _, which ->
-                if (which == 0) generateReport() else exportModel()
+                if (which == 0) exportFeedbackSafely() else exportModel()
             }
             .show()
     }
