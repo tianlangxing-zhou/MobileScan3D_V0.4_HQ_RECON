@@ -50,6 +50,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var reader: ImageReader? = null
+    private lateinit var hqCapture: HqCaptureController
     private var cameraThread: HandlerThread? = null
     private var sensorThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
@@ -162,6 +163,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var edgeModes = intArrayOf()
     private var aeLock = false
     private var awbLock = false
+    private var captureState = "IDLE"
+    private var scanLockedExposureNs = 0L
+    private var scanLockedIso = 0
+    private var scanLockedFocusDiopters = 0f
+    private var lastAeState: Int? = null
+    private var lastAwbState: Int? = null
     private var fps = 0f
     private var fpsFrames = 0
     private var fpsLastNs = 0L
@@ -223,6 +230,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 result.get(android.hardware.camera2.CaptureResult.CONTROL_AF_STATE)
             lastLensFocusDistance =
                 result.get(android.hardware.camera2.CaptureResult.LENS_FOCUS_DISTANCE)
+            lastAeState =
+                result.get(android.hardware.camera2.CaptureResult.CONTROL_AE_STATE)
+            lastAwbState =
+                result.get(android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE)
+            if (::hqCapture.isInitialized) {
+                hqCapture.onCaptureResult(result)
+            }
+            maybeLockScanParameters()
 
             val sensorTs = result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP)
             if (sensorTs != null) {
@@ -629,6 +644,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             reader = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 4).apply {
                 setOnImageAvailableListener({ r -> r.acquireLatestImage()?.let { processImage(it) } }, cameraHandler)
             }
+            if (::hqCapture.isInitialized) {
+                hqCapture.close()
+            }
+            hqCapture = HqCaptureController(this, chars, cameraHandler!!) { msg ->
+                toast(msg)
+            }
 
             cameraManager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
@@ -657,23 +678,41 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                         try { previewSurface?.release() } catch (_: Exception) {}
                         previewSurface = Surface(st)
                         texture.post { configureTransform(texture.width, texture.height) }
-                        camera.createCaptureSession(listOf(previewSurface!!, reader!!.surface), object : CameraCaptureSession.StateCallback() {
+                        val baseSurfaces = listOf(previewSurface!!, reader!!.surface)
+                        val hqSurfaces = hqCapture.prepareSurfaces(pSize, size)
+                        val primarySurfaces = baseSurfaces + hqSurfaces
+
+                        fun finishSession(session: CameraCaptureSession, hqActive: Boolean) {
+                            if (abandonedOpen) {
+                                session.close()
+                                return
+                            }
+                            hqCapture.onSessionConfigured(hqActive)
+                            captureSession = session
+                            // 会话配置完成后再应用一次变换：首个帧到达时
+                            // 部分 HAL 会重置 SurfaceTexture 的 transform
+                            texture.post { configureTransform(texture.width, texture.height) }
+                            texture.postDelayed({ configureTransform(texture.width, texture.height) }, 300L)
+                            applyCaptureSettings()
+                            started.set(true)
+                        }
+
+                        camera.createCaptureSession(primarySurfaces, object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(session: CameraCaptureSession) {
-                                if (abandonedOpen) {
-                                    session.close()
-                                    return
-                                }
-                                captureSession = session
-                                // 会话配置完成后再应用一次变换：首个帧到达时
-                                // 部分 HAL 会重置 SurfaceTexture 的 transform
-                                texture.post { configureTransform(texture.width, texture.height) }
-                                texture.postDelayed({ configureTransform(texture.width, texture.height) }, 300L)
-                                applyCaptureSettings()
-                                started.set(true)
+                                finishSession(session, true)
                             }
 
                             override fun onConfigureFailed(session: CameraCaptureSession) {
-                                toast("Camera session failed")
+                                hqCapture.detachSurfaces()
+                                camera.createCaptureSession(baseSurfaces, object : CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(fallback: CameraCaptureSession) {
+                                        finishSession(fallback, false)
+                                    }
+
+                                    override fun onConfigureFailed(fallback: CameraCaptureSession) {
+                                        toast("Camera session failed")
+                                    }
+                                }, cameraHandler)
                             }
                         }, cameraHandler)
                     } catch (e: Exception) {
@@ -840,6 +879,29 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         return (sensorOrientation - surfaceRotationDegrees * sign + 360) % 360
     }
 
+    private fun maybeLockScanParameters() {
+        if (!scanning || captureState != "CONVERGING" || !::hqCapture.isInitialized) return
+        val ae = lastAeState
+        val awb = lastAwbState
+        val af = lastAfState
+        val aeOk = ae == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+            ae == android.hardware.camera2.CaptureResult.CONTROL_AE_STATE_LOCKED
+        val awbOk = awb == android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE_CONVERGED ||
+            awb == android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE_LOCKED
+        val afOk = af == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+            af == android.hardware.camera2.CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+        if (!aeOk || !awbOk || !afOk) return
+
+        scanLockedExposureNs = exposureTimeNs ?: 0L
+        scanLockedIso = hqCapture.stats.iso
+        scanLockedFocusDiopters = lastLensFocusDistance ?: 0f
+        captureState = "SCAN_LOCKED"
+        hqCapture.stats.captureState = "SCAN_LOCKED"
+        aeLock = aeLockAvailable
+        awbLock = awbLockAvailable
+        applyCaptureSettings()
+    }
+
     private fun applyCaptureSettings() {
         val session = captureSession ?: return
         val camera = cameraDevice ?: return
@@ -849,11 +911,27 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                 addTarget(ps)
                 addTarget(readerSurface)
-                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                if (aeLockAvailable) set(CaptureRequest.CONTROL_AE_LOCK, aeLock)
+                val manualLocked = ::hqCapture.isInitialized &&
+                    hqCapture.caps.manualSensor &&
+                    captureState == "SCAN_LOCKED" &&
+                    scanLockedExposureNs > 0L
+                if (manualLocked) {
+                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, scanLockedExposureNs)
+                    set(CaptureRequest.SENSOR_SENSITIVITY, scanLockedIso.coerceAtLeast(100))
+                    set(CaptureRequest.SENSOR_FRAME_DURATION, scanLockedExposureNs + 16_000_000L)
+                } else {
+                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    if (aeLockAvailable) set(CaptureRequest.CONTROL_AE_LOCK, aeLock)
+                }
                 if (awbLockAvailable) set(CaptureRequest.CONTROL_AWB_LOCK, awbLock)
 
-                val afMode = if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
+                val scanFocusLocked = captureState == "SCAN_LOCKED" &&
+                    manualFocusAvailable &&
+                    scanLockedFocusDiopters > 0f
+                val afMode = if (scanFocusLocked) {
+                    CaptureRequest.CONTROL_AF_MODE_OFF
+                } else if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
                     CaptureRequest.CONTROL_AF_MODE_OFF
                 } else when {
                     fixedFocus -> CaptureRequest.CONTROL_AF_MODE_OFF
@@ -861,7 +939,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     else -> bestContinuousAfMode()
                 }
                 set(CaptureRequest.CONTROL_AF_MODE, afMode)
-                if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
+                if (scanFocusLocked) {
+                    set(CaptureRequest.LENS_FOCUS_DISTANCE, scanLockedFocusDiopters)
+                } else if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
                     set(CaptureRequest.LENS_FOCUS_DISTANCE, targetFocusDistance!!)
                 }
                 focusRegion?.let { region ->
@@ -1068,6 +1148,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         if (targetTrackedPoints in 1..19) warns.add("TARGET_LOW_FEATURES")
         if (previewRot != 0) warns.add("DISPLAY_ROTATION_NOT_APPLIED")
         if (frameMetaMiss > frameMetaHit / 20L && frameMetaHit > 0) warns.add("CAMERA_METADATA_LOSS")
+        if (::hqCapture.isInitialized && hqCapture.stats.lastCaptureRejectReason.isNotEmpty()) {
+            warns.add("HQ_CAPTURE_REJECT")
+        }
         if (warns.isEmpty()) {
             sb.appendLine("overall=PASS")
         } else {
@@ -1113,6 +1196,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    输出尺寸与标定缩放: activeArray=${activeArray.width()}x${activeArray.height()}  captureSize=${captureSize?.let { "${it.width}x${it.height}" }}")
         sb.appendLine("    降噪/锐化: 降噪最小化=${noiseModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)}  锐化关闭=${edgeModes.contains(CaptureRequest.EDGE_MODE_OFF)}")
         sb.appendLine()
+        if (::hqCapture.isInitialized) {
+            hqCapture.report(sb)
+            sb.appendLine()
+        }
         sb.appendLine("[5] 预览与坐标一致性:")
         sb.appendLine("    屏幕尺寸: ${screenW}x${screenH}")
         sb.appendLine("    支持的预览尺寸: $supportedSizes")
@@ -1285,8 +1372,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         lastPlyExportTs = null
         lastPlySessionId = null
         stabilization = false
-        aeLock = aeLockAvailable
-        awbLock = awbLockAvailable
+        aeLock = false
+        awbLock = false
+        captureState = "CONVERGING"
+        scanLockedExposureNs = 0L
+        scanLockedIso = 0
+        scanLockedFocusDiopters = 0f
+        if (::hqCapture.isInitialized) {
+            hqCapture.beginScan(sessionId)
+        }
         applyCaptureSettings()
         // 与相机帧处理线程串行化，避免 reset 期间相机线程正在遍历这些容器（native 崩溃）
         cameraHandler?.post {
@@ -1308,6 +1402,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         scanning = false
         aeLock = false
         awbLock = false
+        captureState = "IDLE"
+        if (::hqCapture.isInitialized) {
+            hqCapture.endScan()
+        }
         applyCaptureSettings()
         primaryButton.text = "实验扫描（非测量）"
         exportModel()
@@ -1368,6 +1466,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun onFrameTick(ts: Long) {
+        if (::hqCapture.isInitialized) {
+            hqCapture.onFrameTick(
+                ts,
+                scanning,
+                captureState == "SCAN_LOCKED",
+                cameraDevice,
+                captureSession
+            )
+        }
         fpsFrames++
         if (fpsLastNs == 0L) fpsLastNs = ts
         val dt = (ts - fpsLastNs) / 1_000_000_000.0
@@ -1588,6 +1695,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 remapDeviceToCamera(e.values[0], e.values[1], e.values[2], lastImu, 3)
                 lastGyrNs = e.timestamp
                 hasGyr = true
+                if (::hqCapture.isInitialized) {
+                    hqCapture.onImuSample(
+                        e.timestamp,
+                        lastImu[3], lastImu[4], lastImu[5],
+                        lastImu[0], lastImu[1], lastImu[2]
+                    )
+                }
             }
             else -> return
         }
@@ -1610,6 +1724,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         try { previewSurface?.release() } catch (_: Exception) {}
         previewSurface = null
         reader?.close(); reader = null
+        if (::hqCapture.isInitialized) {
+            hqCapture.close()
+        }
     }
 
     override fun onPause() {
