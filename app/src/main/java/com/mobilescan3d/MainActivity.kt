@@ -163,11 +163,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var edgeModes = intArrayOf()
     private var aeLock = false
     private var awbLock = false
+    // HQ 状态机只做展示用镜像；preview 的 3A 永远保持自动，不再跟随它切换锁定。
     private var captureState = "IDLE"
-    private var lockRequestedMirror = false
-    private var scanLockedExposureNs = 0L
-    private var scanLockedIso = 0
-    private var scanLockedFocusDiopters = 0f
+    // 深度尺度：只统计 raw↔VINS 的比例失配，绝不自动施加修正（见 DepthScaleEstimator）
+    private val depthScaleEstimator = DepthScaleEstimator()
+    private val depthScaleTargetBuf = FloatArray(10)
+    private val depthScaleDepthBuf = FloatArray(4)
     private var lastAeState: Int? = null
     private var lastAwbState: Int? = null
     private var fps = 0f
@@ -880,34 +881,22 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     /**
-     * 3A 锁定决策由 HqCaptureController 的状态机持有：
-     * WAIT_3A -> APPLY_LOCK -> VERIFY_LOCK -> SCAN_LOCKED -> CAPTURE，
-     * 只有 CaptureResult 真正确认锁定（AE/AWB/AF 全部 LOCKED）才会进入 SCAN_LOCKED。
-     * 这里只做状态镜像，并在「锁定生效 / 解除」的边沿重新下发 capture request。
+     * HQ 状态机（IDLE → WAIT_3A → READY → CAPTURE）只做「当前在干什么」的镜像。
+     *
+     * 这里**不再**跟随控制器去锁 preview 的 3A。旧实现会在 lockRequested 上升沿把
+     * AE_LOCK / AWB_LOCK 与手动曝光/焦距写回 repeating preview，结果 preview 的
+     * AE_MODE 被关成 OFF，而 AE_MODE=OFF 时 AE_STATE 按规范只会报 INACTIVE——
+     * 于是控制器自己要求的 VERIFY_LOCK 三重 LOCKED 永远不可能满足，
+     * 1366 次拍摄机会全部卡死，一张 HQ 都没拍到。
+     *
+     * 现在：preview 全程自动 3A（只负责「收敛」），真正的 3A 冻结只发生在
+     * HqCaptureController.buildLockedStillRequest() 的 still request 上。
      */
     private fun syncCaptureStateFromController() {
         if (!::hqCapture.isInitialized) return
         val st = hqCapture.stats
-        val phaseChanged = st.captureState != captureState
-        val lockEdge = st.lockRequested != lockRequestedMirror
-        if (!phaseChanged && !lockEdge) return
-
+        if (st.captureState == captureState) return
         captureState = st.captureState
-        if (st.lockRequested && !lockRequestedMirror) {
-            // 锁定生效：冻结已经验证过的曝光/ISO/焦距
-            scanLockedExposureNs = st.exposureNs
-            scanLockedIso = st.iso
-            scanLockedFocusDiopters = st.focusDiopters
-            aeLock = aeLockAvailable
-            awbLock = awbLockAvailable
-        } else if (!st.lockRequested && lockRequestedMirror) {
-            aeLock = false
-            awbLock = false
-        }
-        lockRequestedMirror = st.lockRequested
-        if (scanning) {
-            applyCaptureSettings()
-        }
     }
 
     private fun applyCaptureSettings() {
@@ -919,28 +908,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                 addTarget(ps)
                 addTarget(readerSurface)
-                // lockActive 由 HqCaptureController 的 3A 状态机决定（真锁定确认后才为 true）
-                val lockActive = ::hqCapture.isInitialized && hqCapture.stats.lockRequested
-                val manualLocked = lockActive &&
-                    hqCapture.caps.manualSensor &&
-                    scanLockedExposureNs > 0L
-                if (manualLocked) {
-                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, scanLockedExposureNs)
-                    set(CaptureRequest.SENSOR_SENSITIVITY, scanLockedIso.coerceAtLeast(100))
-                    set(CaptureRequest.SENSOR_FRAME_DURATION, scanLockedExposureNs + 16_000_000L)
-                } else {
-                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                    if (aeLockAvailable) set(CaptureRequest.CONTROL_AE_LOCK, aeLock)
-                }
+                // Preview 的 3A 全程保持自动。
+                // HQ 采集只要求「收敛」，不要求「锁定」；真正把参数冻住的地方是
+                // HqCaptureController.buildLockedStillRequest()（still request）。
+                // 这里绝不能再跟随控制器写 AE_MODE_OFF / 手动曝光 / 手动焦距——
+                // 那会把 AE_STATE 打成 INACTIVE，让控制器自己的收敛判定永远不成立。
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                if (aeLockAvailable) set(CaptureRequest.CONTROL_AE_LOCK, aeLock)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                 if (awbLockAvailable) set(CaptureRequest.CONTROL_AWB_LOCK, awbLock)
 
-                val scanFocusLocked = lockActive &&
-                    manualFocusAvailable &&
-                    scanLockedFocusDiopters > 0f
-                val afMode = if (scanFocusLocked) {
-                    CaptureRequest.CONTROL_AF_MODE_OFF
-                } else if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
+                val afMode = if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
                     CaptureRequest.CONTROL_AF_MODE_OFF
                 } else when {
                     fixedFocus -> CaptureRequest.CONTROL_AF_MODE_OFF
@@ -948,9 +926,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     else -> bestContinuousAfMode()
                 }
                 set(CaptureRequest.CONTROL_AF_MODE, afMode)
-                if (scanFocusLocked) {
-                    set(CaptureRequest.LENS_FOCUS_DISTANCE, scanLockedFocusDiopters)
-                } else if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
+                if (targetAfLockEnabled && targetFocusLocked && targetFocusDistance != null && manualFocusAvailable) {
                     set(CaptureRequest.LENS_FOCUS_DISTANCE, targetFocusDistance!!)
                 }
                 focusRegion?.let { region ->
@@ -1000,11 +976,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    /**
+     * Preview 的连续自动对焦模式。
+     *
+     * 优先 CONTINUOUS_PICTURE：本 app 的交付物是 HQ 静帧，画面构图不变的前提下
+     * 对焦精度比「录像模式的平滑度」更重要；拿到更准的 LENS_FOCUS_DISTANCE
+     * 才能让 burst 的冻结焦距更可信。不支持时才退回 CONTINUOUS_VIDEO。
+     */
     private fun bestContinuousAfMode(): Int = when {
-        afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) ->
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
         afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) ->
             CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+        afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) ->
+            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
         else -> CaptureRequest.CONTROL_AF_MODE_AUTO
     }
 
@@ -1322,8 +1305,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    targetDepthP90=$targetDepthP90")
         sb.appendLine("    focusApproxMeters=$focusApproxMeters")
         sb.appendLine("    vinsTriangulatedDepthMedian=$vinsTriangulatedDepthMedian")
+        // 下面两个是同一比例的两种取法，保留旧字段避免报告历史断裂：
+        // depthScaleCandidateFocus = raw/focus，depthScaleCandidateVins = raw/vins
         sb.appendLine("    depthScaleCandidateFocus=$depthScaleCandidateFocus")
         sb.appendLine("    depthScaleCandidateVins=$depthScaleCandidateVins")
+        // [7.2] 深度尺度估计器：scale = vins/raw，只统计不施加（samples ≥ 30 且 MAD/median < 0.12
+        // 且秒级窗口无漂移才算稳定；这一轮绝不把它乘回深度/点云）
+        sb.appendLine("[7.2] DepthScaleEstimator (scale = vinsDepthMedian / targetRawDepthMedian，只记录):")
+        depthScaleEstimator.report(sb, "    ")
+        sb.appendLine()
         sb.appendLine()
         sb.appendLine("[8] World-Locked Render:")
         val renderPose = FloatArray(12)
@@ -1420,10 +1410,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         aeLock = false
         awbLock = false
         captureState = "IDLE"
-        scanLockedExposureNs = 0L
-        scanLockedIso = 0
-        scanLockedFocusDiopters = 0f
-        lockRequestedMirror = false
+        depthScaleEstimator.reset()
         if (::hqCapture.isInitialized) {
             hqCapture.beginScan(sessionId)
             // 状态机由 HqCaptureController 持有，这里只做镜像
@@ -1451,7 +1438,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         aeLock = false
         awbLock = false
         captureState = "IDLE"
-        lockRequestedMirror = false
         if (::hqCapture.isInitialized) {
             hqCapture.endScan()
         }
@@ -1514,10 +1500,36 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    /**
+     * 深度尺度采样：raw 目标深度 ↔ VINS 三角化深度的比例失配。
+     *
+     * **只统计，不修正**。真正的判定与统计在 [DepthScaleEstimator] 里；
+     * 这里的职责只是把两个可观测深度按节流频率喂进去。
+     * `nativeGetTargetState` / `nativeGetDepthDiagnostics` 内部都各自持锁，
+     * 与本函数所在的相机线程没有嵌套持锁关系（nativeOnCameraFrame 早已返回）。
+     */
+    private fun sampleDepthScale(nowNs: Long) {
+        if (!objectLockEnabled) return
+        val state = NativeBridge.nativeGetTargetState(depthScaleTargetBuf)
+        NativeBridge.nativeGetDepthDiagnostics(depthScaleDepthBuf)
+        depthScaleEstimator.maybeSample(
+            nowNs = nowNs,
+            stateCode = state,
+            confidence = depthScaleTargetBuf[5],
+            trackedPoints = depthScaleTargetBuf[8].toInt(),
+            inlierRatio = depthScaleTargetBuf[9],
+            targetRawDepthMedian = depthScaleDepthBuf[1],
+            vinsDepthMedian = depthScaleDepthBuf[3]
+        )
+    }
+
     private fun onFrameTick(ts: Long) {
         if (::hqCapture.isInitialized) {
             hqCapture.onFrameTick(ts, scanning, cameraDevice, captureSession)
             syncCaptureStateFromController()
+        }
+        if (scanning) {
+            sampleDepthScale(ts)
         }
         fpsFrames++
         if (fpsLastNs == 0L) fpsLastNs = ts

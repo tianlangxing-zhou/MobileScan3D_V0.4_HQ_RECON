@@ -43,27 +43,25 @@ data class HqCameraCaps(
 )
 
 data class HqCaptureStats(
-    // 状态机：IDLE / WAIT_3A / APPLY_LOCK / VERIFY_LOCK / SCAN_LOCKED / CAPTURE
+    // 状态机：IDLE / WAIT_3A / READY / CAPTURE
     var captureState: String = "IDLE",
-    var lockRequested: Boolean = false,
-    var lockVerifyStreak: Int = 0,
-    var lockAttempts: Int = 0,
-    var lockFailReason: String = "",
     var sessionCombinationSupported: Boolean = false,
     var previewSize: String = "unknown",
     var analysisYuvSize: String = "unknown",
     var jpegSize: String = "unknown",
     var rawSize: String = "unknown",
+    // 下面三项是「硬件实际报了什么」的纯观测值，不再参与任何决策
     var aeState: Int? = null,
     var aeLocked: Boolean = false,
     var awbState: Int? = null,
     var awbLocked: Boolean = false,
     var afState: Int? = null,
     var afLocked: Boolean = false,
-    // 逐项锁定校验结果（只有 CaptureResult 真正确认才算 true）
-    var aeVerified: Boolean = false,
-    var awbVerified: Boolean = false,
-    var afVerified: Boolean = false,
+    // 3A 收敛判据的逐项连续帧数：卡住时能立刻看出是哪一路没过，而不是只看一个总数
+    var readyAeStreak: Int = 0,
+    var readyAwbStreak: Int = 0,
+    var readyAfStreak: Int = 0,
+    var readyBlockReason: String = "",
     var threeAReady: Boolean = false,
     var exposureNs: Long = 0L,
     var iso: Int = 0,
@@ -110,6 +108,14 @@ data class HqCaptureStats(
     var previewClippedPercent: Float = 0f,
     var previewUnderexposedPercent: Float = 0f,
     var previewLumaSamples: Int = 0,
+    // 亮度分位：欠曝判定的主判据。只看「暗像素占比」会把黑色物体/阴影误判成欠曝。
+    var lumaP05: Float = 0f,
+    var lumaP50: Float = 0f,
+    var lumaP95: Float = 0f,
+    /** 已连续稳定的帧数（陀螺 + 位移同时达标） */
+    var stableFrames: Int = 0,
+    /** 分位判据给出的欠曝结论（P50/P95 双低），与暗像素占比无关 */
+    var realUnderexposed: Boolean = false,
     var alignmentInliers: Float = 0f,
     var alignmentRmseMean: Float = 0f,
     var alignmentRmseMax: Float = 0f,
@@ -189,28 +195,51 @@ class HqCaptureController(
     companion object {
         const val STATE_IDLE = "IDLE"
         const val STATE_WAIT_3A = "WAIT_3A"
-        const val STATE_APPLY_LOCK = "APPLY_LOCK"
-        const val STATE_VERIFY_LOCK = "VERIFY_LOCK"
-        const val STATE_SCAN_LOCKED = "SCAN_LOCKED"
+        const val STATE_READY = "READY"
         const val STATE_CAPTURE = "CAPTURE"
 
-        /** 连续多少个 CaptureResult 确认锁定后才算真锁定 */
-        private const val LOCK_VERIFY_STREAK = 3
-        /** 3A 收敛确认的连续帧数（进入 APPLY_LOCK 的门槛） */
+        /**
+         * 3A「已收敛」需要连续确认的帧数。
+         *
+         * 注意这里只要求收敛（AE CONVERGED / AWB CONVERGED / AF 已合焦），
+         * **不要求硬件进入 LOCKED**。旧状态机额外要求 VERIFY_LOCK 三重 LOCKED，
+         * 而锁定请求本身会把 preview 的 AE_MODE/AF_MODE 关成 OFF，
+         * 关掉之后 AE_STATE/AF_STATE 只会报 INACTIVE —— 校验条件和它自己的副作用
+         * 互相矛盾，于是 1366 次拍摄机会全部超时，一张 HQ 都没拍到。
+         */
         private const val READY_STREAK = 2
-        /** APPLY_LOCK 等待确认的超时 */
-        private const val APPLY_LOCK_TIMEOUT_NS = 1_500_000_000L
         /** burst 冷却区间 0.8~1.2s */
         private const val BURST_COOLDOWN_MIN_NS = 800_000_000L
         private const val BURST_COOLDOWN_MAX_NS = 1_200_000_000L
         private const val RETRY_COOLDOWN_NS = 1_500_000_000L
-        /** 触发前的手持稳定门限 */
-        private const val MAX_GYRO_RMS = 0.05f
-        private const val MAX_VINS_DISP_200MS = 0.05f
-        /** 触发前的曝光预检门限：clipping 与暗部同时达标才允许发 still capture */
+        /**
+         * 稳定窗口门限：gyroRms ≤ 0.08 rad/s 且 VINS 200ms 位移 ≤ 0.015。
+         *
+         * 陀螺门限从 0.05 放宽到 0.08 —— 实机报告里 gyroRms=0.3368 是在用户
+         * 主动移动手机时采到的，0.05 对「边走边扫」的场景过严。
+         * 位移门限反而收紧到 0.015：转视角和位移要区分对待，HQ burst 怕的是平移。
+         */
+        private const val MAX_GYRO_RMS = 0.08f
+        private const val MAX_VINS_DISP_200MS = 0.015f
+        /**
+         * 稳定窗口长度：4 帧 ≈ 130ms @30fps，落在评审建议的 100~200ms 区间。
+         * 单帧稳定没有意义 —— 扫过物体时几乎每帧都在动，但只要用户稍微停一下，
+         * 连续 4 帧就能满足，于是自动拍一组 HQ；继续移动则不拍。
+         */
+        private const val STABLE_WINDOW_FRAMES = 4
+        /** 触发前的高光预检门限 */
         private const val MAX_PREVIEW_CLIP_PERCENT = 5.0f
-        private const val MAX_PREVIEW_UNDEREXPOSED_PERCENT = 20.0f
-        /** 已锁定时若高光仍严重过曝，解锁重收敛 */
+        /**
+         * 暗部兜底门限（放宽到 35%）。
+         *
+         * 「画面里 26% 像素很暗」不等于照片欠曝：拍黑色物体或背景有阴影时，
+         * 本来就该有大量暗像素。主判据改用亮度分位（见下），这个百分比只做兜底。
+         */
+        private const val MAX_PREVIEW_UNDEREXPOSED_PERCENT = 35.0f
+        /** 真正欠曝的分位判据：整体中位亮度低，且高光也上不去 */
+        private const val MIN_LUMA_P50 = 35f
+        private const val MIN_LUMA_P95 = 120f
+        /** 冻结参数期间若高光仍严重过曝，放弃这套参数重新等待收敛 */
         private const val OVEREXPOSURE_RECOVER_PERCENT = 6.0f
         /**
          * burst 内「最清晰一帧」的清晰度下限（640 长边灰度上的 Laplacian 方差）。
@@ -266,16 +295,19 @@ class HqCaptureController(
     private var previewClipEma = 0f
     private var previewUnderEma = 0f
     private var previewLumaInit = false
+    /** 256 桶直方图，复用以免每帧分配（受 lumaLock 保护） */
+    private val lumaHist = IntArray(256)
 
     // 状态机
     private var currentPhase = STATE_IDLE
-    private var lockApplyStartNs = 0L
-    /** WAIT_3A 用：3A 处于「已收敛」的连续帧数 */
+    /** 3A 三条判据各自的连续满足帧数（分开是为了卡住时能定位到具体哪一路） */
+    private var readyAeStreak = 0
+    private var readyAwbStreak = 0
+    private var readyAfStreak = 0
+    /** 三条判据「同时」满足的连续帧数，达到 READY_STREAK 即认为 3A 已收敛 */
     private var readyStreak = 0
-    /** VERIFY_LOCK 用：CaptureResult 确认「已锁定」的连续帧数 */
-    private var lockedStreak = 0
-    private var lastManualExpNs = 0L
-    private var lastManualIso = 0
+    /** 稳定窗口计数：陀螺与位移同时达标的连续帧数 */
+    private var stableFrames = 0
     private var exposureRecoveryAttempts = 0
     private var lastExposureRecoveryNs = 0L
     /** 最近一个「3A 已收敛」的 CaptureResult，冻结参数从这里抓取 */
@@ -417,10 +449,17 @@ class HqCaptureController(
         stats.burstAwbMode = "NONE"
         stats.lastCaptureRejectReason = ""
         stats.triggerRejectReason = ""
-        stats.lockFailReason = ""
-        stats.lockAttempts = 0
-        stats.lockVerifyStreak = 0
+        stats.readyBlockReason = ""
         stats.threeAReady = false
+        readyStreak = 0
+        readyAeStreak = 0
+        readyAwbStreak = 0
+        readyAfStreak = 0
+        stats.readyAeStreak = 0
+        stats.readyAwbStreak = 0
+        stats.readyAfStreak = 0
+        stableFrames = 0
+        stats.stableFrames = 0
         locked3a = null
         lastConvergedResult = null
         lastResultSensorTs = 0L
@@ -464,25 +503,39 @@ class HqCaptureController(
         stats.iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
         stats.focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
 
-        val aeOk = verifyAe(result)
-        val awbOk = verifyAwb(result)
-        val afOk = verifyAf(result)
-        stats.aeVerified = aeOk
-        stats.awbVerified = awbOk
-        stats.afVerified = afOk
-        stats.afLocked = afOk
+        // 只判「收敛」，不判「锁定」。锁定请求本身会把 preview 的 AE/AF 关成 OFF，
+        // 关掉之后 AE_STATE/AF_STATE 只会报 INACTIVE —— 校验条件和它自己的副作用
+        // 互相矛盾，那正是上一版 1366 次机会全部卡死的原因。
+        val aeOk = aeReady(result)
+        val awbOk = awbReady(result)
+        val afOk = afReady(result)
+        stats.afLocked = result.get(CaptureResult.CONTROL_AF_STATE) ==
+            CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
 
-        // 两套判据必须分开，否则 WAIT_3A 阶段永远等不到「已锁定」而死锁：
-        //  - readyStreak  : 3A 已收敛（AE CONVERGED / AF PASSIVE_FOCUSED 以上）
-        //  - lockedStreak : CaptureResult 真正确认锁定（AE/AWB LOCKED + AF FOCUSED_LOCKED）
-        val converged = aeReady(result) && awbReady(result) && afReady(result)
+        readyAeStreak = if (aeOk) readyAeStreak + 1 else 0
+        readyAwbStreak = if (awbOk) readyAwbStreak + 1 else 0
+        readyAfStreak = if (afOk) readyAfStreak + 1 else 0
+        stats.readyAeStreak = readyAeStreak
+        stats.readyAwbStreak = readyAwbStreak
+        stats.readyAfStreak = readyAfStreak
+
+        val converged = aeOk && awbOk && afOk
         readyStreak = if (converged) readyStreak + 1 else 0
-        lockedStreak = if (aeOk && awbOk && afOk) lockedStreak + 1 else 0
-        stats.lockVerifyStreak = lockedStreak
         stats.threeAReady = readyStreak >= READY_STREAK
+        // 卡住时要说清楚是哪一路没过，而不是只给一个总的 false
+        stats.readyBlockReason = when {
+            converged -> ""
+            !aeOk && !awbOk && !afOk -> "AE+AWB+AF 均未收敛"
+            !aeOk && !awbOk -> "AE+AWB 未收敛"
+            !aeOk && !afOk -> "AE+AF 未收敛"
+            !awbOk && !afOk -> "AWB+AF 未收敛"
+            !aeOk -> "AE 未收敛(state=${stats.aeState})"
+            !awbOk -> "AWB 未收敛(state=${stats.awbState})"
+            else -> "AF 未合焦(state=${stats.afState})"
+        }
         if (converged) {
-            // 只有「正在收敛」的结果才是冻结参数的可靠来源：这时 AE/AWB/AF 的数值
-            // 全部是硬件自己算出来的，而不是我们下发到一半的锁定请求造成的中间态。
+            // 收敛时的结果才是冻结参数的可靠来源：这些数值是硬件自己算出来的，
+            // 不是我们下发到一半的锁定请求造成的中间态。
             lastConvergedResult = result
         }
 
@@ -519,14 +572,23 @@ class HqCaptureController(
         }
     }
 
-    /** AF 是否已合焦（PASSIVE_SCAN 不算） */
+    /**
+     * AF 是否已合焦。
+     *
+     * PASSIVE_SCAN（正在搜索）不算就绪。
+     * INACTIVE 在「preview 全程自动对焦」的前提下可以接受：它表示 AF 算法当前没有
+     * 在移动镜头，而不是「AF 被我们关掉了」—— 后者只会在我们主动写 AF_MODE_OFF
+     * 时出现，而那种情况上面那一行已经直接返回 true 了。
+     * 真正在追焦/拉风箱时硬件报的是 PASSIVE_SCAN，仍然会被拒。
+     */
     private fun afReady(result: TotalCaptureResult): Boolean {
         if (result.get(CaptureResult.CONTROL_AF_MODE) == CaptureRequest.CONTROL_AF_MODE_OFF) {
             return true
         }
         return when (result.get(CaptureResult.CONTROL_AF_STATE)) {
             CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED,
-            CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED -> true
+            CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED,
+            CaptureResult.CONTROL_AF_STATE_INACTIVE -> true
             else -> false
         }
     }
@@ -537,56 +599,6 @@ class HqCaptureController(
             CaptureResult.CONTROL_AWB_STATE_LOCKED -> true
             else -> false
         }
-    }
-
-    /** AE 是否已被 CaptureResult 确认为「已锁定」 */
-    private fun verifyAe(result: TotalCaptureResult): Boolean {
-        if (result.get(CaptureResult.CONTROL_AE_MODE) == CaptureRequest.CONTROL_AE_MODE_OFF) {
-            // 手动曝光：以曝光时间/ISO 的稳定性代替 AE_STATE
-            val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
-            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
-            val expStable = lastManualExpNs <= 0L || abs(exp - lastManualExpNs) <= max(1L, lastManualExpNs / 100L)
-            val isoStable = lastManualIso <= 0 || abs(iso - lastManualIso) <= max(1, lastManualIso / 100)
-            lastManualExpNs = exp
-            lastManualIso = iso
-            return exp > 0L && iso > 0 && expStable && isoStable
-        }
-        val state = result.get(CaptureResult.CONTROL_AE_STATE)
-        val stateOk = state == CaptureResult.CONTROL_AE_STATE_LOCKED ||
-            (!caps.aeLock && state == CaptureResult.CONTROL_AE_STATE_CONVERGED)
-        val lockOk = !caps.aeLock || (result.get(CaptureResult.CONTROL_AE_LOCK) ?: false)
-        return stateOk && lockOk
-    }
-
-    private fun verifyAwb(result: TotalCaptureResult): Boolean {
-        val state = result.get(CaptureResult.CONTROL_AWB_STATE)
-        return if (caps.awbLock) {
-            state == CaptureResult.CONTROL_AWB_STATE_LOCKED &&
-                (result.get(CaptureResult.CONTROL_AWB_LOCK) ?: false)
-        } else {
-            state == CaptureResult.CONTROL_AWB_STATE_CONVERGED ||
-                state == CaptureResult.CONTROL_AWB_STATE_LOCKED
-        }
-    }
-
-    private fun verifyAf(result: TotalCaptureResult): Boolean {
-        val mode = result.get(CaptureResult.CONTROL_AF_MODE)
-        if (mode == CaptureRequest.CONTROL_AF_MODE_OFF) {
-            if (!caps.manualFocus) {
-                // 定焦设备：没有可锁定的对焦马达，视为已确定
-                return true
-            }
-            val d = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
-            return d > 0f
-        }
-        val state = result.get(CaptureResult.CONTROL_AF_STATE)
-        if (state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED) {
-            return true
-        }
-        // 连续对焦模式下若拿不到可锁定的焦距（LENS_FOCUS_DISTANCE 不可用），
-        // 只接受「已合焦」PASSIVE_FOCUSED；仍在扫描的 PASSIVE_SCAN 一律不接受。
-        return stats.focusDiopters <= 0f &&
-            state == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
     }
 
     // ------------------------------------------------------------- 冻结 3A 快照
@@ -708,67 +720,62 @@ class HqCaptureController(
         }
         currentPhase = phase
         stats.captureState = phase
-        stats.lockRequested = phase == STATE_APPLY_LOCK ||
-            phase == STATE_VERIFY_LOCK ||
-            phase == STATE_SCAN_LOCKED ||
-            phase == STATE_CAPTURE
+        // 注意：这里不再有任何 lockRequested 概念。
+        // preview 全程自动 3A，控制器只负责「什么时候可以拍」，不负责去锁预览。
         if (phase == STATE_WAIT_3A) {
-            lockedStreak = 0
-            stats.lockVerifyStreak = 0
-            lastManualExpNs = 0L
-            lastManualIso = 0
+            readyAeStreak = 0
+            readyAwbStreak = 0
+            readyAfStreak = 0
+            readyStreak = 0
+            stats.readyAeStreak = 0
+            stats.readyAwbStreak = 0
+            stats.readyAfStreak = 0
             stats.threeAReady = false
+            stableFrames = 0
             // 退回重新收敛后，之前抓的冻结参数已经不对应当前光照，必须丢弃重抓
             locked3a = null
         }
     }
 
     /**
-     * WAIT_3A -> APPLY_LOCK -> VERIFY_LOCK -> SCAN_LOCKED -> CAPTURE
-     * 只有 CaptureResult 真正确认锁定（AE/AWB/AF 全部达到锁定态）才允许 HQ burst。
+     * IDLE -> WAIT_3A -> READY -> CAPTURE
+     *
+     * 只要求 3A「收敛」，不要求它「锁定」。
+     * 真正的手动冻结只发生在 [buildLockedStillRequest]：拍 burst 那一刻把最近一次
+     * 收敛结果写进 still request。preview 全程保持自动 3A，随时适应新角度。
+     *
+     * 职责因此变得很清楚：
+     *   preview  —— 永远自动适应场景
+     *   收敛     —— 触发 WAIT_3A -> READY，并在跃迁处抓一份 Locked3A 快照
+     *   burst    —— 5 帧使用完全相同的手动参数
+     *   burst 后 —— 回到 READY；若场景已变，自动回到 WAIT_3A 重新收敛
      */
     private fun advanceStateMachine(nowNs: Long) {
         when (currentPhase) {
             STATE_WAIT_3A -> {
-                // 注意：这里用「已收敛」判据。AE=SEARCHING(1)、AF=PASSIVE_SCAN(1)
-                // 都不算就绪，只有真正收敛/合焦才允许下发锁定。
-                if (readyStreak >= READY_STREAK) {
-                    stats.lockAttempts++
-                    lockApplyStartNs = nowNs
-                    lockedStreak = 0
-                    setPhase(STATE_APPLY_LOCK)
+                // 需要「新鲜」的收敛结果 + 连续 readyStreak 帧。
+                // AE=SEARCHING、AF=PASSIVE_SCAN 都不算收敛。
+                if (readyStreak >= READY_STREAK && lastConvergedResult != null) {
+                    // 3A 刚收敛，趁现在把参数抓下来冻结。
+                    // 之后的 burst 全部用这套值下发，不再依赖 AE/AWB/AF 的 lock 是否真的生效。
+                    locked3a = snapshot3A()
+                    stats.readyBlockReason = ""
+                    stats.threeAReady = true
+                    stableFrames = 0
+                    setPhase(STATE_READY)
+                    onHint("3A 已收敛，开始采集高质量关键帧")
                 }
             }
 
-            STATE_APPLY_LOCK -> {
-                // 锁定请求由 MainActivity 依据 stats.lockRequested 下发，
-                // 这里只需等下一批结果回来做校验
-                setPhase(STATE_VERIFY_LOCK)
-            }
-
-            STATE_VERIFY_LOCK -> {
-                if (lockedStreak >= LOCK_VERIFY_STREAK) {
-                    stats.lockFailReason = ""
-                    setPhase(STATE_SCAN_LOCKED)
-                    onHint("3A 已确认锁定，开始采集高质量关键帧")
-                } else if (nowNs - lockApplyStartNs > APPLY_LOCK_TIMEOUT_NS) {
-                    stats.lockFailReason =
-                        "3A 锁定超时 AE=${stats.aeState} AF=${stats.afState} AWB=${stats.awbState}"
-                    stats.lockAttempts++
-                    lockApplyStartNs = nowNs
-                    setPhase(STATE_WAIT_3A)
-                    onHint("3A 锁定未被确认，重新收敛")
-                }
-            }
-
-            STATE_SCAN_LOCKED, STATE_CAPTURE -> {
-                // 锁定后续若漂移，退回重新收敛
-                if (lockedStreak == 0 && stats.aeState == CaptureResult.CONTROL_AE_STATE_SEARCHING) {
-                    stats.lockFailReason = "AE 漂移，重新锁定"
+            STATE_READY, STATE_CAPTURE -> {
+                // 不再要求 AE/AWB/AF LOCKED。
+                // 若自动曝光重新开始搜索，说明场景变了（换了角度/光照），
+                // 下一次 burst 前重新等收敛。CAPTURE 期间不打断，让在飞的 burst 跑完。
+                if (!stats.threeAReady && currentPhase == STATE_READY) {
                     setPhase(STATE_WAIT_3A)
                     return
                 }
-                // 高光严重过曝：不要锁死一个过曝的曝光，主动解锁重收敛
+                // 高光严重过曝：不要拿一套过曝的曝光去拍，丢掉快照重新收敛
                 if (stats.previewClippedPercent > OVEREXPOSURE_RECOVER_PERCENT &&
                     exposureRecoveryAttempts < MAX_EXPOSURE_RECOVERY_ATTEMPTS &&
                     nowNs - lastExposureRecoveryNs > EXPOSURE_RECOVERY_COOLDOWN_NS
@@ -776,7 +783,7 @@ class HqCaptureController(
                     exposureRecoveryAttempts++
                     lastExposureRecoveryNs = nowNs
                     stats.triggerRejectReason =
-                        "高光过曝(${"%.1f".format(stats.previewClippedPercent)}%)，解锁重收敛"
+                        "高光过曝(${"%.1f".format(stats.previewClippedPercent)}%)，重新收敛"
                     onHint("高光过曝，重新收敛曝光")
                     setPhase(STATE_WAIT_3A)
                 }
@@ -786,7 +793,14 @@ class HqCaptureController(
 
     // ------------------------------------------------------------------ preview
 
-    /** 粗采样 Y 平面算曝光直方图，用于拍摄前门控（约 1/64 像素，开销可忽略） */
+    /**
+     * 粗采样 Y 平面算亮度分布，用于拍摄前门控（约 1/64 像素，开销可忽略）。
+     *
+     * 除了暗/亮像素占比，还给出 P05/P50/P95 分位 —— 只有百分比是不够的：
+     * 拍黑色物体、背景有阴影时，画面里本来就该有大量暗像素，
+     * 「26% 像素很暗」并不等于照片欠曝。所以欠曝判定的主判据用分位，
+     * 百分比只作为放宽后的兜底。
+     */
     fun onPreviewLuma(y: ByteArray, width: Int, height: Int, rowStride: Int) {
         if (width <= 0 || height <= 0 || rowStride <= 0 || y.isEmpty()) {
             return
@@ -794,6 +808,8 @@ class HqCaptureController(
         var clipped = 0
         var under = 0
         var total = 0
+        val hist = lumaHist
+        java.util.Arrays.fill(hist, 0)
         val step = 8
         var row = 0
         while (row < height) {
@@ -804,6 +820,7 @@ class HqCaptureController(
                 if (idx < y.size) {
                     val v = y[idx].toInt() and 0xFF
                     if (v >= 250) clipped++ else if (v <= 20) under++
+                    hist[v]++
                     total++
                 }
                 col += step
@@ -815,6 +832,11 @@ class HqCaptureController(
         }
         val clipPct = 100f * clipped / total
         val underPct = 100f * under / total
+        // 分位直接发布原始值：单帧已有上万个采样点，本身就很稳，
+        // 再叠 EMA 只会让「用户把镜头转向亮墙」这件事响应变慢。
+        val p05 = percentileFromHist(hist, total, 0.05f)
+        val p50 = percentileFromHist(hist, total, 0.50f)
+        val p95 = percentileFromHist(hist, total, 0.95f)
         synchronized(lumaLock) {
             if (previewLumaInit) {
                 previewClipEma = previewClipEma * 0.7f + clipPct * 0.3f
@@ -827,7 +849,40 @@ class HqCaptureController(
             stats.previewClippedPercent = previewClipEma
             stats.previewUnderexposedPercent = previewUnderEma
         }
+        stats.lumaP05 = p05
+        stats.lumaP50 = p50
+        stats.lumaP95 = p95
         stats.previewLumaSamples = total
+    }
+
+    /** 从 256 桶直方图取分位，q ∈ [0,1] */
+    private fun percentileFromHist(hist: IntArray, total: Int, q: Float): Float {
+        if (total <= 0) return 0f
+        val target = (q * total).toInt().coerceAtLeast(1)
+        var acc = 0
+        for (v in 0 until 256) {
+            acc += hist[v]
+            if (acc >= target) return v.toFloat()
+        }
+        return 255f
+    }
+
+    /**
+     * 是否真的欠曝。
+     *
+     * 主判据：整体中位亮度低，且高光也上不去（说明不是「暗物体 + 亮背景」而是整幅偏暗）。
+     * 兜底：暗像素占比超过放宽后的门限（35%）。分位还没采到样时只用兜底。
+     */
+    private fun reallyUnderexposed(): Boolean {
+        val hasLuma = stats.previewLumaSamples > 0
+        val byPercentile = hasLuma &&
+            stats.lumaP50 < MIN_LUMA_P50 &&
+            stats.lumaP95 < MIN_LUMA_P95
+        val byDarkPercent =
+            stats.previewUnderexposedPercent > MAX_PREVIEW_UNDEREXPOSED_PERCENT
+        val result = byPercentile || byDarkPercent
+        stats.realUnderexposed = result
+        return result
     }
 
     // ---------------------------------------------------------------- frame tick
@@ -840,6 +895,10 @@ class HqCaptureController(
     ) {
         stats.gyroRms = computeMotionRms(nowNs)
         stats.vinsDisplacement200ms = computeTranslationDisplacement200ms(nowNs)
+
+        // 稳定窗口每帧都要更新，包括冷却期：用户停稳的动作不能被冷却期吞掉，
+        // 否则冷却一结束还得再等 4 帧。
+        updateStableWindow()
 
         if (!scanning) {
             if (currentPhase != STATE_IDLE) {
@@ -863,14 +922,11 @@ class HqCaptureController(
         // 而不是像之前那样只能看到 burstStarted 和一堆模糊的 skip。
         stats.schedulerCandidates++
 
-        if (currentPhase != STATE_SCAN_LOCKED) {
+        if (currentPhase != STATE_READY || !stats.threeAReady) {
             stats.reject3A++
-            stats.triggerRejectReason = "state=${currentPhase}"
-            return
-        }
-        if (!stats.threeAReady) {
-            stats.reject3A++
-            stats.triggerRejectReason = "3A 未收敛"
+            stats.triggerRejectReason =
+                if (currentPhase != STATE_READY) "state=$currentPhase"
+                else stats.readyBlockReason.ifEmpty { "3A 未收敛" }
             return
         }
         if (camera == null || session == null || !active) {
@@ -887,16 +943,14 @@ class HqCaptureController(
             return
         }
 
-        // 2) 手持稳定：陀螺 RMS + VINS 200ms 位移
-        if (stats.gyroRms > MAX_GYRO_RMS) {
+        // 2) 稳定窗口：要求连续 STABLE_WINDOW_FRAMES 帧陀螺与位移同时达标。
+        // 单帧稳定没有意义 —— 扫过物体时几乎每帧都在动，
+        // 但只要用户停稳 100~200ms 就会满足，于是自动拍一组 HQ。
+        if (stableFrames < STABLE_WINDOW_FRAMES) {
             stats.rejectMotion++
-            stats.triggerRejectReason = "gyroRms=${"%.3f".format(stats.gyroRms)}"
-            stats.burstSkipCount++
-            return
-        }
-        if (stats.vinsDisplacement200ms > MAX_VINS_DISP_200MS) {
-            stats.rejectMotion++
-            stats.triggerRejectReason = "vinsDisp200ms=${"%.3f".format(stats.vinsDisplacement200ms)}"
+            stats.triggerRejectReason =
+                "stable=${stableFrames}/$STABLE_WINDOW_FRAMES " +
+                    "(gyro=${"%.3f".format(stats.gyroRms)}, disp=${"%.4f".format(stats.vinsDisplacement200ms)})"
             stats.burstSkipCount++
             return
         }
@@ -920,12 +974,12 @@ class HqCaptureController(
             nextBurstAtNs = nowNs + RETRY_COOLDOWN_NS
             return
         }
-        if (stats.previewLumaSamples > 0 &&
-            stats.previewUnderexposedPercent > MAX_PREVIEW_UNDEREXPOSED_PERCENT
-        ) {
+        if (reallyUnderexposed()) {
             stats.rejectExposure++
             stats.triggerRejectReason =
-                "underexposed(预检 dark=${"%.1f".format(stats.previewUnderexposedPercent)}%)"
+                "underexposed(预检 P50=${"%.0f".format(stats.lumaP50)}, " +
+                    "P95=${"%.0f".format(stats.lumaP95)}, " +
+                    "dark=${"%.1f".format(stats.previewUnderexposedPercent)}%)"
             stats.burstSkipCount++
             nextBurstAtNs = nowNs + RETRY_COOLDOWN_NS
             return
@@ -933,6 +987,19 @@ class HqCaptureController(
 
         stats.triggerRejectReason = ""
         startBurst(camera, session)
+    }
+
+    /**
+     * 更新稳定窗口计数。
+     *
+     * 「连续」是关键：只要有一帧不达标就归零重数，避免把「抖一下又稳一下」
+     * 误判成稳定。门限见 MAX_GYRO_RMS / MAX_VINS_DISP_200MS。
+     */
+    private fun updateStableWindow() {
+        val stable = stats.gyroRms <= MAX_GYRO_RMS &&
+            stats.vinsDisplacement200ms <= MAX_VINS_DISP_200MS
+        stableFrames = if (stable) stableFrames + 1 else 0
+        stats.stableFrames = stableFrames
     }
 
     fun onImuSample(
@@ -995,7 +1062,8 @@ class HqCaptureController(
         } catch (e: Exception) {
             burstInFlight = false
             stats.burstDropped += count
-            setPhase(STATE_SCAN_LOCKED)
+            // 下发失败也回到 READY，下一帧稳定窗口到了可以立刻重试
+            setPhase(STATE_READY)
             stats.lastCaptureRejectReason = "burst: ${e.message}"
         }
     }
@@ -1029,7 +1097,8 @@ class HqCaptureController(
 
     private fun finishBurstRound() {
         burstInFlight = false
-        setPhase(STATE_SCAN_LOCKED)
+        // 采完一组就回到 READY：3A 仍保持自动收敛，只是重新攒稳定窗口
+        setPhase(STATE_READY)
         // 已经不再需要那么频繁，给下一次 burst 留出 0.8~1.2s 的冷却
         val span = (BURST_COOLDOWN_MAX_NS - BURST_COOLDOWN_MIN_NS).toDouble()
         val cd = (BURST_COOLDOWN_MIN_NS + (Math.random() * span).toLong())
@@ -1463,20 +1532,18 @@ class HqCaptureController(
         sb.appendLine("jpegSize=${stats.jpegSize}")
         sb.appendLine("rawSize=${stats.rawSize}")
         sb.appendLine("captureState=${stats.captureState}")
-        sb.appendLine("lockRequested=${stats.lockRequested}")
-        sb.appendLine("lockVerifyStreak=${stats.lockVerifyStreak}")
-        sb.appendLine("lockAttempts=${stats.lockAttempts}")
-        sb.appendLine("lockFailReason=${stats.lockFailReason}")
         sb.appendLine("3aReady=${stats.threeAReady}")
+        // 收敛 vs 锁定：只要求收敛，不再要求硬件报 LOCKED
+        sb.appendLine("readyAeStreak=${stats.readyAeStreak}")
+        sb.appendLine("readyAwbStreak=${stats.readyAwbStreak}")
+        sb.appendLine("readyAfStreak=${stats.readyAfStreak}")
+        sb.appendLine("readyBlockReason=${stats.readyBlockReason}")
         sb.appendLine("AE state=${stats.aeState}")
         sb.appendLine("AE locked=${stats.aeLocked}")
-        sb.appendLine("AE verified=${stats.aeVerified}")
         sb.appendLine("AWB state=${stats.awbState}")
         sb.appendLine("AWB locked=${stats.awbLocked}")
-        sb.appendLine("AWB verified=${stats.awbVerified}")
         sb.appendLine("AF state=${stats.afState}")
         sb.appendLine("AF locked=${stats.afLocked}")
-        sb.appendLine("AF verified=${stats.afVerified}")
         sb.appendLine("exposureNs=${stats.exposureNs}")
         sb.appendLine("ISO=${stats.iso}")
         sb.appendLine("focusDiopters=${stats.focusDiopters}")
@@ -1511,11 +1578,16 @@ class HqCaptureController(
         sb.appendLine("rawSkipped=${stats.rawSkipped}")
         sb.appendLine("gyroRms=${stats.gyroRms}")
         sb.appendLine("vinsDisplacement200ms=${stats.vinsDisplacement200ms}")
+        sb.appendLine("stableFrames=${stats.stableFrames}")
+        sb.appendLine("realUnderexposed=${stats.realUnderexposed}")
         sb.appendLine("translationDuringBurst=${stats.translationDuringBurst}")
         sb.appendLine("lastBurstPoseDelta=${stats.lastBurstPoseDelta}")
         sb.appendLine("lastBurstAngleDeltaDeg=${stats.lastBurstAngleDeltaDeg}")
         sb.appendLine("previewClippedPercent=${stats.previewClippedPercent}")
         sb.appendLine("previewUnderexposedPercent=${stats.previewUnderexposedPercent}")
+        sb.appendLine("previewLumaP05=${stats.lumaP05}")
+        sb.appendLine("previewLumaP50=${stats.lumaP50}")
+        sb.appendLine("previewLumaP95=${stats.lumaP95}")
         sb.appendLine("previewLumaSamples=${stats.previewLumaSamples}")
         sb.appendLine("alignmentInliers=${stats.alignmentInliers}")
         sb.appendLine("alignmentRmseMean=${stats.alignmentRmseMean}")
