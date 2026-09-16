@@ -20,7 +20,20 @@ public:
     size_t count() const;
     size_t stableCount() const;
     size_t mergedCount() const;
-    size_t copyPoints(float* out, size_t maxPoints) const;
+    /**
+     * 只输出 hits >= minHits 的点。
+     *
+     * 旧实现把 g_ 里所有点均匀抽样后全部画出来，从不看 hits / state / opacity，
+     * 于是一次性点（hits=1，占实机统计里的绝大多数）也以实心 3px 画满屏幕 ——
+     * 这正是截图上满屏「黑芝麻」的来源。
+     *
+     *   RAW       minHits = 1
+     *   CONFIRMED minHits = 2   <- AR 默认
+     *   STABLE    minHits = 3
+     */
+    size_t copyPoints(float* out, size_t maxPoints, int minHits) const;
+    /** 满足 hits >= minHits 的点数（用于 HUD / 报告里的「确认」「稳定」计数） */
+    size_t confirmedCount(int minHits) const;
     void boundingBox(float* minX, float* minY, float* minZ,
                      float* maxX, float* maxY, float* maxZ) const;
     void centroid(float* x, float* y, float* z) const;

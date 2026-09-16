@@ -89,6 +89,58 @@ static int gVinsH = 480;
 // NanoTrack 真实彩色输入的节流计数：每 5 帧生成一张 BGR 缩略图
 static uint64_t gTrackerColorFrameCounter = 0;
 
+// ---------------------------------------------------------------- AR pose 历史
+/**
+ * 一帧「被采纳的 VINS 位姿」样本，带它自己的 SENSOR_TIMESTAMP。
+ *
+ * 为什么必须带时间戳：Renderer 过去直接拿 nativeGetRenderPose()，
+ * 也就是「回调发生这一刻」的最新 pose。但屏幕上正在显示的 Camera frame
+ * 有自己的 SENSOR_TIMESTAMP，二者不是同一时刻。手机静止时看不出来，
+ * 一转起来点云就会漂/甩/跟不上 —— 因为 AR 拿「现在」的 pose 去画
+ * 「过去某一帧」的画面。
+ *
+ * 正确做法：拿 Preview 的时间戳回来查表，取那一时刻的 pose。
+ */
+struct RenderPoseSample {
+    uint64_t ts = 0;
+    float R[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+    float t[3] = {0.f, 0.f, 0.f};
+};
+
+static std::deque<RenderPoseSample> renderPoseHistory;
+static constexpr size_t kRenderPoseHistoryMax = 120;
+// 查询允许的最大 pose 年龄；超过就说明这段历史里没有对应时刻的位姿
+static constexpr int64_t kRenderPoseMaxAgeNs = 80'000'000LL; // 80ms
+
+// ------------------------------------------------- 当前帧 target depth 调试层
+/**
+ * AR 调试层：**只取当前一帧 depth + 当前 target ROI + 该帧 pose**，不掺历史积累。
+ *
+ * 意义在于把「AR 坐标链」和「点云融合质量」这两件容易互相甩锅的事拆开：
+ * 如果这层绿色点能贴住现实物体、手机平移有正确视差、转动后仍停在原处，
+ * 就证明 VINS pose / 相机光轴 / fx fy cx cy / 竖屏旋转 / TextureView 裁剪 /
+ * 时间戳同步 整条链是对的；此后累计点云若仍然散，问题就只剩
+ * depth scale / depth 精度 / fusion，而不必再回头怀疑 Renderer。
+ */
+static constexpr int kTargetDebugMaxPoints = 2000;
+static bool targetDebugEnabled = false;
+static std::vector<float> targetDebugPoints(kTargetDebugMaxPoints * 6, 0.f);
+static int targetDebugPointCount = 0;
+static int targetDebugRoiPixels = 0;
+static int targetDebugValidPixels = 0;
+static int targetDebugRoiX0 = 0;
+static int targetDebugRoiY0 = 0;
+static int targetDebugRoiX1 = 0;
+static int targetDebugRoiY1 = 0;
+static uint64_t targetDebugTs = 0;
+static bool targetDebugPoseOk = false;
+static uint64_t targetDebugBuilds = 0;
+static uint64_t targetDebugQueries = 0;
+
+// AR 渲染用的过滤门限与计数器（由 Java 侧下发，报告里回显）
+static int gArMinHits = 2;
+static size_t gArDrawnPoints = 0;
+
 static void quatToR(float qx, float qy, float qz, float qw, float R[9]) {
     R[0] = 1 - 2 * (qy * qy + qz * qz);
     R[1] = 2 * (qx * qy - qz * qw);
@@ -490,6 +542,21 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 lastGoodVinsT[1] = vp[1];
                 lastGoodVinsT[2] = vp[2];
 
+                // 记录「带时间戳的位姿」：AR 要用 Preview 的 SENSOR_TIMESTAMP
+                // 反查这一时刻的相机 pose，而不是拿此刻最新的 pose 硬套。
+                {
+                    RenderPoseSample rp;
+                    rp.ts = static_cast<uint64_t>(frameTs);
+                    quatToR(vp[3], vp[4], vp[5], vp[6], rp.R);
+                    rp.t[0] = vp[0];
+                    rp.t[1] = vp[1];
+                    rp.t[2] = vp[2];
+                    renderPoseHistory.push_back(rp);
+                    while (renderPoseHistory.size() > kRenderPoseHistoryMax) {
+                        renderPoseHistory.pop_front();
+                    }
+                }
+
                 haveLastGoodVinsPose = true;
                 vinsPoseOk = true;
             } else {
@@ -589,6 +656,85 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
     }
 }
 
+/**
+ * 用「当前 depth 帧 + 当前 target ROI + 该帧 pose」重建一小片世界点。
+ *
+ * ROI 用 ObjectTracker 的归一化 bbox，它和 depth 帧、相机帧共用同一套
+ * 归一化坐标（updateFromDepth 就是按 depth 的 w/h 归一化的），
+ * 所以这里直接乘 w/h 即可，不需要再做任何旋转/裁剪。
+ *
+ * 必须放在 rotatePoint() 之后 —— 它依赖那个函数。
+ */
+static void buildTargetDebugLayer(const float* d, int w, int h,
+                                 const TargetTrackInfo& ti,
+                                 const float R[9], const float T[3],
+                                 bool poseOk) {
+    targetDebugPointCount = 0;
+    targetDebugRoiPixels = 0;
+    targetDebugValidPixels = 0;
+    targetDebugPoseOk = poseOk;
+    targetDebugTs = 0;
+    if (!targetDebugEnabled) {
+        return;
+    }
+    if (!poseOk || d == nullptr || w < 4 || h < 4) {
+        return;
+    }
+    if (ti.state != TargetState::TRACKING && ti.state != TargetState::ACQUIRING) {
+        return;
+    }
+
+    const int x0 = std::max(0, static_cast<int>(ti.x0 * w));
+    const int y0 = std::max(0, static_cast<int>(ti.y0 * h));
+    const int x1 = std::min(w - 1, static_cast<int>(ti.x1 * w));
+    const int y1 = std::min(h - 1, static_cast<int>(ti.y1 * h));
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+    targetDebugRoiX0 = x0;
+    targetDebugRoiY0 = y0;
+    targetDebugRoiX1 = x1;
+    targetDebugRoiY1 = y1;
+
+    const int roiW = x1 - x0 + 1;
+    const int roiH = y1 - y0 + 1;
+    targetDebugRoiPixels = roiW * roiH;
+
+    int step = 1;
+    while ((roiW / step) * (roiH / step) > kTargetDebugMaxPoints) {
+        step++;
+    }
+
+    for (int y = y0; y <= y1; y += step) {
+        for (int x = x0; x <= x1; x += step) {
+            const float z = d[static_cast<size_t>(y) * w + x];
+            if (!(z > 0.08f && z < 8.f)) {
+                continue;
+            }
+            targetDebugValidPixels++;
+            if (targetDebugPointCount >= kTargetDebugMaxPoints) {
+                continue;
+            }
+            const float Xc = (x - gCx) * z / gFx;
+            const float Yc = (y - gCy) * z / gFy;
+            float Xw, Yw, Zw;
+            rotatePoint(R, T, Xc, Yc, z, Xw, Yw, Zw);
+            float* p = targetDebugPoints.data() +
+                       static_cast<size_t>(targetDebugPointCount) * 6;
+            p[0] = Xw;
+            p[1] = Yw;
+            p[2] = Zw;
+            // 固定绿色：这一层的用途是「和真实画面比对」，颜色必须一眼可辨，
+            // 不能和累计点云的真实颜色混在一起。
+            p[3] = 0.20f;
+            p[4] = 1.00f;
+            p[5] = 0.35f;
+            targetDebugPointCount++;
+        }
+    }
+    targetDebugBuilds++;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         JNIEnv* e, jobject, jfloatArray depth, jint w, jint h,
@@ -635,6 +781,19 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     haveExternalDepth = true;
     depthFrames++;
 
+    // 先抓一份当前 target 状态：调试层和 fuseDepth 都要用。
+    //
+    // 注意：本函数在这一段之前**已经持有 gStateMutex**（见上面的 lock_guard lk），
+    // 所以这里只能直接读全局 objectTracker，绝不能再 lock 一次 ——
+    // std::mutex 不可重入，再锁一次就是自锁死。ObjectTracker 内部有自己的
+    // mutex_，isTracking()/info() 都会自己去拿，不会和外层冲突。
+    TargetTrackInfo ti;
+    bool haveTi = false;
+    if (objectTracker && objectTracker->isTracking()) {
+        ti = objectTracker->info();
+        haveTi = true;
+    }
+
     for (const auto& s : snaps) {
         int64_t diff = (int64_t)s.ts - (int64_t)t;
         if (diff < 0) {
@@ -642,8 +801,18 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         }
         if (diff < 50000000LL) {
             fuseDepth(d.data(), w, h, s, confidence);
+            // 调试层用的必须是**这一帧**的 depth 与**这一帧的** pose，
+            // 所以放在同一个 snap 匹配分支里，而不是另找一次。
+            if (haveTi) {
+                buildTargetDebugLayer(d.data(), w, h, ti, s.R, s.t, true);
+                targetDebugTs = static_cast<uint64_t>(t);
+            }
             break;
         }
+    }
+    if (!targetDebugEnabled) {
+        // 关掉时把上一帧的残留清空，否则切换开关后屏幕上会留着旧点
+        targetDebugPointCount = 0;
     }
 }
 
@@ -766,7 +935,21 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
           << " t=(" << k->tx << ", " << k->ty << ", " << k->tz << ")\n";
     }
     s << "Gaussian: " << g.count() << " stable=" << g.stableCount()
-      << " merged=" << g.mergedCount() << "\n"
+      << " merged=" << g.mergedCount()
+      << " confirmed2=" << g.confirmedCount(2)
+      << " confirmed3=" << g.confirmedCount(3) << "\n"
+      << "AR: minHits=" << gArMinHits << " drawn=" << gArDrawnPoints
+      << " renderPoseHistory=" << renderPoseHistory.size() << "\n"
+      << "TargetDepthDebug: enabled=" << (targetDebugEnabled ? 1 : 0)
+      << " points=" << targetDebugPointCount
+      << " roi=" << targetDebugRoiX0 << "," << targetDebugRoiY0 << "-"
+      << targetDebugRoiX1 << "," << targetDebugRoiY1
+      << " roiPixels=" << targetDebugRoiPixels
+      << " validPixels=" << targetDebugValidPixels
+      << " ts=" << targetDebugTs
+      << " poseOk=" << (targetDebugPoseOk ? 1 : 0)
+      << " builds=" << targetDebugBuilds
+      << " queries=" << targetDebugQueries << "\n"
       << "PointCloud bbox min=(" << pminX << ", " << pminY << ", " << pminZ << ")"
       << " max=(" << pmaxX << ", " << pmaxY << ", " << pmaxZ << ")\n"
       << "PointCloud centroid=(" << pcx << ", " << pcy << ", " << pcz << ")\n"
@@ -786,15 +969,26 @@ Java_com_mobilescan3d_NativeBridge_nativeGetGuidance(JNIEnv* e, jobject) {
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetGaussians(JNIEnv* e, jobject,
-                                                      jfloatArray out, jint maxPoints) {
+                                                      jfloatArray out, jint maxPoints,
+                                                      jint minHits) {
     jfloat* dst = e->GetFloatArrayElements(out, nullptr);
     if (!dst) {
+        return 0;
+    }
+    // 长度契约：native 写 out + written*6，written <= maxPoints。
+    // 调用方必须给够 maxPoints*6 个槽，这里再兜一次底，避免越界写 Java 数组。
+    if (maxPoints <= 0 ||
+        e->GetArrayLength(out) < static_cast<jsize>(maxPoints) * 6) {
+        e->ReleaseFloatArrayElements(out, dst, 0);
         return 0;
     }
     size_t n;
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
-        n = g.copyPoints(dst, (size_t)maxPoints);
+        const int need = minHits > 0 ? minHits : 1;
+        gArMinHits = need;
+        n = g.copyPoints(dst, (size_t)maxPoints, need);
+        gArDrawnPoints = n;
     }
     e->ReleaseFloatArrayElements(out, dst, 0);
     return (jint)n;
@@ -814,8 +1008,13 @@ Java_com_mobilescan3d_NativeBridge_nativeGetHudMetrics(JNIEnv* e, jobject) {
     s << "VINS " << vinsFrames << " 帧" << (vinsInitialized() ? "" : ", 初始化中")
       << " / " << lastVinsMs << " ms"
       << " · 特征 " << vio.features()
-      << " · 深度 " << depthFrames << " 帧"
-      << " · 点云 " << g.count();
+      << " · 深度 " << depthFrames << " 帧";
+    // 只报一个「总量」没有意义：实机出现过 600000 总点里 stable 只有 28，
+    // 那种情况下屏幕上几乎全是一次性噪声，而总数看起来却很壮观。
+    s << " · 地图 " << g.count()
+      << " 确认 " << g.confirmedCount(2)
+      << " 稳定 " << g.confirmedCount(3)
+      << " 绘制 " << gArDrawnPoints;
     return e->NewStringUTF(s.str().c_str());
 }
 
@@ -1009,6 +1208,88 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPose(JNIEnv* env, jobject, jfl
         pose[11] = acceptedVinsT[2];
     }
 
+    env->SetFloatArrayRegion(out, 0, 12, pose);
+    return JNI_TRUE;
+}
+
+// 当前 depth 帧 + 当前 target ROI 的调试层点数（AR 坐标链验证用）
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetTargetDepthDebug(JNIEnv* e, jobject,
+                                                             jfloatArray out,
+                                                             jint maxPoints) {
+    if (out == nullptr || maxPoints <= 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    targetDebugQueries++;
+    const int n = std::min(static_cast<int>(maxPoints), targetDebugPointCount);
+    if (n <= 0) {
+        return 0;
+    }
+    if (e->GetArrayLength(out) < static_cast<jsize>(n) * 6) {
+        return 0;
+    }
+    e->SetFloatArrayRegion(out, 0, static_cast<jsize>(n) * 6,
+                           targetDebugPoints.data());
+    return (jint)n;
+}
+
+// 打开/关闭调试层的构建。关掉时不再做任何像素级的提取与转换。
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetTargetDebugEnabled(JNIEnv*, jobject,
+                                                               jboolean enabled) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    targetDebugEnabled = (enabled == JNI_TRUE);
+    if (!targetDebugEnabled) {
+        targetDebugPointCount = 0;
+    }
+}
+
+/**
+ * 按 SENSOR_TIMESTAMP 查历史位姿（AR 正确跟随的前提）。
+ *
+ * 第一版只做最近邻：|sample.ts - ts| 最小且 < 80ms 就返回。
+ * 以后若发现快速运动下仍有偏差，再升级成 translation 线性插值 +
+ * 四元数 slerp —— 但现在先把「用对时刻」这件事做出来。
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAt(JNIEnv* env, jobject,
+                                                         jlong timestampNs,
+                                                         jfloatArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 12) {
+        return JNI_FALSE;
+    }
+    float pose[12];
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        if (renderPoseHistory.empty()) {
+            return JNI_FALSE;
+        }
+        const int64_t want = static_cast<int64_t>(timestampNs);
+        const RenderPoseSample* best = nullptr;
+        int64_t bestDelta = 0;
+        for (const RenderPoseSample& rp : renderPoseHistory) {
+            int64_t d = static_cast<int64_t>(rp.ts) - want;
+            if (d < 0) {
+                d = -d;
+            }
+            if (best == nullptr || d < bestDelta) {
+                best = &rp;
+                bestDelta = d;
+            }
+        }
+        // 找到的样本离目标时刻太远 = 这段历史里没有对应时刻的位姿。
+        // 此时宁可返回 false 让上层回退，也不要拿错时刻的 pose 去画 AR。
+        if (best == nullptr || bestDelta > kRenderPoseMaxAgeNs) {
+            return JNI_FALSE;
+        }
+        for (int i = 0; i < 9; ++i) {
+            pose[i] = best->R[i];
+        }
+        pose[9] = best->t[0];
+        pose[10] = best->t[1];
+        pose[11] = best->t[2];
+    }
     env->SetFloatArrayRegion(out, 0, 12, pose);
     return JNI_TRUE;
 }

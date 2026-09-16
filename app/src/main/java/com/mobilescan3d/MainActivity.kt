@@ -136,6 +136,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     // 实测纹理变换的 2D 仿射部分 [f0 f4 f12 f1 f5 f13]，供自适应校正矩阵使用
     @Volatile private var stAffine = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f)
     @Volatile private var hasStAffine = false
+    /**
+     * camera-normalized UV -> view-normalized 的 2x3 仿射是否已就绪。
+     * 它是点云 Renderer 与 Camera Preview 共用同一套屏幕坐标系的唯一凭据，
+     * 报告里的 displayRotationApplied 现在反映的就是它。
+     */
+    @Volatile private var cameraToViewReady = false
+    /** Preview 当前帧的时间戳（SurfaceTexture.getTimestamp），AR 用它反查那一刻的 pose */
+    @Volatile private var previewTimestampNs = 0L
+    /** AR 图层切换按钮 */
+    private var arLayerButton: android.widget.Button? = null
+    /** AR 绘制模式，见 PointCloudRenderer.DRAW_* */
+    @Volatile private var arDrawMode = PointCloudRenderer.DRAW_TARGET_DEBUG
     private var cameraIds: List<String> = emptyList()
     private var currentCameraId = ""
     private var cameraIndex = 0
@@ -453,6 +465,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         },
             android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
         toolbar.addView(toolButton("对焦/防抖") { showFocusStabDialog() },
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
+        // AR 图层切换：默认只画「当前帧 target depth 调试层」。
+        // 先用它证明 VINS pose / 光轴 / 内参 / 竖屏旋转 / TextureView 裁剪 /
+        // 时间戳同步 这一整条 AR 坐标链是对的，再切到累计点云；
+        // 那时若累计点仍然散，问题就只剩 depth scale / 精度 / fusion。
+        arLayerButton = toolButton(arDrawModeLabel()) { cycleArLayer() }
+        toolbar.addView(arLayerButton,
             android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(toolbar, android.widget.FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -461,6 +480,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         ).apply { rightMargin = 8 })
 
         setContentView(root)
+
+        // AR 默认只画「当前帧 target depth 调试层」；native 也只有在这个开关
+        // 打开时才做逐帧取点，关掉就是零开销。
+        try {
+            NativeBridge.nativeSetTargetDebugEnabled(
+                arDrawMode != PointCloudRenderer.DRAW_ACCUMULATED
+            )
+        } catch (_: Throwable) {
+        }
+        renderer.drawMode = arDrawMode
+        // 点大小按屏幕密度缩放：固定 3px 在高 DPI 屏上细得几乎看不见
+        renderer.setPointSizes(3f * density, 5f * density)
 
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), 100)
@@ -522,6 +553,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 // 采样 SurfaceTexture 的真实纹理变换矩阵（HAL 旋转标志/裁剪的地面真值）
                 try {
                     st.getTransformMatrix(stMatrixFloats)
+                    // Preview 帧自己的 SENSOR_TIMESTAMP。AR 点云必须用它反查
+                    // 「屏幕上这一帧画面拍摄时相机在哪」，而不是用此刻最新的 pose
+                    // —— 两者不同时刻，手机一转点云就会漂/甩。
+                    previewTimestampNs = st.timestamp
+                    renderer.setPreviewTimestamp(previewTimestampNs)
                     val f = stMatrixFloats
                     // 4x4 中作用于 UV 的 2D 仿射部分：
                     // u' = m0·u + m4·v + m12 ; v' = m1·u + m5·v + m13
@@ -866,6 +902,93 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             "sensor=$sensorOrientation facing=$lensFacing rot=$rot cover=$scale hasA=$hasStAffine " +
                 "size=${size.width}x${size.height} view=${viewW}x${viewH}"
         )
+
+        // texture.setTransform() 之后必须立刻把「camera -> view」重算一遍，
+        // 否则 Renderer 还在用上一套变换，点云会整体偏一段。
+        updateCameraToViewTransform()
+    }
+
+    /**
+     * 求 camera-normalized UV -> view-normalized 的 2x3 仿射，喂给点云 Renderer。
+     *
+     * 这里刻意复用「点选目标」那条**已经验证正确**的链，只是反过来走。
+     *
+     * viewToCameraNorm 用的方向是：
+     *   viewPixel --(texture transform)^-1--> texturePixel --/size--> textureUV
+     *             --(stAffine)--> cameraUV
+     *
+     * 现在要求反方向：
+     *   cameraUV --(stAffine)^-1--> textureUV --*size--> texturePixel
+     *            --(texture transform)--> viewPixel --/size--> viewUV
+     *
+     * 做法是把 cameraUV 空间的一组基（原点 + 两个单位方向）按上面这条链映射到
+     * viewUV，三点就唯一确定这个 2x3 仿射。
+     *
+     * 这样 Renderer 完全不需要知道「90° 竖屏 / 中心裁剪 / 前摄镜像」这些细节，
+     * 也就不会再出现「点云和 Preview 各走一条坐标系」的问题 —— 那正是截图上
+     * 点云像撒了一屏、且不随镜头产生正确视差的根因。
+     */
+    private fun updateCameraToViewTransform() {
+        try {
+            if (!hasStAffine) {
+                cameraToViewReady = false
+                return
+            }
+            if (texture.width <= 0 || texture.height <= 0) {
+                cameraToViewReady = false
+                return
+            }
+            val a = stAffine
+            val st = android.graphics.Matrix().apply {
+                setValues(
+                    floatArrayOf(
+                        a[0], a[1], a[2],
+                        a[3], a[4], a[5],
+                        0f, 0f, 1f
+                    )
+                )
+            }
+            val invSt = android.graphics.Matrix()
+            if (!st.invert(invSt)) {
+                cameraToViewReady = false
+                return
+            }
+
+            // cameraUV 空间的三点：(0,0) (1,0) (0,1)
+            val p = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)
+            // cameraUV -> textureUV
+            invSt.mapPoints(p)
+
+            val w = texture.width.toFloat()
+            val h = texture.height.toFloat()
+            for (i in 0..2) {
+                p[i * 2] *= w
+                p[i * 2 + 1] *= h
+            }
+
+            // texturePixel -> viewPixel
+            val tv = android.graphics.Matrix()
+            texture.getTransform(tv)
+            tv.mapPoints(p)
+
+            for (i in 0..2) {
+                p[i * 2] /= w
+                p[i * 2 + 1] /= h
+            }
+
+            val x0 = p[0]
+            val y0 = p[1]
+            renderer.setCameraToView(
+                floatArrayOf(
+                    p[2] - x0, p[4] - x0, x0,
+                    p[3] - y0, p[5] - y0, y0
+                )
+            )
+            cameraToViewReady = true
+        } catch (t: Throwable) {
+            cameraToViewReady = false
+            android.util.Log.e("CameraPreview", "updateCameraToViewTransform failed", t)
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -1389,7 +1512,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    cameraRight=($r00, $r10, $r20)")
         sb.appendLine("    cameraDown=($r01, $r11, $r21)")
         sb.appendLine("    cameraForward=($r02, $r12, $r22)")
-        sb.appendLine("    displayRotationApplied=false")
+        // displayRotationApplied 过去是硬编码 false —— 而那时点云确实走的是
+        // 「通用透视相机」，和 Preview 的屏幕坐标系互不相干，报 false 是诚实的。
+        // 现在 Renderer 直接复现 Preview 的投影链，这个字段才真正有意义：
+        // 它反映 camera->view 仿射有没有算出来。
+        sb.appendLine("    displayRotationApplied=${cameraToViewReady}")
+        sb.appendLine("    projectionMode=intrinsics+previewAffine")
+        sb.appendLine("    arDrawMode=${arDrawModeLabel()}")
+        sb.appendLine("    arAccumMinHits=${renderer.accumulatedMinHits}")
+        sb.appendLine("    arDrawnAccumulated=${renderer.drawnAccumulated}")
+        sb.appendLine("    arDrawnTargetDebug=${renderer.drawnDebug}")
+        // 点云用的是哪一时刻的 pose：true=按 Preview 时间戳查到的，
+        // false=历史里没有，回退成了「此刻最新」。快速转动时这两者差别很大。
+        sb.appendLine("    arPoseFromTimestamp=${renderer.poseFromTimestamp}")
+        sb.appendLine("    arPreviewTimestampNs=$previewTimestampNs")
         sb.appendLine("    actualPreviewRot=$previewRot")
         sb.appendLine("    autoYaw=false")
         sb.appendLine("    touchOrbit=false")
@@ -1641,13 +1777,35 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
         warningBanner.visibility =
             if (scanning && !vinsOk) android.view.View.VISIBLE else android.view.View.GONE
-        val target = NativeBridge.nativeGetPointCount().toFloat()
+        val target = try {
+            NativeBridge.nativeGetPointCount().toFloat()
+        } catch (t: Throwable) {
+            0f
+        }
         hudShownPoints += (target - hudShownPoints) * 0.35f
         val shown = hudShownPoints.toInt()
         hudText.text = if (hudExpanded) {
-            "点云 $shown 点 · 世界锁定\n视角跟随 VINS 相机"
+            // 只报「总点数」没有诊断价值：实机出现过 600000 总点里 stable 只有 28，
+            // 那种情况下屏幕几乎全是一次性噪声，而总数看起来却很壮观。
+            // 所以把「地图 / 确认 / 稳定 / 绘制」四个数都列出来。
+            val metrics = try {
+                NativeBridge.nativeGetHudMetrics()
+            } catch (t: Throwable) {
+                "点云 $shown 点"
+            }
+            metrics +
+                "\n图层 ${arDrawModeLabel()}" +
+                " · 累计绘制 ${renderer.drawnAccumulated}" +
+                " 当前帧 ${renderer.drawnDebug}" +
+                "\n" + if (renderer.poseFromTimestamp) {
+                "AR 按帧时间戳取 pose"
+            } else {
+                "AR 回退：用最新 pose（时间戳没查到）"
+            }
         } else {
-            "点云 $shown 点 · 非米制"
+            "地图 $shown · 绘制 ${renderer.drawnAccumulated}" +
+                (if (renderer.drawnDebug > 0) " + ${renderer.drawnDebug}" else "") +
+                " · 非米制"
         }
     }
 
@@ -1675,6 +1833,40 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun toggleHud() {
         hudExpanded = !hudExpanded
+        updateHeader()
+    }
+
+    private fun arDrawModeLabel(): String = when (arDrawMode) {
+        PointCloudRenderer.DRAW_ACCUMULATED -> "累计"
+        PointCloudRenderer.DRAW_BOTH -> "两者"
+        else -> "当前帧"
+    }
+
+    /**
+     * 循环切换 AR 图层：当前帧调试层 -> 累计点云 -> 两者。
+     *
+     * 顺序刻意如此：先只用「当前一帧 depth + 当前 ROI + 该帧 pose」验证坐标链，
+     * 确认无误后再打开累计点云。否则一旦点云发散，无法判断是 Renderer 的
+     * 投影错了，还是 depth scale / 精度 / fusion 的问题。
+     */
+    private fun cycleArLayer() {
+        arDrawMode = (arDrawMode + 1) % 3
+        renderer.drawMode = arDrawMode
+        val wantDebug = arDrawMode != PointCloudRenderer.DRAW_ACCUMULATED
+        try {
+            NativeBridge.nativeSetTargetDebugEnabled(wantDebug)
+        } catch (_: Throwable) {
+        }
+        arLayerButton?.text = arDrawModeLabel()
+        glView.requestRender()
+        toast(
+            when (arDrawMode) {
+                PointCloudRenderer.DRAW_ACCUMULATED ->
+                    "只画累计点云（hits>=${renderer.accumulatedMinHits}，已剔除一次性点）"
+                PointCloudRenderer.DRAW_BOTH -> "两层都画：绿色 = 当前帧调试层"
+                else -> "只画当前帧 target depth 调试层（验证 AR 坐标链）"
+            }
+        )
         updateHeader()
     }
 

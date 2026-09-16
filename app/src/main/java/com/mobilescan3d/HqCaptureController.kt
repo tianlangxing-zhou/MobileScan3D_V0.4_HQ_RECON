@@ -198,6 +198,16 @@ data class HqCaptureStats(
     // ---- 融合门限与逐帧诊断 ----
     var minFusionFrames: Int = 0,
     var frameDiagnostics: String = "",
+    /**
+     * 由 BurstFrameTag.index 定位不到帧号的 JPEG 数。
+     *
+     * 这类 JPEG 的 CaptureResult 没到，我们无法知道它是 burst 里的第几张。
+     * 宁可不收（并计数），也不能把它塞进有序序列 —— native 用 paths[0] 当
+     * reference，顺序一旦被污染，配准会去追时间上更远的帧。
+     */
+    var jpegUnindexed: Long = 0L,
+    /** 每帧的 SENSOR_TIMESTAMP 与该时刻 VINS pose 的查询结果（逐帧一行） */
+    var burstFramePose: String = "",
 
     // ---- RAW 独立捕获 ----
     var rawReferenceIssued: Long = 0L,
@@ -262,8 +272,19 @@ private class BurstContext(
     val sessionId: String,
     val tempDir: File
 ) {
-    /** 本组已落盘的 JPEG 路径，读写都持 [jpegLock] */
-    val jpegPaths = mutableListOf<String>()
+    /**
+     * 本组已落盘的 JPEG，**下标即 Camera2 帧号**，读写都持 [jpegLock]。
+     *
+     * 旧实现按 Image/Result 的**回调完成顺序** append 到一个 List，然后把这个
+     * 顺序直接交给 native，并把 paths[0] 当 reference。可 Camera2 的 capture
+     * 请求顺序是 0→1→2→3，而 JPEG 编码 / ImageReader / CaptureResult 的完成
+     * 顺序未必相同（实测可能变成 2→0→3→1）。那样 native 看到的 frame[0]
+     * 其实可能是第 2 张，LK 要追的帧间时间距离被无谓放大，
+     * 好帧成片被判成 "features too few"。
+     *
+     * 用「下标即帧号」的数组，顺序由 Camera2 的语义决定，与回调时序彻底解耦。
+     */
+    val jpegPathByIndex = arrayOfNulls<String>(BURST_FRAME_SLOTS)
     val jpegLock = Any()
     /** 本组期望的帧数 */
     var expectedFrames = 0
@@ -284,6 +305,10 @@ private class BurstContext(
     val framePose = Array(BURST_FRAME_SLOTS) { FloatArray(12) }
     val framePoseValid = BooleanArray(BURST_FRAME_SLOTS)
     val frameRecorded = BooleanArray(BURST_FRAME_SLOTS)
+    /** 该帧的 SENSOR_TIMESTAMP（不是回调时刻的墙钟） */
+    val frameSensorTs = LongArray(BURST_FRAME_SLOTS)
+    /** 能否在 pose 历史里查到 frameSensorTs 那一刻的 VINS pose */
+    val framePoseAtOk = BooleanArray(BURST_FRAME_SLOTS)
 }
 
 /**
@@ -463,7 +488,14 @@ class HqCaptureController(
         private const val MAX_STILL_HIGHLIGHT_PERCENT = 5.0f
         private const val MIN_STILL_HIGHLIGHT_LUMA = 250f
         /** native 逐帧 alignment 诊断每个帧占几个浮点 */
-        private const val FRAME_STAT_STRIDE = 8
+        /**
+         * native frameStatsOut 每帧的浮点个数，必须与 hq_fusion.cpp 的 kFrameStride 一致。
+         *
+         * 0-7 是结果量（frameIndex/isReference/fbGood/ransacInliers/rmse/ecc/reason/sharpness），
+         * 8-14 是**过滤链的逐级计数**（refFeatures/lkForwardOk/lkBackwardOk/fbPass/errPass/
+         * boundsPass/alignScale）—— 没有这几项就无法回答 fbGood=1 到底是哪一道过滤造成的。
+         */
+        private const val FRAME_STAT_STRIDE = 15
         /** native statsOut 的槽数，必须与 hq_fusion.cpp 的 kStatsSlots 一致 */
         private const val FRAME_STAT_SLOTS = 25
         /**
@@ -662,6 +694,7 @@ class HqCaptureController(
         stats.jpegReceived = 0L
         stats.jpegMatched = 0L
         stats.jpegExpired = 0L
+        stats.jpegUnindexed = 0L
         stats.rawReceived = 0L
         stats.rawMatched = 0L
         stats.rawExpired = 0L
@@ -674,6 +707,7 @@ class HqCaptureController(
         stats.rawReferenceEveryNBursts = RAW_REFERENCE_EVERY_N_BURSTS
         stats.minFusionFrames = MIN_FUSION_FRAMES
         stats.frameDiagnostics = ""
+        stats.burstFramePose = ""
         stats.stillShadowPercent = 0f
         stats.stillHighlightPercent = 0f
         stats.stillAnyChannelHighlightPercent = 0f
@@ -866,10 +900,33 @@ class HqCaptureController(
         ctx.frameExposureNs[i] = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
         ctx.frameIso[i] = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
         ctx.frameFocusD[i] = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
-        val pose = FloatArray(12)
-        if (NativeBridge.nativeGetRenderPose(pose)) {
+
+        // ---- 位姿必须按 SENSOR_TIMESTAMP 取，绝不能取「回调这一刻」的 ----
+        // 旧实现调 nativeGetRenderPose()，拿的是回调发生瞬间最新的 VINS pose。
+        // 但 12MP still 很可能暂停/拖慢实时 YUV 管线，几个 capture callback
+        // 到来时 pose 还都是最后那一个，于是
+        //   burstMaxTranslationFromReference / burstMaxRotationFromReference
+        // 恒为 0 —— 看起来像「中间没动」，其实只是没测到。
+        val sensorTs = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L
+        ctx.frameSensorTs[i] = sensorTs
+        val pose = FloatArray(NativeBridge.RENDER_POSE_SLOTS)
+        var atOk = false
+        if (sensorTs > 0L) {
+            atOk = try {
+                NativeBridge.nativeGetRenderPoseAt(sensorTs, pose)
+            } catch (t: Throwable) {
+                false
+            }
+        }
+        if (atOk) {
             System.arraycopy(pose, 0, ctx.framePose[i], 0, 12)
             ctx.framePoseValid[i] = true
+            ctx.framePoseAtOk[i] = true
+        } else {
+            // 历史里没有该时刻的位姿：不再拿一个错时刻的 pose 冒充，
+            // 只把「这一帧没有可信 pose」如实记下来。
+            ctx.framePoseValid[i] = false
+            ctx.framePoseAtOk[i] = false
         }
         ctx.frameRecorded[i] = true
     }
@@ -1566,6 +1623,19 @@ class HqCaptureController(
         stats.burstMaxTranslationFromReference = maxT
         stats.burstMaxRotationFromReference = maxR
 
+        // 逐帧把「SENSOR_TIMESTAMP + 该时刻 pose 是否查到」写进报告。
+        // 上面那两个 max 值恒为 0 时，看这一行就能立刻区分：
+        //   poseAt 全 0  -> 历史里根本没有对应时刻的位姿（查不到，不是没动）
+        //   poseAt 有 1  -> 真的测到了，0 就是真的没动
+        val fb = StringBuilder()
+        for (k in 0 until ctx.expectedFrames.coerceAtMost(BURST_FRAME_SLOTS)) {
+            if (k > 0) fb.append(" | ")
+            fb.append("frame[").append(k).append("] ts=").append(ctx.frameSensorTs[k])
+            fb.append(",poseAt=").append(if (ctx.framePoseAtOk[k]) 1 else 0)
+            fb.append(",recorded=").append(if (ctx.frameRecorded[k]) 1 else 0)
+        }
+        stats.burstFramePose = fb.toString()
+
         // 硬件实际执行了什么。和 requestedBurst* 放在一起看，
         // 才能分清「我们要错了」和「HAL 没照办」。
         stats.requestedBurstIso = stats.burstIso
@@ -1688,7 +1758,8 @@ class HqCaptureController(
         val jpeg = b.jpeg
         if (jpeg != null) {
             stats.jpegMatched++
-            if (ctx != null) runCatching { saveJpeg(jpeg, ts, ctx) }
+            // frameIndex 来自桶里的 BurstFrameTag.index —— 这是唯一可信的帧序来源
+            if (ctx != null) runCatching { saveJpeg(jpeg, ts, ctx, b.frameIndex) }
             runCatching { jpeg.close() }
         }
         val raw = b.raw
@@ -1726,7 +1797,7 @@ class HqCaptureController(
             val ts = jpeg.timestamp
             if (ctx != null) {
                 stats.jpegMatched++
-                runCatching { saveJpeg(jpeg, ts, ctx) }
+                runCatching { saveJpeg(jpeg, ts, ctx, b.frameIndex) }
             } else {
                 stats.jpegExpired++
             }
@@ -1825,15 +1896,28 @@ class HqCaptureController(
         for (b in expired) expireCapture(b)
     }
 
-    private fun saveJpeg(image: Image, ts: Long, ctx: BurstContext) {
+    /**
+     * 把一张 burst JPEG 落盘，并**按 Camera2 帧号**放进有序槽位。
+     *
+     * [frameIndex] 来自 BurstFrameTag.index（经 PendingCapture 传下来），
+     * **不是回调顺序**。索引非法时宁可不收：一个定位不了帧号的 JPEG
+     * 会破坏「paths 顺序 == 拍摄顺序」这个不变量，而融合的 reference
+     * 选择完全依赖它。
+     */
+    private fun saveJpeg(image: Image, ts: Long, ctx: BurstContext, frameIndex: Int) {
+        if (frameIndex !in 0 until BURST_FRAME_SLOTS) {
+            stats.jpegUnindexed++
+            return
+        }
         val bytes = ByteArray(image.planes[0].buffer.remaining())
         image.planes[0].buffer.get(bytes)
-        // burst 成员先落在「本组自己的」临时目录，融合结束后只保留参考帧 + 融合结果
-        val file = File(ctx.tempDir, "burst_${ts}.jpg")
+        // burst 成员先落在「本组自己的」临时目录，融合结束后只保留参考帧 + 融合结果。
+        // 文件名自带帧号，出问题时一眼就能看出 native 拿到的是不是有序序列。
+        val file = File(ctx.tempDir, "frame_${frameIndex}_${ts}.jpg")
         FileOutputStream(file).use { it.write(bytes) }
         stats.jpegSaved++
         synchronized(ctx.jpegLock) {
-            ctx.jpegPaths.add(file.absolutePath)
+            ctx.jpegPathByIndex[frameIndex] = file.absolutePath
         }
     }
 
@@ -1866,15 +1950,29 @@ class HqCaptureController(
     private fun maybeStartFusion(ctx: BurstContext) {
         if (fusionStarted || !processingInFlight) return
         if (activeBurst !== ctx) return
-        val n = synchronized(ctx.jpegLock) { ctx.jpegPaths.size }
+        val n = synchronized(ctx.jpegLock) { ctx.jpegPathByIndex.count { it != null } }
         if (n < ctx.expectedFrames) return
         fusionStarted = true
         startFusion(ctx)
     }
 
     private fun startFusion(ctx: BurstContext) {
-        // 融合读的是不可变快照：之后谁再往 ctx 里加/删都不影响这一趟
-        val paths = synchronized(ctx.jpegLock) { ctx.jpegPaths.toList() }
+        // 按 Camera2 帧号顺序取出，**绝不按回调顺序**。
+        // native 把 paths[0] 当 reference；顺序错了，配准就会拿一张
+        // 时间上并不相邻的帧去追，好帧成片被拒。
+        // 这里读的是一份不可变快照：之后谁再往 ctx 里写都不影响这一趟。
+        val paths = synchronized(ctx.jpegLock) {
+            (0 until ctx.expectedFrames).mapNotNull { ctx.jpegPathByIndex[it] }
+        }
+        if (paths.size != ctx.expectedFrames) {
+            // 帧序不完整时不再「硬凑」：缺帧意味着 reference 都可能选错，
+            // 那种融合结果没有诊断价值。如实报告让上层重拍。
+            stats.lastCaptureRejectReason =
+                "burst order incomplete(${paths.size}/${ctx.expectedFrames})"
+            finishFusion(ctx)
+            scheduleRetake()
+            return
+        }
         if (paths.size < 2) {
             stats.lastCaptureRejectReason = "burst images < 2"
             finishFusion(ctx)
@@ -1920,7 +2018,9 @@ class HqCaptureController(
      */
     private fun finishFusion(ctx: BurstContext) {
         cleanupBurstDir(ctx)
-        synchronized(ctx.jpegLock) { ctx.jpegPaths.clear() }
+        synchronized(ctx.jpegLock) {
+            for (i in ctx.jpegPathByIndex.indices) ctx.jpegPathByIndex[i] = null
+        }
         if (activeBurst === ctx) activeBurst = null
         fusionStarted = false
         processingInFlight = false
@@ -2071,8 +2171,11 @@ class HqCaptureController(
     /**
      * 把 native 的逐帧诊断拼成一行可读文本。
      *
-     * 每帧 8 个浮点：frameIndex / isReference / fbGood / ransacInliers / rmse /
-     * ecc / rejectReason / sharpness。参考帧没有 LK/RANSAC/ECC 过程，写 -1。
+     * 每帧 15 个浮点（见 FRAME_STAT_STRIDE）。后 7 个是过滤链的逐级计数，
+     * 用来定位 "features too few" 到底是哪一道过滤造成的：
+     *   chain[ref=300 fwd=288 bwd=275 fb=260 err=2]   -> errF<20 太严格
+     *   chain[ref=300 fwd=5 ...]                      -> 运动/尺度/帧序问题，与门限无关
+     * 参考帧没有 LK/RANSAC/ECC 过程，其余项写 -1。
      */
     private fun buildFrameDiagnostics(frameStats: FloatArray, n: Int): String {
         if (frameStats.isEmpty() || n <= 0) return ""
@@ -2084,6 +2187,7 @@ class HqCaptureController(
             if (frameStats[base + 1] > 0.5f) {
                 sb.append("frame[$i]=reference sharpness=")
                 sb.append("%.2f".format(frameStats[base + 7]))
+                sb.append(",refFeatures=").append(frameStats[base + 8].toInt())
             } else {
                 sb.append("frame[$i]=fbGood=").append(frameStats[base + 2].toInt())
                 sb.append(",ransacInliers=").append(frameStats[base + 3].toInt())
@@ -2092,6 +2196,14 @@ class HqCaptureController(
                 sb.append(",rejectReason=")
                 sb.append(frameRejectReasonName(frameStats[base + 6].toInt()))
                 sb.append(",sharpness=").append("%.2f".format(frameStats[base + 7]))
+                // 过滤链逐级保留数：把「谁杀掉了 298 个点」这件事摊开
+                sb.append(",chain[ref=").append(frameStats[base + 8].toInt())
+                sb.append(" fwd=").append(frameStats[base + 9].toInt())
+                sb.append(" bwd=").append(frameStats[base + 10].toInt())
+                sb.append(" fb=").append(frameStats[base + 11].toInt())
+                sb.append(" err=").append(frameStats[base + 12].toInt())
+                sb.append(" bounds=").append(frameStats[base + 13].toInt())
+                sb.append("] alignScale=").append("%.4f".format(frameStats[base + 14]))
             }
         }
         return sb.toString()
@@ -2326,6 +2438,8 @@ class HqCaptureController(
         sb.appendLine("jpegReceived=${stats.jpegReceived}")
         sb.appendLine("jpegMatched=${stats.jpegMatched}")
         sb.appendLine("jpegExpired=${stats.jpegExpired}")
+        // 帧序保证：收下但定位不到帧号的 JPEG 数（>0 说明帧序不变量被破坏过）
+        sb.appendLine("jpegUnindexed=${stats.jpegUnindexed}")
         sb.appendLine("rawReceived=${stats.rawReceived}")
         sb.appendLine("rawMatched=${stats.rawMatched}")
         sb.appendLine("rawExpired=${stats.rawExpired}")
@@ -2346,6 +2460,8 @@ class HqCaptureController(
         // 逐帧最大偏离：只比首尾无法发现「左移→右移回来」
         sb.appendLine("burstMaxTranslationFromReference=${stats.burstMaxTranslationFromReference}")
         sb.appendLine("burstMaxRotationFromReference=${stats.burstMaxRotationFromReference}")
+        // 上面两个为 0 时，看这一行区分「真没动」与「查不到 pose」
+        sb.appendLine("burstFramePose=${stats.burstFramePose}")
         sb.appendLine("previewClippedPercent=${stats.previewClippedPercent}")
         sb.appendLine("previewUnderexposedPercent=${stats.previewUnderexposedPercent}")
         sb.appendLine("previewLumaP05=${stats.lumaP05}")

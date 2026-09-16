@@ -15,6 +15,18 @@ constexpr int kMinAlignInliers = 30;
 constexpr double kMaxAlignRmsePx = 1.5;
 constexpr double kMinAlignEcc = 0.95;
 
+/**
+ * GFTT + FB-LK + RANSAC 全部在这个长边尺寸上做。
+ *
+ * 直接在 4096x3072 上做特征追踪对 HQ fusion 来说既慢又脆弱：
+ * 同样是 0.5° 的机身旋转，在 12MP 上是 25~40px 的位移，缩到 1280 长边
+ * 只剩 8~13px，LK 金字塔的搜索压力小一个量级，内点率显著更高。
+ * 而融合真正需要的只是**几何变换**，不是 12MP 级别的追踪精度 ——
+ * 求出小图 affine 后把 translation 除以 scale 换回全分辨率，
+ * 再拿它对原始 12MP JPEG 做 warp 即可。
+ */
+constexpr int kAlignMaxDim = 1280;
+
 // 参考帧自己都解码不开时算一次 decode 失败
 constexpr int kReasonOk = 0;
 constexpr int kReasonDecodeFail = 1;
@@ -44,12 +56,27 @@ constexpr int kReasonException = 6;
 constexpr int kStatsSlots = 25;
 
 /**
- * frameStatsOut 每帧 8 个浮点，用于回答「那 3 张到底卡在哪一道门」：
- *   0 frameIndex  1 isReference  2 fbGood(LK 存活数)  3 ransacInliers
- *   4 rmse        5 ecc          6 rejectReason      7 sharpness
+ * frameStatsOut 每帧 15 个浮点，用于回答「那 3 张到底卡在哪一道门」。
+ *
+ * 前 8 个是结果量，后面 7 个是**过滤链的逐级计数**：
+ *   0  frameIndex            1  isReference         2  fbGood（最终活下来的）
+ *   3  ransacInliers         4  rmse                5  ecc
+ *   6  rejectReason          7  sharpness
+ *   8  refFeatures           9  lkForwardOk        10  lkBackwardOk
+ *  11  fbPass               12  errPass            13  boundsPass
+ *  14  alignScale
+ *
+ * 为什么必须逐级拆开：fbGood 是「forward status + backward status + FB error +
+ * errF + bounds」全部过完之后的数字。实机只看到 fbGood=1/2，无法回答
+ * 「是 errF<20 太严，还是 forward 本身就只有 5 个点」。
+ * 有了 9~13，一眼就能看出问题出在哪一道：
+ *   9=288 10=275 11=260 12=2    -> errF<20 太严格
+ *   9=5                         -> 运动/尺度/顺序问题，跟门限无关
+ * 这比直接把 20 放宽到 50 科学得多。
+ *
  * 未尝试的项写 -1（例如参考帧没有 LK/RANSAC/ECC 过程）。
  */
-constexpr int kFrameStride = 8;
+constexpr int kFrameStride = 15;
 
 double medianAbsDeviation(const cv::Mat& a, const cv::Mat& b)
 {
@@ -322,8 +349,22 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         stats[23] = static_cast<float>(p95);
     }
 
+    // 对齐专用的小图。refAlign 与 curAlign 尺寸必须一致，否则 LK 会直接失败。
+    const cv::Mat refAlign = downscaleGray(refGray, kAlignMaxDim);
+    const double alignScale = (refAlign.cols > 0 && reference.cols > 0)
+        ? static_cast<double>(refAlign.cols) / static_cast<double>(reference.cols)
+        : 1.0;
+    const double invAlignScale = alignScale > 1e-9 ? (1.0 / alignScale) : 1.0;
+
     std::vector<cv::Point2f> refPoints;
-    cv::goodFeaturesToTrack(refGray, refPoints, 300, 0.01, 5.0);
+    if (!refAlign.empty()) {
+        // 小图上可以放心多取一些点：500 个特征在 1280 长边上的 GFTT
+        // 比 300 个在 4096 长边上的还便宜。
+        cv::goodFeaturesToTrack(refAlign, refPoints, 500, 0.01, 4.0);
+    }
+    if (haveFrameStats) {
+        frameStats[8] = static_cast<float>(refPoints.size());
+    }
 
     double noiseSigma = std::max(2.0, static_cast<double>(iso) / 20.0);
     const double noise2 = (noiseSigma / 255.0) * (noiseSigma / 255.0) + 1e-6;
@@ -421,9 +462,22 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         double frameRmse = 0.0;
         double frameEcc = 0.0;
         double frameFbGood = 0.0;
+        // 过滤链的逐级计数。fbGood 只是最终结果，拆开才能知道是谁杀掉了其余的点。
+        double stageRefFeatures = static_cast<double>(refPoints.size());
+        double stageFwdOk = 0.0;
+        double stageBwdOk = 0.0;
+        double stageFbPass = 0.0;
+        double stageErrPass = 0.0;
+        double stageBoundsPass = 0.0;
 
         try {
-            if (refPoints.size() < 20) {
+            const cv::Mat curAlign = downscaleGray(curGray, kAlignMaxDim);
+            if (refAlign.empty() || curAlign.empty() ||
+                refAlign.size() != curAlign.size()) {
+                // 尺寸不一致（理论上不该发生）会让 LK 直接抛异常，
+                // 这里提前判掉，归到「特征不足」这一类而不是 exception。
+                reason = kReasonFeaturesTooFew;
+            } else if (refPoints.size() < 20) {
                 // 参考帧本身特征就太少，所有候选帧都会走到这里
                 reason = kReasonFeaturesTooFew;
             } else {
@@ -433,25 +487,36 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                 std::vector<uint8_t> statusB;
                 std::vector<float> errF;
                 std::vector<float> errB;
+                // 在小图坐标上做前后向 LK。窗口放大到 31x31、层数 4，
+                // 因为小图上同样的物理位移对应更少的像素，需要更宽的金字塔兜底。
                 cv::calcOpticalFlowPyrLK(
-                    refGray, curGray, refPoints, next, statusF, errF,
-                    cv::Size(21, 21), 3);
+                    refAlign, curAlign, refPoints, next, statusF, errF,
+                    cv::Size(31, 31), 4);
                 cv::calcOpticalFlowPyrLK(
-                    curGray, refGray, next, back, statusB, errB,
-                    cv::Size(21, 21), 3);
+                    curAlign, refAlign, next, back, statusB, errB,
+                    cv::Size(31, 31), 4);
 
                 std::vector<cv::Point2f> gPrev, gNext;
                 for (size_t k = 0; k < statusF.size() &&
-                    k < statusB.size() && k < next.size(); ++k) {
-                    if (!statusF[k] || !statusB[k]) continue;
+                    k < statusB.size() && k < next.size() &&
+                    k < back.size() && k < refPoints.size(); ++k) {
+                    if (!statusF[k]) continue;
+                    stageFwdOk += 1.0;
+                    if (!statusB[k]) continue;
+                    stageBwdOk += 1.0;
+                    // fb 与 errF 都在小图坐标系里，和 1.5px / 20.0 的门限同尺度。
                     const double fb = cv::norm(refPoints[k] - back[k]);
-                    if (fb > 1.5 || errF[k] > 20.0) continue;
+                    if (fb > 1.5) continue;
+                    stageFbPass += 1.0;
+                    if (errF[k] > 20.0) continue;
+                    stageErrPass += 1.0;
                     const cv::Point2f& p = next[k];
                     if (!std::isfinite(p.x) || !std::isfinite(p.y) ||
                         p.x < 0 || p.y < 0 ||
-                        p.x >= curGray.cols || p.y >= curGray.rows) {
+                        p.x >= curAlign.cols || p.y >= curAlign.rows) {
                         continue;
                     }
+                    stageBoundsPass += 1.0;
                     gPrev.push_back(refPoints[k]);
                     gNext.push_back(p);
                 }
@@ -459,20 +524,20 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
 
                 if (gPrev.size() >= static_cast<size_t>(kMinAlignInliers)) {
                     cv::Mat inliers;
-                    cv::Mat affine = cv::estimateAffinePartial2D(
+                    cv::Mat affineSmall = cv::estimateAffinePartial2D(
                         gPrev, gNext, inliers, cv::RANSAC, 3.0);
-                    if (!affine.empty()) {
+                    if (!affineSmall.empty()) {
                         // RMSE 必须是「affine 模型拟合之后还剩多少误差」，
                         // 而不是「特征从上一帧移动了多少像素」。
                         // 旧实现算的是后者：手机轻微平移 5px 时，即使模型完全正确，
                         // RMSE 也会是 5px，然后被 1.5px 的门限误杀。这是把好帧
                         // 成片拒掉的一个重要原因。
-                        const double m00 = affine.at<double>(0, 0);
-                        const double m01 = affine.at<double>(0, 1);
-                        const double m02 = affine.at<double>(0, 2);
-                        const double m10 = affine.at<double>(1, 0);
-                        const double m11 = affine.at<double>(1, 1);
-                        const double m12 = affine.at<double>(1, 2);
+                        const double m00 = affineSmall.at<double>(0, 0);
+                        const double m01 = affineSmall.at<double>(0, 1);
+                        const double m02 = affineSmall.at<double>(0, 2);
+                        const double m10 = affineSmall.at<double>(1, 0);
+                        const double m11 = affineSmall.at<double>(1, 1);
+                        const double m12 = affineSmall.at<double>(1, 2);
                         int inlierCount = 0;
                         double sumSq = 0.0;
                         for (int k = 0; k < inliers.rows; ++k) {
@@ -501,13 +566,22 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                         } else if (frameRmse > kMaxAlignRmsePx) {
                             reason = kReasonRmse;
                         } else {
+                            // 把「小图 affine」换算成「全分辨率 affine」：
+                            // p_small = scale * p_full，所以
+                            //   scale * p_cur_full = A * scale * p_ref_full + t_small
+                            // => p_cur_full = A * p_ref_full + t_small / scale
+                            // 线性部分（旋转 + 缩放）完全不变，只有 translation 要除以 scale。
+                            cv::Mat affineFull = affineSmall.clone();
+                            affineFull.at<double>(0, 2) *= invAlignScale;
+                            affineFull.at<double>(1, 2) *= invAlignScale;
+
                             // affine 由 estimateAffinePartial2D(gPrev=ref, gNext=cur)
                             // 解出，方向是 reference -> current；而 warpAffine 的
                             // dst 是 reference、src 是 cur，方向恰好相反。
                             // 必须用 WARP_INVERSE_MAP 告诉 OpenCV「按 dst->src 使用这个矩阵」，
                             // 否则 OpenCV 会再求一次逆，把图像往反方向拉。
                             cv::warpAffine(
-                                cur, warped, affine, reference.size(),
+                                cur, warped, affineFull, reference.size(),
                                 cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
                                 cv::BORDER_REPLICATE);
                             good = true;
@@ -582,6 +656,13 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
             fs[3] = static_cast<float>(frameInliers);
             fs[4] = static_cast<float>(frameRmse);
             fs[5] = static_cast<float>(frameEcc);
+            fs[8] = static_cast<float>(stageRefFeatures);
+            fs[9] = static_cast<float>(stageFwdOk);
+            fs[10] = static_cast<float>(stageBwdOk);
+            fs[11] = static_cast<float>(stageFbPass);
+            fs[12] = static_cast<float>(stageErrPass);
+            fs[13] = static_cast<float>(stageBoundsPass);
+            fs[14] = static_cast<float>(alignScale);
         }
 
         if (!good || warped.empty() || warped.size() != reference.size()) {

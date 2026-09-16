@@ -79,15 +79,53 @@ size_t GaussianEngine::count() const { return g_.size(); }
 size_t GaussianEngine::stableCount() const { return stable_; }
 size_t GaussianEngine::mergedCount() const { return merged_; }
 
-size_t GaussianEngine::copyPoints(float* out, size_t maxPoints) const {
-    const size_t n = g_.size();
-    if (n == 0 || out == nullptr || maxPoints == 0) {
+size_t GaussianEngine::confirmedCount(int minHits) const {
+    if (minHits <= 1) {
+        return g_.size();
+    }
+    const uint16_t need = static_cast<uint16_t>(minHits > 65535 ? 65535 : minHits);
+    size_t n = 0;
+    for (const Gaussian& a : g_) {
+        if (a.hits >= need) {
+            n++;
+        }
+    }
+    return n;
+}
+
+size_t GaussianEngine::copyPoints(float* out, size_t maxPoints, int minHits) const {
+    if (out == nullptr || maxPoints == 0 || g_.empty()) {
         return 0;
     }
-    const size_t step = n > maxPoints ? (n + maxPoints - 1) / maxPoints : 1;
+    const uint16_t need = static_cast<uint16_t>(minHits > 1 ? minHits : 1);
+
+    // 先数一遍「满足 minHits 的点」，再按它算采样步长。
+    // 旧实现直接对 g_ 全体均匀抽样并全部画出来，于是未验证点也进了渲染 ——
+    // 实机统计 600000 总点里 stable 只有 28，屏幕自然是一层噪声。
+    size_t enabled = 0;
+    for (const Gaussian& a : g_) {
+        if (a.hits >= need) {
+            enabled++;
+        }
+    }
+    if (enabled == 0) {
+        return 0;
+    }
+
+    const size_t step =
+        enabled > maxPoints ? (enabled + maxPoints - 1) / maxPoints : 1;
+    size_t seen = 0;
     size_t written = 0;
-    for (size_t i = 0; i < n && written < maxPoints; i += step) {
+    for (size_t i = 0; i < g_.size() && written < maxPoints; ++i) {
         const Gaussian& a = g_[i];
+        if (a.hits < need) {
+            continue;
+        }
+        const bool take = (seen % step) == 0;
+        seen++;
+        if (!take) {
+            continue;
+        }
         float* p = out + written * 6;
         p[0] = a.px;
         p[1] = a.py;
