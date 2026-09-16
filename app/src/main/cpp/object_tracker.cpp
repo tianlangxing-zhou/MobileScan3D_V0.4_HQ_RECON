@@ -44,6 +44,7 @@ void ObjectTracker::reset()
     colorFrameCalls_ = 0;
     nanoWeakAttempts_ = 0;
     nanoWeakRecoveries_ = 0;
+    nanoForcedUpdates_ = 0;
     info_.colorFrameValid = false;
     info_.colorFrameWidth = 0;
     info_.colorFrameHeight = 0;
@@ -367,6 +368,8 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         goodNext.push_back(p);
     }
 
+    info_.kltGoodPoints = static_cast<int>(goodPrev.size());
+
     if (goodPrev.size() < kMinKltPoints) {
         info_.trackedPoints = static_cast<int>(goodPrev.size());
         info_.inlierRatio = 0.0f;
@@ -383,6 +386,8 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                 cv::Rect nanoRect;
                 ++nanoWeakAttempts_;
                 info_.nanoWeakAttempts = nanoWeakAttempts_;
+                ++nanoForcedUpdates_;
+                info_.nanoForcedUpdates = nanoForcedUpdates_;
                 if (runNanoUpdate(nanoFrame, nanoFrame.cols, nanoFrame.rows, nanoRect)) {
                     info_.nanoUsedRealColor = usedColor;
                     if (nanoScore_ >= kNanoWeakScore) {
@@ -503,6 +508,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     }
 
     info_.trackedPoints = static_cast<int>(goodNext.size());
+    info_.kltGoodPoints = info_.trackedPoints;
     info_.inlierRatio = goodNext.empty() ? 0.0f : static_cast<float>(inlierCount) / static_cast<float>(goodNext.size());
     info_.confidence = std::clamp(info_.inlierRatio * std::min(1.0f, info_.trackedPoints / 60.0f), 0.0f, 1.0f);
     info_.timestamp = timestamp;
@@ -849,6 +855,7 @@ void ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
     info_.visibleBBoxHeightPx = box.height;
     info_.visibleFraction = 1.0f;
     info_.trackedPoints = static_cast<int>(prevPoints_.size());
+    info_.kltGoodPoints = info_.trackedPoints;
     info_.prevPointCount = info_.trackedPoints;
     info_.prevGrayValid = !prevGray_.empty();
     info_.prevGrayWidth = prevGray_.cols;

@@ -57,6 +57,8 @@ struct TargetTrackInfo
     double nanoLastMs = 0.0;
     // KLT 弱帧连续计数；以及 NanoTrack 恢复/彩色输入诊断
     int weakKltFrames = 0;
+    int kltGoodPoints = 0;
+    uint64_t nanoForcedUpdates = 0;
     uint64_t nanoWeakRecoveries = 0;
     uint64_t nanoWeakAttempts = 0;
     bool nanoUsedRealColor = false;
@@ -140,6 +142,8 @@ private:
     uint64_t nanoFailures_ = 0;
     double nanoLastMs_ = 0.0;
     int weakKltFrames_ = 0;
+    // 被 KLT 弱帧分支"强制"触发的 Nano 更新次数（区别于每 5 帧的周期性更新）
+    uint64_t nanoForcedUpdates_ = 0;
     uint64_t nanoWeakAttempts_ = 0;
     uint64_t nanoWeakRecoveries_ = 0;
     float lastNanoScore_ = 0.f;

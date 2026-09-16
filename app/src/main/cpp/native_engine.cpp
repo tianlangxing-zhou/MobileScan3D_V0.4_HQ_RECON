@@ -943,6 +943,8 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "nanoScore=" << i.nanoScore << "\n"
       << "nanoLastMs=" << i.nanoLastMs << "\n"
       << "weakKltFrames=" << i.weakKltFrames << "\n"
+      << "kltGoodPoints=" << i.kltGoodPoints << "\n"
+      << "nanoForcedUpdates=" << i.nanoForcedUpdates << "\n"
       << "nanoWeakAttempts=" << i.nanoWeakAttempts << "\n"
       << "nanoWeakRecoveries=" << i.nanoWeakRecoveries << "\n"
       << "nanoUsedRealColor=" << (i.nanoUsedRealColor ? "true" : "false") << "\n"
