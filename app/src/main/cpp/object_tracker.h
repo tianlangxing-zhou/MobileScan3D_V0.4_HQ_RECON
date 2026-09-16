@@ -32,6 +32,16 @@ struct TargetTrackInfo
     float depthP10 = 0.f;
     float depthP90 = 0.f;
     float roiSharpness = 0.f;
+    // 深度样本的「有效程度」。目标出界时 ROI 会被裁到只剩几行，
+    // ROI 里真正拿到有效深度的像素会掉到个位数，此时 P10/P50/P90 会退化成
+    // 同一个值（实机出现过 P10=P50=P90=5.14128），不能当作可用观测。
+    //   depthRoiArea      —— ROI 像素总数
+    //   depthValidPixels  —— ROI 内 isfinite(d) && d>0 的像素数
+    //   depthSampleCount  —— 实际参与分位统计的样本数（当前等于 validPixels，
+    //                        独立保留是为了将来引入 outlier 剔除时不必改报告格式）
+    int depthValidPixels = 0;
+    int depthSampleCount = 0;
+    int depthRoiArea = 0;
     uint64_t timestamp = 0;
 
     bool haveCameraFrame = false;

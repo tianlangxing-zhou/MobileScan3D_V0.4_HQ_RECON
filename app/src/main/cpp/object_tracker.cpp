@@ -99,6 +99,9 @@ void ObjectTracker::clearTarget()
     info_.depthP10 = 0.f;
     info_.depthP90 = 0.f;
     info_.roiSharpness = 0.f;
+    info_.depthValidPixels = 0;
+    info_.depthSampleCount = 0;
+    info_.depthRoiArea = 0;
     info_.targetTemplateAllocated = false;
     info_.templateWidth = 0;
     info_.templateHeight = 0;
@@ -609,7 +612,8 @@ void ObjectTracker::updateFromDepth(const float* depth, int width, int height, u
     const int x1 = std::min(width - 1, static_cast<int>(info_.x1 * width));
     const int y1 = std::min(height - 1, static_cast<int>(info_.y1 * height));
     std::vector<float> values;
-    values.reserve(static_cast<size_t>((x1 - x0 + 1) * (y1 - y0 + 1)));
+    const int roiArea = (x1 - x0 + 1) * (y1 - y0 + 1);
+    values.reserve(static_cast<size_t>(roiArea));
     for (int y = y0; y <= y1; ++y) {
         for (int x = x0; x <= x1; ++x) {
             const float d = depth[static_cast<size_t>(y) * width + x];
@@ -618,6 +622,13 @@ void ObjectTracker::updateFromDepth(const float* depth, int width, int height, u
             }
         }
     }
+    // ROI 面积 / 有效深度像素数必须一起上报：只看 P10/P50/P90 无法区分
+    // 「目标处深度真的一致」和「ROI 里只剩 3 个有效像素」。
+    // 这里不把空的 medianDepth 置 0 —— filterDepth 依赖它，而这一轮
+    // 明确不动 Object Lock / Depth Filter 的既有行为。
+    info_.depthRoiArea = roiArea;
+    info_.depthValidPixels = static_cast<int>(values.size());
+    info_.depthSampleCount = static_cast<int>(values.size());
     if (!values.empty()) {
         std::sort(values.begin(), values.end());
         const size_t n = values.size();

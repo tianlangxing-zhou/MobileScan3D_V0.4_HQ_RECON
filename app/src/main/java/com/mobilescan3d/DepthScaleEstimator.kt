@@ -3,7 +3,7 @@ package com.mobilescan3d
 import kotlin.math.abs
 
 /**
- * 深度尺度估计器 —— **只统计，不施加**。
+ * 深度尺度估计器 —— **只统计 + shadow 验证，绝不施加**。
  *
  * 实机证据（2026-09-16 报告）：
  * ```
@@ -16,11 +16,17 @@ import kotlin.math.abs
  * 也就是说 raw depth 与 VINS 三角化深度之间存在一个稳定的比例失配，但
  * **一次测试场景不能拿来永久标定**：可能随场景尺度、目标距离、纹理条件而变。
  *
- * 因此这里只做一件事：在 Object Lock 可靠、且 raw / VINS 两条深度都可观测时，
- * 持续收集 `scale = vinsTriangulatedDepthMedian / targetRawDepthMedian`，
- * 输出 median / MAD / min / max / 样本数 / 漂移 / 是否稳定。
- * **任何地方都不允许据此自动修改深度或点云**；等样本足够多、稳定判据长期成立之后，
- * 再由人决定要不要固化成常数。
+ * 因此这里只做两件事：
+ *  1. 在 Object Lock 可靠、且 raw / VINS 两条深度都可观测时，持续收集
+ *     `scale = vinsTriangulatedDepthMedian / targetRawDepthMedian`，
+ *     输出 median / MAD / min / max / 样本数 / 漂移 / 是否稳定。
+ *  2. **shadow correction 验证**（本轮新增）：用当前窗口 median 算
+ *     `shadowMetricDepth = rawDepth × median`，并记录它与 VINS 深度的偏差。
+ *     这一步只写报告，**不参与任何重建**。
+ *
+ * **任何地方都不允许据此自动修改深度或点云**；等样本足够多、稳定判据在
+ * 连续 3～5 次不同距离的扫描里都成立之后，再由人决定是纯 scale 还是
+ * 拟合 `metric = a × raw + b`。
  */
 class DepthScaleEstimator {
 
@@ -56,6 +62,15 @@ class DepthScaleEstimator {
         const val MIN_CONFIDENCE = 0.7f
         const val MIN_TRACKED_POINTS = 50
         const val MIN_INLIER_RATIO = 0.7f
+
+        /**
+         * ROI 内必须有多少个「真的有深度」的像素，这个中位数才算观测。
+         *
+         * 目标出界时 ROI 会被裁到只剩几行，有效像素掉到个位数，此时
+         * P10/P50/P90 会退化成同一个值（实机出现过 `P10=P50=P90=5.14128`）。
+         * 这种样本一旦进入统计，会把 median 往完全错误的方向拽。
+         */
+        const val MIN_VALID_DEPTH_PIXELS = 100
     }
 
     /**
@@ -67,6 +82,12 @@ class DepthScaleEstimator {
     private var head = 0
     /** 当前样本数，上限 MAX_SAMPLES */
     private var size = 0
+
+    // shadow correction 的只读验证缓冲：与 buffer 同步 push，索引一一对应
+    private val shadowDepthBuf = FloatArray(MAX_SAMPLES)
+    private val shadowVinsBuf = FloatArray(MAX_SAMPLES)
+    private var shadowHead = 0
+    private var shadowSize = 0
 
     private var lastSampleNs = 0L
 
@@ -91,9 +112,24 @@ class DepthScaleEstimator {
     var rejectedSamples: Long = 0L
         private set
 
+    // ---- shadow correction（只记录，绝不施加）----
+    var shadowSampleCount: Int = 0
+        private set
+    var shadowDepthMedian: Float = 0f
+        private set
+    var shadowVsVinsErrorMeters: Float = 0f
+        private set
+    var shadowVsVinsErrorPercent: Float = 0f
+        private set
+    /** 最近一次采样时 ROI 里真正有深度的像素数，用于判断样本可信度 */
+    var lastValidDepthPixels: Int = 0
+        private set
+
     fun reset() {
         head = 0
         size = 0
+        shadowHead = 0
+        shadowSize = 0
         lastSampleNs = 0L
         sampleCount = 0
         median = 0f
@@ -104,6 +140,11 @@ class DepthScaleEstimator {
         stable = false
         lastRejectReason = ""
         rejectedSamples = 0L
+        shadowSampleCount = 0
+        shadowDepthMedian = 0f
+        shadowVsVinsErrorMeters = 0f
+        shadowVsVinsErrorPercent = 0f
+        lastValidDepthPixels = 0
     }
 
     /** 第 k 个样本（k=0 最旧） */
@@ -116,6 +157,19 @@ class DepthScaleEstimator {
         buffer[head] = v
         head = (head + 1) % MAX_SAMPLES
         if (size < MAX_SAMPLES) size++
+    }
+
+    private fun shadowAt(buf: FloatArray, k: Int): Float {
+        val oldest = if (shadowSize < MAX_SAMPLES) 0 else shadowHead
+        return buf[(oldest + k) % MAX_SAMPLES]
+    }
+
+    private fun pushShadow(shadowDepth: Float, vinsDepth: Float) {
+        shadowDepthBuf[shadowHead] = shadowDepth
+        shadowVinsBuf[shadowHead] = vinsDepth
+        shadowHead = (shadowHead + 1) % MAX_SAMPLES
+        if (shadowSize < MAX_SAMPLES) shadowSize++
+        shadowSampleCount = shadowSize
     }
 
     /**
@@ -131,8 +185,10 @@ class DepthScaleEstimator {
         trackedPoints: Int,
         inlierRatio: Float,
         targetRawDepthMedian: Float,
-        vinsDepthMedian: Float
+        vinsDepthMedian: Float,
+        targetDepthValidPixels: Int
     ): Boolean {
+        lastValidDepthPixels = targetDepthValidPixels
         if (lastSampleNs != 0L && nowNs - lastSampleNs < SAMPLE_INTERVAL_NS) return false
         lastSampleNs = nowNs
 
@@ -145,6 +201,8 @@ class DepthScaleEstimator {
                 "trackedPoints=$trackedPoints≤$MIN_TRACKED_POINTS"
             inlierRatio <= MIN_INLIER_RATIO ->
                 "inlierRatio=${"%.2f".format(inlierRatio)}≤$MIN_INLIER_RATIO"
+            targetDepthValidPixels < MIN_VALID_DEPTH_PIXELS ->
+                "validDepthPixels=$targetDepthValidPixels<$MIN_VALID_DEPTH_PIXELS(目标可能出界)"
             targetRawDepthMedian <= 0f ->
                 "targetRawDepthMedian=${"%.3f".format(targetRawDepthMedian)}≤0"
             vinsDepthMedian <= 0f ->
@@ -165,8 +223,14 @@ class DepthScaleEstimator {
         }
 
         push(scale)
-        lastRejectReason = ""
         recompute()
+        // shadow 值用「本样本进来之后」的窗口 median，才是可复现的确定性结果；
+        // 它只写报告，绝不参与重建。
+        if (stable || sampleCount >= MIN_SAMPLES) {
+            pushShadow(targetRawDepthMedian * median, vinsDepthMedian)
+            recomputeShadow()
+        }
+        lastRejectReason = ""
         return true
     }
 
@@ -217,6 +281,38 @@ class DepthScaleEstimator {
             driftRatio < MAX_DRIFT_RATIO
     }
 
+    /**
+     * shadow 误差：把 raw 深度按窗口 median 乘成「假装是米制」的深度，
+     * 再与同一时刻的 VINS 三角化深度比。这一轮只看它是否稳定在 0 附近，
+     * **不把它接回 TSDF / 点云**。
+     */
+    private fun recomputeShadow() {
+        val n = shadowSize
+        shadowSampleCount = n
+        if (n == 0) {
+            shadowDepthMedian = 0f
+            shadowVsVinsErrorMeters = 0f
+            shadowVsVinsErrorPercent = 0f
+            return
+        }
+        val depths = FloatArray(n)
+        val errMeters = FloatArray(n)
+        val errPercent = FloatArray(n)
+        for (k in 0 until n) {
+            val sh = shadowAt(shadowDepthBuf, k)
+            val vv = shadowAt(shadowVinsBuf, k)
+            depths[k] = sh
+            errMeters[k] = sh - vv
+            errPercent[k] = if (vv > 1e-3f) 100f * (sh - vv) / vv else 0f
+        }
+        depths.sort()
+        errMeters.sort()
+        errPercent.sort()
+        shadowDepthMedian = medianOfSorted(depths)
+        shadowVsVinsErrorMeters = medianOfSorted(errMeters)
+        shadowVsVinsErrorPercent = medianOfSorted(errPercent)
+    }
+
     /** 已排序数组的中位数 */
     private fun medianOfSorted(sorted: FloatArray): Float {
         val n = sorted.size
@@ -237,7 +333,8 @@ class DepthScaleEstimator {
 
     /**
      * 写进诊断报告。字段名与评审要求一致：
-     * `depthScaleSamples` / `depthScaleMedian` / `depthScaleMAD` / `depthScaleStable`。
+     * `depthScaleSamples` / `depthScaleMedian` / `depthScaleMAD` / `depthScaleStable`
+     * / `shadowDepthMedian` / `shadowVsVinsErrorMeters` / `shadowVsVinsErrorPercent`。
      */
     fun report(sb: StringBuilder, indent: String = "") {
         sb.appendLine("${indent}depthScaleDirection=vins/raw (=depthCorrectionScaleVins)")
@@ -249,8 +346,18 @@ class DepthScaleEstimator {
         sb.appendLine("${indent}depthScaleDriftRatio=$driftRatio")
         sb.appendLine("${indent}depthScaleStable=$stable")
         sb.appendLine("${indent}depthScaleRejected=$rejectedSamples")
+        sb.appendLine("${indent}depthScaleMinValidDepthPixels=$MIN_VALID_DEPTH_PIXELS")
+        sb.appendLine("${indent}depthScaleLastValidDepthPixels=$lastValidDepthPixels")
         if (lastRejectReason.isNotEmpty()) {
             sb.appendLine("${indent}depthScaleRejectReason=$lastRejectReason")
         }
+        // shadow correction 验证：只记录，绝不写回 TSDF / 点云。
+        // shadowCorrectionApplied 恒为 false —— 这一轮明确不施加修正。
+        sb.appendLine("${indent}shadowCorrectionMode=true")
+        sb.appendLine("${indent}shadowCorrectionApplied=false")
+        sb.appendLine("${indent}shadowSamples=$shadowSampleCount")
+        sb.appendLine("${indent}shadowDepthMedian=$shadowDepthMedian")
+        sb.appendLine("${indent}shadowVsVinsErrorMeters=$shadowVsVinsErrorMeters")
+        sb.appendLine("${indent}shadowVsVinsErrorPercent=$shadowVsVinsErrorPercent")
     }
 }

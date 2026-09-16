@@ -168,7 +168,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     // 深度尺度：只统计 raw↔VINS 的比例失配，绝不自动施加修正（见 DepthScaleEstimator）
     private val depthScaleEstimator = DepthScaleEstimator()
     private val depthScaleTargetBuf = FloatArray(10)
-    private val depthScaleDepthBuf = FloatArray(4)
+    // 槽位与 native_engine.cpp 的 kDepthDiagSlots 一致：
+    //   0 P10  1 median  2 P90  3 vinsMedian
+    //   4 validPixels  5 sampleCount  6 roiArea
+    private val depthScaleDepthBuf = FloatArray(7)
     private var lastAeState: Int? = null
     private var lastAwbState: Int? = null
     private var fps = 0f
@@ -1309,6 +1312,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    targetDepthP10=$targetDepthP10")
         sb.appendLine("    targetDepthMedian=$targetDepthMedian")
         sb.appendLine("    targetDepthP90=$targetDepthP90")
+        // 这三个是「上面的中位数到底可不可信」的前提。P10=P50=P90 且
+        // validPixels 只有个位数时，说明 ROI 里几乎没有有效深度样本。
+        sb.appendLine("    targetDepthValidPixels=${dd[4].toInt()}")
+        sb.appendLine("    targetDepthSampleCount=${dd[5].toInt()}")
+        sb.appendLine("    targetDepthRoiArea=${dd[6].toInt()}")
         sb.appendLine("    focusApproxMeters=$focusApproxMeters")
         sb.appendLine("    vinsTriangulatedDepthMedian=$vinsTriangulatedDepthMedian")
         // 三个字段名字自带方向，不会再读反：
@@ -1528,7 +1536,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             trackedPoints = depthScaleTargetBuf[8].toInt(),
             inlierRatio = depthScaleTargetBuf[9],
             targetRawDepthMedian = depthScaleDepthBuf[1],
-            vinsDepthMedian = depthScaleDepthBuf[3]
+            vinsDepthMedian = depthScaleDepthBuf[3],
+            // ROI 里真正有深度的像素数。目标出界时它会掉到个位数，
+            // 此时 P10/P50/P90 会退化成同一个值（实机 P10=P50=P90=5.14128），
+            // 这种样本一进统计就会把 median 往完全错误的方向拽。
+            targetDepthValidPixels = depthScaleDepthBuf[4].toInt()
         )
     }
 

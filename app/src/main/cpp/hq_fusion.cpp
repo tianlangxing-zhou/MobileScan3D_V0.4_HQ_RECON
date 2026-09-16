@@ -15,6 +15,42 @@ constexpr int kMinAlignInliers = 30;
 constexpr double kMaxAlignRmsePx = 1.5;
 constexpr double kMinAlignEcc = 0.95;
 
+// 参考帧自己都解码不开时算一次 decode 失败
+constexpr int kReasonOk = 0;
+constexpr int kReasonDecodeFail = 1;
+// 特征点太少（goodFeaturesToTrack 没找到，或 LK 前后向校验后活下来的不够）
+constexpr int kReasonFeaturesTooFew = 2;
+// RANSAC 内点不足
+constexpr int kReasonInliers = 3;
+// affine 重投影残差超门限
+constexpr int kReasonRmse = 4;
+// ECC 相关性不足 / 尺寸不匹配
+constexpr int kReasonEcc = 5;
+// OpenCV 或 std 异常
+constexpr int kReasonException = 6;
+
+/**
+ * statsOut 的槽位布局（与 HqCaptureController.applyFusionStats 一一对应）
+ *   0 sharpness(ref)      1 stillAnyChannelHighlightPercent   2 stillShadowPercent
+ *   3 noiseSigma          4 confidenceMean                    5 confidenceLowPercent
+ *   6 inliersMean         7 rmseMean                          8 eccMean
+ *   9 nInputs            10 accepted                         11 rejected
+ *  12 rmseMax            13 sharpestIndex                    14 sharpestScore
+ *  15 fusedWritten       16 rejectedAlign                    17 rejectedEcc
+ *  18 rejectedDecode     19 alignedCount
+ *  20 stillHighlightPercent  21 stillLumaP05  22 stillLumaP50  23 stillLumaP95
+ *  24 minAcceptedFrames（回显，方便在报告里核对两侧门限一致）
+ */
+constexpr int kStatsSlots = 25;
+
+/**
+ * frameStatsOut 每帧 8 个浮点，用于回答「那 3 张到底卡在哪一道门」：
+ *   0 frameIndex  1 isReference  2 fbGood(LK 存活数)  3 ransacInliers
+ *   4 rmse        5 ecc          6 rejectReason      7 sharpness
+ * 未尝试的项写 -1（例如参考帧没有 LK/RANSAC/ECC 过程）。
+ */
+constexpr int kFrameStride = 8;
+
 double medianAbsDeviation(const cv::Mat& a, const cv::Mat& b)
 {
     if (a.empty() || b.empty() || a.size() != b.size()) {
@@ -79,6 +115,82 @@ double sharpnessScore(const cv::Mat& gray)
     return stddev[0] * stddev[0];
 }
 
+/** 从 256 桶直方图取分位，q ∈ [0,1] */
+int percentileFromHist(const int* hist, int total, double q)
+{
+    if (total <= 0) return 0;
+    int target = static_cast<int>(q * total);
+    if (target < 1) target = 1;
+    int acc = 0;
+    for (int v = 0; v < 256; ++v) {
+        acc += hist[v];
+        if (acc >= target) return v;
+    }
+    return 255;
+}
+
+/**
+ * 单张 still JPEG 的曝光统计。
+ *
+ * 旧实现有两个明确错误：
+ *  (a) 把「任一通道接近黑或白」都算成 clipped —— 一个像素只要某个通道接近黑色
+ *      就被记成过曝，于是报告里的 71.85% clipped 根本不能解释成 71.85% 高光过曝。
+ *  (b) luma 权重按 RGB 顺序取值。cv::imread() 默认返回 **BGR**，所以 c[0] 是 B、
+ *      c[2] 才是 R，权重必须写成 114*B + 587*G + 299*R。
+ *
+ * 现在拆成三个互不混淆的量 + 三个亮度分位，与 preview 侧同一套语义。
+ */
+void computeStillExposure(
+    const cv::Mat& bgr,
+    int& shadowPixels,
+    int& highlightPixels,
+    int& anyChannelHighlight,
+    int& totalPixels,
+    int& outP05,
+    int& outP50,
+    int& outP95)
+{
+    shadowPixels = 0;
+    highlightPixels = 0;
+    anyChannelHighlight = 0;
+    totalPixels = 0;
+    outP05 = outP50 = outP95 = 0;
+    if (bgr.empty() || bgr.type() != CV_8UC3) {
+        return;
+    }
+
+    int hist[256] = {};
+    for (int y = 0; y < bgr.rows; ++y) {
+        const cv::Vec3b* row = bgr.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < bgr.cols; ++x) {
+            const cv::Vec3b& c = row[x];
+            const int b = c[0];
+            const int g = c[1];
+            const int r = c[2];
+            // 真正的亮度（BT.601，注意通道顺序是 BGR）
+            const int luma = (114 * b + 587 * g + 299 * r) / 1000;
+            if (luma <= 20) {
+                shadowPixels++;
+            }
+            if (luma >= 250) {
+                highlightPixels++;
+            }
+            // 只有「某个通道已经打到上限」才是真正的通道级饱和
+            if (b > 252 || g > 252 || r > 252) {
+                anyChannelHighlight++;
+            }
+            hist[luma]++;
+            totalPixels++;
+        }
+    }
+    if (totalPixels <= 0) {
+        return;
+    }
+    outP05 = percentileFromHist(hist, totalPixels, 0.05);
+    outP50 = percentileFromHist(hist, totalPixels, 0.50);
+    outP95 = percentileFromHist(hist, totalPixels, 0.95);
+}
+
 } // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -89,10 +201,12 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     jstring outputPath,
     jfloat exposureMs,
     jint iso,
-    jfloatArray statsOut)
+    jint minAcceptedFrames,
+    jfloatArray statsOut,
+    jfloatArray frameStatsOut)
 {
-    // statsOut 共 20 槽，布局见下方 stats[..] 赋值处的注释
-    if (!inputPaths || !outputPath || env->GetArrayLength(statsOut) < 20) {
+    if (!inputPaths || !outputPath || !statsOut ||
+        env->GetArrayLength(statsOut) < kStatsSlots) {
         return JNI_FALSE;
     }
 
@@ -100,6 +214,12 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     if (nInputs <= 0) {
         return JNI_FALSE;
     }
+
+    // 融合所需最少帧数由 Kotlin 传入，两侧不再各写一个魔数。
+    // 旧实现 C++ 用 2、Kotlin 用 MIN_FUSION_FRAMES=3，于是 accepted=2 时
+    // native 白做一次合成、写出 JPEG，Kotlin 再把它删掉。
+    int minAccepted = static_cast<int>(minAcceptedFrames);
+    if (minAccepted < 2) minAccepted = 2;
 
     std::vector<std::string> paths;
     paths.reserve(static_cast<size_t>(nInputs));
@@ -127,17 +247,31 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     const std::string outPath(out);
     env->ReleaseStringUTFChars(outputPath, out);
 
-    // stats 槽位约定（与 HqCaptureController.applyFusionStats 一一对应）：
-    //   0 sharpness(ref)      1 clippedPercent     2 underexposedPercent
-    //   3 noiseSigma          4 confidenceMean     5 confidenceLowPercent
-    //   6 inliersMean         7 rmseMean           8 eccMean
-    //   9 nInputs            10 accepted          11 rejected
-    //  12 rmseMax            13 sharpestIndex     14 sharpestScore
-    //  15 fusedWritten       16 rejectedAlign     17 rejectedEcc
-    //  18 rejectedDecode     19 alignedCount
-    float stats[20] = {};
+    float stats[kStatsSlots] = {};
     stats[9] = static_cast<float>(nInputs);
     stats[13] = -1.f;
+    stats[24] = static_cast<float>(minAccepted);
+
+    // 逐帧诊断缓冲：每帧 kFrameStride 个浮点
+    std::vector<float> frameStats;
+    const bool haveFrameStats =
+        frameStatsOut != nullptr &&
+        env->GetArrayLength(frameStatsOut) >= static_cast<jsize>(nInputs) * kFrameStride;
+    if (haveFrameStats) {
+        frameStats.assign(static_cast<size_t>(nInputs) * kFrameStride, -1.f);
+        for (jsize i = 0; i < nInputs; ++i) {
+            frameStats[static_cast<size_t>(i) * kFrameStride] = static_cast<float>(i);
+            frameStats[static_cast<size_t>(i) * kFrameStride + 6] =
+                static_cast<float>(kReasonDecodeFail); // 默认：没走到最后就算失败
+        }
+    }
+    const auto pushFrameStats = [&]() {
+        if (haveFrameStats) {
+            env->SetFloatArrayRegion(
+                frameStatsOut, 0, static_cast<jsize>(frameStats.size()),
+                frameStats.data());
+        }
+    };
 
     cv::Mat reference = cv::imread(paths[0], cv::IMREAD_COLOR);
     if (reference.empty()) {
@@ -145,7 +279,12 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         // 否则报告里会同时出现「reference frame decode failed」和 rejectedDecode=0
         // 这种自相矛盾的组合（旧版本就是这样）。
         stats[18] = 1.f;
-        env->SetFloatArrayRegion(statsOut, 0, 20, stats);
+        if (haveFrameStats) {
+            frameStats[1] = 1.f; // isReference
+            frameStats[6] = static_cast<float>(kReasonDecodeFail);
+        }
+        env->SetFloatArrayRegion(statsOut, 0, kStatsSlots, stats);
+        pushFrameStats();
         return JNI_FALSE;
     }
 
@@ -156,31 +295,32 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     int sharpestIndex = 0;
     double sharpestScore = sharpnessScore(refGray);
 
-    cv::Mat lap;
-    cv::Laplacian(refGray, lap, CV_32F);
-    cv::Scalar lapMean, lapStd;
-    cv::meanStdDev(lap, lapMean, lapStd);
-    stats[0] = static_cast<float>(lapStd[0] * lapStd[0]);
+    // 清晰度评分与 sharpestScore 用同一套尺度（都先降到 640 长边），
+    // 否则 stats[0] 与 stats[14] 量纲不同，看报告的人会以为其中一个是错的。
+    stats[0] = static_cast<float>(sharpestScore);
 
-    int clipped = 0;
-    int underexposed = 0;
-    const int totalPixels = reference.rows * reference.cols;
-    for (int y = 0; y < reference.rows; ++y) {
-        const cv::Vec3b* row = reference.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < reference.cols; ++x) {
-            const cv::Vec3b& c = row[x];
-            if (c[0] < 3 || c[1] < 3 || c[2] < 3 ||
-                c[0] > 252 || c[1] > 252 || c[2] > 252) {
-                clipped++;
-            }
-            const int luma = (c[0] * 299 + c[1] * 587 + c[2] * 114) / 1000;
-            if (luma < 25) {
-                underexposed++;
-            }
-        }
+    if (haveFrameStats) {
+        frameStats[1] = 1.f; // isReference
+        frameStats[6] = static_cast<float>(kReasonOk);
+        frameStats[7] = static_cast<float>(sharpestScore);
     }
-    stats[1] = totalPixels > 0 ? static_cast<float>(100.0 * clipped / totalPixels) : 0.f;
-    stats[2] = totalPixels > 0 ? static_cast<float>(100.0 * underexposed / totalPixels) : 0.f;
+
+    // ---- 参考帧曝光统计（BGR -> luma，拆 shadow / highlight / anyChannelHighlight）----
+    {
+        int shadowPixels = 0, highlightPixels = 0, anyChannelHighlight = 0, totalPixels = 0;
+        int p05 = 0, p50 = 0, p95 = 0;
+        computeStillExposure(
+            reference, shadowPixels, highlightPixels, anyChannelHighlight,
+            totalPixels, p05, p50, p95);
+        if (totalPixels > 0) {
+            stats[1] = static_cast<float>(100.0 * anyChannelHighlight / totalPixels);
+            stats[2] = static_cast<float>(100.0 * shadowPixels / totalPixels);
+            stats[20] = static_cast<float>(100.0 * highlightPixels / totalPixels);
+        }
+        stats[21] = static_cast<float>(p05);
+        stats[22] = static_cast<float>(p50);
+        stats[23] = static_cast<float>(p95);
+    }
 
     std::vector<cv::Point2f> refPoints;
     cv::goodFeaturesToTrack(refGray, refPoints, 300, 0.01, 5.0);
@@ -245,10 +385,18 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     bool haveNoise = false;
 
     for (jsize i = 1; i < nInputs; ++i) {
+        float* fs = haveFrameStats
+            ? frameStats.data() + static_cast<size_t>(i) * kFrameStride
+            : nullptr;
+        const auto markReason = [fs](int reason) {
+            if (fs) fs[6] = static_cast<float>(reason);
+        };
+
         cv::Mat cur = cv::imread(paths[i], cv::IMREAD_COLOR);
         if (cur.empty()) {
             rejected++;
             rejectedDecode++;
+            markReason(kReasonDecodeFail);
             continue;
         }
 
@@ -258,6 +406,7 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         // 每一帧都参与「最清晰帧」评选（同尺度比较），
         // 即使它因对齐失败被拒绝 —— 它仍可能是整组里最好看的一张。
         const double curScore = sharpnessScore(curGray);
+        if (fs) fs[7] = static_cast<float>(curScore);
         if (curScore > sharpestScore) {
             sharpestScore = curScore;
             sharpestIndex = static_cast<int>(i);
@@ -267,12 +416,17 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         bool good = false;
         // 1 = 对齐门（含异常 / 特征不足 / RANSAC 不达标），2 = ECC 门
         int rejectKind = 1;
+        int reason = kReasonFeaturesTooFew;
         double frameInliers = 0.0;
         double frameRmse = 0.0;
         double frameEcc = 0.0;
+        double frameFbGood = 0.0;
 
         try {
-            if (refPoints.size() >= 20) {
+            if (refPoints.size() < 20) {
+                // 参考帧本身特征就太少，所有候选帧都会走到这里
+                reason = kReasonFeaturesTooFew;
+            } else {
                 std::vector<cv::Point2f> next;
                 std::vector<cv::Point2f> back;
                 std::vector<uint8_t> statusF;
@@ -301,6 +455,7 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                     gPrev.push_back(refPoints[k]);
                     gNext.push_back(p);
                 }
+                frameFbGood = static_cast<double>(gPrev.size());
 
                 if (gPrev.size() >= static_cast<size_t>(kMinAlignInliers)) {
                     cv::Mat inliers;
@@ -341,8 +496,11 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                         rmseMax = std::max(rmseMax, frameRmse);
 
                         // 第一道门：RANSAC 内点数量与残差同时达标才继续
-                        if (inlierCount >= kMinAlignInliers &&
-                            frameRmse <= kMaxAlignRmsePx) {
+                        if (inlierCount < kMinAlignInliers) {
+                            reason = kReasonInliers;
+                        } else if (frameRmse > kMaxAlignRmsePx) {
+                            reason = kReasonRmse;
+                        } else {
                             // affine 由 estimateAffinePartial2D(gPrev=ref, gNext=cur)
                             // 解出，方向是 reference -> current；而 warpAffine 的
                             // dst 是 reference、src 是 cur，方向恰好相反。
@@ -353,8 +511,13 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                                 cv::INTER_LINEAR | cv::WARP_INVERSE_MAP,
                                 cv::BORDER_REPLICATE);
                             good = true;
+                            reason = kReasonOk;
                         }
+                    } else {
+                        reason = kReasonFeaturesTooFew;
                     }
+                } else {
+                    reason = kReasonFeaturesTooFew;
                 }
             }
 
@@ -368,6 +531,7 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                 if (refSmall.empty() || warpedSmall.empty() ||
                     refSmall.size() != warpedSmall.size()) {
                     good = false;
+                    reason = kReasonEcc;
                 } else {
                     cv::Mat ecc = cv::Mat::eye(2, 3, CV_32F);
                     cv::TermCriteria criteria(
@@ -379,6 +543,7 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                     // 第二道门：ECC 相关性不足同样视为不可融合的帧
                     if (!std::isfinite(eccScore) || eccScore < kMinAlignEcc) {
                         good = false;
+                        reason = kReasonEcc;
                     } else {
                         const double scaleX =
                             static_cast<double>(reference.cols) / refSmall.cols;
@@ -398,13 +563,25 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
                             cv::BORDER_REPLICATE);
                         warped = refined;
                         frameEcc = eccScore;
+                        reason = kReasonOk;
                     }
                 }
             }
         } catch (const cv::Exception&) {
             good = false;
+            reason = kReasonException;
+            rejectKind = 1;
         } catch (const std::exception&) {
             good = false;
+            reason = kReasonException;
+            rejectKind = 1;
+        }
+
+        if (fs) {
+            fs[2] = static_cast<float>(frameFbGood);
+            fs[3] = static_cast<float>(frameInliers);
+            fs[4] = static_cast<float>(frameRmse);
+            fs[5] = static_cast<float>(frameEcc);
         }
 
         if (!good || warped.empty() || warped.size() != reference.size()) {
@@ -417,8 +594,11 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
             } else {
                 rejectedAlign++;
             }
+            markReason(reason);
             continue;
         }
+
+        markReason(kReasonOk);
 
         if (!haveNoise) {
             const double measured = medianAbsDeviation(refGray, curGray);
@@ -458,10 +638,14 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     }
     stats[3] = static_cast<float>(noiseSigma);
 
-    if (accepted < 2) {
-        // 没有任何帧通过严格对齐门限：如实上报统计，
-        // 由上层给出具体拒绝原因（acceptedFrames 等），而不是笼统的 "fusion failed"。
-        env->SetFloatArrayRegion(statsOut, 0, 20, stats);
+    if (accepted < minAccepted) {
+        // 通过严格对齐门限的帧数不够：如实上报统计与逐帧诊断，
+        // 由上层给出具体拒绝原因（acceptedFrames / rejectedAlign / rejectedEcc），
+        // 而不是笼统的 "fusion failed"。
+        // 也**不再**做无谓的合成 —— 旧实现这里用 accepted<2，与 Kotlin 的
+        // MIN_FUSION_FRAMES=3 不一致，accepted=2 时会白算一遍再被上层删掉。
+        env->SetFloatArrayRegion(statsOut, 0, kStatsSlots, stats);
+        pushFrameStats();
         return JNI_TRUE;
     }
 
@@ -512,16 +696,19 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         params.push_back(cv::IMWRITE_JPEG_QUALITY);
         params.push_back(95);
         if (!cv::imwrite(outPath, fused, params)) {
-            env->SetFloatArrayRegion(statsOut, 0, 20, stats);
+            env->SetFloatArrayRegion(statsOut, 0, kStatsSlots, stats);
+            pushFrameStats();
             return JNI_FALSE;
         }
     } catch (const cv::Exception&) {
-        env->SetFloatArrayRegion(statsOut, 0, 20, stats);
+        env->SetFloatArrayRegion(statsOut, 0, kStatsSlots, stats);
+        pushFrameStats();
         return JNI_FALSE;
     }
 
     // 只有真正写出了融合图才置 1；上层据此判断「有没有东西可交付」
     stats[15] = 1.f;
-    env->SetFloatArrayRegion(statsOut, 0, 20, stats);
+    env->SetFloatArrayRegion(statsOut, 0, kStatsSlots, stats);
+    pushFrameStats();
     return JNI_TRUE;
 }

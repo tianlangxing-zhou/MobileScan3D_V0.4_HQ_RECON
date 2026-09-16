@@ -143,8 +143,16 @@ data class HqCaptureStats(
     var acceptedFrames: Int = 0,
     var rejectedFrames: Int = 0,
     var sharpness: Float = 0f,
-    var clippedPercent: Float = 0f,
-    var underexposedPercent: Float = 0f,
+    // still JPEG 的曝光统计。旧实现只有一个语义含混的 clippedPercent
+    // （「任一通道接近黑或白」都算 clipped，于是报告里出现过 71.85% clipped），
+    // 现在按 preview 侧同一套语义拆开：暗部 / 高光 / 通道级饱和 + 三个亮度分位。
+    var stillShadowPercent: Float = 0f,
+    var stillHighlightPercent: Float = 0f,
+    var stillAnyChannelHighlightPercent: Float = 0f,
+    var stillLumaP05: Float = 0f,
+    var stillLumaP50: Float = 0f,
+    var stillLumaP95: Float = 0f,
+    var stillExposureVerdict: String = "unknown",
     var noiseSigma: Float = 0f,
     var confidenceMean: Float = 0f,
     var confidenceLowPercent: Float = 0f,
@@ -157,7 +165,44 @@ data class HqCaptureStats(
     var jpegSaved: Long = 0L,
     var fusedImageSaved: Long = 0L,
     var referenceJpeg: String = "",
-    var lastCaptureRejectReason: String = ""
+    var lastCaptureRejectReason: String = "",
+
+    // ---- Burst 触发瞬间的 preview 快照 ----
+    // 报告生成时的 preview 可能比 burst 晚几十秒（实机出现过 burst ISO=258
+    // 而报告里 preview ISO=513），两者本来就没有可比性。要判断「是我们要错了
+    // 参数，还是 HAL 实际执行了别的」，必须把触发那一刻的状态留下来。
+    var triggerPreviewExposureNs: Long = 0L,
+    var triggerPreviewIso: Int = 0,
+    var triggerPreviewFocus: Float = 0f,
+    var triggerPreviewLumaP05: Float = 0f,
+    var triggerPreviewLumaP50: Float = 0f,
+    var triggerPreviewLumaP95: Float = 0f,
+    var triggerPreviewClippedPercent: Float = 0f,
+    var triggerPreviewUnderexposedPercent: Float = 0f,
+    var triggerPreviewGyroMagnitudeRms: Float = 0f,
+    var triggerPreviewVinsDisp200ms: Float = 0f,
+
+    // ---- 请求 vs 实际 ----
+    // requested* = 我们下发的手动冻结值；actual* = still CaptureResult 真正返回的值。
+    // 两者不一致说明 HAL 没有照办，而不是我们的判据错了。
+    var requestedBurstIso: Int = 0,
+    var requestedBurstExposureNs: Long = 0L,
+    var actualBurstIso: Int = 0,
+    var actualBurstExposureNs: Long = 0L,
+    var actualBurstFocusDiopters: Float = 0f,
+
+    // ---- burst 内最大偏离（相对参考帧，而非只比首尾）----
+    var burstMaxTranslationFromReference: Float = 0f,
+    var burstMaxRotationFromReference: Float = 0f,
+
+    // ---- 融合门限与逐帧诊断 ----
+    var minFusionFrames: Int = 0,
+    var frameDiagnostics: String = "",
+
+    // ---- RAW 独立捕获 ----
+    var rawReferenceIssued: Long = 0L,
+    var rawReferenceDropped: Long = 0L,
+    var rawReferenceEveryNBursts: Int = 0
 )
 
 private data class HqImuSample(
@@ -171,6 +216,37 @@ private data class HqImuSample(
 )
 
 private data class PoseSample(val timestampNs: Long, val pose: FloatArray)
+
+/** 一帧 still 请求带哪些输出面（决定配对桶要凑齐什么） */
+private const val FRAME_MODE_JPEG = 0
+private const val FRAME_MODE_JPEG_RAW = 1
+private const val FRAME_MODE_RAW = 2
+
+/** 独立 RAW 参考帧的伪帧号：它是 burst 之外的单独一次 capture，不参与 burst 统计 */
+private const val RAW_FRAME_INDEX = -1
+
+/** 逐帧参数/位姿数组容量，必须 ≥ BURST_FRAMES */
+private const val BURST_FRAME_SLOTS = 8
+
+/**
+ * 触发那一刻的 preview / 位姿快照。
+ *
+ * burst 与其后的报告之间可能隔了几十秒，preview 早就变了。
+ * 没有这份快照，「我们请求 ISO 258 导致照片暗」和「HAL 实际执行了别的参数」
+ * 这两个完全不同的结论在报告里长得一模一样。
+ */
+private data class BurstTriggerSnapshot(
+    val exposureNs: Long,
+    val iso: Int,
+    val focusD: Float,
+    val lumaP05: Float,
+    val lumaP50: Float,
+    val lumaP95: Float,
+    val clippedPercent: Float,
+    val underPercent: Float,
+    val gyroMagnitudeRms: Float,
+    val vinsDisp200ms: Float
+)
 
 /**
  * 一次 burst 的上下文。
@@ -195,6 +271,19 @@ private class BurstContext(
     var rawSaved = false
     var startPose: FloatArray? = null
     var startNs = 0L
+
+    /** 触发瞬间的 preview / 位姿快照 */
+    var triggerSnapshot: BurstTriggerSnapshot? = null
+
+    // ---- 逐帧记录「硬件实际执行」的参数与当时的 VINS 位姿 ----
+    // 只比首尾位移是不够的：起点和终点很接近并不能证明中间没有
+    // 「左移→右移回来」或「转过去→转回来」。所以每一帧都留一份。
+    val frameExposureNs = LongArray(BURST_FRAME_SLOTS)
+    val frameIso = IntArray(BURST_FRAME_SLOTS)
+    val frameFocusD = FloatArray(BURST_FRAME_SLOTS)
+    val framePose = Array(BURST_FRAME_SLOTS) { FloatArray(12) }
+    val framePoseValid = BooleanArray(BURST_FRAME_SLOTS)
+    val frameRecorded = BooleanArray(BURST_FRAME_SLOTS)
 }
 
 /**
@@ -207,8 +296,13 @@ private class BurstContext(
 private data class BurstFrameTag(
     val ctx: BurstContext,
     val index: Int,
-    val expectsRaw: Boolean
-)
+    val mode: Int
+) {
+    /** 这次 capture 有没有 JPEG 输出面 */
+    val expectsJpeg: Boolean get() = mode != FRAME_MODE_RAW
+    /** 这次 capture 有没有 RAW 输出面 */
+    val expectsRaw: Boolean get() = mode != FRAME_MODE_JPEG
+}
 
 /**
  * 一次 capture 的「配对桶」。
@@ -226,6 +320,9 @@ private class PendingCapture {
     var jpeg: Image? = null
     var raw: Image? = null
     var ctx: BurstContext? = null
+    /** 默认要有 JPEG：RAW-only 的桶要靠 tag 在 Result 到达时把它改成 false，
+     *  否则「Result 先到」会在 JPEG 还没落盘时就把桶消费掉。 */
+    var expectsJpeg = true
     var expectsRaw = false
     var frameIndex = -1
     val arrivedNs = System.nanoTime()
@@ -339,10 +436,36 @@ class HqCaptureController(
         private const val MIN_ALIGN_INLIERS = 30f
         private const val MAX_ALIGN_RMSE_PX = 1.5f
         private const val MIN_ALIGN_ECC = 0.95f
-        /** burst 固定帧数：第 0 帧 JPEG+RAW，第 1..4 帧只出 JPEG */
-        private const val BURST_FRAMES = 5
-        /** 通过严格对齐的帧少于这个数就不融合，降级为最清晰单帧 */
+        /**
+         * burst 帧数与「通过严格对齐的门限」。
+         *
+         * 这一版改成 **4 张 JPEG-only 快速 burst + burst 之外单独捕 1 张 RAW**：
+         * 实机 `burstDurationMs=1352`（5 张 1.35 秒），对多帧降噪来说太长了。
+         * 第 0 帧同时出 RAW+12MP JPEG 很可能拖慢整条 still 流水线，
+         * 而 RAW 的用途（线性参考 / RAW ISP / 噪声模型 / 色彩标定）并不要求
+         * 它和融合帧属于同一次 burst。
+         */
+        private const val BURST_FRAMES = 4
+        /** 融合所需的最少通过帧数。同时作为 JNI 参数传给 native，两侧不再各写魔数。 */
         private const val MIN_FUSION_FRAMES = 3
+        /**
+         * 每多少个 HQ keyframe 捕一张独立 RAW 参考。
+         * 1 = 每轮都拍（当前）。想进一步降低 Camera HAL 压力就改成 3。
+         */
+        private const val RAW_REFERENCE_EVERY_N_BURSTS = 1
+        /**
+         * still 与 preview 必须用同一套曝光判据。
+         *
+         * 旧实现 preview 用分位判据、still 拍完却回到 `underexposedPercent > 20%`
+         * 就直接拒绝，两套标准互相矛盾 —— 拍黑色物体时本来就可能有两三成暗像素，
+         * 那次 `lastCaptureRejectReason=underexposed` 很可能就是误杀。
+         */
+        private const val MAX_STILL_HIGHLIGHT_PERCENT = 5.0f
+        private const val MIN_STILL_HIGHLIGHT_LUMA = 250f
+        /** native 逐帧 alignment 诊断每个帧占几个浮点 */
+        private const val FRAME_STAT_STRIDE = 8
+        /** native statsOut 的槽数，必须与 hq_fusion.cpp 的 kStatsSlots 一致 */
+        private const val FRAME_STAT_SLOTS = 25
         /**
          * Image 与 CaptureResult 配对的超时，判据在 SENSOR_TIMESTAMP 时间域上。
          * 两者都来自 sensor 时钟，直接相减即可；混用 System.currentTimeMillis()
@@ -434,6 +557,11 @@ class HqCaptureController(
     // 新视角判定
     private var haveLastBurstPose = false
     private val lastBurstPose = FloatArray(12)
+
+    // burst 之外的独立 RAW 参考捕获要用到（finishBurstRound 拿不到这两个参数）
+    private var lastCamera: CameraDevice? = null
+    private var lastSession: CameraCaptureSession? = null
+    private var burstsSinceRawCapture = 0
 
     init {
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -541,6 +669,36 @@ class HqCaptureController(
         stats.rawSkipped = 0L
         stats.rawDngSaved = 0L
         stats.jpegSaved = 0L
+        stats.rawReferenceIssued = 0L
+        stats.rawReferenceDropped = 0L
+        stats.rawReferenceEveryNBursts = RAW_REFERENCE_EVERY_N_BURSTS
+        stats.minFusionFrames = MIN_FUSION_FRAMES
+        stats.frameDiagnostics = ""
+        stats.stillShadowPercent = 0f
+        stats.stillHighlightPercent = 0f
+        stats.stillAnyChannelHighlightPercent = 0f
+        stats.stillLumaP05 = 0f
+        stats.stillLumaP50 = 0f
+        stats.stillLumaP95 = 0f
+        stats.stillExposureVerdict = "unknown"
+        stats.triggerPreviewExposureNs = 0L
+        stats.triggerPreviewIso = 0
+        stats.triggerPreviewFocus = 0f
+        stats.triggerPreviewLumaP05 = 0f
+        stats.triggerPreviewLumaP50 = 0f
+        stats.triggerPreviewLumaP95 = 0f
+        stats.triggerPreviewClippedPercent = 0f
+        stats.triggerPreviewUnderexposedPercent = 0f
+        stats.triggerPreviewGyroMagnitudeRms = 0f
+        stats.triggerPreviewVinsDisp200ms = 0f
+        stats.requestedBurstIso = 0
+        stats.requestedBurstExposureNs = 0L
+        stats.actualBurstIso = 0
+        stats.actualBurstExposureNs = 0L
+        stats.actualBurstFocusDiopters = 0f
+        stats.burstMaxTranslationFromReference = 0f
+        stats.burstMaxRotationFromReference = 0f
+        burstsSinceRawCapture = 0
         stats.fusedImageSaved = 0L
         stats.fusionSuccess = 0L
         stats.fusionFallbackSingle = 0L
@@ -680,6 +838,7 @@ class HqCaptureController(
             val bucket = pendingCaptures.getOrPut(ts) { PendingCapture() }
             bucket.result = result
             bucket.ctx = tag.ctx
+            bucket.expectsJpeg = tag.expectsJpeg
             bucket.expectsRaw = tag.expectsRaw
             bucket.frameIndex = tag.index
             while (pendingCaptures.size > 256) {
@@ -688,7 +847,31 @@ class HqCaptureController(
                 pendingCaptures.remove(oldest.key)
             }
         }
+        recordFrameParameters(tag, result)
         tryConsumeCapture(ts)
+    }
+
+    /**
+     * 逐帧记下「硬件实际执行」的曝光/ISO/焦距与当时的 VINS 位姿。
+     *
+     * 报告里只有平均值时，无法回答「那 3 张到底卡在哪一道门」，
+     * 也无法回答「照片暗是我们要错了参数，还是 HAL 执行了别的参数」。
+     * 独立 RAW 参考帧的伪帧号是负数，直接跳过。
+     */
+    private fun recordFrameParameters(tag: BurstFrameTag, result: TotalCaptureResult) {
+        val ctx = tag.ctx
+        val i = tag.index
+        if (i < 0 || i >= BURST_FRAME_SLOTS) return
+        if (activeBurst !== ctx) return
+        ctx.frameExposureNs[i] = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+        ctx.frameIso[i] = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+        ctx.frameFocusD[i] = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
+        val pose = FloatArray(12)
+        if (NativeBridge.nativeGetRenderPose(pose)) {
+            System.arraycopy(pose, 0, ctx.framePose[i], 0, 12)
+            ctx.framePoseValid[i] = true
+        }
+        ctx.frameRecorded[i] = true
     }
 
     /**
@@ -812,14 +995,16 @@ class HqCaptureController(
     }
 
     /**
-     * 构造一帧 burst 的 still capture 请求。
+     * 构造一帧 still capture 请求。
      *
-     * [includeRaw] 只对第 0 帧为 true：JPEG+RAW 各一份，其余帧只出 JPEG。
-     * 5 张 RAW 纯属浪费带宽和存储，而 DNG 只需要一张作为色彩/线性参考。
+     * [frameMode] 决定挂哪些输出面：
+     *   FRAME_MODE_JPEG      —— burst 成员，只出 JPEG（走快速路径）
+     *   FRAME_MODE_JPEG_RAW  —— JPEG + RAW（仅用于兼容旧路径）
+     *   FRAME_MODE_RAW       —— burst 之外的独立 RAW 参考帧
      */
     private fun buildLockedStillRequest(
         camera: CameraDevice,
-        includeRaw: Boolean,
+        frameMode: Int,
         tag: BurstFrameTag
     ): CaptureRequest {
         val frozen = locked3a ?: snapshot3A()
@@ -827,8 +1012,10 @@ class HqCaptureController(
         // 打 tag：只有带 BurstFrameTag 的结果才进 HQ 配对表，
         // preview result 会被 onCaptureResult 直接忽略。
         b.setTag(tag)
-        jpegReader?.surface?.let { b.addTarget(it) }
-        if (includeRaw) {
+        if (frameMode != FRAME_MODE_RAW) {
+            jpegReader?.surface?.let { b.addTarget(it) }
+        }
+        if (frameMode != FRAME_MODE_JPEG) {
             rawReader?.surface?.let { b.addTarget(it) }
         }
         b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
@@ -1242,6 +1429,31 @@ class HqCaptureController(
         burstFailedThisRound = 0
 
         // 记录本次拍摄的位姿：既用于「新视角」判定，也用于 burst 内部运动统计
+        // 触发瞬间的 preview / 位姿快照。报告是在几十秒后生成的，
+        // 那时的 preview 早就变了，拿它去质问「burst 为什么这么暗」毫无意义。
+        ctx.triggerSnapshot = BurstTriggerSnapshot(
+            exposureNs = stats.exposureNs,
+            iso = stats.iso,
+            focusD = stats.focusDiopters,
+            lumaP05 = stats.lumaP05,
+            lumaP50 = stats.lumaP50,
+            lumaP95 = stats.lumaP95,
+            clippedPercent = stats.previewClippedPercent,
+            underPercent = stats.previewUnderexposedPercent,
+            gyroMagnitudeRms = stats.gyroMagnitudeRms,
+            vinsDisp200ms = stats.vinsDisplacement200ms
+        )
+        stats.triggerPreviewExposureNs = stats.exposureNs
+        stats.triggerPreviewIso = stats.iso
+        stats.triggerPreviewFocus = stats.focusDiopters
+        stats.triggerPreviewLumaP05 = stats.lumaP05
+        stats.triggerPreviewLumaP50 = stats.lumaP50
+        stats.triggerPreviewLumaP95 = stats.lumaP95
+        stats.triggerPreviewClippedPercent = stats.previewClippedPercent
+        stats.triggerPreviewUnderexposedPercent = stats.previewUnderexposedPercent
+        stats.triggerPreviewGyroMagnitudeRms = stats.gyroMagnitudeRms
+        stats.triggerPreviewVinsDisp200ms = stats.vinsDisplacement200ms
+
         val pose = FloatArray(12)
         if (NativeBridge.nativeGetRenderPose(pose)) {
             System.arraycopy(pose, 0, lastBurstPose, 0, 12)
@@ -1250,14 +1462,16 @@ class HqCaptureController(
         }
 
         try {
-            // 只有第 0 帧需要 RAW：一张 DNG 足够做线性/色彩参考，
-            // 5 张 RAW 会把 burst 的带宽和落盘时间翻好几倍。
+            // burst 全部 JPEG-only：把 RAW 从融合路径里拆出去。
+            // 实机 5 帧带 1 张 RAW 用了 1352ms，对多帧降噪来说太长；
+            // RAW 会在 burst 结束后由 maybeCaptureReferenceRaw() 单独捕一次。
+            lastCamera = camera
+            lastSession = session
             val requests = (0 until count).map { i ->
-                val expectsRaw = (i == 0) && rawReader != null
                 buildLockedStillRequest(
                     camera,
-                    includeRaw = expectsRaw,
-                    tag = BurstFrameTag(ctx, i, expectsRaw)
+                    FRAME_MODE_JPEG,
+                    BurstFrameTag(ctx, i, FRAME_MODE_JPEG)
                 )
             }
             burstInFlight = true
@@ -1331,6 +1545,40 @@ class HqCaptureController(
         }
         stats.burstDurationMs = (System.nanoTime() - ctx.startNs) / 1_000_000L
 
+        // 逐帧最大偏离（相对参考帧）。只比首尾是不够的：起点和终点很接近
+        // 并不能证明中间没有「左移→右移回来」或「转过去→转回来」。
+        var maxT = 0f
+        var maxR = 0f
+        if (ctx.framePoseValid[0]) {
+            val refPose = ctx.framePose[0]
+            for (k in 0 until BURST_FRAME_SLOTS) {
+                if (!ctx.framePoseValid[k]) continue
+                val p = ctx.framePose[k]
+                val dx = p[9] - refPose[9]
+                val dy = p[10] - refPose[10]
+                val dz = p[11] - refPose[11]
+                val t = hypot(hypot(dx, dy), dz)
+                if (t > maxT) maxT = t
+                val r = rotationAngleDeg(refPose, p)
+                if (r > maxR) maxR = r
+            }
+        }
+        stats.burstMaxTranslationFromReference = maxT
+        stats.burstMaxRotationFromReference = maxR
+
+        // 硬件实际执行了什么。和 requestedBurst* 放在一起看，
+        // 才能分清「我们要错了」和「HAL 没照办」。
+        stats.requestedBurstIso = stats.burstIso
+        stats.requestedBurstExposureNs = stats.burstExposureNs
+        if (ctx.frameRecorded[0]) {
+            stats.actualBurstExposureNs = ctx.frameExposureNs[0]
+            stats.actualBurstIso = ctx.frameIso[0]
+            stats.actualBurstFocusDiopters = ctx.frameFocusD[0]
+        }
+
+        // burst 已发完，现在单独补一张 RAW 参考（每 RAW_REFERENCE_EVERY_N_BURSTS 轮一次）
+        maybeCaptureReferenceRaw(ctx)
+
         // 正常路径：第 N 张 JPEG 全部落盘后由 tryConsumeCapture 立刻启动融合。
         // 这里只挂一个兜底定时器，防止个别 Image 迟到导致永远不融合，
         // 取代了旧的无条件固定 700ms 等待。
@@ -1341,6 +1589,64 @@ class HqCaptureController(
             }
         }, FUSION_FALLBACK_DELAY_MS)
         maybeStartFusion(ctx)
+    }
+
+    /**
+     * burst 之外的独立 RAW 参考捕获。
+     *
+     * RAW 的用途（线性参考 / RAW ISP / 噪声模型 / 色彩标定）不要求它和融合帧
+     * 属于同一次 burst，而把它放进 burst 会明显拉长 still 流水线
+     * （实机 5 帧 = 1352ms）。这里改成 burst 发完后单独发一次 capture，
+     * 走同一条配对链路（tag 里 index = RAW_FRAME_INDEX，不参与 burst 统计），
+     * DNG 直接落到 captureDir，不受融合结束时的临时目录清理影响。
+     */
+    private fun maybeCaptureReferenceRaw(ctx: BurstContext) {
+        if (!caps.rawSupported || rawReader == null) {
+            stats.rawSkipped++
+            return
+        }
+        val camera = lastCamera
+        val session = lastSession
+        if (camera == null || session == null) {
+            stats.rawReferenceDropped++
+            return
+        }
+        burstsSinceRawCapture++
+        if (burstsSinceRawCapture < RAW_REFERENCE_EVERY_N_BURSTS) {
+            stats.rawSkipped++
+            return
+        }
+        burstsSinceRawCapture = 0
+        try {
+            val req = buildLockedStillRequest(
+                camera,
+                FRAME_MODE_RAW,
+                BurstFrameTag(ctx, RAW_FRAME_INDEX, FRAME_MODE_RAW)
+            )
+            stats.rawReferenceIssued++
+            session.capture(req, rawReferenceCallback, handler)
+        } catch (e: Exception) {
+            stats.rawReferenceDropped++
+            stats.lastCaptureRejectReason = "raw reference: ${e.message}"
+        }
+    }
+
+    private val rawReferenceCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            onCaptureResult(result)
+        }
+
+        override fun onCaptureFailed(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            failure: android.hardware.camera2.CaptureFailure
+        ) {
+            stats.rawReferenceDropped++
+        }
     }
 
     // ------------------------------------------------- Image / CaptureResult 配对
@@ -1365,7 +1671,10 @@ class HqCaptureController(
         var bucket: PendingCapture? = null
         synchronized(matcherLock) {
             val b = pendingCaptures[ts]
-            val ready = b != null && b.result != null && b.jpeg != null &&
+            // 一个桶要凑齐它自己那次 capture 声明的全部输出面。
+            // RAW-only 的桶不能等 JPEG，否则永远凑不齐。
+            val ready = b != null && b.result != null &&
+                (!b.expectsJpeg || b.jpeg != null) &&
                 (!b.expectsRaw || b.raw != null)
             if (ready) {
                 bucket = b
@@ -1375,6 +1684,7 @@ class HqCaptureController(
         val b = bucket ?: return
         val result = b.result
         val ctx = b.ctx
+        // 关掉桶里可能残留的 Image，避免 RAW-only 请求下 b.jpeg 长期占着缓冲
         val jpeg = b.jpeg
         if (jpeg != null) {
             stats.jpegMatched++
@@ -1394,7 +1704,8 @@ class HqCaptureController(
         }
         b.jpeg = null
         b.raw = null
-        // JPEG 落盘后立刻检查能不能融合（不再死等固定延迟）
+        // JPEG 落盘后立刻检查能不能融合（不再死等固定延迟）。
+        // RAW-only 的桶走这里时融合早已启动，maybeStartFusion 会直接返回。
         if (ctx != null) maybeStartFusion(ctx)
     }
 
@@ -1575,7 +1886,9 @@ class HqCaptureController(
         val out = File(outDir, "fused_${ctx.token}.jpg")
         // 参考帧 / 单帧降级的落盘都放到 applyFusionStats 里按结果决定，
         // 避免出现「reference_*.jpg」和「single_*.jpg」两份重复交付物。
-        val statsOut = FloatArray(20)
+        // native 的槽位布局见 hq_fusion.cpp 顶部注释
+        val statsOut = FloatArray(FRAME_STAT_SLOTS)
+        val frameStatsOut = FloatArray(paths.size * FRAME_STAT_STRIDE)
         // 噪声估计用的是冻结后的实际曝光参数，不是可能已经刷新的 stats
         val frozen = locked3a
         val exposureMs = (if (frozen?.haveExposure == true) frozen.exposureNs else stats.exposureNs) / 1_000_000f
@@ -1587,13 +1900,15 @@ class HqCaptureController(
                     out.absolutePath,
                     exposureMs,
                     iso,
-                    statsOut
+                    MIN_FUSION_FRAMES,
+                    statsOut,
+                    frameStatsOut
                 )
             } catch (e: Throwable) {
                 false
             }
             handler.post {
-                applyFusionStats(ctx, ok, out, statsOut, paths)
+                applyFusionStats(ctx, ok, out, statsOut, frameStatsOut, paths)
                 finishFusion(ctx)
             }
         }.start()
@@ -1616,12 +1931,13 @@ class HqCaptureController(
         ok: Boolean,
         out: File,
         statsOut: FloatArray,
+        frameStatsOut: FloatArray,
         paths: List<String>
     ) {
         stats.inputFrames = if (statsOut.size > 9 && statsOut[9] > 0f) statsOut[9].toInt() else paths.size
         stats.sharpness = statsOut[0]
-        stats.clippedPercent = statsOut[1]
-        stats.underexposedPercent = statsOut[2]
+        stats.stillAnyChannelHighlightPercent = statsOut[1]
+        stats.stillShadowPercent = statsOut[2]
         stats.noiseSigma = statsOut[3]
         stats.confidenceMean = statsOut[4]
         stats.confidenceLowPercent = statsOut[5]
@@ -1633,18 +1949,49 @@ class HqCaptureController(
         if (statsOut.size > 12) stats.alignmentRmseMax = statsOut[12]
         val sharpestIndex = if (statsOut.size > 13) statsOut[13].toInt() else -1
         val sharpestScore = if (statsOut.size > 14) statsOut[14] else 0f
+        // 旧 bug：这两个值只赋给了局部变量，从来没有写回 stats，
+        // 于是报告里恒为 sharpestIndex=-1 / sharpestScore=0，
+        // 和「参考帧解码成功后就立刻初始化了它们」在逻辑上自相矛盾。
+        // 真正的 fallback 判断用的是局部变量，所以行为一直是对的，只有日志错了。
+        stats.sharpestIndex = sharpestIndex
+        stats.sharpestScore = sharpestScore
         val fusedWritten = if (statsOut.size > 15) statsOut[15] > 0.5f else ok
         if (statsOut.size > 16) stats.rejectedAlignment = statsOut[16].toInt()
         if (statsOut.size > 17) stats.rejectedEcc = statsOut[17].toInt()
         if (statsOut.size > 18) stats.rejectedDecode = statsOut[18].toInt()
+        if (statsOut.size > 20) stats.stillHighlightPercent = statsOut[20]
+        if (statsOut.size > 21) stats.stillLumaP05 = statsOut[21]
+        if (statsOut.size > 22) stats.stillLumaP50 = statsOut[22]
+        if (statsOut.size > 23) stats.stillLumaP95 = statsOut[23]
+        if (statsOut.size > 24) stats.minFusionFrames = statsOut[24].toInt()
+        // 逐帧 alignment 诊断：只有平均数无法回答「那 3 张卡在哪一道门」
+        stats.frameDiagnostics = buildFrameDiagnostics(frameStatsOut, paths.size)
 
         // 分三类处理，而不是笼统地「不合格就重拍」：
         //  1) 光照不合格 / 整组全糊  -> 重拍，融合也救不回来
         //  2) 光照没问题但对齐凑不够 -> 不融合，降级交付「最清晰单帧」
         //  3) 全部达标              -> 真融合
+        // still 与 preview 统一到同一套判据（分位 + 真正的高光占比）。
+        // 不再用 `underexposedPercent > 20%`：拍黑色物体时本来就可能有两三成暗像素，
+        // 那一次 lastCaptureRejectReason=underexposed 很可能就是误杀。
+        val stillReallyUnderexposed =
+            stats.stillLumaP50 < MIN_LUMA_P50 && stats.stillLumaP95 < MIN_LUMA_P95
+        val stillReallyOverexposed =
+            stats.stillHighlightPercent > MAX_STILL_HIGHLIGHT_PERCENT &&
+                stats.stillLumaP95 >= MIN_STILL_HIGHLIGHT_LUMA
+        stats.stillExposureVerdict = when {
+            stillReallyUnderexposed && stillReallyOverexposed -> "underexposed+overexposed"
+            stillReallyUnderexposed -> "underexposed"
+            stillReallyOverexposed -> "overexposed"
+            else -> "ok"
+        }
         val exposureReason = when {
-            stats.underexposedPercent > 20f -> "underexposed"
-            stats.clippedPercent > 5f -> "overexposed"
+            stillReallyUnderexposed ->
+                "underexposed(P50=${"%.0f".format(stats.stillLumaP50)}, " +
+                    "P95=${"%.0f".format(stats.stillLumaP95)})"
+            stillReallyOverexposed ->
+                "overexposed(highlight=${"%.2f".format(stats.stillHighlightPercent)}%, " +
+                    "P95=${"%.0f".format(stats.stillLumaP95)})"
             else -> ""
         }
         // sharpestIndex < 0 表示连参考帧都没解码成功（native 提前返回），
@@ -1719,6 +2066,47 @@ class HqCaptureController(
         if (retake) {
             scheduleRetake()
         }
+    }
+
+    /**
+     * 把 native 的逐帧诊断拼成一行可读文本。
+     *
+     * 每帧 8 个浮点：frameIndex / isReference / fbGood / ransacInliers / rmse /
+     * ecc / rejectReason / sharpness。参考帧没有 LK/RANSAC/ECC 过程，写 -1。
+     */
+    private fun buildFrameDiagnostics(frameStats: FloatArray, n: Int): String {
+        if (frameStats.isEmpty() || n <= 0) return ""
+        val sb = StringBuilder()
+        for (i in 0 until n) {
+            val base = i * FRAME_STAT_STRIDE
+            if (base + FRAME_STAT_STRIDE > frameStats.size) break
+            if (i > 0) sb.append(" | ")
+            if (frameStats[base + 1] > 0.5f) {
+                sb.append("frame[$i]=reference sharpness=")
+                sb.append("%.2f".format(frameStats[base + 7]))
+            } else {
+                sb.append("frame[$i]=fbGood=").append(frameStats[base + 2].toInt())
+                sb.append(",ransacInliers=").append(frameStats[base + 3].toInt())
+                sb.append(",rmse=").append("%.3f".format(frameStats[base + 4]))
+                sb.append(",ecc=").append("%.4f".format(frameStats[base + 5]))
+                sb.append(",rejectReason=")
+                sb.append(frameRejectReasonName(frameStats[base + 6].toInt()))
+                sb.append(",sharpness=").append("%.2f".format(frameStats[base + 7]))
+            }
+        }
+        return sb.toString()
+    }
+
+    /** 与 hq_fusion.cpp 的 kReason* 常量一一对应 */
+    private fun frameRejectReasonName(code: Int): String = when (code) {
+        0 -> "ok"
+        1 -> "decode failed"
+        2 -> "features too few"
+        3 -> "ransac inliers low"
+        4 -> "rmse high"
+        5 -> "ecc low"
+        6 -> "exception"
+        else -> "unknown($code)"
     }
 
     /**
@@ -1899,12 +2287,34 @@ class HqCaptureController(
         sb.appendLine("burstFocusDiopters=${stats.burstFocusDiopters}")
         sb.appendLine("burstAwbMode=${stats.burstAwbMode}")
         sb.appendLine("captureCycles=${stats.captureCycles}")
+        sb.appendLine("burstFrames=$BURST_FRAMES")
         sb.appendLine("burstStarted=${stats.burstStarted}")
         sb.appendLine("burstRequested=${stats.burstRequested}")
         sb.appendLine("burstCompleted=${stats.burstCompleted}")
         sb.appendLine("burstDropped=${stats.burstDropped}")
         sb.appendLine("burstSkipCount=${stats.burstSkipCount}")
         sb.appendLine("burstCooldownMs=${stats.burstCooldownMs}")
+        sb.appendLine("burstDurationMs=${stats.burstDurationMs}")
+        // 触发那一刻的 preview（报告生成时的 preview 可能已经晚了几十秒）
+        sb.appendLine("triggerPreviewExposureNs=${stats.triggerPreviewExposureNs}")
+        sb.appendLine("triggerPreviewISO=${stats.triggerPreviewIso}")
+        sb.appendLine("triggerPreviewFocus=${stats.triggerPreviewFocus}")
+        sb.appendLine("triggerPreviewLumaP05=${stats.triggerPreviewLumaP05}")
+        sb.appendLine("triggerPreviewLumaP50=${stats.triggerPreviewLumaP50}")
+        sb.appendLine("triggerPreviewLumaP95=${stats.triggerPreviewLumaP95}")
+        sb.appendLine("triggerPreviewClippedPercent=${stats.triggerPreviewClippedPercent}")
+        sb.appendLine("triggerPreviewUnderexposedPercent=${stats.triggerPreviewUnderexposedPercent}")
+        sb.appendLine("triggerPreviewGyroMagnitudeRms=${stats.triggerPreviewGyroMagnitudeRms}")
+        sb.appendLine("triggerPreviewVinsDisp200ms=${stats.triggerPreviewVinsDisp200ms}")
+        // 请求 vs 实际：两者不一致说明 HAL 没照办，而不是我们的判据错了
+        sb.appendLine("requestedBurstISO=${stats.requestedBurstIso}")
+        sb.appendLine("requestedBurstExposureNs=${stats.requestedBurstExposureNs}")
+        sb.appendLine("actualBurstISO=${stats.actualBurstIso}")
+        sb.appendLine("actualBurstExposureNs=${stats.actualBurstExposureNs}")
+        sb.appendLine("actualBurstFocusDiopters=${stats.actualBurstFocusDiopters}")
+        sb.appendLine("rawReferenceEveryNBursts=${stats.rawReferenceEveryNBursts}")
+        sb.appendLine("rawReferenceIssued=${stats.rawReferenceIssued}")
+        sb.appendLine("rawReferenceDropped=${stats.rawReferenceDropped}")
         // 调度门控：candidates - accepted 应当等于下面四个 reject 之和
         sb.appendLine("schedulerCandidates=${stats.schedulerCandidates}")
         sb.appendLine("schedulerAccepted=${stats.schedulerAccepted}")
@@ -1933,7 +2343,9 @@ class HqCaptureController(
         sb.appendLine("viewpointDeltaDeg=${stats.viewpointDeltaDeg}")
         sb.appendLine("burstTranslationMeters=${stats.burstTranslationMeters}")
         sb.appendLine("burstRotationDeg=${stats.burstRotationDeg}")
-        sb.appendLine("burstDurationMs=${stats.burstDurationMs}")
+        // 逐帧最大偏离：只比首尾无法发现「左移→右移回来」
+        sb.appendLine("burstMaxTranslationFromReference=${stats.burstMaxTranslationFromReference}")
+        sb.appendLine("burstMaxRotationFromReference=${stats.burstMaxRotationFromReference}")
         sb.appendLine("previewClippedPercent=${stats.previewClippedPercent}")
         sb.appendLine("previewUnderexposedPercent=${stats.previewUnderexposedPercent}")
         sb.appendLine("previewLumaP05=${stats.lumaP05}")
@@ -1948,14 +2360,23 @@ class HqCaptureController(
         sb.appendLine("rejectedEcc=${stats.rejectedEcc}")
         sb.appendLine("rejectedDecode=${stats.rejectedDecode}")
         sb.appendLine("referenceDecodeFail=${stats.referenceDecodeFail}")
+        // 逐帧 alignment 诊断：回答「那几张到底卡在哪一道门」
+        sb.appendLine("frameDiagnostics=${stats.frameDiagnostics}")
         sb.appendLine("inputFrames=${stats.inputFrames}")
         sb.appendLine("acceptedFrames=${stats.acceptedFrames}")
         sb.appendLine("rejectedFrames=${stats.rejectedFrames}")
         sb.appendLine("sharpness=${stats.sharpness}")
         sb.appendLine("sharpestIndex=${stats.sharpestIndex}")
         sb.appendLine("sharpestScore=${stats.sharpestScore}")
-        sb.appendLine("clippedPercent=${stats.clippedPercent}")
-        sb.appendLine("underexposedPercent=${stats.underexposedPercent}")
+        // still JPEG 的曝光统计（与 preview 同一套语义，BGR->luma 已修正）
+        sb.appendLine("stillShadowPercent=${stats.stillShadowPercent}")
+        sb.appendLine("stillHighlightPercent=${stats.stillHighlightPercent}")
+        sb.appendLine("stillAnyChannelHighlightPercent=${stats.stillAnyChannelHighlightPercent}")
+        sb.appendLine("stillLumaP05=${stats.stillLumaP05}")
+        sb.appendLine("stillLumaP50=${stats.stillLumaP50}")
+        sb.appendLine("stillLumaP95=${stats.stillLumaP95}")
+        sb.appendLine("stillExposureVerdict=${stats.stillExposureVerdict}")
+        sb.appendLine("minFusionFrames=${stats.minFusionFrames}")
         sb.appendLine("noiseSigma=${stats.noiseSigma}")
         sb.appendLine("confidenceMean=${stats.confidenceMean}")
         sb.appendLine("confidenceLowPercent=${stats.confidenceLowPercent}")

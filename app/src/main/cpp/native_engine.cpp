@@ -819,6 +819,9 @@ Java_com_mobilescan3d_NativeBridge_nativeGetHudMetrics(JNIEnv* e, jobject) {
     return e->NewStringUTF(s.str().c_str());
 }
 
+// nativeGetDepthDiagnostics 的槽数（与 MainActivity 的 depthScaleDepthBuf 一致）
+static constexpr int kDepthDiagSlots = 7;
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetPointCount(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(gStateMutex);
@@ -882,13 +885,18 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jf
 // 深度尺度诊断：只上报可观测量，不自动施加任何 scale 修正。
 // out[0]=targetDepthP10 out[1]=targetDepthMedian out[2]=targetDepthP90
 // out[3]=vinsTriangulatedDepthMedian
+// out[4]=targetDepthValidPixels out[5]=targetDepthSampleCount out[6]=targetDepthRoiArea
+//
+// 后三个是「这个中位数到底可不可信」的前提：目标出界时 ROI 会被裁到只剩几行，
+// 有效像素掉到个位数，P10/P50/P90 就会退化成同一个值（实机 P10=P50=P90=5.14128）。
+// 上层据此拒绝这类样本，而不是把它算进 depth scale 的统计里。
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetDepthDiagnostics(JNIEnv* env, jobject, jfloatArray out) {
-    if (out == nullptr || env->GetArrayLength(out) < 4) {
+    if (out == nullptr || env->GetArrayLength(out) < kDepthDiagSlots) {
         return 0;
     }
 
-    float vals[4] = {0.f, 0.f, 0.f, 0.f};
+    float vals[kDepthDiagSlots] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
     std::shared_ptr<ObjectTracker> tracker;
     {
@@ -900,12 +908,15 @@ Java_com_mobilescan3d_NativeBridge_nativeGetDepthDiagnostics(JNIEnv* env, jobjec
         vals[0] = info.depthP10;
         vals[1] = info.medianDepth;
         vals[2] = info.depthP90;
+        vals[4] = static_cast<float>(info.depthValidPixels);
+        vals[5] = static_cast<float>(info.depthSampleCount);
+        vals[6] = static_cast<float>(info.depthRoiArea);
     }
 
     // vinsFeatureDepthMedian 内部持有自己的 vins 锁，必须在 gStateMutex 之外调用
     vals[3] = vinsFeatureDepthMedian();
 
-    env->SetFloatArrayRegion(out, 0, 4, vals);
+    env->SetFloatArrayRegion(out, 0, kDepthDiagSlots, vals);
     return 1;
 }
 
@@ -954,6 +965,9 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "depthP10=" << i.depthP10 << "\n"
       << "depthMedian=" << i.medianDepth << "\n"
       << "depthP90=" << i.depthP90 << "\n"
+      << "depthValidPixels=" << i.depthValidPixels << "\n"
+      << "depthSampleCount=" << i.depthSampleCount << "\n"
+      << "depthRoiArea=" << i.depthRoiArea << "\n"
       << "templateAllocated=" << (i.targetTemplateAllocated ? "true" : "false") << "\n"
       << "templateSize=" << i.templateWidth << "x" << i.templateHeight << "\n"
       << "prevGrayValid=" << (i.prevGrayValid ? "true" : "false") << "\n"
