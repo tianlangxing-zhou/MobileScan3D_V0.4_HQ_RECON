@@ -22,6 +22,8 @@ add_library(mobilescan3d SHARED
     v06/uv_unwrap.cpp
     v06/texture_baker.cpp
     v06/textured_glb_exporter.cpp
+    ar_textured_asset.cpp
+    persistent_relocalizer.cpp
     hq_fusion.cpp
     vins_prelude.cpp
     vins_ceres_check.cpp

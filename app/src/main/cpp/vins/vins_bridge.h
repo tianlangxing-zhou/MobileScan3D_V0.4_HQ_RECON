@@ -78,3 +78,27 @@ float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
 // @param maxSamples  最多取多少样本
 // @return 实际写入的样本数
 int vinsFeatureSamples(float* out, int maxSamples);
+
+struct VinsWorldFeature {
+    float u = 0.0f;
+    float v = 0.0f;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    int featureId = -1;
+};
+
+/**
+ * Current/latest VINS observations that already have a triangulated 3D point.
+ * u/v are VINS-image pixels; x/y/z are in the current VINS world frame.
+ */
+int vinsGetCurrentWorldFeatures(
+    VinsWorldFeature* out,
+    int maxFeatures);
+
+/** Camera (not IMU body) pose in the current VINS world. */
+bool vinsGetCameraPoseMatrix(
+    float outRwc[9],
+    float outTwc[3]);
+/** SENSOR_TIMESTAMP of the last image that actually reached Estimator::processImage. */
+std::uint64_t vinsLastProcessedImageTimestampNs();

@@ -3,6 +3,7 @@ package com.mobilescan3d
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import com.mobilescan3d.render.MeshRenderer
+import com.mobilescan3d.render.TexturedMeshRenderer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -110,6 +111,37 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
      */
     private val meshRenderer = MeshRenderer()
 
+/**
+     * V0.6.1 HQ texture pass. The legacy MeshRenderer remains as a fallback
+     * for vertex-color assets or while texture upload is not available.
+     */
+    private val texturedMeshRenderer =
+        TexturedMeshRenderer()
+
+    val texturedMeshUploadedTriangles: Int
+        get() =
+            texturedMeshRenderer.uploadedTriangleCount
+
+    val texturedMeshLastError: String
+        get() =
+            texturedMeshRenderer.lastError
+
+    fun setTexturedMesh(
+        vertices8: FloatArray?,
+        indices: IntArray?,
+        atlasJpeg: ByteArray?
+    ) {
+        texturedMeshRenderer.setAsset(
+            vertices8,
+            indices,
+            atlasJpeg
+        )
+    }
+
+    fun clearTexturedMesh() {
+        texturedMeshRenderer.clearAsset()
+    }
+
     /** 最近一帧实际画出的网格三角形数（0 = 没网格或没上传成功）。 */
     @Volatile var drawnMeshTriangles = 0
         private set
@@ -131,6 +163,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     /** AR 网格的不透明度。半透明才能在相机画面上同时看到几何与真实场景。 */
     fun setMeshAlpha(a: Float) {
         meshRenderer.alpha = a
+        texturedMeshRenderer.alpha = a
     }
 
     private val poseBuf = FloatArray(NativeBridge.RENDER_POSE_SLOTS)
@@ -217,6 +250,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         // 网格 pass 的 program / VBO / IBO。GL 上下文重建时必须重新初始化，
         // 否则 setEGLContextClientVersion 之后拿到的全是失效句柄。
         meshRenderer.init()
+        texturedMeshRenderer.init()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -291,15 +325,40 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         // 它是 world 空间的三角面，用和累计点云**完全相同**的
         // `Pc = Rwc^T (Pw - twc)` -> 内参 -> cameraToView -> NDC 链。
         if (wantMesh) {
-            drawnMeshTriangles = try {
-                meshRenderer.draw(
-                    poseBuf, cameraFx, cameraFy, cameraCx, cameraCy,
-                    cameraImageWidth, cameraImageHeight,
-                    cameraToView, NEAR_PLANE, FAR_PLANE
-                )
+            val texturedTriangles = try {
+                if (texturedMeshRenderer.hasAsset) {
+                    texturedMeshRenderer.draw(
+                        poseBuf,
+                        cameraFx, cameraFy,
+                        cameraCx, cameraCy,
+                        cameraImageWidth, cameraImageHeight,
+                        cameraToView,
+                        NEAR_PLANE, FAR_PLANE
+                    )
+                } else {
+                    0
+                }
             } catch (t: Throwable) {
                 0
             }
+
+            drawnMeshTriangles =
+                if (texturedTriangles > 0) {
+                    texturedTriangles
+                } else {
+                    try {
+                        meshRenderer.draw(
+                            poseBuf,
+                            cameraFx, cameraFy,
+                            cameraCx, cameraCy,
+                            cameraImageWidth, cameraImageHeight,
+                            cameraToView,
+                            NEAR_PLANE, FAR_PLANE
+                        )
+                    } catch (t: Throwable) {
+                        0
+                    }
+                }
             return
         }
 

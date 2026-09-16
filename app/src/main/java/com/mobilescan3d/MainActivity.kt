@@ -32,6 +32,8 @@ import android.widget.TextView
 import com.mobilescan3d.depth.DepthProvider
 import com.mobilescan3d.depth.DepthProviderFactory
 import com.mobilescan3d.export.ExportManager
+import com.mobilescan3d.persistence.ScanPackageManager
+import com.mobilescan3d.render.TexturedArAssetLoader
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : ComponentActivity(), SensorEventListener {
@@ -142,6 +144,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     // V0.5：停扫后进入「AR 查看」态 —— 只继续跑 VINS 拿位姿（模型才能钉在
     // 真实世界里），深度推理与 TSDF 融合都停掉。
     @Volatile private var arMeshViewing = false
+private var lastRelocPollMs = 0L
+    private var lastRelocWasLocalized = false
+    @Volatile private var relocalizationBusy = false
     @Volatile private var sessionCreated = false
     @Volatile private var openingCamera = false
     @Volatile private var abandonedOpen = false
@@ -609,7 +614,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         // 那时若累计点仍然散，问题就只剩 depth scale / 精度 / fusion。
         arLayerButton = toolButton(arDrawModeLabel()) { cycleArLayer() }
         toolbar.addView(arLayerButton,
-            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 6 })
+        toolbar.addView(
+            toolButton("恢复AR") {
+                restoreLatestPersistentAr()
+            },
+            android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
         root.addView(toolbar, android.widget.FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1963,6 +1980,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             image.close()
         }
         onFrameTick(ts)
+        if (!scanning && arMeshViewing) {
+            pollPersistentRelocalization()
+        }
     }
 
     /**
@@ -2040,6 +2060,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         lastGlbBytes = 0L
         lastMeshSummary = "n/a"
         renderer.clearMesh()
+        renderer.clearTexturedMesh()
         // V0.6：新一轮扫描要清掉上一轮的 HQ 纹理关键帧登记表，否则会把
         // 上一场拍的照片烘到这一场的网格上（native 侧 nativeCreate 另有兜底）。
         try {
@@ -2085,6 +2106,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             NativeBridge.nativeConfigureTrackerModels(backbone, head)
             sessionCreated = true
             // V0.5：native 侧全部配置完成，从这里起相机帧才允许进入 native。
+            try {
+                NativeBridge.nativeClearTexturedArAsset()
+                NativeBridge.nativeClearPersistentRelocalization()
+                NativeBridge.nativeSetPersistentMapCaptureEnabled(true)
+            } catch (_: Throwable) {
+            }
             scanNativeReady = true
         }
         primaryButton.text = "停止实验扫描"
@@ -2098,6 +2125,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         // 网格才会钉在真实世界里。所以这里先把 arMeshViewing 打开，网格若构建
         // 失败会在回调里关回去。
         scanNativeReady = false
+        try {
+            NativeBridge.nativeSetPersistentMapCaptureEnabled(false)
+        } catch (_: Throwable) {
+        }
         depthGeneration++
         arMeshViewing = true
         aeLock = false
@@ -2152,6 +2183,28 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 val mesh = exportManager.lastMesh
                 if (r.ok && mesh != null) {
                     renderer.setMesh(mesh.vertices, mesh.indices)
+
+                    val texturedAr =
+                        TexturedArAssetLoader.loadInto(renderer)
+
+                    if (texturedAr.ok) {
+                        kotlin.concurrent.thread(
+                            start = true,
+                            isDaemon = true,
+                            name = "ScanPackageSave"
+                        ) {
+                            val persistent =
+                                ScanPackageManager.saveCurrent(
+                                    this,
+                                    sessionId,
+                                    r.file
+                                )
+
+                            runOnUiThread {
+                                toast(persistent.message)
+                            }
+                        }
+                    }
                     lastGlbFilename = r.file.name
                     lastGlbTriangles = r.triangles
                     lastGlbBytes = r.fileBytes
@@ -2304,6 +2357,210 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             " 去分量${c[NativeBridge.MESH_CLEANUP_INDEX_REMOVED_COMPONENTS]}" +
             " 补洞${c[NativeBridge.MESH_CLEANUP_INDEX_FILLED_HOLES]}" +
             " 塌缩${c[NativeBridge.MESH_CLEANUP_INDEX_QEM_COLLAPSED_EDGES]}"
+    }
+
+// --------------------------------------------------------- V0.7 persistent AR
+
+    private fun restoreLatestPersistentAr() {
+        if (scanning) {
+            toast("请先停止当前扫描，再恢复历史 AR")
+            return
+        }
+
+        val packageInfo =
+            ScanPackageManager.latest(this)
+
+        if (packageInfo == null) {
+            toast("没有可恢复的 V0.7 扫描包")
+            return
+        }
+
+        // Immediately put Camera2/VINS into pose-only mode. The native pose
+        // getter will intentionally return false after map load until visual
+        // relocalization has actually locked, so the old model cannot flash
+        // at an arbitrary new-session origin.
+        depthGeneration++
+        scanNativeReady = false
+        arMeshViewing = true
+        lastRelocWasLocalized = false
+        lastRelocPollMs = 0L
+
+        try {
+            NativeBridge.nativeSetPersistentMapCaptureEnabled(false)
+        } catch (_: Throwable) {
+        }
+
+        renderer.clearMesh()
+        renderer.clearTexturedMesh()
+
+        val handler =
+            depthHandler ?: cameraHandler
+
+        val work = Runnable {
+            val restored =
+                ScanPackageManager.restore(
+                    this,
+                    packageInfo
+                )
+
+            val asset =
+                if (restored.ok) {
+                    TexturedArAssetLoader.loadInto(
+                        renderer
+                    )
+                } else {
+                    null
+                }
+
+            runOnUiThread {
+                if (
+                    restored.ok &&
+                    asset?.ok == true
+                ) {
+                    arDrawMode =
+                        PointCloudRenderer.DRAW_MESH
+                    renderer.drawMode =
+                        arDrawMode
+
+                    arLayerButton?.text =
+                        arDrawModeLabel()
+
+                    glView.requestRender()
+
+                    toast(
+                        "已加载 ${packageInfo.sessionId} · " +
+                            "${packageInfo.mapPoints} 地图点；" +
+                            "请缓慢移动手机寻找原扫描区域"
+                    )
+                } else {
+                    arMeshViewing = false
+
+                    toast(
+                        asset?.message
+                            ?: restored.message
+                    )
+                }
+            }
+        }
+
+        if (handler != null) {
+            handler.post(work)
+        } else {
+            work.run()
+        }
+    }
+
+    private fun pollPersistentRelocalization() {
+        if (
+            scanning ||
+            !arMeshViewing
+        ) {
+            return
+        }
+
+        val now =
+            android.os.SystemClock.elapsedRealtime()
+
+        if (
+            now - lastRelocPollMs <
+            500L
+        ) {
+            return
+        }
+
+        lastRelocPollMs = now
+
+        val handler = depthHandler
+        if (
+            !relocalizationBusy &&
+            handler != null
+        ) {
+            relocalizationBusy = true
+            handler.post {
+                try {
+                    NativeBridge.nativeTryPersistentRelocalization()
+                } catch (_: Throwable) {
+                } finally {
+                    relocalizationBusy = false
+                }
+            }
+        }
+
+        val stats =
+            FloatArray(
+                NativeBridge.RELOCALIZATION_STATS_SLOTS
+            )
+
+        val ok =
+            try {
+                NativeBridge.nativeGetRelocalizationStats(
+                    stats
+                )
+            } catch (_: Throwable) {
+                false
+            }
+
+        if (!ok) return
+
+        val state =
+            stats[
+                NativeBridge.RELOC_INDEX_STATE
+            ].toInt()
+
+        val localized =
+            stats[
+                NativeBridge.RELOC_INDEX_LOCALIZED
+            ] > 0.5f
+
+        val matches =
+            stats[
+                NativeBridge.RELOC_INDEX_MATCHES
+            ].toInt()
+
+        val inliers =
+            stats[
+                NativeBridge.RELOC_INDEX_INLIERS
+            ].toInt()
+
+        val ratio =
+            stats[
+                NativeBridge.RELOC_INDEX_INLIER_RATIO
+            ]
+
+        val reproj =
+            stats[
+                NativeBridge.RELOC_INDEX_MEDIAN_REPROJ
+            ]
+
+        if (localized) {
+            lastMeshSummary =
+                "AR重定位成功 · " +
+                    "$inliers/$matches inliers · " +
+                    "${"%.1f".format(java.util.Locale.US, reproj)} px"
+
+            if (!lastRelocWasLocalized) {
+                lastRelocWasLocalized = true
+                toast(
+                    "AR 重定位成功 · " +
+                        "$inliers/$matches inliers"
+                )
+                glView.requestRender()
+            }
+        } else {
+            lastRelocWasLocalized = false
+
+            lastMeshSummary =
+                when (state) {
+                    1 ->
+                        "AR地图已加载 · 等待 VINS 初始化"
+                    2 ->
+                        "AR重定位中 · " +
+                            "$inliers/$matches inliers · " +
+                            "ratio=${"%.2f".format(java.util.Locale.US, ratio)}"
+                    else ->
+                        "AR重定位未启动"
+                }
+        }
     }
 
     private fun materializeAsset(assetName: String): String {
@@ -2479,7 +2736,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
         // 切到网格图层时，如果 GPU 上还没有网格就先弄一个出来
         // —— 否则用户会看到一个「图层是网格但屏幕上什么都没有」的状态。
-        if (arDrawMode == PointCloudRenderer.DRAW_MESH && renderer.meshUploadedTriangles <= 0) {
+        if (arDrawMode == PointCloudRenderer.DRAW_MESH && (renderer.meshUploadedTriangles <= 0 && renderer.texturedMeshUploadedTriangles <= 0)) {
             val cached = if (::exportManager.isInitialized) exportManager.lastMesh else null
             if (cached != null) {
                 renderer.setMesh(cached.vertices, cached.indices)

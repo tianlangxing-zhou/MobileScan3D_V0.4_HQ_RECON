@@ -32,6 +32,8 @@
 #include "v06/uv_unwrap.h"
 #include "v06/texture_baker.h"
 #include "v06/textured_glb_exporter.h"
+#include "ar_textured_asset.h"
+#include "persistent_relocalizer.h"
 #include <fstream>
 #include <opencv2/imgcodecs.hpp>
 
@@ -84,6 +86,17 @@ static MeshPostProcessStats meshCleanupStats;
 static std::vector<TextureKeyframe> gTextureKeyframes;
 static TextureBakeStats textureBakeStats;
 static UvUnwrapStats uvUnwrapStats;
+static std::mutex gArAssetMutex;
+static ArTexturedAsset gArTexturedAsset;
+static PersistentRelocalizer gPersistentRelocalizer;
+static std::mutex gRelocFrameMutex;
+static std::vector<std::uint8_t> gRelocGray;
+static std::uint64_t gRelocFrameTimestampNs = 0u;
+static std::uint64_t gRelocConsumedTimestampNs = 0u;
+static float gRelocFrameRwc[9] = {1,0,0, 0,1,0, 0,0,1};
+static float gRelocFrameTwc[3] = {0,0,0};
+static int gV07InputW = 1;
+static int gV07InputH = 1;
 
 // --------------------------------------------------------------- 深度标定
 // 评审 P0-4：把「单一 median ratio」升级成 MAD 剔除 + Huber IRLS + EMA 的
@@ -612,6 +625,15 @@ static PresenceDecision evaluatePresence(const TargetTrackInfo& ti,
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h,
                                                 jfloat fx, jfloat fy, jfloat cx, jfloat cy) {
+    gPersistentRelocalizer.resetLiveAlignment();
+    gV07InputW = std::max(1, static_cast<int>(w));
+    gV07InputH = std::max(1, static_cast<int>(h));
+    {
+        std::lock_guard<std::mutex> rlk(gRelocFrameMutex);
+        gRelocGray.clear();
+        gRelocFrameTimestampNs = 0u;
+        gRelocConsumedTimestampNs = 0u;
+    }
     std::lock_guard<std::mutex> lk(gStateMutex);
     gFx = fx;
     gFy = fy;
@@ -763,6 +785,95 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
     downscaleGray(yy, w, h, rs, vinsGray.data(), gVinsW, gVinsH);
     const auto vinsStart = std::chrono::steady_clock::now();
     vinsInputImage((double)vinsTs * 1e-9, vinsGray.data(), gVinsW, gVinsH, gVinsW);
+
+// ------------------------------------------------------- V0.7 persistent map
+    //
+    // Camera thread responsibilities are intentionally light:
+    //   1) capture ORB descriptors only on sparse map keyframes;
+    //   2) cache the exact VINS-processed 640x480 gray frame + same-time pose.
+    //
+    // Full-frame ORB detection / BF matching / PnP is NOT done here. A
+    // background JNI call consumes the cached frame so relocalization cannot
+    // stall Camera2/VINS.
+    float mapCameraRwc[9];
+    float mapCameraTwc[3];
+
+    if (vinsGetCameraPoseMatrix(
+            mapCameraRwc,
+            mapCameraTwc)) {
+        const std::uint64_t processedTs =
+            vinsLastProcessedImageTimestampNs();
+
+        const std::uint64_t currentVinsTs =
+            vinsTs > 0
+                ? static_cast<std::uint64_t>(vinsTs)
+                : 0u;
+
+        const std::uint64_t dt =
+            processedTs > currentVinsTs
+                ? processedTs - currentVinsTs
+                : currentVinsTs - processedTs;
+
+        // Only use the gray frame whose timestamp exactly corresponds to the
+        // estimator state/feature observations (2ms tolerance for rounding).
+        if (processedTs > 0u &&
+            dt <= 2'000'000ULL) {
+            if (gPersistentRelocalizer.captureEnabled()) {
+                constexpr int kMaxMapObs = 512;
+
+                VinsWorldFeature features[kMaxMapObs];
+
+                const int count =
+                    vinsGetCurrentWorldFeatures(
+                        features,
+                        kMaxMapObs);
+
+                if (count > 0) {
+                    PersistentWorldObservation obs[kMaxMapObs];
+
+                    for (int i = 0; i < count; ++i) {
+                        obs[i].u = features[i].u;
+                        obs[i].v = features[i].v;
+                        obs[i].x = features[i].x;
+                        obs[i].y = features[i].y;
+                        obs[i].z = features[i].z;
+                        obs[i].featureId =
+                            features[i].featureId;
+                    }
+
+                    gPersistentRelocalizer.captureFrame(
+                        vinsGray.data(),
+                        gVinsW,
+                        gVinsH,
+                        gVinsW,
+                        currentVinsTs,
+                        mapCameraRwc,
+                        mapCameraTwc,
+                        obs,
+                        count);
+                }
+            }
+
+            if (gPersistentRelocalizer.hasLoadedMap()) {
+                std::lock_guard<std::mutex> rlk(
+                    gRelocFrameMutex);
+
+                gRelocGray = vinsGray;
+                gRelocFrameTimestampNs =
+                    currentVinsTs;
+
+                std::copy(
+                    mapCameraRwc,
+                    mapCameraRwc + 9,
+                    gRelocFrameRwc);
+
+                std::copy(
+                    mapCameraTwc,
+                    mapCameraTwc + 3,
+                    gRelocFrameTwc);
+            }
+        }
+    }
     const auto vinsEnd = std::chrono::steady_clock::now();
     const double vinsMs = std::chrono::duration<double, std::milli>(vinsEnd - vinsStart).count();
 
@@ -1390,6 +1501,452 @@ Java_com_mobilescan3d_NativeBridge_nativeExportPly(JNIEnv* e, jobject, jstring p
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetPersistentMapCaptureEnabled(
+        JNIEnv*,
+        jobject,
+        jboolean enabled) {
+    gPersistentRelocalizer.setCaptureEnabled(
+        enabled == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSavePersistentMap(
+        JNIEnv* env,
+        jobject,
+        jstring path) {
+    if (!path) return JNI_FALSE;
+
+    const char* p =
+        env->GetStringUTFChars(
+            path,
+            nullptr);
+
+    if (!p) return JNI_FALSE;
+
+    const bool ok =
+        gPersistentRelocalizer.saveMap(p);
+
+    env->ReleaseStringUTFChars(
+        path,
+        p);
+
+    return ok
+        ? JNI_TRUE
+        : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeLoadPersistentMap(
+        JNIEnv* env,
+        jobject,
+        jstring path) {
+    if (!path) return JNI_FALSE;
+
+    const char* p =
+        env->GetStringUTFChars(
+            path,
+            nullptr);
+
+    if (!p) return JNI_FALSE;
+
+    const bool ok =
+        gPersistentRelocalizer.loadMap(p);
+
+    env->ReleaseStringUTFChars(
+        path,
+        p);
+
+    if (ok) {
+        // Old history belongs to a different live VINS world. Until the new
+        // session is visually aligned to the saved world, no historical pose
+        // is allowed to leak to the renderer.
+        {
+            std::lock_guard<std::mutex> lk(
+                gStateMutex);
+            renderPoseHistory.clear();
+        }
+        {
+            std::lock_guard<std::mutex> rlk(
+                gRelocFrameMutex);
+            gRelocGray.clear();
+            gRelocFrameTimestampNs = 0u;
+            gRelocConsumedTimestampNs = 0u;
+        }
+    }
+
+    return ok
+        ? JNI_TRUE
+        : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeClearPersistentRelocalization(
+        JNIEnv*,
+        jobject) {
+    gPersistentRelocalizer.resetAll();
+
+    {
+        std::lock_guard<std::mutex> lk(
+            gStateMutex);
+        renderPoseHistory.clear();
+    }
+    {
+        std::lock_guard<std::mutex> rlk(
+            gRelocFrameMutex);
+        gRelocGray.clear();
+        gRelocFrameTimestampNs = 0u;
+        gRelocConsumedTimestampNs = 0u;
+    }
+}
+
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeTryPersistentRelocalization(
+        JNIEnv*,
+        jobject) {
+    std::vector<std::uint8_t> gray;
+    std::uint64_t timestampNs = 0;
+    float Rwc[9];
+    float twc[3];
+
+    {
+        std::lock_guard<std::mutex> lk(
+            gRelocFrameMutex);
+
+        if (gRelocFrameTimestampNs == 0u ||
+            gRelocFrameTimestampNs ==
+                gRelocConsumedTimestampNs ||
+            gRelocGray.empty()) {
+            return gPersistentRelocalizer.localized()
+                ? JNI_TRUE
+                : JNI_FALSE;
+        }
+
+        gray = gRelocGray;
+        timestampNs =
+            gRelocFrameTimestampNs;
+
+        std::copy(
+            gRelocFrameRwc,
+            gRelocFrameRwc + 9,
+            Rwc);
+
+        std::copy(
+            gRelocFrameTwc,
+            gRelocFrameTwc + 3,
+            twc);
+
+        gRelocConsumedTimestampNs =
+            timestampNs;
+    }
+
+    const float sx =
+        static_cast<float>(gVinsW) /
+        static_cast<float>(
+            std::max(1, gV07InputW));
+
+    const float sy =
+        static_cast<float>(gVinsH) /
+        static_cast<float>(
+            std::max(1, gV07InputH));
+
+    const bool ok =
+        gPersistentRelocalizer.tryRelocalize(
+            gray.data(),
+            gVinsW,
+            gVinsH,
+            gVinsW,
+            timestampNs,
+            gFx * sx,
+            gFy * sy,
+            gCx * sx,
+            gCy * sy,
+            Rwc,
+            twc);
+
+    return ok
+        ? JNI_TRUE
+        : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetRelocalizationStats(
+        JNIEnv* env,
+        jobject,
+        jfloatArray out) {
+    constexpr int kSlots = 13;
+
+    if (!out ||
+        env->GetArrayLength(out) < kSlots) {
+        return JNI_FALSE;
+    }
+
+    const auto s =
+        gPersistentRelocalizer.stats();
+
+    jfloat values[kSlots] = {
+        static_cast<jfloat>(s.state),
+        static_cast<jfloat>(s.mapPoints),
+        static_cast<jfloat>(s.capturedKeyframes),
+        static_cast<jfloat>(s.capturedPoints),
+        static_cast<jfloat>(s.lastDetected),
+        static_cast<jfloat>(s.lastMatches),
+        static_cast<jfloat>(s.lastInliers),
+        static_cast<jfloat>(s.lastInlierRatio),
+        static_cast<jfloat>(s.lastMedianReprojectionPx),
+        static_cast<jfloat>(s.attempts),
+        static_cast<jfloat>(s.successes),
+        s.mapLoaded ? 1.0f : 0.0f,
+        s.localized ? 1.0f : 0.0f
+    };
+
+    env->SetFloatArrayRegion(
+        out,
+        0,
+        kSlots,
+        values);
+
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetTexturedArAssetStats(
+        JNIEnv* env,
+        jobject) {
+    jint values[3] = {0, 0, 0};
+
+    {
+        std::lock_guard<std::mutex> lk(
+            gArAssetMutex);
+
+        values[0] =
+            static_cast<jint>(
+                std::min<std::size_t>(
+                    gArTexturedAsset.vertexCount(),
+                    static_cast<std::size_t>(
+                        std::numeric_limits<jint>::max())));
+
+        values[1] =
+            static_cast<jint>(
+                std::min<std::size_t>(
+                    gArTexturedAsset.indexCount(),
+                    static_cast<std::size_t>(
+                        std::numeric_limits<jint>::max())));
+
+        values[2] =
+            static_cast<jint>(
+                std::min<std::size_t>(
+                    gArTexturedAsset.jpeg().size(),
+                    static_cast<std::size_t>(
+                        std::numeric_limits<jint>::max())));
+    }
+
+    jintArray out =
+        env->NewIntArray(3);
+
+    if (!out) return nullptr;
+
+    env->SetIntArrayRegion(
+        out,
+        0,
+        3,
+        values);
+
+    return out;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetTexturedArVertices(
+        JNIEnv* env,
+        jobject,
+        jfloatArray out) {
+    if (!out) return 0;
+
+    std::lock_guard<std::mutex> lk(
+        gArAssetMutex);
+
+    if (!gArTexturedAsset.ready()) {
+        return 0;
+    }
+
+    const auto& src =
+        gArTexturedAsset.vertices();
+
+    const jsize cap =
+        env->GetArrayLength(out);
+
+    if (cap <
+        static_cast<jsize>(
+            src.size())) {
+        return 0;
+    }
+
+    env->SetFloatArrayRegion(
+        out,
+        0,
+        static_cast<jsize>(
+            src.size()),
+        src.data());
+
+    return static_cast<jint>(
+        gArTexturedAsset.vertexCount());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetTexturedArIndices(
+        JNIEnv* env,
+        jobject,
+        jintArray out) {
+    if (!out) return 0;
+
+    std::lock_guard<std::mutex> lk(
+        gArAssetMutex);
+
+    if (!gArTexturedAsset.ready()) {
+        return 0;
+    }
+
+    const auto& src =
+        gArTexturedAsset.indices();
+
+    const jsize cap =
+        env->GetArrayLength(out);
+
+    if (cap <
+        static_cast<jsize>(
+            src.size())) {
+        return 0;
+    }
+
+    std::vector<jint> tmp(
+        src.size());
+
+    for (std::size_t i = 0;
+         i < src.size();
+         ++i) {
+        tmp[i] =
+            static_cast<jint>(
+                src[i]);
+    }
+
+    env->SetIntArrayRegion(
+        out,
+        0,
+        static_cast<jsize>(
+            tmp.size()),
+        tmp.data());
+
+    return static_cast<jint>(
+        src.size());
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetTexturedArAtlasJpeg(
+        JNIEnv* env,
+        jobject) {
+    std::lock_guard<std::mutex> lk(
+        gArAssetMutex);
+
+    if (!gArTexturedAsset.ready()) {
+        return nullptr;
+    }
+
+    const auto& src =
+        gArTexturedAsset.jpeg();
+
+    jbyteArray out =
+        env->NewByteArray(
+            static_cast<jsize>(
+                src.size()));
+
+    if (!out) return nullptr;
+
+    env->SetByteArrayRegion(
+        out,
+        0,
+        static_cast<jsize>(
+            src.size()),
+        reinterpret_cast<const jbyte*>(
+            src.data()));
+
+    return out;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSaveTexturedArAsset(
+        JNIEnv* env,
+        jobject,
+        jstring path) {
+    if (!path) return JNI_FALSE;
+
+    const char* p =
+        env->GetStringUTFChars(
+            path,
+            nullptr);
+
+    if (!p) return JNI_FALSE;
+
+    bool ok = false;
+
+    {
+        std::lock_guard<std::mutex> lk(
+            gArAssetMutex);
+
+        ok =
+            gArTexturedAsset.save(p);
+    }
+
+    env->ReleaseStringUTFChars(
+        path,
+        p);
+
+    return ok
+        ? JNI_TRUE
+        : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeLoadTexturedArAsset(
+        JNIEnv* env,
+        jobject,
+        jstring path) {
+    if (!path) return JNI_FALSE;
+
+    const char* p =
+        env->GetStringUTFChars(
+            path,
+            nullptr);
+
+    if (!p) return JNI_FALSE;
+
+    bool ok = false;
+
+    {
+        std::lock_guard<std::mutex> lk(
+            gArAssetMutex);
+
+        ok =
+            gArTexturedAsset.load(p);
+    }
+
+    env->ReleaseStringUTFChars(
+        path,
+        p);
+
+    return ok
+        ? JNI_TRUE
+        : JNI_FALSE;
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeClearTexturedArAsset(
+        JNIEnv*,
+        jobject) {
+    std::lock_guard<std::mutex> lk(
+        gArAssetMutex);
+    gArTexturedAsset.clear();
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeSetMode(JNIEnv*, jobject, jint m) {
     std::lock_guard<std::mutex> lk(gStateMutex);
     mode = m;
@@ -1904,6 +2461,17 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPose(JNIEnv* env, jobject, jfl
         pose[11] = acceptedVinsT[2];
     }
 
+    // V0.7 saved-world transform (latest).
+    float savedR[9];
+    float savedT[3];
+    if (!gPersistentRelocalizer.transformPose(
+            pose, pose + 9, savedR, savedT)) {
+        return JNI_FALSE;
+    }
+    for (int i = 0; i < 9; ++i) pose[i] = savedR[i];
+    pose[9] = savedT[0];
+    pose[10] = savedT[1];
+    pose[11] = savedT[2];
     env->SetFloatArrayRegion(out, 0, 12, pose);
     return JNI_TRUE;
 }
@@ -1986,6 +2554,17 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAt(JNIEnv* env, jobject,
         pose[10] = best->t[1];
         pose[11] = best->t[2];
     }
+    // V0.7 saved-world transform (timestamp).
+    float savedR[9];
+    float savedT[3];
+    if (!gPersistentRelocalizer.transformPose(
+            pose, pose + 9, savedR, savedT)) {
+        return JNI_FALSE;
+    }
+    for (int i = 0; i < 9; ++i) pose[i] = savedR[i];
+    pose[9] = savedT[0];
+    pose[10] = savedT[1];
+    pose[11] = savedT[2];
     env->SetFloatArrayRegion(out, 0, 12, pose);
     return JNI_TRUE;
 }
@@ -2504,6 +3083,13 @@ Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
     }
     const bool ok = TexturedGlbExporter::write(p, uvMesh, jpeg);
     env->ReleaseStringUTFChars(path, p);
+
+    if (ok) {
+        std::lock_guard<std::mutex> alk(gArAssetMutex);
+        if (!gArTexturedAsset.set(uvMesh, jpeg)) {
+            return JNI_FALSE;
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lk(gStateMutex);

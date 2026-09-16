@@ -27,6 +27,8 @@ static bool g_vinsReady = false;
 static double g_lastImuTimestamp = -1.0;
 static double g_lastImuDt = 0.0;
 static double g_lastFeaturePubTimestamp = -1.0;
+// V0.7: exact visual frame that most recently reached processImage().
+static std::uint64_t g_lastEstimatorImageTimestampNs = 0;
 static bool g_firstFeaturePublish = true;
 
 // VINS 输入图像的尺寸（nativeVinsInit 里由 Kotlin 下发，通常是 640 长边）。
@@ -231,6 +233,7 @@ void vinsInit(
     g_lastImuDt = 0.0;
     g_lastImuTimestamp = -1.0;
     g_lastFeaturePubTimestamp = -1.0;
+    g_lastEstimatorImageTimestampNs = 0;
     g_firstFeaturePublish = true;
     g_vinsReady = true;
 }
@@ -425,6 +428,10 @@ void vinsInputImage(double t, const std::uint8_t* gray, int w, int h, int stride
     std_msgs::Header header;
     header.stamp.sec = t;
     g_estimator.processImage(image, header);
+    g_lastEstimatorImageTimestampNs =
+        static_cast<std::uint64_t>(
+            std::llround(
+                std::max(0.0, t) * 1e9));
 }
 
 bool vinsGetPose(float* out7) {
@@ -697,4 +704,171 @@ int vinsFeatureSamples(float* out, int maxSamples) {
         ++n;
     }
     return n;
+}
+
+int vinsGetCurrentWorldFeatures(
+        VinsWorldFeature* out,
+        int maxFeatures) {
+    if (!out || maxFeatures <= 0) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lk(g_vinsMutex);
+
+    if (!g_vinsReady ||
+        g_estimator.solver_flag !=
+            Estimator::NON_LINEAR) {
+        return 0;
+    }
+
+    int written = 0;
+
+    for (const auto& feature :
+         g_estimator.f_manager.feature) {
+        if (written >= maxFeatures) break;
+
+        if (feature.solve_flag != 1 ||
+            feature.feature_per_frame.empty() ||
+            feature.feature_id < 0) {
+            continue;
+        }
+
+        const int anchorFrame =
+            feature.start_frame;
+
+        const int latestFrame =
+            feature.start_frame +
+            static_cast<int>(
+                feature.feature_per_frame.size()) -
+            1;
+
+        // processImage() may have just slid the window. Accept only features
+        // seen in the newest one/two slots so the back().uv truly belongs to
+        // the gray frame currently being described by ORB.
+        if (anchorFrame < 0 ||
+            anchorFrame > WINDOW_SIZE ||
+            latestFrame != WINDOW_SIZE - 1) {
+            continue;
+        }
+
+        const double depth =
+            feature.estimated_depth;
+
+        if (!std::isfinite(depth) ||
+            depth <= 0.08 ||
+            depth > 20.0) {
+            continue;
+        }
+
+        const Eigen::Vector3d pAnchor =
+            feature.feature_per_frame.front()
+                .point *
+            depth;
+
+        const Eigen::Matrix3d RwcAnchor =
+            g_estimator.Rs[anchorFrame] *
+            g_estimator.ric[0];
+
+        const Eigen::Vector3d twcAnchor =
+            g_estimator.Ps[anchorFrame] +
+            g_estimator.Rs[anchorFrame] *
+                g_estimator.tic[0];
+
+        const Eigen::Vector3d pWorld =
+            RwcAnchor * pAnchor +
+            twcAnchor;
+
+        const Eigen::Vector2d& uv =
+            feature.feature_per_frame.back()
+                .uv;
+
+        if (!pWorld.allFinite() ||
+            !std::isfinite(uv.x()) ||
+            !std::isfinite(uv.y())) {
+            continue;
+        }
+
+        if (uv.x() < 0.0 ||
+            uv.y() < 0.0 ||
+            uv.x() >=
+                static_cast<double>(
+                    g_vinsImageW) ||
+            uv.y() >=
+                static_cast<double>(
+                    g_vinsImageH)) {
+            continue;
+        }
+
+        VinsWorldFeature& dst =
+            out[written++];
+
+        dst.u =
+            static_cast<float>(uv.x());
+        dst.v =
+            static_cast<float>(uv.y());
+
+        dst.x =
+            static_cast<float>(
+                pWorld.x());
+        dst.y =
+            static_cast<float>(
+                pWorld.y());
+        dst.z =
+            static_cast<float>(
+                pWorld.z());
+
+        dst.featureId =
+            feature.feature_id;
+    }
+
+    return written;
+}
+
+bool vinsGetCameraPoseMatrix(
+        float outRwc[9],
+        float outTwc[3]) {
+    if (!outRwc || !outTwc) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(g_vinsMutex);
+
+    if (!g_vinsReady ||
+        g_estimator.solver_flag !=
+            Estimator::NON_LINEAR) {
+        return false;
+    }
+
+    const int i = WINDOW_SIZE;
+
+    const Eigen::Matrix3d Rwc =
+        g_estimator.Rs[i] *
+        g_estimator.ric[0];
+
+    const Eigen::Vector3d twc =
+        g_estimator.Ps[i] +
+        g_estimator.Rs[i] *
+            g_estimator.tic[0];
+
+    int n = 0;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            outRwc[n++] =
+                static_cast<float>(
+                    Rwc(r,c));
+        }
+    }
+
+    outTwc[0] =
+        static_cast<float>(twc.x());
+    outTwc[1] =
+        static_cast<float>(twc.y());
+    outTwc[2] =
+        static_cast<float>(twc.z());
+
+    return true;
+}
+std::uint64_t vinsLastProcessedImageTimestampNs() {
+    std::lock_guard<std::mutex> lk(g_vinsMutex);
+    return g_lastEstimatorImageTimestampNs;
 }

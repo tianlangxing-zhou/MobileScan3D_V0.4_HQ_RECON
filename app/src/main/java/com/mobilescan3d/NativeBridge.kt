@@ -331,4 +331,66 @@ object NativeBridge {
 
     /** 导出前清理统计（MESH_CLEANUP_STATS_SLOTS 槽）。 */
     external fun nativeGetMeshCleanupStats(out: IntArray): Boolean
+
+const val AR_TEXTURED_VERTEX_FLOATS = 8
+    const val AR_TEXTURED_MAX_VERTICES = 800_000
+    const val AR_TEXTURED_MAX_INDICES = 2_400_000
+    const val AR_TEXTURED_MAX_JPEG_BYTES = 64 * 1024 * 1024
+
+    const val RELOCALIZATION_STATS_SLOTS = 13
+    const val RELOC_INDEX_STATE = 0
+    const val RELOC_INDEX_MAP_POINTS = 1
+    const val RELOC_INDEX_CAPTURED_KEYFRAMES = 2
+    const val RELOC_INDEX_CAPTURED_POINTS = 3
+    const val RELOC_INDEX_DETECTED = 4
+    const val RELOC_INDEX_MATCHES = 5
+    const val RELOC_INDEX_INLIERS = 6
+    const val RELOC_INDEX_INLIER_RATIO = 7
+    const val RELOC_INDEX_MEDIAN_REPROJ = 8
+    const val RELOC_INDEX_ATTEMPTS = 9
+    const val RELOC_INDEX_SUCCESSES = 10
+    const val RELOC_INDEX_MAP_LOADED = 11
+    const val RELOC_INDEX_LOCALIZED = 12
+
+    external fun nativeSetPersistentMapCaptureEnabled(
+        enabled: Boolean
+    )
+
+    external fun nativeSavePersistentMap(
+        path: String
+    ): Boolean
+
+    external fun nativeLoadPersistentMap(
+        path: String
+    ): Boolean
+
+    external fun nativeClearPersistentRelocalization()
+
+    external fun nativeTryPersistentRelocalization(): Boolean
+
+    external fun nativeGetRelocalizationStats(
+        out: FloatArray
+    ): Boolean
+
+    external fun nativeGetTexturedArAssetStats(): IntArray
+
+    external fun nativeGetTexturedArVertices(
+        out: FloatArray
+    ): Int
+
+    external fun nativeGetTexturedArIndices(
+        out: IntArray
+    ): Int
+
+    external fun nativeGetTexturedArAtlasJpeg(): ByteArray?
+
+    external fun nativeSaveTexturedArAsset(
+        path: String
+    ): Boolean
+
+    external fun nativeLoadTexturedArAsset(
+        path: String
+    ): Boolean
+
+    external fun nativeClearTexturedArAsset()
 }
