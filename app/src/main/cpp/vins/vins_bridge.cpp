@@ -589,3 +589,52 @@ float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
     }
     return static_cast<float>(depths[n / 2]);
 }
+
+int vinsFeatureSamples(float* out, int maxSamples) {
+    if (out == nullptr || maxSamples <= 0) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lk(g_vinsMutex);
+
+    if (g_estimator.solver_flag != Estimator::NON_LINEAR) {
+        return 0;
+    }
+    if (g_vinsImageW <= 0 || g_vinsImageH <= 0) {
+        return 0;
+    }
+
+    const float invW = 1.0f / static_cast<float>(g_vinsImageW);
+    const float invH = 1.0f / static_cast<float>(g_vinsImageH);
+
+    int n = 0;
+    for (const auto &it_per_id : g_estimator.f_manager.feature) {
+        if (n >= maxSamples) {
+            break;
+        }
+        if (it_per_id.solve_flag != 1) {
+            continue;
+        }
+        const double d = it_per_id.estimated_depth;
+        if (!std::isfinite(d) || d <= 0.1) {
+            continue;
+        }
+        if (it_per_id.feature_per_frame.empty()) {
+            continue;
+        }
+        const Eigen::Vector2d &uv = it_per_id.feature_per_frame.back().uv;
+        if (!std::isfinite(uv.x()) || !std::isfinite(uv.y())) {
+            continue;
+        }
+        const float nu = static_cast<float>(uv.x()) * invW;
+        const float nv = static_cast<float>(uv.y()) * invH;
+        if (!(nu >= 0.0f && nu <= 1.0f && nv >= 0.0f && nv <= 1.0f)) {
+            continue;
+        }
+        out[n * 3 + 0] = nu;
+        out[n * 3 + 1] = nv;
+        out[n * 3 + 2] = static_cast<float>(d);
+        ++n;
+    }
+    return n;
+}

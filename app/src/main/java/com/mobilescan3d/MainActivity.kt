@@ -29,6 +29,9 @@ import android.view.Surface
 import android.view.TextureView
 import android.view.ViewGroup
 import android.widget.TextView
+import com.mobilescan3d.depth.DepthProvider
+import com.mobilescan3d.depth.DepthProviderFactory
+import com.mobilescan3d.export.ExportManager
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : ComponentActivity(), SensorEventListener {
@@ -65,6 +68,27 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var depthProvider: DepthProvider
     private var depthThread: HandlerThread? = null
     private var depthHandler: Handler? = null
+
+    /**
+     * 深度来源的能力探测结论。
+     * 硬件 DEPTH16 只做探测并进诊断报告 —— 打开它是**另一颗相机**，
+     * 与 RGB 主摄不同步且外参未标定，把它设成默认值等于在一条已经
+     * 能工作的链路上引入未经验证的变量。详见 DepthProviderFactory。
+     */
+    private var depthProbe = DepthProviderFactory.Probe.UNKNOWN
+
+    /** PLY / GLB 导出与网格构建（构建在后台线程，绝不占 UI 线程）。 */
+    private lateinit var exportManager: ExportManager
+
+    /** 最近一次网格构建结论（HUD / 报告）。 */
+    @Volatile private var lastMeshSummary = "n/a"
+    /** 最近一次导出的 GLB —— 新的最终产物。 */
+    @Volatile private var lastGlbFilename: String? = null
+    @Volatile private var lastGlbTriangles: Int = 0
+    @Volatile private var lastGlbBytes: Long = 0L
+
+    /** 深度标定读取缓冲，复用避免每帧分配。 */
+    private val calibBuf = FloatArray(NativeBridge.DEPTH_CALIBRATION_SLOTS)
 
     @Volatile
     private var depthBusy = false
@@ -638,7 +662,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         cameraThread = HandlerThread("CameraCapture").also { it.start() }
         sensorThread = HandlerThread("IMU").also { it.start() }
         cameraHandler = Handler(cameraThread!!.looper)
-        depthProvider = DepthProvider(assets)
+        // 深度来源：硬件优先、模型兜底；本版**默认走模型**（实机验收过的
+        // 路径），硬件 DEPTH16 只做能力探测并进报告。
+        depthProbe = DepthProviderFactory.probe(this)
+        android.util.Log.i("DepthProvider", "probe: ${depthProbe.note}")
+        depthProvider = DepthProviderFactory.create(
+            this, assets, preferHardware = false, probe = depthProbe
+        )
+        exportManager = ExportManager(this)
         depthThread = HandlerThread("DepthInference").also { it.start() }
         depthHandler = Handler(depthThread!!.looper)
         registerImu()
@@ -1835,6 +1866,27 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         sb.appendLine("    actualPreviewRot=$previewRot")
         sb.appendLine("    autoYaw=false")
         sb.appendLine("    touchOrbit=false")
+        sb.appendLine()
+        // ---- 真 TSDF / Mesh / GLB / 深度鲁棒标定 ----
+        sb.appendLine("[9] 真 TSDF / Mesh / GLB / 深度标定:")
+        sb.appendLine("    depthBackend=${if (::depthProvider.isInitialized) depthProvider.backendName else "n/a"}")
+        sb.appendLine("    depthProviderAvailable=${if (::depthProvider.isInitialized) depthProvider.available else false}")
+        sb.appendLine("    hardwareDepthProbe=${depthProbe.note}")
+        sb.appendLine("    " + depthCalibrationSummary())
+        sb.appendLine("    " + meshStatsSummary("meshStats"))
+        sb.appendLine("    meshSummary=$lastMeshSummary")
+        sb.appendLine("    meshGpuVertices=${renderer.meshUploadedVertices}")
+        sb.appendLine("    meshGpuTriangles=${renderer.meshUploadedTriangles}")
+        sb.appendLine("    meshLastError=${renderer.meshLastError}")
+        sb.appendLine("    arDrawnMeshTriangles=${renderer.drawnMeshTriangles}")
+        sb.appendLine("    glbFile=${lastGlbFilename ?: "unknown"}")
+        sb.appendLine("    glbTriangles=$lastGlbTriangles")
+        sb.appendLine("    glbBytes=$lastGlbBytes")
+        sb.appendLine("    voxelPlan=scene:0.020 target:0.008 truncation:0.100 (VINS-world units)")
+        sb.appendLine("    meshPipeline=marching_tetrahedra+component_filter+taubin+qem")
+        sb.appendLine("    glbFormat=glTF2 binary, POSITION+NORMAL+COLOR_0, uint32 indices")
+        sb.appendLine()
+        sb.appendLine(NativeBridge.nativeGetStats())
 
         return sb.toString()
     }
@@ -1894,15 +1946,39 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         onFrameTick(ts)
     }
 
+    /**
+     * 深度推断（在专用线程上）。
+     *
+     * 走 [DepthProvider] 接口的「推一帧 + 取最新结果」形态，而不是直接
+     * 调具体实现：硬件深度是**异步**到达的（ImageReader 回调），根本没法
+     * 同步返回，包成同一形态后上层只有一条代码路径。
+     *
+     * `t` 必须是**这一帧相机帧的时间戳**，不是推理完成时刻 —— native 侧
+     * 用它按 SENSOR_TIMESTAMP 找对应的 VINS pose 快照，用错时间戳会让
+     * 深度与位姿差一帧，表现为「边走边扫时模型层层错位」。
+     */
     private fun scheduleDepth(y: ByteArray, u: ByteArray, v: ByteArray, w: Int, h: Int, rowStride: Int, uRowStride: Int, uPixelStride: Int, t: Long) {
         if (depthBusy) return
+        val handler = depthHandler
+        if (handler == null) {
+            // 没有深度线程就不能把 depthBusy 永久置起，否则深度链从此静默死掉。
+            depthBusy = false
+            return
+        }
         depthBusy = true
-        depthHandler?.post {
+        handler.post {
             try {
-                val depth = FloatArray(w * h)
-                depthProvider.estimate(y, u, v, w, h, rowStride, uRowStride, uPixelStride, depth)
-                NativeBridge.nativeOnDepthMap(depth, w, h, 0.5f, t)
-                glView.requestRender()
+                val provider = depthProvider
+                if (provider.available) {
+                    val produced = provider.submitFrame(
+                        y, u, v, w, h, rowStride, uRowStride, uPixelStride, t
+                    )
+                    val res = if (produced) provider.latest() else null
+                    if (res != null && res.depth.isNotEmpty()) {
+                        NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height, 0.5f, t)
+                        glView.requestRender()
+                    }
+                }
             } catch (_: Throwable) {
             } finally {
                 depthBusy = false
@@ -1931,6 +2007,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         lastPlyFileBytes = null
         lastPlyExportTs = null
         lastPlySessionId = null
+        lastGlbFilename = null
+        lastGlbTriangles = 0
+        lastGlbBytes = 0L
+        lastMeshSummary = "n/a"
+        renderer.clearMesh()
+        if (::exportManager.isInitialized) {
+            exportManager.resetMesh()
+        }
         stabilization = false
         aeLock = false
         awbLock = false
@@ -1946,6 +2030,19 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         cameraHandler?.post {
             NativeBridge.nativeDestroy()
             NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
+            // 体素边长与块预算。
+            //
+            // **这些数值不是真实米制**：融合用的 Rwc/twc 来自 VINS，而深度是
+            // 会话 min/max 映射出来的相对尺度，实机上是 raw≈5.56m vs
+            // VINS≈0.54m，两者相差约一个常数因子。所以体素边长是按
+            // 「VINS world 的可见表面」选的；真实的米制对齐由 native 侧的
+            // 鲁棒标定（MAD + Huber IRLS + EMA）负责。
+            //
+            // 截断距离在 native 侧固定 0.10（见 tsdf_engine.cpp），
+            // 即场景约 5 个体素、目标约 12 个体素 —— 对噪声更宽容。
+            NativeBridge.nativeSetVoxelSizes(0.020f, 0.008f)
+            NativeBridge.nativeSetVoxelBudget(8192, 4096)
+            NativeBridge.nativeSetDepthCalibrationEnabled(true)
             if (objectLockEnabled) {
                 NativeBridge.nativeSetObjectLockEnabled(true)
             }
@@ -1969,26 +2066,138 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         applyCaptureSettings()
         primaryButton.text = "实验扫描（非测量）"
         exportModel()
+        // 会话结束顺手产出真正的 AR 模型：带索引三角面 + 逐顶点法线 + 逐顶点
+        // 颜色的 GLB。构建在 ExportManager 的后台线程上，构建期间 native 会
+        // 短暂持锁（预览顿一下），这是为保证构建时体素场不被并发修改 ——
+        // TsdfEngine 的块哈希表插入时会 rehash，并发读会踩空。
+        buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_NORMAL)
     }
 
+    /**
+     * 导出点云 PLY。**它不再是最终产物** ——
+     *
+     * 旧链路的终点就是这里，而 PLY 里只有 `element vertex`，没有
+     * `element face`。在 Blender / Unity / AR 里那只是一堆孤立的点，
+     * 不是模型。真正的最终产物走 [buildMeshAndExport]（GLB）。
+     * PLY 保留，是因为它 still 是「点云级」的可观测中间产物。
+     */
     private fun exportModel() {
-        val dir = getExternalFilesDir(null) ?: filesDir
-        val filename = "scan_${sessionId}.ply"
-        val path = "${dir.absolutePath}/$filename"
-        val ok = NativeBridge.nativeExportPly(path)
-        if (ok) {
-            val plyFile = java.io.File(path)
-            lastPlyFilename = filename
+        if (!::exportManager.isInitialized) return
+        val r = exportManager.exportPly(sessionId)
+        if (r.ok) {
+            lastPlyFilename = r.file.name
             lastPlySessionId = sessionId
-            lastPlyVertexCount = readPlyVertexCount(plyFile)
-            lastPlyFileBytes = plyFile.length()
+            lastPlyVertexCount = r.vertexCount.toInt()
+            lastPlyFileBytes = r.fileBytes
             lastPlyExportTs = System.currentTimeMillis()
         }
-        android.widget.Toast.makeText(
-            this,
-            if (ok) "模型已导出：$path" else "导出失败（模型数据不足）",
-            android.widget.Toast.LENGTH_LONG
-        ).show()
+        toast(r.message)
+    }
+
+    /**
+     * 重建网格并导出 GLB（glTF 2.0，vertex color）。**新的最终产物链路**。
+     *
+     * 构建（Marching Tetrahedra + 去小分量 + 孤立面 + Taubin + QEM 简化）
+     * 可能几百毫秒到数秒，所以整条链在后台线程，回调再回主线程挂到 Renderer。
+     */
+    private fun buildMeshAndExport(sessionId: String, quality: Int) {
+        if (!::exportManager.isInitialized) return
+        val label = meshQualityLabel(quality)
+        toast("正在重建网格（$label），请稍候…")
+        try {
+            exportManager.buildAndExportGlb(sessionId, quality) { r ->
+                val mesh = exportManager.lastMesh
+                if (r.ok && mesh != null) {
+                    renderer.setMesh(mesh.vertices, mesh.indices)
+                    lastGlbFilename = r.file.name
+                    lastGlbTriangles = r.triangles
+                    lastGlbBytes = r.fileBytes
+                    lastMeshSummary =
+                        "${r.triangles} 面 / ${r.vertices} 顶点 · ${r.fileBytes / 1024} KB · $label"
+                } else {
+                    renderer.clearMesh()
+                    lastMeshSummary = "失败：${r.message}"
+                }
+                glView.requestRender()
+                toast(r.message)
+            }
+        } catch (t: Throwable) {
+            toast("网格导出异常：${t.javaClass.simpleName}")
+        }
+    }
+
+    /** 只重建网格并挂到 AR 预览上，不落盘。 */
+    private fun buildMeshForPreview() {
+        if (!::exportManager.isInitialized) return
+        toast("正在生成网格（预览质量）…")
+        try {
+            exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
+                if (mesh == null || mesh.triangleCount <= 0) {
+                    renderer.clearMesh()
+                    lastMeshSummary = "失败：体素场不足以提取表面"
+                    toast("网格构建失败（体素场不足以提取表面）")
+                } else {
+                    renderer.setMesh(mesh.vertices, mesh.indices)
+                    lastMeshSummary = "${mesh.triangleCount} 面 / ${mesh.vertexCount} 顶点（预览）"
+                    toast("网格已生成：${lastMeshSummary}")
+                }
+                glView.requestRender()
+            }
+        } catch (t: Throwable) {
+            toast("网格生成异常：${t.javaClass.simpleName}")
+        }
+    }
+
+    private fun meshQualityLabel(q: Int): String = when (q) {
+        NativeBridge.MESH_QUALITY_PREVIEW -> "预览"
+        NativeBridge.MESH_QUALITY_HQ -> "HQ"
+        else -> "常规"
+    }
+
+    /**
+     * 深度标定一行摘要（HUD / 报告共用）。
+     *
+     * **`usable` 才是「可以当米制用」的判据**，`valid` 只是「这一帧拟合成功」。
+     * 把两者混为一谈会让人以为标定已经在生效，而实际上尺度并没有被施加。
+     */
+    private fun depthCalibrationSummary(): String {
+        val n = try {
+            NativeBridge.nativeGetDepthCalibration(calibBuf)
+        } catch (t: Throwable) {
+            0
+        }
+        if (n < NativeBridge.DEPTH_CALIBRATION_SLOTS) return "深度标定 n/a"
+        val usable = calibBuf[NativeBridge.CALIB_INDEX_USABLE] > 0.5f
+        val model = if (calibBuf[NativeBridge.CALIB_INDEX_INVERSE_MODEL] > 0.5f) "逆深度" else "线性"
+        fun f(i: Int, fmt: String): String =
+            String.format(java.util.Locale.US, fmt, calibBuf[i])
+        return "深度标定${if (usable) "已生效" else "未生效"} · $model" +
+            " scale=${f(NativeBridge.CALIB_INDEX_SCALE, "%.4f")}" +
+            " shift=${f(NativeBridge.CALIB_INDEX_SHIFT, "%.4f")}" +
+            " conf=${f(NativeBridge.CALIB_INDEX_CONFIDENCE, "%.2f")}" +
+            " 样本=${calibBuf[NativeBridge.CALIB_INDEX_SAMPLES].toInt()}" +
+            " 时序=${f(NativeBridge.CALIB_INDEX_TEMPORAL_RATIO, "%.2f")}" +
+            " 拒绝=${calibBuf[NativeBridge.CALIB_INDEX_REJECTED_FRAMES].toInt()}"
+    }
+
+    /** 网格统计一行摘要（含「提取了多少原始面、去掉了多少小分量」）。 */
+    private fun meshStatsSummary(prefix: String = "网格"): String {
+        if (!::exportManager.isInitialized) return "$prefix n/a"
+        val s = try {
+            exportManager.meshStats()
+        } catch (t: Throwable) {
+            IntArray(0)
+        }
+        if (s.size < NativeBridge.MESH_STATS_SLOTS) return "$prefix n/a"
+        return "$prefix ${s[NativeBridge.MESH_STATS_INDEX_TRIANGLES]}面/" +
+            "${s[NativeBridge.MESH_STATS_INDEX_VERTICES]}顶点" +
+            " 原始${s[NativeBridge.MESH_STATS_INDEX_RAW_TRIANGLES]}面" +
+            " 去分量${s[NativeBridge.MESH_STATS_INDEX_COMPONENTS_REMOVED]}" +
+            " 块${s[NativeBridge.MESH_STATS_INDEX_BLOCKS_SCANNED]}" +
+            " 体素${s[NativeBridge.MESH_STATS_INDEX_VOXEL_SIZE_UM] / 1000f}mm" +
+            " 简化${if (s[NativeBridge.MESH_STATS_INDEX_DECIMATED] != 0) 1 else 0}" +
+            " 质量${s[NativeBridge.MESH_STATS_INDEX_QUALITY]}" +
+            " ${s[NativeBridge.MESH_STATS_INDEX_TOTAL_MS]}ms"
     }
 
     private fun materializeAsset(assetName: String): String {
@@ -2003,20 +2212,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             }
         }
         return out.absolutePath
-    }
-
-    private fun readPlyVertexCount(file: java.io.File): Int? {
-        if (!file.exists()) return null
-        file.bufferedReader().use { br ->
-            repeat(32) {
-                val line = br.readLine() ?: return null
-                if (line.startsWith("element vertex ")) {
-                    return line.substringAfter("element vertex ").trim().toIntOrNull()
-                }
-                if (line.trim() == "end_header") return null
-            }
-        }
-        return null
     }
 
     private fun toast(msg: String) {
@@ -2111,6 +2306,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 "\n图层 ${arDrawModeLabel()}" +
                 " · 累计绘制 ${renderer.drawnAccumulated}" +
                 " 当前帧 ${renderer.drawnDebug}" +
+                (if (renderer.drawnMeshTriangles > 0) " 网格 ${renderer.drawnMeshTriangles}" else "") +
+                "\n" + depthCalibrationSummary() +
+                "\n网格 " + (if (lastMeshSummary == "n/a") "未生成" else lastMeshSummary) +
                 "\n" + if (renderer.poseFromTimestamp) {
                 "AR 按帧时间戳取 pose"
             } else {
@@ -2153,6 +2351,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun arDrawModeLabel(): String = when (arDrawMode) {
         PointCloudRenderer.DRAW_ACCUMULATED -> "累计"
         PointCloudRenderer.DRAW_BOTH -> "两者"
+        PointCloudRenderer.DRAW_MESH -> "网格"
         else -> "当前帧"
     }
 
@@ -2164,12 +2363,23 @@ class MainActivity : ComponentActivity(), SensorEventListener {
      * 投影错了，还是 depth scale / 精度 / fusion 的问题。
      */
     private fun cycleArLayer() {
-        arDrawMode = (arDrawMode + 1) % 3
+        arDrawMode = (arDrawMode + 1) % 4
         renderer.drawMode = arDrawMode
-        val wantDebug = arDrawMode != PointCloudRenderer.DRAW_ACCUMULATED
+        val wantDebug = arDrawMode == PointCloudRenderer.DRAW_TARGET_DEBUG ||
+            arDrawMode == PointCloudRenderer.DRAW_BOTH
         try {
             NativeBridge.nativeSetTargetDebugEnabled(wantDebug)
         } catch (_: Throwable) {
+        }
+        // 切到网格图层时，如果 GPU 上还没有网格就先弄一个出来
+        // —— 否则用户会看到一个「图层是网格但屏幕上什么都没有」的状态。
+        if (arDrawMode == PointCloudRenderer.DRAW_MESH && renderer.meshUploadedTriangles <= 0) {
+            val cached = if (::exportManager.isInitialized) exportManager.lastMesh else null
+            if (cached != null) {
+                renderer.setMesh(cached.vertices, cached.indices)
+            } else {
+                buildMeshForPreview()
+            }
         }
         arLayerButton?.text = arDrawModeLabel()
         glView.requestRender()
@@ -2178,6 +2388,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 PointCloudRenderer.DRAW_ACCUMULATED ->
                     "只画累计点云（hits>=${renderer.accumulatedMinHits}，已剔除一次性点）"
                 PointCloudRenderer.DRAW_BOTH -> "两层都画：绿色 = 当前帧调试层"
+                PointCloudRenderer.DRAW_MESH ->
+                    "只画重建网格（TSDF 零交叉面 -> Marching Tetrahedra）"
                 else -> "只画当前帧 target depth 调试层（验证 AR 坐标链）"
             }
         )
@@ -2287,8 +2499,32 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun showExportDrawer() {
         android.app.AlertDialog.Builder(this)
             .setTitle("导出")
-            .setItems(arrayOf("导出反馈报告", "导出实验 PLY")) { _, which ->
-                if (which == 0) exportFeedbackSafely() else exportModel()
+            .setItems(
+                arrayOf(
+                    "导出反馈报告",
+                    "导出实验 PLY（只有顶点，非最终模型）",
+                    "生成网格 + 导出 GLB（常规）",
+                    "生成网格 + 导出 GLB（HQ）",
+                    "只生成网格（AR 预览）"
+                )
+            ) { _, which ->
+                when (which) {
+                    0 -> exportFeedbackSafely()
+                    1 -> exportModel()
+                    2 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_NORMAL)
+                    3 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ)
+                    else -> {
+                        // 预览网格不需要每次都重建：缓存命中就直接挂上去。
+                        val cached = if (::exportManager.isInitialized) exportManager.lastMesh else null
+                        if (cached != null) {
+                            renderer.setMesh(cached.vertices, cached.indices)
+                            toast("已复用网格：${cached.triangleCount} 面")
+                            glView.requestRender()
+                        } else {
+                            buildMeshForPreview()
+                        }
+                    }
+                }
             }
             .show()
     }
@@ -2402,6 +2638,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
         NativeBridge.nativeDestroy()
         sessionCreated = false
+        // 权限被拒路径下 startSystem 未执行，lateinit 字段还没初始化。
+        if (::depthProvider.isInitialized) {
+            try {
+                depthProvider.close()
+            } catch (_: Throwable) {
+            }
+        }
+        if (::exportManager.isInitialized) {
+            exportManager.shutdown()
+        }
         cameraThread?.quitSafely()
         sensorThread?.quitSafely()
         depthThread?.quitSafely()

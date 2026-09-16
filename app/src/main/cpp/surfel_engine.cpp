@@ -1,17 +1,17 @@
-#include "gaussian_engine.h"
+#include "surfel_engine.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
-void GaussianEngine::reset() {
+void SurfelEngine::reset() {
     g_.clear();
     index_.clear();
     stable_ = 0;
     merged_ = 0;
 }
 
-void GaussianEngine::ingestPoint(
+void SurfelEngine::ingestPoint(
         float x,
         float y,
         float z,
@@ -32,7 +32,7 @@ void GaussianEngine::ingestPoint(
 
     auto it = index_.find(k);
     if (it != index_.end()) {
-        Gaussian& a = g_[it->second];
+        Surfel& a = g_[it->second];
         const float w = std::min(0.5f, confidence);
         const float iw = 1.f / (1.f + w);
         a.px = (a.px + x * w) * iw;
@@ -56,7 +56,7 @@ void GaussianEngine::ingestPoint(
         return;
     }
 
-    Gaussian a{};
+    Surfel a{};
     a.px = x;
     a.py = y;
     a.pz = z;
@@ -75,17 +75,17 @@ void GaussianEngine::ingestPoint(
     g_.push_back(a);
 }
 
-size_t GaussianEngine::count() const { return g_.size(); }
-size_t GaussianEngine::stableCount() const { return stable_; }
-size_t GaussianEngine::mergedCount() const { return merged_; }
+size_t SurfelEngine::count() const { return g_.size(); }
+size_t SurfelEngine::stableCount() const { return stable_; }
+size_t SurfelEngine::mergedCount() const { return merged_; }
 
-size_t GaussianEngine::confirmedCount(int minHits) const {
+size_t SurfelEngine::confirmedCount(int minHits) const {
     if (minHits <= 1) {
         return g_.size();
     }
     const uint16_t need = static_cast<uint16_t>(minHits > 65535 ? 65535 : minHits);
     size_t n = 0;
-    for (const Gaussian& a : g_) {
+    for (const Surfel& a : g_) {
         if (a.hits >= need) {
             n++;
         }
@@ -93,7 +93,7 @@ size_t GaussianEngine::confirmedCount(int minHits) const {
     return n;
 }
 
-size_t GaussianEngine::copyPoints(float* out, size_t maxPoints, int minHits) const {
+size_t SurfelEngine::copyPoints(float* out, size_t maxPoints, int minHits) const {
     if (out == nullptr || maxPoints == 0 || g_.empty()) {
         return 0;
     }
@@ -103,7 +103,7 @@ size_t GaussianEngine::copyPoints(float* out, size_t maxPoints, int minHits) con
     // 旧实现直接对 g_ 全体均匀抽样并全部画出来，于是未验证点也进了渲染 ——
     // 实机统计 600000 总点里 stable 只有 28，屏幕自然是一层噪声。
     size_t enabled = 0;
-    for (const Gaussian& a : g_) {
+    for (const Surfel& a : g_) {
         if (a.hits >= need) {
             enabled++;
         }
@@ -117,7 +117,7 @@ size_t GaussianEngine::copyPoints(float* out, size_t maxPoints, int minHits) con
     size_t seen = 0;
     size_t written = 0;
     for (size_t i = 0; i < g_.size() && written < maxPoints; ++i) {
-        const Gaussian& a = g_[i];
+        const Surfel& a = g_[i];
         if (a.hits < need) {
             continue;
         }
@@ -138,14 +138,14 @@ size_t GaussianEngine::copyPoints(float* out, size_t maxPoints, int minHits) con
     return written;
 }
 
-void GaussianEngine::boundingBox(float* minX, float* minY, float* minZ,
+void SurfelEngine::boundingBox(float* minX, float* minY, float* minZ,
                                  float* maxX, float* maxY, float* maxZ) const {
     if (!minX || !minY || !minZ || !maxX || !maxY || !maxZ) {
         return;
     }
     *minX = *minY = *minZ = std::numeric_limits<float>::max();
     *maxX = *maxY = *maxZ = -std::numeric_limits<float>::max();
-    for (const Gaussian& a : g_) {
+    for (const Surfel& a : g_) {
         *minX = std::min(*minX, a.px);
         *minY = std::min(*minY, a.py);
         *minZ = std::min(*minZ, a.pz);
@@ -159,7 +159,7 @@ void GaussianEngine::boundingBox(float* minX, float* minY, float* minZ,
     }
 }
 
-void GaussianEngine::centroid(float* x, float* y, float* z) const {
+void SurfelEngine::centroid(float* x, float* y, float* z) const {
     if (!x || !y || !z) {
         return;
     }
@@ -167,7 +167,7 @@ void GaussianEngine::centroid(float* x, float* y, float* z) const {
     if (g_.empty()) {
         return;
     }
-    for (const Gaussian& a : g_) {
+    for (const Surfel& a : g_) {
         *x += a.px;
         *y += a.py;
         *z += a.pz;

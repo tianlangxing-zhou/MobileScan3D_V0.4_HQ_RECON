@@ -60,3 +60,21 @@ float vinsFeatureDepthMedian();
 // VINS 输入图像像素。ROI 内没有有效特征时返回 0，并令 *outSampleCount = 0。
 float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
                                   int* outSampleCount);
+
+// 取当前滑窗内已三角化特征的 (u, v, depth) 样本。
+//
+// 为什么需要"逐样本"而不是又一个中位数：深度标定要拟合
+//
+//     z = a*d + b        或        1/z = a*d + b
+//
+// 这是一个需要**配对样本**的回归问题。中位数只能给出一个乘性 ratio，
+// 既估不出偏移项，也没法做 MAD 剔除与 Huber 降权（那正是把三角化失败的
+// 野值、以及画面里混进来的墙/地面挡在外面的手段）。
+//
+// u/v 是**归一化**坐标 [0,1]（内部已按 VINS 输入图像尺寸归一化），
+// 调用方可以直接用它去采样同尺寸的深度图；depth 是 VINS 自身尺度下的米。
+//
+// @param out         至少 maxSamples*3 个 float
+// @param maxSamples  最多取多少样本
+// @return 实际写入的样本数
+int vinsFeatureSamples(float* out, int maxSamples);

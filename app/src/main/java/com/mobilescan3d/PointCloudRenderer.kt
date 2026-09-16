@@ -2,6 +2,7 @@ package com.mobilescan3d
 
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import com.mobilescan3d.render.MeshRenderer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -100,6 +101,38 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     @Volatile private var accumPointSize = 3f
     @Volatile private var debugPointSize = 5f
 
+    /**
+     * 网格图层（`DRAW_MESH`）的绘制 pass。
+     *
+     * 它有自己的 program / VBO / IBO，但**复用本类的相机模型投影参数**
+     * （pose / 内参 / cameraToView）—— 这三样是本类从已验证的链路里
+     * 拿到的，另起一个 GLSurfaceView 只会把它们复制成两份并必然漂移。
+     */
+    private val meshRenderer = MeshRenderer()
+
+    /** 最近一帧实际画出的网格三角形数（0 = 没网格或没上传成功）。 */
+    @Volatile var drawnMeshTriangles = 0
+        private set
+
+    /** 已上传到 GPU 的网格三角形数，供 HUD / 报告判断「网格在不在」。 */
+    val meshUploadedTriangles: Int get() = meshRenderer.uploadedTriangleCount
+    val meshUploadedVertices: Int get() = meshRenderer.uploadedVertexCount
+    val meshLastError: String get() = meshRenderer.lastError
+
+    /** 提交网格数据（任意线程可调，真正上传在下一帧 GL 线程上发生）。 */
+    fun setMesh(vertices: FloatArray?, indices: IntArray?) {
+        meshRenderer.setMesh(vertices, indices)
+    }
+
+    fun clearMesh() {
+        meshRenderer.clearMesh()
+    }
+
+    /** AR 网格的不透明度。半透明才能在相机画面上同时看到几何与真实场景。 */
+    fun setMeshAlpha(a: Float) {
+        meshRenderer.alpha = a
+    }
+
     private val poseBuf = FloatArray(NativeBridge.RENDER_POSE_SLOTS)
     private val accumData = FloatArray(NativeBridge.AR_MAX_POINTS * NativeBridge.POINT_SLOTS)
     private val debugData =
@@ -181,6 +214,9 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
         GLES20.glDepthFunc(GLES20.GL_LEQUAL)
+        // 网格 pass 的 program / VBO / IBO。GL 上下文重建时必须重新初始化，
+        // 否则 setEGLContextClientVersion 之后拿到的全是失效句柄。
+        meshRenderer.init()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -193,6 +229,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         drawnAccumulated = 0
         drawnDebug = 0
+        drawnMeshTriangles = 0
 
         // 坐标链没就绪时宁可不画：画出来的点位置一定是错的，
         // 那种「看起来有点云」比「什么都没有」更难排查。
@@ -223,8 +260,12 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         }
         if (!ok) return
 
-        val wantAccum = drawMode != DRAW_TARGET_DEBUG
-        val wantDebug = drawMode != DRAW_ACCUMULATED
+        // 三个图层的需求用显式判断表达，而不是 `!= 某一种」：
+        // 图层从 3 种变成 4 种（多了网格）之后，`!=` 那种写法会悄悄
+        // 把新图层也算成「要画点云」，多查一次 native 白费一次拷贝。
+        val wantMesh = drawMode == DRAW_MESH
+        val wantAccum = drawMode == DRAW_ACCUMULATED || drawMode == DRAW_BOTH
+        val wantDebug = drawMode == DRAW_TARGET_DEBUG || drawMode == DRAW_BOTH
 
         var accumCount = 0
         if (wantAccum) {
@@ -246,6 +287,22 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
                 0
             }
         }
+        // 网格图层：pose 已经取到了，直接转交给 MeshRenderer。
+        // 它是 world 空间的三角面，用和累计点云**完全相同**的
+        // `Pc = Rwc^T (Pw - twc)` -> 内参 -> cameraToView -> NDC 链。
+        if (wantMesh) {
+            drawnMeshTriangles = try {
+                meshRenderer.draw(
+                    poseBuf, cameraFx, cameraFy, cameraCx, cameraCy,
+                    cameraImageWidth, cameraImageHeight,
+                    cameraToView, NEAR_PLANE, FAR_PLANE
+                )
+            } catch (t: Throwable) {
+                0
+            }
+            return
+        }
+
         if (accumCount <= 0 && debugCount <= 0) return
 
         GLES20.glUseProgram(program)
@@ -335,6 +392,15 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         const val DRAW_ACCUMULATED = 1
         /** 两者都画 */
         const val DRAW_BOTH = 2
+        /**
+         * 只画重建出来的三角网格。
+         *
+         * 这是评审要求的「AR Mesh Preview」：它验证的不是「点云看着对不对」，
+         * 而是「TSDF 的零交叉面提出来之后，投影链还对不对」—— 只要
+         * 投影链有一丝偏差，三角面会立刻表现为贴不住真实物体，
+         * 比点云这种本来就没有明确边界的显示方式敏感得多。
+         */
+        const val DRAW_MESH = 3
 
         /** 视锥裁剪用的近/远平面。只影响点云自身的深度排序，不影响屏幕位置。 */
         private const val NEAR_PLANE = 0.05f

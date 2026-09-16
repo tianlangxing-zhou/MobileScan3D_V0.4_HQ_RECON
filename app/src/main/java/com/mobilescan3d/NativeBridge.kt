@@ -78,6 +78,78 @@ object NativeBridge {
      */
     const val AR_MIN_HITS_CONFIRMED = 2
     const val AR_MIN_HITS_STABLE = 3
+
+    // ------------------------------------------------------------------
+    //  网格 / GLB / 深度标定
+    // ------------------------------------------------------------------
+
+    /**
+     * 网格顶点交错布局：`x,y,z, nx,ny,nz, r,g,b` —— 9 个 float / 顶点。
+     *
+     * **必须与 native 的 `MESH_VERTEX_FLOATS` 完全一致**：Kotlin 侧按它
+     * 分配 `FloatArray(vertexCount * MESH_VERTEX_FLOATS)`，native 按它写
+     * `out[i * 9 + k]`，两边差一个数字就是越界或截断。
+     */
+    const val MESH_VERTEX_FLOATS = 9
+
+    /**
+     * 网格质量档位，与 native `MeshOptions::quality` 对应。
+     *
+     * 三角形预算：预览 2 万 / 常规 10 万 / HQ 40 万。
+     * AR 预览永远用 PREVIEW —— 十多万个三角形在手机上跑 30FPS 没有意义，
+     * 反而把 GPU 时间全吃掉。
+     */
+    const val MESH_QUALITY_PREVIEW = 0
+    const val MESH_QUALITY_NORMAL = 1
+    const val MESH_QUALITY_HQ = 2
+
+    /**
+     * [nativeGetDepthCalibration] 的输出槽数。
+     *
+     *   0  scale              1  shift            2  confidence
+     *   3  samples            4  valid            5  inverseModel
+     *   6  enabled            7  acceptedFrames   8  rejectedFrames
+     *   9  temporalRatio      10 temporalRejects  11 usable
+     *
+     * `inverseModel = 1` 时 `z = 1 / (scale * d + shift)`，否则 `z = scale*d + shift`。
+     * `usable` 才是「可以拿它当米制用」的判据 —— `valid` 只是「这一帧拟合成功」。
+     */
+    const val DEPTH_CALIBRATION_SLOTS = 12
+    const val CALIB_INDEX_SCALE = 0
+    const val CALIB_INDEX_SHIFT = 1
+    const val CALIB_INDEX_CONFIDENCE = 2
+    const val CALIB_INDEX_SAMPLES = 3
+    const val CALIB_INDEX_VALID = 4
+    const val CALIB_INDEX_INVERSE_MODEL = 5
+    const val CALIB_INDEX_ENABLED = 6
+    const val CALIB_INDEX_ACCEPTED_FRAMES = 7
+    const val CALIB_INDEX_REJECTED_FRAMES = 8
+    const val CALIB_INDEX_TEMPORAL_RATIO = 9
+    const val CALIB_INDEX_TEMPORAL_REJECTS = 10
+    const val CALIB_INDEX_USABLE = 11
+
+    /**
+     * [nativeGetMeshStats] 的输出槽数（全整型）。
+     *
+     *   0  outVertices      1  outTriangles    2  rawVertices     3  rawTriangles
+     *   4  componentsBefore 5  componentsRemoved 6 trianglesRemovedRaw
+     *   7  trianglesRemovedComp 8 blocksScanned 9 decimated       10 ok
+     *   11 quality          12 totalMs         13 builds          14 voxelSizeUm
+     *   15 smoothIterations
+     */
+    const val MESH_STATS_SLOTS = 16
+    const val MESH_STATS_INDEX_VERTICES = 0
+    const val MESH_STATS_INDEX_TRIANGLES = 1
+    const val MESH_STATS_INDEX_RAW_TRIANGLES = 3
+    const val MESH_STATS_INDEX_COMPONENTS_REMOVED = 5
+    const val MESH_STATS_INDEX_BLOCKS_SCANNED = 8
+    const val MESH_STATS_INDEX_DECIMATED = 9
+    const val MESH_STATS_INDEX_OK = 10
+    const val MESH_STATS_INDEX_QUALITY = 11
+    const val MESH_STATS_INDEX_TOTAL_MS = 12
+    const val MESH_STATS_INDEX_BUILDS = 13
+    const val MESH_STATS_INDEX_VOXEL_SIZE_UM = 14
+
     external fun nativeCreate(w:Int,h:Int,fx:Float,fy:Float,cx:Float,cy:Float):Boolean
     external fun nativeDestroy()
     external fun nativeOnImu(t:Long,ax:Float,ay:Float,az:Float,gx:Float,gy:Float,gz:Float)
@@ -124,4 +196,63 @@ object NativeBridge {
     external fun nativeVinsImu(t: Long, ax: Float, ay: Float, az: Float, gx: Float, gy: Float, gz: Float)
     external fun nativeVinsImage(t: Double, gray: ByteArray, w: Int, h: Int, stride: Int)
     external fun nativeVinsGetPose(out: FloatArray): Boolean
+
+    // ------------------------------------------------------------------
+    //  真 TSDF / Mesh / GLB / 深度标定
+    // ------------------------------------------------------------------
+
+    /**
+     * 体素边长（米）。`sceneMeters` 作用于全场景 TSDF，`targetMeters` 作用于
+     * 独立的目标模型 TSDF。
+     *
+     * 注意**这里填的不是真实米制尺度**：融合用的位姿 `Rwc/twc` 是 VINS world，
+     * 而深度是按会话 min/max 映射出来的相对尺度，两者相差约一个常数因子。
+     * 所以体素大小与截断距离是按「VINS world 的可见表面尺度」选的，
+     * 真实的米制对齐由 [nativeGetDepthCalibration] 那套标定负责。
+     */
+    external fun nativeSetVoxelSizes(sceneMeters: Float, targetMeters: Float)
+
+    /**
+     * 体素块预算（稀疏体素块哈希的容量上限）。
+     * 一个块 = 8x8x8 体素（3072 字节）。超过预算后新的块不再分配，
+     * 融合会整帧停止而不是静默丢一部分，避免出现「半边模型」。
+     */
+    external fun nativeSetVoxelBudget(sceneBlocks: Int, targetBlocks: Int)
+
+    /**
+     * 开关 VINS 稀疏深度鲁棒标定（MAD 剔除 + Huber IRLS + EMA）。
+     * 关掉会退回旧的「单个 median 比值」尺度。
+     */
+    external fun nativeSetDepthCalibrationEnabled(enabled: Boolean)
+
+    /** 读深度标定状态（[DEPTH_CALIBRATION_SLOTS] 槽）。返回写入的槽数。 */
+    external fun nativeGetDepthCalibration(out: FloatArray): Int
+
+    /**
+     * 从当前体素场构建三角网格。**这是一次可能耗时几百毫秒的同步操作**，
+     * 必须在后台线程调用（[com.mobilescan3d.export.ExportManager] 已经这么做了）。
+     *
+     * 有目标模型时优先用目标体素场（与「有目标就只导目标」的口径一致）。
+     */
+    external fun nativeBuildMesh(quality: Int): Boolean
+
+    /** 网格统计（[MESH_STATS_SLOTS] 槽）。 */
+    external fun nativeGetMeshStats(): IntArray
+
+    external fun nativeGetMeshVertexCount(): Int
+    external fun nativeGetMeshIndexCount(): Int
+
+    /**
+     * 拉顶点：交错 9 float（[MESH_VERTEX_FLOATS]），`out` 至少要
+     * `maxVertices * MESH_VERTEX_FLOATS` 长。返回实际写入的顶点数。
+     */
+    external fun nativeGetMeshVertices(out: FloatArray, maxVertices: Int): Int
+
+    /** 拉索引（三角形，每 3 个一组）。返回实际写入的索引数。 */
+    external fun nativeGetMeshIndices(out: IntArray, maxIndices: Int): Int
+
+    external fun nativeResetMesh()
+
+    /** 导出 glTF 2.0 二进制（GLB），逐顶点颜色。返回是否成功。 */
+    external fun nativeExportGlb(path: String): Boolean
 }

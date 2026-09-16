@@ -16,7 +16,7 @@
 
 #include "vins/vins_bridge.h"
 #include "vins/estimator/feature_manager.h"
-#include "gaussian_engine.h"
+#include "surfel_engine.h"
 #include "vio_engine.h"
 #include "depth_fusion.h"
 #include "ai_quality.h"
@@ -25,6 +25,9 @@
 #include "keyframe_engine.h"
 #include "object_tracker.h"
 #include "target_mask_engine.h"
+#include "depth_calib.h"
+#include "mesh/mesh_engine.h"
+#include "export/gltf_exporter.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "MobileScan3D", __VA_ARGS__)
 #define TARGET_DEPTH_FILTER_ENABLED 0
@@ -35,7 +38,7 @@
 // 迭代器失效和 g_ 的 vector 扩容都是未定义行为（崩溃/花屏根因）。
 static std::mutex gStateMutex;
 static NullAiBackend aiBackend;
-static GaussianEngine g;
+static SurfelEngine g;
 static VioEngine vio;
 static DepthFusion df;
 static AiQualityEngine ai;
@@ -45,9 +48,54 @@ static TsdfEngine tsdf;
 // 代码路径。比「给 g 加一个过滤标志」强得多 —— 后者只要有一个调用点漏掉，
 // 背景就又会漏进来，而且很难在实机上发现。
 // Renderer 只读 targetG，PLY 只导 targetTsdf。
-static GaussianEngine targetG;
+static SurfelEngine targetG;
 static TsdfEngine targetTsdf;
 static TargetMaskEngine targetMaskEngine;
+
+// ---------------------------------------------------------------- mesh 管线
+// 评审 P0-3：旧导出只有顶点、没有三角面，那不是 AR 模型。这里补一条真正的
+//   TSDF -> Marching Tetrahedra -> 去小分量/平滑/简化 -> GLB
+// 链路。构建是一次性操作（用户点「生成网格」或停止扫描时），不是每帧。
+static MeshEngine meshEngine;
+static MeshBuildStats meshStats;
+static int meshQuality = 1;            // 0 = preview / 1 = normal / 2 = hq
+static bool meshDirty = true;          // 体素场变了置脏，避免重复构建
+static uint64_t meshBuilds = 0;
+static uint64_t meshDirtyMarks = 0;
+/** 顶点交错布局：x,y,z, nx,ny,nz, r,g,b —— 9 个 float 一个顶点（与 Kotlin 契约一致）。 */
+static constexpr int MESH_VERTEX_FLOATS = 9;
+
+// --------------------------------------------------------------- 深度标定
+// 评审 P0-4：把「单一 median ratio」升级成 MAD 剔除 + Huber IRLS + EMA 的
+// 鲁棒回归，并同时支持线性 / 逆深度两种模型。
+//
+// 标定目标刻意选 **VINS 自身尺度**而不是米制：TSDF 融合用的位姿（s.R / s.t）
+// 就是 VINS world 下的。深度与位姿必须处在同一尺度，否则点云会整体膨胀或
+// 缩小 —— 这正是评审说的「模型膨胀/缩小」。旧代码里深度是「按会话 min/max
+// 映射到 [0.4, 6]m 的假米制」，与 VINS 位姿根本不是一个尺度。
+static DepthCalibrator depthCalibrator;
+static bool depthCalibrationEnabled = true;
+static float lastCalibScale = 1.f;
+static float lastCalibShift = 0.f;
+static float lastCalibConfidence = 0.f;
+static int lastCalibSamples = 0;
+static bool lastCalibValid = false;
+static bool lastCalibInverse = false;
+static uint64_t calibFrames = 0;
+static uint64_t calibRejectFrames = 0;
+static constexpr int kMaxCalibSamples = 256;
+static float gCalibSampleBuf[kMaxCalibSamples * 3];
+
+// 时序一致性：上一帧深度按相对位姿重投影到当前帧，比较逐像素一致性，
+// 不一致就压低这一帧的融合权重（消「毛刺 / 浮点 / 重影」）。
+static std::vector<float> lastFusedDepth;
+static float lastFuseR[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
+static float lastFuseT[3] = {0.f, 0.f, 0.f};
+static bool haveLastFusePose = false;
+static bool lastFuseCalibrated = false;
+static float lastTemporalRatio = 1.f;
+static uint64_t temporalChecks = 0;
+static uint64_t temporalRejects = 0;
 static cv::Mat targetMaskMat;        // 与 depth 同尺寸的 CV_8U，目标内 255
 static TargetMaskStats targetMaskStats;
 // PresenceGate 连续失败帧数（只在 gStateMutex 下访问）
@@ -348,6 +396,31 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
  * 调用点：新建会话 / 销毁 / 选中新目标 / 清除目标。
  * 必须在 gStateMutex 下调用。
  */
+/**
+ * 重置 mesh 管线与深度标定。调用点：新建会话 / 销毁 / 换目标。
+ * 必须在 gStateMutex 下调用。
+ */
+static void resetMeshPipeline() {
+    meshEngine = MeshEngine();
+    meshStats = MeshBuildStats{};
+    meshDirty = true;
+    depthCalibrator.reset();
+    lastCalibScale = 1.f;
+    lastCalibShift = 0.f;
+    lastCalibConfidence = 0.f;
+    lastCalibSamples = 0;
+    lastCalibValid = false;
+    lastCalibInverse = false;
+    calibFrames = 0;
+    calibRejectFrames = 0;
+    lastFusedDepth.clear();
+    haveLastFusePose = false;
+    lastFuseCalibrated = false;
+    lastTemporalRatio = 1.f;
+    temporalChecks = 0;
+    temporalRejects = 0;
+}
+
 static void resetTargetModel() {
     targetG.reset();
     targetTsdf.reset();
@@ -359,6 +432,8 @@ static void resetTargetModel() {
     lastTargetVinsMedian = 0.f;
     lastTargetRawMedian = 0.f;
     lastTargetVinsFeatureCount = 0;
+    // 换了目标（或新会话）之后，旧网格是对旧目标/旧体素场提的，必须作废。
+    resetMeshPipeline();
 }
 
 /** 目标专属深度尺度的最小样本数：样本太少就先用原始深度，不猜。 */
@@ -369,6 +444,11 @@ static constexpr float kTargetScaleMax = 20.f;
 
 /** 当前生效的目标深度尺度（vins/raw）。样本不足时返回 1（即不修正）。 */
 static float currentTargetDepthScale() {
+    // 全局深度标定已经把深度对齐到 VINS 尺度时，不再叠加「目标专属尺度」——
+    // 两者目标完全相同，叠加就变成双重缩放。
+    if (depthCalibrationEnabled && depthCalibrator.usable()) {
+        return 1.f;
+    }
     if (targetDepthScaleSamples < kTargetScaleMinSamples) {
         return 1.f;
     }
@@ -518,6 +598,12 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     df.reset();
     ai.reset();
     tsdf.reset();
+    // 体素分辨率：全场景沿用 20mm（与历史行为一致，避免内存暴涨）；
+    // 目标专属模型用 8mm —— 它只为单个物体建网格，体素数可控，
+    // 而 mesh 的质量直接取决于体素分辨率。
+    tsdf.setVoxelSize(0.020f);
+    targetTsdf.setVoxelSize(0.008f);
+    resetMeshPipeline();
     // 目标专用模型与诊断：新会话必须从头开始，否则会残留上一轮的目标点云
     targetG.reset();
     targetTsdf.reset();
@@ -603,6 +689,7 @@ Java_com_mobilescan3d_NativeBridge_nativeDestroy(JNIEnv*, jobject) {
     presenceFailStreak = 0;
     targetDepthScaleSamples = 0;
     targetDepthScaleEma = 0.f;
+    resetMeshPipeline();
     kf.reset();
     objectTracker.reset();
     snaps.clear();
@@ -1043,6 +1130,76 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         }
     }
 
+    // ---- 深度标定：用 VINS 稀疏三角化深度做鲁棒回归 ----
+    //
+    // 必须放在**进入 gStateMutex 之前**：vinsFeatureSamples() 内部持 g_vinsMutex，
+    // 嵌进主临界区就会形成 gStateMutex -> g_vinsMutex 的嵌套锁序，而
+    // nativeOnCameraFrame 是「先拿 gStateMutex 做统计、VINS 计算放在锁外」，
+    // 两者锁序不一致迟早互相等。
+    if (depthCalibrationEnabled) {
+        const int ns = vinsFeatureSamples(gCalibSampleBuf, kMaxCalibSamples);
+        if (ns >= depthCalibrator.config().minSamples) {
+            std::vector<float> dPairs;
+            std::vector<float> zPairs;
+            dPairs.reserve((size_t)ns);
+            zPairs.reserve((size_t)ns);
+            for (int i = 0; i < ns; ++i) {
+                const float nu = gCalibSampleBuf[i * 3 + 0];
+                const float nv = gCalibSampleBuf[i * 3 + 1];
+                const float vz = gCalibSampleBuf[i * 3 + 2];
+                if (!(nu >= 0.f && nu <= 1.f && nv >= 0.f && nv <= 1.f)) {
+                    continue;
+                }
+                if (!std::isfinite(vz) || !(vz > 0.05f)) {
+                    continue;
+                }
+                const int px = std::min(w - 1, std::max(0, (int)(nu * (float)w)));
+                const int py = std::min(h - 1, std::max(0, (int)(nv * (float)h)));
+                const float dv = d[(size_t)py * w + px];
+                if (!std::isfinite(dv)) {
+                    continue;
+                }
+                dPairs.push_back(dv);
+                zPairs.push_back(vz);
+            }
+            if (!dPairs.empty()) {
+                if (depthCalibrator.update(dPairs, zPairs)) {
+                    calibFrames++;
+                } else {
+                    calibRejectFrames++;
+                }
+            }
+        }
+        lastCalibValid = depthCalibrator.usable();
+        const DepthCalibration& c = depthCalibrator.calibration();
+        lastCalibScale = c.scale;
+        lastCalibShift = c.shift;
+        lastCalibConfidence = c.confidence;
+        lastCalibSamples = c.samples;
+        lastCalibInverse = c.inverseDepthModel;
+    }
+
+    // 融合用的深度图：标定可用时逐像素映射到 VINS 尺度，否则原样透传
+    // （tracker / mask 仍看未标定的 d，保持第八轮已验收的行为不变）。
+    const bool calibratedNow = depthCalibrationEnabled && depthCalibrator.usable();
+    std::vector<float> zCal;
+    const float* depthForFusion = d.data();
+    if (calibratedNow) {
+        const DepthCalibration& c = depthCalibrator.calibration();
+        zCal.assign((size_t)w * h, 0.f);
+        for (size_t i = 0; i < zCal.size(); ++i) {
+            const float dv = d[i];
+            if (!std::isfinite(dv)) {
+                continue;
+            }
+            const float zz = c.toMetric(dv, 0.f);
+            if (zz > 0.f && std::isfinite(zz)) {
+                zCal[i] = zz;
+            }
+        }
+        depthForFusion = zCal.data();
+    }
+
     std::lock_guard<std::mutex> lk(gStateMutex);
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
     haveExternalDepth = true;
@@ -1106,32 +1263,91 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         presenceFailStreak = 0;
     }
 
+    const FrameSnap* match = nullptr;
     for (const auto& s : snaps) {
         int64_t diff = (int64_t)s.ts - (int64_t)t;
         if (diff < 0) {
             diff = -diff;
         }
         if (diff < 50000000LL) {
-            // 全场景地图照旧（保持既有行为，不动既有能力）
-            fuseDepth(d.data(), w, h, s, confidence);
-
-            // 目标专用模型：**只有 presenceOk 且 mask 有效才允许融合**。
-            // 这是「墙/天花板/桌子进不了目标点云」的落地点。
-            if (haveTi && presenceOk && maskOk) {
-                fuseTargetDepth(d.data(), w, h, s, targetMaskMat, confidence);
-            }
-
-            // live 层用的是**这一帧**的 depth 与**这一帧**的 mask，
-            // 所以放在同一个 snap 匹配分支里，而不是另找一次。
-            // 只有 mask 有效才建：验收要求「绿色 live 点只存在于目标轮廓内」，
-            // mask 建不出来时宁可一个点都不画，也不要把整个 bbox 里的点放出去。
-            if (haveTi && maskOk) {
-                buildTargetDebugLayer(d.data(), w, h, ti, targetMaskMat);
-                targetDebugTs = static_cast<uint64_t>(t);
-            }
+            match = &s;
             break;
         }
     }
+
+    if (match != nullptr) {
+        // ---- 时序一致性：上一帧深度按相对位姿重投影到当前帧 ----
+        // 单目深度网络在细节上本来就会抖，动得快时更明显。这里把「同一表面在
+        // 两帧里深度不一致」的像素识别出来，用一致性比例给融合降权。
+        float conf = confidence;
+        if (haveLastFusePose && lastFuseCalibrated == calibratedNow &&
+            lastFusedDepth.size() == (size_t)w * h) {
+            // Pc_cur = Rcur^T * Rprev * Pc_prev + Rcur^T * (tprev - tcur)
+            float Rrel[9];
+            float trel[3];
+            const float dv[3] = {lastFuseT[0] - match->t[0],
+                                 lastFuseT[1] - match->t[1],
+                                 lastFuseT[2] - match->t[2]};
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    float acc = 0.f;
+                    for (int k = 0; k < 3; ++k) {
+                        acc += match->R[k * 3 + i] * lastFuseR[k * 3 + j];
+                    }
+                    Rrel[i * 3 + j] = acc;
+                }
+                float acc = 0.f;
+                for (int k = 0; k < 3; ++k) {
+                    acc += match->R[k * 3 + i] * dv[k];
+                }
+                trel[i] = acc;
+            }
+            lastTemporalRatio = temporalConsistencyRatio(
+                lastFusedDepth.data(), depthForFusion, w, h,
+                gFx, gFy, gCx, gCy, Rrel, trel);
+            temporalChecks++;
+            if (lastTemporalRatio < 0.35f) {
+                temporalRejects++;
+            }
+            // 下限 0.25：一致性差就降权，但不至于完全不融合 ——
+            // 否则一边走一边扫时根本重建不出来。
+            conf = confidence * std::clamp(lastTemporalRatio, 0.25f, 1.f);
+        }
+
+        // 全场景地图
+        fuseDepth(depthForFusion, w, h, *match, conf);
+
+        // 目标专用模型：**只有 presenceOk 且 mask 有效才允许融合**。
+        // 这是「墙/天花板/桌子进不了目标点云」的落地点。
+        if (haveTi && presenceOk && maskOk) {
+            fuseTargetDepth(depthForFusion, w, h, *match, targetMaskMat, conf);
+        }
+
+        // live 层用的是**这一帧**的 depth 与**这一帧**的 mask，
+        // 所以放在同一个 snap 匹配分支里，而不是另找一次。
+        // 只有 mask 有效才建：验收要求「绿色 live 点只存在于目标轮廓内」，
+        // mask 建不出来时宁可一个点都不画，也不要把整个 bbox 里的点放出去。
+        if (haveTi && maskOk) {
+            buildTargetDebugLayer(depthForFusion, w, h, ti, targetMaskMat);
+            targetDebugTs = static_cast<uint64_t>(t);
+        }
+
+        // 记录本帧，供下一帧做时序一致性检查
+        lastFusedDepth.assign(depthForFusion, depthForFusion + (size_t)w * h);
+        for (int i = 0; i < 9; ++i) {
+            lastFuseR[i] = match->R[i];
+        }
+        for (int i = 0; i < 3; ++i) {
+            lastFuseT[i] = match->t[i];
+        }
+        haveLastFusePose = true;
+        lastFuseCalibrated = calibratedNow;
+
+        // 体素场变了 -> 网格变脏
+        meshDirty = true;
+        meshDirtyMarks++;
+    }
+
     if (!targetDebugEnabled) {
         // 关掉时把上一帧的残留清空，否则切换开关后屏幕上会留着旧点
         targetDebugPointCount = 0;
@@ -1304,7 +1520,34 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << "PointCloud centroid=(" << pcx << ", " << pcy << ", " << pcz << ")\n"
       << "PointCloud vs Cam offset=(" << offX << ", " << offY << ", " << offZ
       << ")  dist=" << offDist << "\n"
-      << "TSDF voxels: " << tsdf.voxels() << "\n"
+      << "TSDF: voxels=" << tsdf.voxels()
+      << " blocks=" << tsdf.blocks()
+      << " voxelSize=" << tsdf.voxelSize()
+      << " memMB=" << (tsdf.memoryBytes() / (1024 * 1024))
+      << " targetVoxels=" << targetTsdf.voxels()
+      << " targetVoxelSize=" << targetTsdf.voxelSize() << "\n"
+      << "DepthCalib: enabled=" << (depthCalibrationEnabled ? 1 : 0)
+      << " valid=" << (lastCalibValid ? 1 : 0)
+      << " model=" << (lastCalibInverse ? "inverse" : "linear")
+      << " scale=" << lastCalibScale
+      << " shift=" << lastCalibShift
+      << " confidence=" << lastCalibConfidence
+      << " samples=" << lastCalibSamples
+      << " accepted=" << calibFrames
+      << " rejected=" << calibRejectFrames << "\n"
+      << "Temporal: ratio=" << lastTemporalRatio
+      << " checks=" << temporalChecks
+      << " rejects=" << temporalRejects << "\n"
+      << "Mesh: dirty=" << (meshDirty ? 1 : 0)
+      << " builds=" << meshBuilds
+      << " quality=" << meshQuality
+      << " vertices=" << meshStats.outVertices
+      << " triangles=" << meshStats.outTriangles
+      << " rawTriangles=" << meshStats.rawTriangles
+      << " componentsRemoved=" << meshStats.componentsRemoved
+      << " decimated=" << (meshStats.decimated ? 1 : 0)
+      << " buildMs=" << meshStats.totalMs
+      << " note=" << meshStats.note << "\n"
       << "Vulkan: " << (vk ? "available" : "unavailable") << "\n"
       << "Next view: " << kf.guidance();
     return e->NewStringUTF(s.str().c_str());
@@ -1338,7 +1581,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetGaussians(JNIEnv* e, jobject,
         gArMinHits = need;
         // Renderer 只读**目标模型**：背景点云根本没有进入 targetG 的代码路径。
         // 还没有目标（用户没锁定过）时退回全场景 g，避免一上来屏幕全空。
-        GaussianEngine& src = (targetG.count() > 0) ? targetG : g;
+        SurfelEngine& src = (targetG.count() > 0) ? targetG : g;
         n = src.copyPoints(dst, (size_t)maxPoints, need);
         gArDrawnPoints = n;
     }
@@ -1746,5 +1989,270 @@ Java_com_mobilescan3d_NativeBridge_nativeConfigureTrackerModels(JNIEnv* env, job
     tracker->configureAppearance(std::string(), std::string(), b, h);
     env->ReleaseStringUTFChars(backbone, b);
     env->ReleaseStringUTFChars(head, h);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+
+// ============================================================================
+//  Mesh / GLB / 深度标定 JNI
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetVoxelSizes(JNIEnv*, jobject,
+                                                       jfloat sceneMeters,
+                                                       jfloat targetMeters) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    if (sceneMeters > 0.f) {
+        tsdf.setVoxelSize(sceneMeters);
+    }
+    if (targetMeters > 0.f) {
+        targetTsdf.setVoxelSize(targetMeters);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetVoxelBudget(JNIEnv*, jobject,
+                                                        jint sceneBlocks,
+                                                        jint targetBlocks) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    if (sceneBlocks > 0) {
+        tsdf.setMaxBlocks((size_t)sceneBlocks);
+    }
+    if (targetBlocks > 0) {
+        targetTsdf.setMaxBlocks((size_t)targetBlocks);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetDepthCalibrationEnabled(JNIEnv*, jobject,
+                                                                   jboolean enabled) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    depthCalibrationEnabled = (enabled == JNI_TRUE);
+}
+
+/**
+ * 深度标定状态（12 槽）。
+ *   0 scale   1 shift   2 confidence   3 samples       4 valid
+ *   5 inverseModel  6 enabled  7 acceptedFrames  8 rejectedFrames
+ *   9 temporalRatio 10 temporalRejects 11 usable
+ */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetDepthCalibration(JNIEnv* e, jobject,
+                                                             jfloatArray out) {
+    if (out == nullptr) {
+        return 0;
+    }
+    const jsize cap = e->GetArrayLength(out);
+    if (cap < 12) {
+        return 0;
+    }
+    jfloat v[12];
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        v[0] = lastCalibScale;
+        v[1] = lastCalibShift;
+        v[2] = lastCalibConfidence;
+        v[3] = (jfloat)lastCalibSamples;
+        v[4] = lastCalibValid ? 1.f : 0.f;
+        v[5] = lastCalibInverse ? 1.f : 0.f;
+        v[6] = depthCalibrationEnabled ? 1.f : 0.f;
+        v[7] = (jfloat)calibFrames;
+        v[8] = (jfloat)calibRejectFrames;
+        v[9] = lastTemporalRatio;
+        v[10] = (jfloat)temporalRejects;
+        v[11] = depthCalibrator.usable() ? 1.f : 0.f;
+    }
+    e->SetFloatArrayRegion(out, 0, 12, v);
+    return 12;
+}
+
+/**
+ * 从当前体素场构建三角网格（Marching Tetrahedra + 清理 + 简化）。
+ *
+ * 有目标模型时优先用 targetTsdf —— 与「有目标就只导目标」的 PLY / 点云口径一致。
+ * 这是一次性操作，可能耗时几百毫秒，不要在帧回调里调。
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeBuildMesh(JNIEnv*, jobject, jint quality) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    meshQuality = std::clamp((int)quality, 0, 2);
+
+    MeshOptions opt;
+    opt.quality = meshQuality;
+    const TsdfEngine& src = (targetTsdf.voxels() > 0) ? targetTsdf : tsdf;
+
+    const bool ok = meshEngine.build(src, opt, meshStats);
+    meshBuilds++;
+    // 构建成功后体素场与网格一致；失败则保持脏，允许用户重试。
+    meshDirty = !ok;
+
+    LOGI("nativeBuildMesh quality=%d ok=%d src=%s verts=%zu tris=%zu rawTris=%zu "
+         "compRemoved=%zu/%zu decimated=%d ms=%.1f note=%s",
+         meshQuality, ok ? 1 : 0,
+         (&src == &targetTsdf) ? "target" : "scene",
+         meshStats.outVertices, meshStats.outTriangles, meshStats.rawTriangles,
+         meshStats.componentsRemoved, meshStats.componentsBefore,
+         meshStats.decimated ? 1 : 0, meshStats.totalMs, meshStats.note.c_str());
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/** mesh 统计（16 槽，全部为整型）。 */
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetMeshStats(JNIEnv* e, jobject) {
+    jint v[16];
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        v[0] = (jint)meshStats.outVertices;
+        v[1] = (jint)meshStats.outTriangles;
+        v[2] = (jint)meshStats.rawVertices;
+        v[3] = (jint)meshStats.rawTriangles;
+        v[4] = (jint)meshStats.componentsBefore;
+        v[5] = (jint)meshStats.componentsRemoved;
+        v[6] = (jint)meshStats.trianglesRemovedRaw;
+        v[7] = (jint)meshStats.trianglesRemovedComp;
+        v[8] = (jint)meshStats.blocksScanned;
+        v[9] = meshStats.decimated ? 1 : 0;
+        v[10] = meshStats.ok ? 1 : 0;
+        v[11] = (jint)meshQuality;
+        v[12] = (jint)meshStats.totalMs;
+        v[13] = (jint)meshBuilds;
+        v[14] = (jint)(meshStats.voxelSize * 1000000.f);  // 微米
+        v[15] = meshStats.smoothIterations;
+    }
+    jintArray out = e->NewIntArray(16);
+    if (out == nullptr) {
+        return nullptr;
+    }
+    e->SetIntArrayRegion(out, 0, 16, v);
+    return out;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetMeshVertexCount(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    return (jint)meshEngine.mesh().vertexCount();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetMeshIndexCount(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    return (jint)meshEngine.mesh().indices.size();
+}
+
+/** 顶点交错布局 x,y,z,nx,ny,nz,r,g,b（9 float/顶点）。返回写入的顶点数。 */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetMeshVertices(JNIEnv* e, jobject,
+                                                         jfloatArray out,
+                                                         jint maxVertices) {
+    if (out == nullptr || maxVertices <= 0) {
+        return 0;
+    }
+    std::vector<float> buf;
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        const Mesh& m = meshEngine.mesh();
+        const size_t nv = m.vertexCount();
+        if (nv == 0) {
+            return 0;
+        }
+        const jsize cap = e->GetArrayLength(out) / MESH_VERTEX_FLOATS;
+        n = std::min((size_t)(maxVertices > 0 ? maxVertices : 0), (size_t)cap);
+        if (n > nv) {
+            n = nv;
+        }
+        buf.resize(n * MESH_VERTEX_FLOATS);
+        const bool hasN = m.normals.size() >= nv * 3;
+        const bool hasC = m.colors.size() >= nv * 3;
+        for (size_t i = 0; i < n; ++i) {
+            float* p = buf.data() + i * MESH_VERTEX_FLOATS;
+            p[0] = m.positions[i * 3 + 0];
+            p[1] = m.positions[i * 3 + 1];
+            p[2] = m.positions[i * 3 + 2];
+            if (hasN) {
+                p[3] = m.normals[i * 3 + 0];
+                p[4] = m.normals[i * 3 + 1];
+                p[5] = m.normals[i * 3 + 2];
+            } else {
+                p[3] = 0.f;
+                p[4] = 0.f;
+                p[5] = 1.f;
+            }
+            if (hasC) {
+                p[6] = m.colors[i * 3 + 0];
+                p[7] = m.colors[i * 3 + 1];
+                p[8] = m.colors[i * 3 + 2];
+            } else {
+                p[6] = p[7] = p[8] = 0.6f;
+            }
+        }
+    }
+    if (n == 0) {
+        return 0;
+    }
+    e->SetFloatArrayRegion(out, 0, (jsize)(n * MESH_VERTEX_FLOATS), buf.data());
+    return (jint)n;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetMeshIndices(JNIEnv* e, jobject,
+                                                        jintArray out,
+                                                        jint maxIndices) {
+    if (out == nullptr || maxIndices <= 0) {
+        return 0;
+    }
+    std::vector<jint> buf;
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        const Mesh& m = meshEngine.mesh();
+        if (m.indices.empty()) {
+            return 0;
+        }
+        const jsize cap = e->GetArrayLength(out);
+        n = std::min((size_t)maxIndices, (size_t)cap);
+        if (n > m.indices.size()) {
+            n = m.indices.size();
+        }
+        buf.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            buf[i] = (jint)m.indices[i];
+        }
+    }
+    if (n == 0) {
+        return 0;
+    }
+    e->SetIntArrayRegion(out, 0, (jsize)n, buf.data());
+    return (jint)n;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeResetMesh(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    meshEngine = MeshEngine();
+    meshStats = MeshBuildStats{};
+    meshDirty = true;
+}
+
+/** 导出 glTF 2.0 二进制 GLB（vertex color）。返回是否成功。 */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeExportGlb(JNIEnv* e, jobject, jstring path) {
+    if (path == nullptr) {
+        return JNI_FALSE;
+    }
+    const char* p = e->GetStringUTFChars(path, nullptr);
+    if (p == nullptr) {
+        return JNI_FALSE;
+    }
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        GlbExportStats gs;
+        ok = exportGlb(meshEngine.mesh(), std::string(p), "MobileScan3D_scan", &gs);
+        LOGI("nativeExportGlb ok=%d verts=%zu tris=%zu json=%zu bin=%zu bytes=%zu color=%d note=%s",
+             ok ? 1 : 0, gs.vertices, gs.triangles, gs.jsonBytes, gs.binBytes,
+             gs.fileBytes, gs.hasVertexColor ? 1 : 0, gs.note.c_str());
+    }
+    e->ReleaseStringUTFChars(path, p);
     return ok ? JNI_TRUE : JNI_FALSE;
 }

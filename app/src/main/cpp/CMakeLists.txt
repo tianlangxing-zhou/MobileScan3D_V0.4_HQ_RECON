@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(mobilescan3d SHARED
     native_engine.cpp
-    gaussian_engine.cpp
+    surfel_engine.cpp
     vio_engine.cpp
     keyframe_engine.cpp
     depth_fusion.cpp
@@ -15,6 +15,9 @@ add_library(mobilescan3d SHARED
     object_tracker.cpp
     target_mask_engine.cpp
     appearance_tracker.cpp
+    depth_calib.cpp
+    mesh/mesh_engine.cpp
+    export/gltf_exporter.cpp
     hq_fusion.cpp
     vins_prelude.cpp
     vins_ceres_check.cpp
@@ -104,11 +107,18 @@ target_include_directories(
     ${OPENCV_ANDROID_SDK}/sdk/native/jni/include
 )
 
+# 评审第七点：去掉全局 -ffast-math。
+#
+# -ffast-math 会打开 -ffinite-math-only / -funsafe-math-optimizations，
+# 也就是允许编译器**假定不存在 NaN / Inf**，并重排浮点运算顺序。本工程
+# 大量依赖 std::isfinite() 做 guard（深度、VINS 残差、Ceres 收敛判据），
+# 在 fast-math 下这些检查会被优化掉 —— 一个 NaN 就能静默污染整条 TSDF。
+# 真正需要激进数学的 compute kernel（将来 Vulkan/NEON）再单独开。
 target_compile_options(
     mobilescan3d
     PRIVATE
     -O3
-    -ffast-math
+    -fno-finite-math-only
 )
 
 add_library(opencv_java SHARED IMPORTED)

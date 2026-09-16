@@ -1,10 +1,28 @@
 #pragma once
 
+// ============================================================================
+//  SurfelEngine（原 GaussianEngine）
+// ============================================================================
+//
+// 评审指出命名与实现不符，这里改成如实的名字：
+//
+// 本类做的是「1cm 体素哈希 + 位置/颜色加权平均 + 固定 scale + 单位四元数 +
+// 置信度不透明度」。它 **没有** 3D Gaussian Splatting 的协方差、球谐系数、
+// 可微渲染与训练优化 —— 所以它本质上是 colored surfel（有向点），
+// 不是 3DGS。
+//
+// 定位（与评审建议一致）：
+//   * 本类  -> 扫描过程中的实时预览（噪声低、开销小）
+//   * TSDF Mesh -> 最终几何（mesh_engine + export/gltf_exporter）
+//   * 未来若要真 3DGS，新增独立的 GaussianTrainer / GaussianRenderer，
+//     不要改这条 TSDF/mesh 主链。
+// ============================================================================
+
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
 
-struct Gaussian {
+struct Surfel {
     float px, py, pz;
     float sx, sy, sz;
     float qx, qy, qz, qw;
@@ -13,7 +31,7 @@ struct Gaussian {
     uint8_t state;
 };
 
-class GaussianEngine {
+class SurfelEngine {
 public:
     void reset();
     void ingestPoint(float x, float y, float z, uint8_t r, uint8_t g, uint8_t b, float confidence);
@@ -52,8 +70,12 @@ private:
         }
     };
 
-    std::vector<Gaussian> g_;
+    std::vector<Surfel> g_;
     std::unordered_map<Key, size_t, Hash> index_;
     size_t stable_ = 0;
     size_t merged_ = 0;
 };
+
+// 旧名保留为别名：native_engine.cpp 等调用点在下一轮再逐步统一，
+// 但「新代码一律写 SurfelEngine」。
+using GaussianEngine = SurfelEngine;
