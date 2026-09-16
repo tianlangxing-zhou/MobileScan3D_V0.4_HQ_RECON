@@ -56,6 +56,29 @@ cv::Mat downscaleGray(const cv::Mat& gray, int maxDim = 640)
     return small;
 }
 
+/**
+ * 统一分辨率下的清晰度评分（Laplacian 方差）。
+ *
+ * 必须在同一尺度上比较，否则 4096 宽的参考帧和 1080 宽的候选帧算出来的方差
+ * 根本不可比，所以先降到 maxDim=640 再算。
+ * 上层用它从 burst 里挑「最清晰的一帧」做降级交付。
+ */
+double sharpnessScore(const cv::Mat& gray)
+{
+    if (gray.empty()) {
+        return 0.0;
+    }
+    const cv::Mat small = downscaleGray(gray);
+    if (small.empty()) {
+        return 0.0;
+    }
+    cv::Mat lap;
+    cv::Laplacian(small, lap, CV_32F);
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(lap, mean, stddev);
+    return stddev[0] * stddev[0];
+}
+
 } // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -68,7 +91,8 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     jint iso,
     jfloatArray statsOut)
 {
-    if (!inputPaths || !outputPath || env->GetArrayLength(statsOut) < 12) {
+    // statsOut 共 20 槽，布局见下方 stats[..] 赋值处的注释
+    if (!inputPaths || !outputPath || env->GetArrayLength(statsOut) < 20) {
         return JNI_FALSE;
     }
 
@@ -103,17 +127,30 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     const std::string outPath(out);
     env->ReleaseStringUTFChars(outputPath, out);
 
-    float stats[12] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    // stats 槽位约定（与 HqCaptureController.applyFusionStats 一一对应）：
+    //   0 sharpness(ref)      1 clippedPercent     2 underexposedPercent
+    //   3 noiseSigma          4 confidenceMean     5 confidenceLowPercent
+    //   6 inliersMean         7 rmseMean           8 eccMean
+    //   9 nInputs            10 accepted          11 rejected
+    //  12 rmseMax            13 sharpestIndex     14 sharpestScore
+    //  15 fusedWritten       16 rejectedAlign     17 rejectedEcc
+    //  18 rejectedDecode     19 alignedCount
+    float stats[20] = {};
     stats[9] = static_cast<float>(nInputs);
+    stats[13] = -1.f;
 
     cv::Mat reference = cv::imread(paths[0], cv::IMREAD_COLOR);
     if (reference.empty()) {
-        env->SetFloatArrayRegion(statsOut, 0, 12, stats);
+        env->SetFloatArrayRegion(statsOut, 0, 20, stats);
         return JNI_FALSE;
     }
 
     cv::Mat refGray;
     cv::cvtColor(reference, refGray, cv::COLOR_BGR2GRAY);
+
+    // burst 内最清晰帧的追踪：对齐帧数不足时上层直接取这一帧交付
+    int sharpestIndex = 0;
+    double sharpestScore = sharpnessScore(refGray);
 
     cv::Mat lap;
     cv::Laplacian(refGray, lap, CV_32F);
@@ -194,21 +231,38 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     int alignedCount = 0;
     double inlierSum = 0.0;
     double rmseSum = 0.0;
+    double rmseMax = 0.0;
     double eccSum = 0.0;
     int eccCount = 0;
+    // 被哪一道门挡掉的：分开展示才能判断是「点太少」还是「配准不够」
+    int rejectedAlign = 0;
+    int rejectedEcc = 0;
+    int rejectedDecode = 0;
     bool haveNoise = false;
 
     for (jsize i = 1; i < nInputs; ++i) {
         cv::Mat cur = cv::imread(paths[i], cv::IMREAD_COLOR);
         if (cur.empty()) {
             rejected++;
+            rejectedDecode++;
             continue;
         }
 
         cv::Mat curGray;
         cv::cvtColor(cur, curGray, cv::COLOR_BGR2GRAY);
+
+        // 每一帧都参与「最清晰帧」评选（同尺度比较），
+        // 即使它因对齐失败被拒绝 —— 它仍可能是整组里最好看的一张。
+        const double curScore = sharpnessScore(curGray);
+        if (curScore > sharpestScore) {
+            sharpestScore = curScore;
+            sharpestIndex = static_cast<int>(i);
+        }
+
         cv::Mat warped;
         bool good = false;
+        // 1 = 对齐门（含异常 / 特征不足 / RANSAC 不达标），2 = ECC 门
+        int rejectKind = 1;
         double frameInliers = 0.0;
         double frameRmse = 0.0;
         double frameEcc = 0.0;
@@ -278,6 +332,8 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
             }
 
             if (good) {
+                // 过了对齐门，之后任何失败都归到 ECC 门
+                rejectKind = 2;
                 cv::Mat refSmall = downscaleGray(refGray);
                 cv::Mat warpedGray;
                 cv::cvtColor(warped, warpedGray, cv::COLOR_BGR2GRAY);
@@ -344,6 +400,13 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
 
     stats[10] = static_cast<float>(accepted);
     stats[11] = static_cast<float>(rejected);
+    stats[12] = static_cast<float>(rmseMax);
+    stats[13] = static_cast<float>(sharpestIndex);
+    stats[14] = static_cast<float>(sharpestScore);
+    stats[16] = static_cast<float>(rejectedAlign);
+    stats[17] = static_cast<float>(rejectedEcc);
+    stats[18] = static_cast<float>(rejectedDecode);
+    stats[19] = static_cast<float>(alignedCount);
     if (alignedCount > 0) {
         stats[6] = static_cast<float>(inlierSum / alignedCount);
         stats[7] = static_cast<float>(rmseSum / alignedCount);
@@ -359,7 +422,7 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
     if (accepted < 2) {
         // 没有任何帧通过严格对齐门限：如实上报统计，
         // 由上层给出具体拒绝原因（acceptedFrames 等），而不是笼统的 "fusion failed"。
-        env->SetFloatArrayRegion(statsOut, 0, 12, stats);
+        env->SetFloatArrayRegion(statsOut, 0, 20, stats);
         return JNI_TRUE;
     }
 
@@ -410,14 +473,16 @@ Java_com_mobilescan3d_NativeBridge_nativeFuseBurst(
         params.push_back(cv::IMWRITE_JPEG_QUALITY);
         params.push_back(95);
         if (!cv::imwrite(outPath, fused, params)) {
-            env->SetFloatArrayRegion(statsOut, 0, 12, stats);
+            env->SetFloatArrayRegion(statsOut, 0, 20, stats);
             return JNI_FALSE;
         }
     } catch (const cv::Exception&) {
-        env->SetFloatArrayRegion(statsOut, 0, 12, stats);
+        env->SetFloatArrayRegion(statsOut, 0, 20, stats);
         return JNI_FALSE;
     }
 
-    env->SetFloatArrayRegion(statsOut, 0, 12, stats);
+    // 只有真正写出了融合图才置 1；上层据此判断「有没有东西可交付」
+    stats[15] = 1.f;
+    env->SetFloatArrayRegion(statsOut, 0, 20, stats);
     return JNI_TRUE;
 }
