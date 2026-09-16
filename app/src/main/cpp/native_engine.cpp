@@ -839,6 +839,13 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "acquireFail=" << i.acquireFail << "\n"
       << "trackSuccess=" << i.trackSuccess << "\n"
       << "trackLost=" << i.trackLost << "\n"
+      << "nanoLoaded=" << (i.nanoLoaded ? "true" : "false") << "\n"
+      << "nanoInitCalls=" << i.nanoInitCalls << "\n"
+      << "nanoUpdateCalls=" << i.nanoUpdateCalls << "\n"
+      << "nanoFailures=" << i.nanoFailures << "\n"
+      << "nanoRecoveries=" << i.nanoRecoveries << "\n"
+      << "nanoScore=" << i.nanoScore << "\n"
+      << "nanoLastMs=" << i.nanoLastMs << "\n"
       << "templateAllocated=" << (i.targetTemplateAllocated ? "true" : "false") << "\n"
       << "templateSize=" << i.templateWidth << "x" << i.templateHeight << "\n"
       << "prevGrayValid=" << (i.prevGrayValid ? "true" : "false") << "\n"
@@ -879,4 +886,27 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPose(JNIEnv* env, jobject, jfl
 
     env->SetFloatArrayRegion(out, 0, 12, pose);
     return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeConfigureTrackerModels(JNIEnv* env, jobject, jstring backbone, jstring head) {
+    std::shared_ptr<ObjectTracker> tracker;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        tracker = objectTracker;
+    }
+    if (!tracker) return JNI_FALSE;
+
+    const char* b = env->GetStringUTFChars(backbone, nullptr);
+    const char* h = env->GetStringUTFChars(head, nullptr);
+    if (!b || !h) {
+        if (b) env->ReleaseStringUTFChars(backbone, b);
+        if (h) env->ReleaseStringUTFChars(head, h);
+        return JNI_FALSE;
+    }
+
+    const bool ok = tracker->configureNano(b, h);
+    env->ReleaseStringUTFChars(backbone, b);
+    env->ReleaseStringUTFChars(head, h);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }

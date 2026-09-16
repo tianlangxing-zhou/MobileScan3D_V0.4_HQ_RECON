@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/video/tracking.hpp>
 
 enum class TargetState
 {
@@ -45,6 +46,13 @@ struct TargetTrackInfo
     uint64_t acquireFail = 0;
     uint64_t trackSuccess = 0;
     uint64_t trackLost = 0;
+    bool nanoLoaded = false;
+    uint64_t nanoInitCalls = 0;
+    uint64_t nanoUpdateCalls = 0;
+    uint64_t nanoFailures = 0;
+    uint64_t nanoRecoveries = 0;
+    float nanoScore = 0.f;
+    double nanoLastMs = 0.0;
     uint64_t depthFilterCalls = 0;
     uint64_t depthFilterSkipped = 0;
     bool maskAllocated = false;
@@ -79,6 +87,7 @@ public:
     void reset();
     void clearTarget();
     void setEnabled(bool enabled);
+    bool configureNano(const std::string& backbone, const std::string& head);
     bool requestTarget(float u, float v);
     bool selectTarget(float u, float v);
     void updateFrame(const uint8_t* gray, int width, int height, int stride, uint64_t timestamp);
@@ -105,6 +114,17 @@ private:
     float trackHalfH_ = 120.f;
     int framesSinceLastReseed_ = 0;
     int edgeLostFrames_ = 0;
+    cv::Ptr<cv::TrackerNano> nano_;
+    bool nanoLoaded_ = false;
+    bool nanoNeedInit_ = false;
+    int nanoFrameCounter_ = 0;
+    float nanoScore_ = 0.f;
+    cv::Rect2f nanoBoxFull_;
+    uint64_t nanoInitCalls_ = 0;
+    uint64_t nanoUpdateCalls_ = 0;
+    uint64_t nanoRecoveries_ = 0;
+    uint64_t nanoFailures_ = 0;
+    double nanoLastMs_ = 0.0;
 
     std::atomic<bool> pendingSelect_{false};
     std::atomic<float> pendingU_{0.5f};

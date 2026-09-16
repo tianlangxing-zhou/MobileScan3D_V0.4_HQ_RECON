@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <chrono>
 
 void ObjectTracker::reset()
 {
@@ -69,6 +70,25 @@ void ObjectTracker::setEnabled(bool enabled)
         prevGray_.release();
         prevPoints_.clear();
         havePrev_ = false;
+    }
+}
+
+bool ObjectTracker::configureNano(const std::string& backbone, const std::string& head)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    try {
+        cv::TrackerNano::Params p;
+        p.backbone = backbone;
+        p.neckhead = head;
+        nano_ = cv::TrackerNano::create(p);
+        nanoLoaded_ = !nano_.empty();
+        info_.nanoLoaded = nanoLoaded_;
+        return nanoLoaded_;
+    } catch (const cv::Exception& e) {
+        info_.lastError = std::string("NanoTrack load: ") + e.what();
+        nanoLoaded_ = false;
+        info_.nanoLoaded = false;
+        return false;
     }
 }
 
@@ -227,6 +247,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         info_.state = TargetState::TRACKING;
         info_.lastError.clear();
         havePrev_ = true;
+        nanoNeedInit_ = true;
     }
 }
 
@@ -396,6 +417,64 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.prevGrayWidth = prevGray_.cols;
     info_.prevGrayHeight = prevGray_.rows;
     info_.prevPointCount = static_cast<int>(prevPoints_.size());
+
+    if (nanoLoaded_ && info_.state == TargetState::TRACKING) {
+        nanoFrameCounter_++;
+        cv::Mat bgr;
+        try {
+            cv::cvtColor(owned, bgr, cv::COLOR_GRAY2BGR);
+            if (nanoNeedInit_) {
+                cv::Rect initRect(
+                    static_cast<int>(info_.x0 * width),
+                    static_cast<int>(info_.y0 * height),
+                    std::max(1, static_cast<int>((info_.x1 - info_.x0) * width)),
+                    std::max(1, static_cast<int>((info_.y1 - info_.y0) * height))
+                );
+                nano_->init(bgr, initRect);
+                nanoNeedInit_ = false;
+                nanoInitCalls_++;
+                info_.nanoInitCalls = nanoInitCalls_;
+            } else if ((nanoFrameCounter_ % 5) == 0) {
+                const auto start = std::chrono::steady_clock::now();
+                cv::Rect nanoRect;
+                const bool ok = nano_->update(bgr, nanoRect);
+                const auto end = std::chrono::steady_clock::now();
+                nanoLastMs_ = std::chrono::duration<double, std::milli>(end - start).count();
+                nanoUpdateCalls_++;
+                info_.nanoUpdateCalls = nanoUpdateCalls_;
+                info_.nanoLastMs = nanoLastMs_;
+                if (ok) {
+                    nanoScore_ = nano_->getTrackingScore();
+                    nanoBoxFull_ = nanoRect;
+                    info_.nanoScore = nanoScore_;
+                    const float nanoCx = nanoRect.x + nanoRect.width * 0.5f;
+                    const float nanoCy = nanoRect.y + nanoRect.height * 0.5f;
+                    if (nanoScore_ > 0.45f && info_.confidence > 0.45f) {
+                        trackCx_ = trackCx_ * 0.75f + nanoCx * 0.25f;
+                        trackCy_ = trackCy_ * 0.75f + nanoCy * 0.25f;
+                    } else if (nanoScore_ > 0.60f && prevPoints_.size() < 20) {
+                        trackCx_ = nanoCx;
+                        trackCy_ = nanoCy;
+                        nanoRecoveries_++;
+                        info_.nanoRecoveries = nanoRecoveries_;
+                    }
+                } else {
+                    nanoFailures_++;
+                    info_.nanoFailures = nanoFailures_;
+                }
+            }
+        } catch (const cv::Exception& e) {
+            nanoFailures_++;
+            info_.nanoFailures = nanoFailures_;
+            info_.lastError = std::string("NanoTrack: ") + e.what();
+            nanoNeedInit_ = false;
+        } catch (const std::exception& e) {
+            nanoFailures_++;
+            info_.nanoFailures = nanoFailures_;
+            info_.lastError = std::string("NanoTrack: ") + e.what();
+            nanoNeedInit_ = false;
+        }
+    }
 
     const bool lowFeatures = goodNext.size() < 35;
     const bool enoughVisible = info_.visibleFraction >= 0.40f;

@@ -1295,6 +1295,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (objectLockEnabled) {
                 NativeBridge.nativeSetObjectLockEnabled(true)
             }
+            val backbone = materializeAsset("nanotrack_backbone_sim.onnx")
+            val head = materializeAsset("nanotrack_head_sim.onnx")
+            NativeBridge.nativeConfigureTrackerModels(backbone, head)
             sessionCreated = true
         }
         primaryButton.text = "停止实验扫描"
@@ -1328,6 +1331,20 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             if (ok) "模型已导出：$path" else "导出失败（模型数据不足）",
             android.widget.Toast.LENGTH_LONG
         ).show()
+    }
+
+    private fun materializeAsset(assetName: String): String {
+        val dir = java.io.File(filesDir, "tracker_models")
+        dir.mkdirs()
+        val out = java.io.File(dir, assetName)
+        if (!out.exists()) {
+            assets.open("models/$assetName").use { input ->
+                out.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+        }
+        return out.absolutePath
     }
 
     private fun readPlyVertexCount(file: java.io.File): Int? {
