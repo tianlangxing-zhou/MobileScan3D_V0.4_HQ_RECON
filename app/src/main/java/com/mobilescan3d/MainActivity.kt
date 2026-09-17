@@ -197,10 +197,35 @@ private var lastRelocPollMs = 0L
     /** AR 图层切换按钮 */
     private var arLayerButton: android.widget.Button? = null
     /** AR 绘制模式，见 PointCloudRenderer.DRAW_* */
-    @Volatile private var arDrawMode = PointCloudRenderer.DRAW_TARGET_DEBUG
+    @Volatile private var arDrawMode = PointCloudRenderer.DRAW_LIVE
+    /** V0.12: 实时网格快照是否正在后台重建（防止同一时刻排队两次）。 */
+    @Volatile private var liveMeshBuildBusy = false
+    /** V0.12: 上一次提交网格快照的时刻（SystemClock.elapsedRealtime）。 */
+    @Volatile private var lastLiveMeshRefreshMs = 0L
+    /** 已经因为「epoch 未激活」清过一次网格，避免逐帧重复清。 */
+    private var liveMeshBlockedNotice = false
+    /**
+     * V0.12: 扫描期网格快照周期。
+     *
+     * 网格**刻意不追 30FPS**：逐帧跑一次 TSDF -> Marching Tetrahedra 会把
+     * CPU 吃光，反而拖慢 VIO 让模型更差。5 秒一次已足够让用户看出
+     * 「模型在长」——而点云是每帧刷新的，画面并不会显得僵。
+     */
+    private val liveMeshRefreshPeriodMs = 5_000L
+    /** Fusion Epoch 诊断槽缓冲（HUD / 报告用，走 UI 线程）。 */
+    private val fusionEpochBuf = FloatArray(NativeBridge.FUSION_EPOCH_STATS_SLOTS)
+    /**
+     * Fusion Epoch 探测缓冲（**只**给相机回调线程用）。
+     *
+     * 和 [fusionEpochBuf] 分开不是洁癖：网格节拍在相机线程上跑，而 HUD / 报告
+     * 在 UI 线程上跑，共用一个数组会让报告里出现半新半旧的混合读数。
+     */
+    private val epochProbeBuf = FloatArray(NativeBridge.FUSION_EPOCH_STATS_SLOTS)
     // V0.12 扫描期 AR 材质：青绿色半透明网格。
     // 0.30–0.40 是「看得清形状、又不把真实画面糊掉」的折中。
-    private val scanMeshAlpha = 0.35f
+    private val scanMeshAlpha = 0.34f
+    /** 停扫 / 查看期网格不透明度：留一点透明才看得出它和真实场景贴不贴。 */
+    private val viewMeshAlpha = 0.78f
     private val scanMeshTintR = 0.15f
     private val scanMeshTintG = 0.95f
     private val scanMeshTintB = 1.00f
@@ -547,7 +572,7 @@ private var lastRelocPollMs = 0L
             setTextColor(android.graphics.Color.WHITE)
             textSize = 14f
             setTypeface(null, android.graphics.Typeface.BOLD)
-            text = "MobileScan3D 0.5.1 · $buildGitSha"
+            text = "MobileScan3D ${BuildConfig.VERSION_NAME} · $buildGitSha"
         }
         headerStatus = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
@@ -662,17 +687,22 @@ private var lastRelocPollMs = 0L
 
         setContentView(root)
 
-        // AR 默认只画「当前帧 target depth 调试层」；native 也只有在这个开关
-        // 打开时才做逐帧取点，关掉就是零开销。
+        // V0.12: 默认进「实时」图层 —— 半透明网格 + 累计 surfel(hits>=1)
+        // + 当前帧 target depth 点。native 的逐帧取点开关必须跟着打开，
+        // 否则 LIVE 就少了「当前帧点」这一层，用户看不出新数据进没进来。
         try {
             NativeBridge.nativeSetTargetDebugEnabled(
-                arDrawMode != PointCloudRenderer.DRAW_ACCUMULATED
+                arDrawMode == PointCloudRenderer.DRAW_TARGET_DEBUG ||
+                    arDrawMode == PointCloudRenderer.DRAW_BOTH ||
+                    arDrawMode == PointCloudRenderer.DRAW_LIVE
             )
         } catch (_: Throwable) {
         }
         renderer.drawMode = arDrawMode
-        // 点大小按屏幕密度缩放：固定 3px 在高 DPI 屏上细得几乎看不见
-        renderer.setPointSizes(3f * density, 5f * density)
+        renderer.setMeshAlpha(scanMeshAlpha)
+        // 点大小按屏幕密度缩放：固定 3px 在高 DPI 屏上细得几乎看不见。
+        // LIVE 用 4/6：半透明网格之下还要能看清点，稍大一点对比度更好。
+        renderer.setPointSizes(4f * density, 6f * density)
 
         // 目标离开画面时震一下。取不到（无马达 / 无权限）就静默降级，
         // 绝不因为震动失败影响追踪。
@@ -1683,7 +1713,7 @@ private var lastRelocPollMs = 0L
             // PresenceGate 在本帧就否掉了「目标还在」：bbox 可能仍然好好地
             // 停在画面中间（tracker 失配到背景纹理上了），但语义上目标已经不在。
             state == NativeBridge.TARGET_STATE_TRACKING && !presenceValid ->
-                "目标暂时丢失，正在自动找回…"
+                "⛔ 目标外观/深度不一致，正在自动找回…"
 
             // V0.12 两级预警：**不等 native state**，直接用本帧（30Hz camera-rate）
             // 的 visibleFraction 判。旧的单一 0.40 阈值太晚，用户感受就是
@@ -1693,7 +1723,7 @@ private var lastRelocPollMs = 0L
                 "⛔ 目标即将离开画面" + edgeHint(cx, cy)
 
             state == NativeBridge.TARGET_STATE_TRACKING && visibleFraction < 0.65f ->
-                "⚠ 目标接近边缘" + edgeHint(cx, cy)
+                "⚠ 目标接近边缘，请减速" + edgeHint(cx, cy)
 
             else -> null
         }
@@ -2097,7 +2127,10 @@ private var lastRelocPollMs = 0L
         sb.appendLine("    displayRotationApplied=${cameraToViewReady}")
         sb.appendLine("    projectionMode=intrinsics+previewAffine")
         sb.appendLine("    arDrawMode=${arDrawModeLabel()}")
+        sb.appendLine("    arRenderTrigger=preview_frame_when_dirty")
+        sb.appendLine("    liveMeshRefreshPeriodMs=$liveMeshRefreshPeriodMs")
         sb.appendLine("    arAccumMinHits=${renderer.accumulatedMinHits}")
+        sb.appendLine("    arLiveMinHits=${NativeBridge.AR_MIN_HITS_RAW}")
         sb.appendLine("    arDrawnAccumulated=${renderer.drawnAccumulated}")
         sb.appendLine("    arDrawnTargetDebug=${renderer.drawnDebug}")
         // 点云用的是哪一时刻的 pose：true=按 Preview 时间戳查到的，
@@ -2115,6 +2148,8 @@ private var lastRelocPollMs = 0L
         sb.appendLine("    hardwareDepthProbe=${depthProbe.note}")
         multiCam?.report(sb)
         sb.appendLine("    " + depthCalibrationSummary())
+        sb.appendLine("    " + fusionEpochSummary())
+        appendFusionEpochReport(sb)
         sb.appendLine("    " + meshStatsSummary("meshStats"))
         sb.appendLine("    meshSummary=$lastMeshSummary")
         sb.appendLine("    meshGpuVertices=${renderer.meshUploadedVertices}")
@@ -2343,6 +2378,11 @@ private var lastRelocPollMs = 0L
         }
         // V0.12: 扫描期默认进 LIVE 图层 —— 半透明网格 + 累计 surfel(hits>=1)
         // + 当前帧 target depth 点，三者同时显示，用户立刻能看到模型「长出来」。
+        // 网格快照的节流状态必须在这里清零，否则上一场留下的
+        // lastLiveMeshRefreshMs 会让新一场开头 5 秒不出网格。
+        lastLiveMeshRefreshMs = 0L
+        liveMeshBuildBusy = false
+        liveMeshBlockedNotice = false
         applyScanArLayer(true)
         primaryButton.text = "停止实验扫描"
         updateHeader()
@@ -2372,7 +2412,7 @@ private var lastRelocPollMs = 0L
             arDrawMode = PointCloudRenderer.DRAW_MESH
             renderer.drawMode = arDrawMode
             renderer.accumulatedMinHits = NativeBridge.AR_MIN_HITS_CONFIRMED
-            renderer.setMeshAlpha(1.0f)
+            renderer.setMeshAlpha(viewMeshAlpha)
             renderer.setMeshTint(0f, 0f, 0f, false)
         }
         arLayerButton?.text = arDrawModeLabel()
@@ -2480,6 +2520,7 @@ private var lastRelocPollMs = 0L
                     arMeshViewing = true
                     arDrawMode = PointCloudRenderer.DRAW_MESH
                     renderer.drawMode = arDrawMode
+                    renderer.setMeshAlpha(viewMeshAlpha)
                     arLayerButton?.text = arDrawModeLabel()
                     try {
                         NativeBridge.nativeSetTargetDebugEnabled(false)
@@ -2551,6 +2592,189 @@ private var lastRelocPollMs = 0L
             " 样本=${calibBuf[NativeBridge.CALIB_INDEX_SAMPLES].toInt()}" +
             " 时序=${f(NativeBridge.CALIB_INDEX_TEMPORAL_RATIO, "%.2f")}" +
             " 拒绝=${calibBuf[NativeBridge.CALIB_INDEX_REJECTED_FRAMES].toInt()}"
+    }
+
+    /**
+     * V0.12: Fusion Epoch 一行摘要（HUD / 报告共用）。
+     *
+     *   ACTIVE  = scale/shift/inverse 已冻结，几何正在按它累计
+     *   WARMUP  = 还在等连续若干好帧，此时**禁止**累计任何几何
+     *
+     * 「WARMUP 期间屏幕上是空的」是**预期行为**：宁可先什么都不画，也不能
+     * 拿一套还没稳的尺度往体素场里灌 —— 那正是「覆盖大半屏的黑壳」与
+     * 「双层 mesh」的来源。
+     */
+    private fun fusionEpochSummary(): String {
+        val n = try {
+            NativeBridge.nativeGetFusionEpochStats(fusionEpochBuf)
+        } catch (_: Throwable) {
+            0
+        }
+        if (n < NativeBridge.FUSION_EPOCH_STATS_SLOTS) return "融合Epoch n/a"
+        val active = fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] > 0.5f
+        return "融合Epoch ${if (active) "ACTIVE" else "WARMUP"}" +
+            " #${fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SERIAL].toInt()}" +
+            " good=${fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_GOOD_STREAK].toInt()}" +
+            " bad=${fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_BAD_STREAK].toInt()}" +
+            " skip=${fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_WARMUP_SKIPPED].toLong()}" +
+            " restart=${fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_RESTARTS].toLong()}" +
+            " drift=" + String.format(
+                java.util.Locale.US, "%.3f",
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_LAST_DRIFT_REL]
+            )
+    }
+
+    /**
+     * V0.12: 把 Fusion Epoch 的完整状态写进 feedback 报告。
+     *
+     * 排查「为什么屏幕一直空着」时先看这里：
+     *   active=false 且 goodStreak 涨不上去  -> 标定 / 深度链没通；
+     *   active=true  但 fusedFrames=0        -> epoch 开了却没有深度进来；
+     *   restarts 反复增长                    -> 尺度在漂（lastDriftRel 给幅度）。
+     */
+    private fun appendFusionEpochReport(sb: StringBuilder) {
+        val n = try {
+            NativeBridge.nativeGetFusionEpochStats(fusionEpochBuf)
+        } catch (_: Throwable) {
+            0
+        }
+        sb.appendLine()
+        sb.appendLine("[FUSION EPOCH V0.12]")
+        if (n < NativeBridge.FUSION_EPOCH_STATS_SLOTS) {
+            sb.appendLine("available=false")
+            return
+        }
+        sb.appendLine("available=true")
+        sb.appendLine(
+            "active=" + (fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] > 0.5f)
+        )
+        sb.appendLine(
+            "serial=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SERIAL].toLong()
+        )
+        sb.appendLine(
+            "goodStreak=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_GOOD_STREAK].toInt()
+        )
+        sb.appendLine(
+            "badStreak=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_BAD_STREAK].toInt()
+        )
+        sb.appendLine(
+            "warmupSkippedFrames=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_WARMUP_SKIPPED].toLong()
+        )
+        sb.appendLine(
+            "fusedFrames=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_FUSED_FRAMES].toLong()
+        )
+        sb.appendLine(
+            "restarts=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_RESTARTS].toLong()
+        )
+        sb.appendLine(
+            "driftRejects=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_DRIFT_REJECTS].toLong()
+        )
+        sb.appendLine(
+            "lastDriftRel=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_LAST_DRIFT_REL]
+        )
+        sb.appendLine(
+            "frozenScale=" + fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SCALE]
+        )
+        sb.appendLine(
+            "frozenShift=" + fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SHIFT]
+        )
+        sb.appendLine(
+            "frozenConfidence=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_CONFIDENCE]
+        )
+        sb.appendLine(
+            "frozenSamples=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SAMPLES].toInt()
+        )
+        sb.appendLine(
+            "frozenInverseModel=" +
+                (fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_INVERSE] > 0.5f)
+        )
+        sb.appendLine(
+            "currentCalibrationUsable=" +
+                (fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_CURRENT_USABLE] > 0.5f)
+        )
+        sb.appendLine(
+            "startGoodFramesRequired=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_START_FRAMES].toInt()
+        )
+    }
+
+    /** Fusion Epoch 是否已激活（网格快照的门控；只从相机回调线程调用）。 */
+    private fun fusionEpochActive(): Boolean {
+        val n = try {
+            NativeBridge.nativeGetFusionEpochStats(epochProbeBuf)
+        } catch (_: Throwable) {
+            0
+        }
+        return n >= NativeBridge.FUSION_EPOCH_STATS_SLOTS &&
+            epochProbeBuf[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] > 0.5f
+    }
+
+    /**
+     * V0.12: 扫描期的「实时网格」快照。
+     *
+     * 只在 LIVE 图层 + 正在扫描 + epoch 已激活时做；否则**清掉**网格 ——
+     * 宁可空着，也不能拿上一套尺度的旧网格冒充「现在的形状」。
+     *
+     * `buildMeshAsync` 在 ExportManager 的后台线程上构建、回调回到主线程，
+     * 所以本函数自身绝不阻塞相机帧回调。**绝不能**改成按相机帧率重建。
+     */
+    private fun maybeRefreshLiveMesh() {
+        if (!scanning ||
+            !scanNativeReady ||
+            arDrawMode != PointCloudRenderer.DRAW_LIVE ||
+            liveMeshBuildBusy ||
+            !::exportManager.isInitialized ||
+            !::glView.isInitialized
+        ) return
+
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastLiveMeshRefreshMs < liveMeshRefreshPeriodMs) return
+
+        // 不要按相机帧率去碰 native 状态，只在网格节拍上问一次。
+        if (!fusionEpochActive()) {
+            if (!liveMeshBlockedNotice) {
+                liveMeshBlockedNotice = true
+                renderer.clearMesh()
+                lastMeshSummary = "等待 Fusion Epoch"
+                glView.requestRender()
+            }
+            return
+        }
+        liveMeshBlockedNotice = false
+
+        lastLiveMeshRefreshMs = now
+        liveMeshBuildBusy = true
+        try {
+            exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
+                try {
+                    if (scanning && arDrawMode == PointCloudRenderer.DRAW_LIVE) {
+                        if (mesh != null && mesh.triangleCount > 0) {
+                            renderer.setMesh(mesh.vertices, mesh.indices)
+                            lastMeshSummary =
+                                "${mesh.triangleCount} 面 / ${mesh.vertexCount} 顶点（LIVE）"
+                        } else {
+                            renderer.clearMesh()
+                            lastMeshSummary = "Fusion Epoch 已激活，网格尚不足"
+                        }
+                        glView.requestRender()
+                    }
+                } finally {
+                    liveMeshBuildBusy = false
+                }
+            }
+        } catch (_: Throwable) {
+            liveMeshBuildBusy = false
+        }
     }
 
     /** 网格统计一行摘要（含「提取了多少原始面、去掉了多少小分量」）。 */
@@ -2877,6 +3101,9 @@ private var lastRelocPollMs = 0L
     private fun onFrameTick(ts: Long) {
         // 目标框自成一个 30Hz 节拍，与 Header 的 1Hz 解耦。
         updateTargetUiTick(ts)
+        // V0.12: 网格快照走自己的 5s 节拍（函数内部自带节流与忙碌门），
+        // 这里绝不做任何按相机帧率的 native 重操作。
+        maybeRefreshLiveMesh()
         if (::hqCapture.isInitialized) {
             hqCapture.onFrameTick(ts, scanning, cameraDevice, captureSession)
             syncCaptureStateFromController()
@@ -2944,6 +3171,7 @@ private var lastRelocPollMs = 0L
                 " 当前帧 ${renderer.drawnDebug}" +
                 (if (renderer.drawnMeshTriangles > 0) " 网格 ${renderer.drawnMeshTriangles}" else "") +
                 "\n" + depthCalibrationSummary() +
+                "\n" + fusionEpochSummary() +
                 "\n" + (multiCam?.hudSummary() ?: "MultiCam: n/a") +
                 "\n网格 " + (if (lastMeshSummary == "n/a") "未生成" else lastMeshSummary) +
                 "\n" + if (renderer.poseFromTimestamp) {
@@ -3003,6 +3231,15 @@ private var lastRelocPollMs = 0L
     private fun cycleArLayer() {
         arDrawMode = (arDrawMode + 1) % 5
         renderer.drawMode = arDrawMode
+        // 材质跟着图层走：LIVE 半透明（要看见真实场景），其它档回到偏
+        // 实心的观感，方便验收几何。
+        renderer.setMeshAlpha(
+            if (arDrawMode == PointCloudRenderer.DRAW_LIVE) {
+                scanMeshAlpha
+            } else {
+                viewMeshAlpha
+            }
+        )
         val wantDebug = arDrawMode == PointCloudRenderer.DRAW_TARGET_DEBUG ||
             arDrawMode == PointCloudRenderer.DRAW_BOTH ||
             arDrawMode == PointCloudRenderer.DRAW_LIVE

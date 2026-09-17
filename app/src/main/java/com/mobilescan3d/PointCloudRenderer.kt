@@ -322,8 +322,16 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         var accumCount = 0
         if (wantAccum) {
             accumCount = try {
+                // LIVE 图层要「模型立刻长出来」，所以固定用 hits>=1：
+                // 每个只被看过一次的点也画。其它图层仍然尊重 accumulatedMinHits
+                // —— 那时候要看几何质量，一次性点就是噪声。
+                val minHits = if (drawMode == DRAW_LIVE) {
+                    NativeBridge.AR_MIN_HITS_RAW
+                } else {
+                    accumulatedMinHits
+                }
                 NativeBridge.nativeGetGaussians(
-                    accumData, NativeBridge.AR_MAX_POINTS, accumulatedMinHits
+                    accumData, NativeBridge.AR_MAX_POINTS, minHits
                 )
             } catch (t: Throwable) {
                 0
@@ -388,6 +396,12 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
 
         if (accumCount <= 0 && debugCount <= 0) return
 
+        // V0.12：LIVE 图层下网格是半透明的，而绘制顺序是「网格先、点云后」
+        // —— 只要网格写了深度缓冲，后面的点云就被整片挡掉，半透明网格
+        // 反而变成一堵不透明的墙。这里临时关掉深度测试，让点云永远叠在
+        // 网格之上；收尾立刻恢复，绝不把 GL 状态泄漏给下一帧。
+        val liveOverlayOnTop = drawMode == DRAW_LIVE && drawnMeshTriangles > 0
+        if (liveOverlayOnTop) GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glUseProgram(program)
 
         // 世界点 -> 相机：Pc = Rwc^T (Pw - twc)。
@@ -442,6 +456,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
 
         GLES20.glDisableVertexAttribArray(posLoc)
         GLES20.glDisableVertexAttribArray(colorLoc)
+        if (liveOverlayOnTop) GLES20.glEnable(GLES20.GL_DEPTH_TEST)
     }
 
     /**

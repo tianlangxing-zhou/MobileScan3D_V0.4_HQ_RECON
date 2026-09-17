@@ -129,6 +129,39 @@ object NativeBridge {
      * `usable` 才是「可以拿它当米制用」的判据 —— `valid` 只是「这一帧拟合成功」。
      */
     const val DEPTH_CALIBRATION_SLOTS = 12
+
+    /**
+     * V0.12 Fusion Epoch 诊断槽（[nativeGetFusionEpochStats]）。
+     *
+     *   0  active             1  serial            2  goodStreak
+     *   3  badStreak          4  warmupSkipped     5  fusedFrames
+     *   6  restarts           7  driftRejects      8  lastDriftRel
+     *   9  scale             10  shift            11  confidence
+     *  12  samples           13  inverse          14  currentUsable
+     *  15  startFrames
+     *
+     * `frozen*` 那几项是 **epoch 开启那一刻冻结** 的标定参数，之后不再变 ——
+     * 这正是 epoch 的意义：同一面墙不允许被两套尺度各切一次零交叉面
+     * （那会表现为 mesh 双层/撕裂）。`currentUsable` 才是「现在这一刻的
+     * 在线标定还可用吗」，它只用于漂移监控，不参与融合。
+     */
+    const val FUSION_EPOCH_STATS_SLOTS = 16
+    const val FUSION_EPOCH_INDEX_ACTIVE = 0
+    const val FUSION_EPOCH_INDEX_SERIAL = 1
+    const val FUSION_EPOCH_INDEX_GOOD_STREAK = 2
+    const val FUSION_EPOCH_INDEX_BAD_STREAK = 3
+    const val FUSION_EPOCH_INDEX_WARMUP_SKIPPED = 4
+    const val FUSION_EPOCH_INDEX_FUSED_FRAMES = 5
+    const val FUSION_EPOCH_INDEX_RESTARTS = 6
+    const val FUSION_EPOCH_INDEX_DRIFT_REJECTS = 7
+    const val FUSION_EPOCH_INDEX_LAST_DRIFT_REL = 8
+    const val FUSION_EPOCH_INDEX_SCALE = 9
+    const val FUSION_EPOCH_INDEX_SHIFT = 10
+    const val FUSION_EPOCH_INDEX_CONFIDENCE = 11
+    const val FUSION_EPOCH_INDEX_SAMPLES = 12
+    const val FUSION_EPOCH_INDEX_INVERSE = 13
+    const val FUSION_EPOCH_INDEX_CURRENT_USABLE = 14
+    const val FUSION_EPOCH_INDEX_START_FRAMES = 15
     const val CALIB_INDEX_SCALE = 0
     const val CALIB_INDEX_SHIFT = 1
     const val CALIB_INDEX_CONFIDENCE = 2
@@ -311,6 +344,12 @@ object NativeBridge {
 
     /** 读深度标定状态（[DEPTH_CALIBRATION_SLOTS] 槽）。返回写入的槽数。 */
     external fun nativeGetDepthCalibration(out: FloatArray): Int
+
+    /**
+     * V0.12: 当前 Fusion Epoch 状态（[FUSION_EPOCH_STATS_SLOTS] 槽）。
+     * 返回写入的槽数，正常时恒为 16（< 16 表示 native 还没实现，调用方必须降级）。
+     */
+    external fun nativeGetFusionEpochStats(out: FloatArray): Int
 
     /**
      * 从当前体素场构建三角网格。**这是一次可能耗时几百毫秒的同步操作**，

@@ -209,6 +209,9 @@ private:
     float trackHalfH_ = 120.f;
     int framesSinceLastReseed_ = 0;
     int edgeLostFrames_ = 0;
+    // V0.12：Nano 与 KLT 框「明显不一致」的**连续**帧数。单帧抖动不判，
+    // 连续 kNanoMismatchFrames 帧才进 REACQUIRING。
+    int appearanceMismatchFrames_ = 0;
     // REACQUIRING 已经持续的帧数；超过 kReacquireTimeoutFrames 才判 LOST。
     // 刻意不用「时间」，因为 track() 的调用频率由相机帧率决定，
     // 帧数计数在掉帧时反而更保守（不急于判死）。

@@ -140,13 +140,29 @@ static float gCalibSampleBuf[kMaxCalibSamples * 3];
 //
 // 判据刻意选「同一 raw 值下两条映射的差」而不是「本帧深度均值」：
 // 后者在用户走近走远时会剧烈变化，那和标定漂移完全是两回事。
+//
+// V0.12 加固（采纳外部补丁包的保守参数）：
+//   * 漂移阈值 6% -> 8%，且必须**连续 kEpochDriftBadFrames 帧**都超标才重建。
+//     单帧超标就重建会让几何被反复清空，得不偿失。
+//   * 重建时**同时清空几何**（见 clearGeometryForFusionEpochRestart）：
+//     旧体素场是用旧 scale 灌的，留着它继续叠新 scale，正是「大模型壳 /
+//     双层撕裂」的来源。
+//   * 标定**短暂**失效不再立即停融合：epoch 生效期间继续用冻结参数融合，
+//     连续 kEpochCalibLossFrames 帧都拿不到可用标定才重建。
 static constexpr int kEpochStableFrames = 5;
-static constexpr float kEpochRebuildRatio = 0.06f;
+static constexpr int kEpochDriftBadFrames = 2;
+static constexpr int kEpochCalibLossFrames = 5;
+static constexpr float kEpochRebuildRatio = 0.08f;
 static bool epochActive = false;
 static DepthCalibration epochCalib{};
 static float epochRefRaw = 0.f;
 static float epochRefZ = 0.f;
 static int epochStableStreak = 0;
+// 连续「坏」帧：漂移超标 **或** 标定不可用。两类坏帧共用同一个 streak，
+// 与外部补丁包的 fusionEpochBadStreak 语义一致。
+static int epochBadStreak = 0;
+static uint64_t epochDriftRejects = 0;
+static float epochLastDriftRel = 0.f;
 static bool haveEpochPrevZ = false;
 static float epochPrevZ = 0.f;
 // V0.12: 诊断用 —— 换目标时**保留**标定的次数 vs 真正整会话重置的次数。
@@ -168,6 +184,9 @@ static void resetFusionEpoch() {
     epochStableStreak = 0;
     haveEpochPrevZ = false;
     epochPrevZ = 0.f;
+    epochBadStreak = 0;
+    epochDriftRejects = 0;
+    epochLastDriftRel = 0.f;
     epochIndex = 0;
     epochOpens = 0;
     epochRebuilds = 0;
@@ -759,6 +778,29 @@ static void resetMeshPipeline() {
     //
     // 需要清标定的场合只有一个：新会话 / 销毁会话 —— 见 resetDepthCalibration()。
     ++depthCalibKeptAcrossTarget;
+}
+
+/**
+ * V0.12：Fusion Epoch 重建时**必须连几何一起清掉**。
+ *
+ * 旧体素场是用**旧 scale** 灌进 TSDF 的。如果只把 epoch 状态重置、让新 scale
+ * 继续往同一个体素场里叠加，同一面墙就会同时在两套尺度上产生零交叉面 ——
+ * mesh 长成双层 / 撕裂，而且越扫越严重（这正是「大模型壳」的来源之一）。
+ *
+ * 注意：**不动深度标定本身**（那是 resetDepthCalibration 的事，只在新会话 /
+ * 销毁会话时调用）。epoch 重建只是「这一批几何不可信了」，与标定器无关。
+ *
+ * 必须在 gStateMutex 下调用。
+ */
+static void clearGeometryForFusionEpochRestart() {
+    g.reset();
+    tsdf.reset();
+    targetG.reset();
+    targetTsdf.reset();
+    resetMeshPipeline();
+    lastFusedDepth.clear();
+    haveLastFusePose = false;
+    lastFuseCalibrated = false;
 }
 
 static void resetTargetModel() {
@@ -1398,7 +1440,14 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
 
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
-        if (!haveExternalDepth && (frames % 2 == 0)) {
+        // V0.12：启用深度标定后**不再**灌合成 Gaussian 兜底深度。
+        //
+        // 这段 fallback 是「没有外部 depth 时用 VIO 特征数编一个假深度场」，
+        // 尺度是随手定的（depthBase ≈ 1.15）。以前它在第一批真 depth 到来之前
+        // 会先往 TSDF 灌若干帧 —— 等到真 depth（带标定）接上时，体素场里
+        // 已经躺着一套完全不同尺度的零交叉面，这就是「覆盖大半屏幕的黑壳」的
+        // 另一个入口。没有真深度时宁可这一帧不建。
+        if (!haveExternalDepth && !depthCalibrationEnabled && (frames % 2 == 0)) {
             int sx = std::max(1, w / 96);
             int sy = std::max(1, h / 72);
             float depthBase = 1.15f + 0.25f * std::min(1.f, vio.features() / 1200.f);
@@ -1817,11 +1866,37 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             (calibratedNow && rawNow > 0.f) ? liveCal.toMetric(rawNow, 0.f) : 0.f;
         const bool liveOk = std::isfinite(zLiveNow) && zLiveNow > 0.f;
 
-        if (!calibratedNow || !liveOk) {
-            // 标定不可用 -> epoch 立即作废，融合暂停（见下面的门控）。
-            epochActive = false;
-            epochStableStreak = 0;
-            haveEpochPrevZ = false;
+        if (!depthCalibrationEnabled) {
+            // 退路：整条标定链被关掉时，退回「融合 raw depth」的旧行为。
+            // 否则「关掉标定」会静默变成「永远不融合」—— 比标定不准更糟。
+            // 同时把 active 标记成 1，让诊断里的 active 与实际融合行为一致。
+            if (!epochActive) {
+                epochActive = true;
+                epochStableStreak = kEpochStableFrames;
+                epochBadStreak = 0;
+                ++epochIndex;
+                ++epochOpens;
+            }
+        } else if (!calibratedNow || !liveOk) {
+            // 标定**短暂**不可用：epoch 生效期间**继续用冻结参数融合**（下面是
+            // `if (epochActive)` 生成 epochFusionDepth，仍然有效）。单帧拟合失败
+            // 很常见（纹理弱 / 运动模糊），一失败就停融合会让点云频繁断流，
+            // 比「标定略旧几帧」更影响体验。
+            //
+            // 只有**连续** kEpochCalibLossFrames 帧都拿不到可用标定，才判定这个
+            // epoch 已无法证明尺度一致 —— 清几何 + 回到 warmup。
+            ++epochBadStreak;
+            if (!epochActive) {
+                epochStableStreak = 0;
+                haveEpochPrevZ = false;
+            } else if (epochBadStreak >= kEpochCalibLossFrames) {
+                clearGeometryForFusionEpochRestart();
+                epochActive = false;
+                epochStableStreak = 0;
+                haveEpochPrevZ = false;
+                epochBadStreak = 0;
+                ++epochRebuilds;
+            }
         } else if (!epochActive) {
             // 还没开 epoch：要求连续 kEpochStableFrames 帧稳定（相邻帧之间
             // 同一工作点算出的 z 变化不超过 kEpochRebuildRatio）。
@@ -1831,6 +1906,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             epochStableStreak = stableStep ? (epochStableStreak + 1) : 1;
             epochPrevZ = zLiveNow;
             haveEpochPrevZ = true;
+            epochBadStreak = 0;
             if (epochStableStreak >= kEpochStableFrames) {
                 epochCalib = liveCal;
                 epochCalib.valid = true;
@@ -1838,22 +1914,35 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
                 epochRefZ = zLiveNow;
                 epochActive = true;
                 epochStableStreak = 0;
+                epochBadStreak = 0;
+                epochLastDriftRel = 0.f;
                 ++epochIndex;
                 ++epochOpens;
             }
         } else {
             // epoch 生效中：监控漂移。冻结参数与当前参数在 epochRefRaw 上算出的
-            // z 相差超过 kEpochRebuildRatio -> 作废并重新等稳定。
+            // z 相差超过 kEpochRebuildRatio -> 记一次漂移，**连续
+            // kEpochDriftBadFrames 帧**都超标才重建（单帧超标不重建）。
             const float zFrozen = epochCalib.toMetric(epochRefRaw, 0.f);
             const float zLiveAtRef = liveCal.toMetric(epochRefRaw, 0.f);
             const bool bothOk = std::isfinite(zFrozen) && zFrozen > 0.f &&
                                 std::isfinite(zLiveAtRef) && zLiveAtRef > 0.f;
-            if (bothOk &&
-                std::fabs(zLiveAtRef - zFrozen) / zFrozen > kEpochRebuildRatio) {
+            if (bothOk) {
+                epochLastDriftRel = std::fabs(zLiveAtRef - zFrozen) / zFrozen;
+                if (epochLastDriftRel > kEpochRebuildRatio) {
+                    ++epochDriftRejects;
+                    ++epochBadStreak;
+                } else {
+                    epochBadStreak = 0;
+                }
+            }
+            if (epochBadStreak >= kEpochDriftBadFrames) {
+                clearGeometryForFusionEpochRestart();
                 epochActive = false;
                 epochStableStreak = 0;
                 haveEpochPrevZ = true;
                 epochPrevZ = zLiveNow;
+                epochBadStreak = 0;
                 ++epochRebuilds;
             }
         }
@@ -1941,10 +2030,18 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
 
     // V0.7.0.1 current-frame target debug:
     // camera-space only; it must not depend on a VINS pose snapshot.
-    if (haveTi && maskOk) {
+    //
+    // V0.12：标定还没 usable 时**宁可暂时不画**。此时 depthForFusion 还是 raw
+    // 量级（实机 ~4~5），画出来就是一个「看起来已经扫出来了」的错误大壳 ——
+    // 用户会以为模型长歪了，实际只是标定没到位。空白比错误的大壳诚实。
+    if (haveTi && maskOk &&
+        (!depthCalibrationEnabled || calibratedNow)) {
         buildTargetDebugLayer(
             depthForFusion, w, h, ti, targetMaskMat);
         targetDebugTs = static_cast<uint64_t>(t);
+    } else if (depthCalibrationEnabled && !calibratedNow) {
+        targetDebugPointCount = 0;
+        targetDebugValidPixels = 0;
     }
 
     const FrameSnap* match = nullptr;
@@ -2777,6 +2874,11 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " stableFrames=" << kEpochStableFrames
       << " stableStreak=" << epochStableStreak
       << " rebuildRatio=" << kEpochRebuildRatio
+      << " driftBadFrames=" << kEpochDriftBadFrames
+      << " calibLossFrames=" << kEpochCalibLossFrames
+      << " badStreak=" << epochBadStreak
+      << " driftRejects=" << epochDriftRejects
+      << " lastDriftRel=" << epochLastDriftRel
       << " frozenScale=" << epochCalib.scale
       << " frozenShift=" << epochCalib.shift
       << " frozenInverse=" << (epochCalib.inverseDepthModel ? 1 : 0)
@@ -3312,6 +3414,53 @@ Java_com_mobilescan3d_NativeBridge_nativeSetDepthCalibrationEnabled(JNIEnv*, job
  *   5 inverseModel  6 enabled  7 acceptedFrames  8 rejectedFrames
  *   9 temporalRatio 10 temporalRejects 11 usable
  */
+/**
+ * V0.12 Fusion Epoch 状态（16 槽）—— 给 Kotlin 侧 HUD / 报告用。
+ *
+ *   0 active        1 serial        2 goodStreak     3 badStreak
+ *   4 warmupSkipped 5 fusedFrames   6 restarts       7 driftRejects
+ *   8 lastDriftRel  9 scale        10 shift         11 confidence
+ *  12 samples      13 inverseModel 14 currentUsable 15 startGoodFrames
+ *
+ * 槽位定义必须与 Kotlin 侧 NativeBridge.FUSION_EPOCH_INDEX_* 严格一致。
+ * warmupSkipped 复用 fusionGatedFrames：二者语义相同（epoch 未生效、融合被
+ * 门控拦下的帧数）。
+ */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetFusionEpochStats(
+        JNIEnv* e, jobject, jfloatArray out) {
+    if (out == nullptr) {
+        return 0;
+    }
+    const jsize cap = e->GetArrayLength(out);
+    if (cap < 16) {
+        return 0;
+    }
+    jfloat v[16];
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        const DepthCalibration& current = depthCalibrator.calibration();
+        v[0] = epochActive ? 1.f : 0.f;
+        v[1] = static_cast<jfloat>(epochIndex);
+        v[2] = static_cast<jfloat>(epochStableStreak);
+        v[3] = static_cast<jfloat>(epochBadStreak);
+        v[4] = static_cast<jfloat>(fusionGatedFrames);
+        v[5] = static_cast<jfloat>(fusionFusedFrames);
+        v[6] = static_cast<jfloat>(epochRebuilds);
+        v[7] = static_cast<jfloat>(epochDriftRejects);
+        v[8] = epochLastDriftRel;
+        v[9] = epochCalib.scale;
+        v[10] = epochCalib.shift;
+        v[11] = epochCalib.confidence;
+        v[12] = static_cast<jfloat>(epochCalib.samples);
+        v[13] = epochCalib.inverseDepthModel ? 1.f : 0.f;
+        v[14] = (depthCalibrator.usable() && current.valid) ? 1.f : 0.f;
+        v[15] = static_cast<jfloat>(kEpochStableFrames);
+    }
+    e->SetFloatArrayRegion(out, 0, 16, v);
+    return e->ExceptionCheck() ? 0 : 16;
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetDepthCalibration(JNIEnv* e, jobject,
                                                              jfloatArray out) {
