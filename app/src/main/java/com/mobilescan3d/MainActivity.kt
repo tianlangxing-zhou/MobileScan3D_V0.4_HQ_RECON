@@ -55,6 +55,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var reader: ImageReader? = null
+    /** V0.8: logical CameraDevice + two explicitly bound physical YUV streams. */
+    private var multiCam: MultiCameraFusionController? = null
     private lateinit var hqCapture: HqCaptureController
     private var cameraThread: HandlerThread? = null
     private var sensorThread: HandlerThread? = null
@@ -855,8 +857,36 @@ private var lastRelocPollMs = 0L
                 sessionCreated = true
             }
 
-            reader = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 4).apply {
-                setOnImageAvailableListener({ r -> r.acquireLatestImage()?.let { processImage(it) } }, cameraHandler)
+            // V0.8: first try a real physical-camera pair. If the HAL does
+            // not expose/accept it, preserve the original logical YUV path.
+            multiCam?.close()
+            multiCam = MultiCameraFusionController(
+                this,
+                cameraManager,
+                id,
+                chars,
+                cameraHandler!!
+            ) { msg ->
+                android.util.Log.i("MultiCamV08", msg)
+                toast(msg)
+            }
+            val multiReady = multiCam?.configure(size) { image ->
+                processImage(image)
+            } == true
+            reader = if (multiReady) {
+                multiCam!!.primaryReader
+            } else {
+                ImageReader.newInstance(
+                    size.width,
+                    size.height,
+                    ImageFormat.YUV_420_888,
+                    4
+                ).apply {
+                    setOnImageAvailableListener(
+                        { r -> r.acquireLatestImage()?.let { processImage(it) } },
+                        cameraHandler
+                    )
+                }
             }
             if (::hqCapture.isInitialized) {
                 hqCapture.close()
@@ -896,39 +926,102 @@ private var lastRelocPollMs = 0L
                         val hqSurfaces = hqCapture.prepareSurfaces(pSize, size)
                         val primarySurfaces = baseSurfaces + hqSurfaces
 
-                        fun finishSession(session: CameraCaptureSession, hqActive: Boolean) {
+                        fun finishSession(
+                            session: CameraCaptureSession,
+                            hqActive: Boolean
+                        ) {
                             if (abandonedOpen) {
                                 session.close()
                                 return
                             }
                             hqCapture.onSessionConfigured(hqActive)
                             captureSession = session
-                            // 会话配置完成后再应用一次变换：首个帧到达时
-                            // 部分 HAL 会重置 SurfaceTexture 的 transform
-                            texture.post { configureTransform(texture.width, texture.height) }
-                            texture.postDelayed({ configureTransform(texture.width, texture.height) }, 300L)
+                            // Some HALs reset SurfaceTexture transform around first frame.
+                            texture.post {
+                                configureTransform(texture.width, texture.height)
+                            }
+                            texture.postDelayed(
+                                { configureTransform(texture.width, texture.height) },
+                                300L
+                            )
                             applyCaptureSettings()
                             started.set(true)
                         }
 
-                        camera.createCaptureSession(primarySurfaces, object : CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(session: CameraCaptureSession) {
-                                finishSession(session, true)
-                            }
-
-                            override fun onConfigureFailed(session: CameraCaptureSession) {
-                                hqCapture.detachSurfaces()
-                                camera.createCaptureSession(baseSurfaces, object : CameraCaptureSession.StateCallback() {
-                                    override fun onConfigured(fallback: CameraCaptureSession) {
-                                        finishSession(fallback, false)
+                        fun startLegacySessionWithHq() {
+                            camera.createCaptureSession(
+                                primarySurfaces,
+                                object : CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(
+                                        session: CameraCaptureSession
+                                    ) {
+                                        finishSession(session, true)
                                     }
 
-                                    override fun onConfigureFailed(fallback: CameraCaptureSession) {
-                                        toast("Camera session failed")
+                                    override fun onConfigureFailed(
+                                        session: CameraCaptureSession
+                                    ) {
+                                        runCatching { session.close() }
+                                        hqCapture.detachSurfaces()
+                                        camera.createCaptureSession(
+                                            baseSurfaces,
+                                            object : CameraCaptureSession.StateCallback() {
+                                                override fun onConfigured(
+                                                    fallback: CameraCaptureSession
+                                                ) {
+                                                    finishSession(fallback, false)
+                                                }
+
+                                                override fun onConfigureFailed(
+                                                    fallback: CameraCaptureSession
+                                                ) {
+                                                    toast("Camera session failed")
+                                                }
+                                            },
+                                            cameraHandler
+                                        )
                                     }
-                                }, cameraHandler)
+                                },
+                                cameraHandler
+                            )
+                        }
+
+                        val mc = multiCam
+                        if (mc != null && mc.active) {
+                            // Preview/JPEG/RAW stay logical. Only the two analysis
+                            // YUV outputs are explicitly associated with physical IDs.
+                            val logicalSurfaces = listOf(previewSurface!!) + hqSurfaces
+                            val dualStarted = mc.createPhysicalSession(
+                                camera,
+                                logicalSurfaces,
+                                object : CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(
+                                        session: CameraCaptureSession
+                                    ) {
+                                        finishSession(session, true)
+                                    }
+
+                                    override fun onConfigureFailed(
+                                        session: CameraCaptureSession
+                                    ) {
+                                        runCatching { session.close() }
+                                        mc.fallbackToLogical(
+                                            "HAL rejected physical + HQ outputs"
+                                        )
+                                        startLegacySessionWithHq()
+                                    }
+                                }
+                            )
+
+                            if (!dualStarted) {
+                                mc.fallbackToLogical(
+                                    "createCaptureSession failed"
+                                )
+                                startLegacySessionWithHq()
                             }
-                        }, cameraHandler)
+                        } else {
+                            startLegacySessionWithHq()
+                        }
                     } catch (e: Exception) {
                         camera.close()
                         cameraDevice = null
@@ -1210,6 +1303,9 @@ private var lastRelocPollMs = 0L
             val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                 addTarget(ps)
                 addTarget(readerSurface)
+                if (multiCam?.active == true) {
+                    multiCam?.secondarySurface?.let { addTarget(it) }
+                }
                 // Preview 的 3A 全程保持自动。
                 // HQ 采集只要求「收敛」，不要求「锁定」；真正把参数冻住的地方是
                 // HqCaptureController.buildLockedStillRequest()（still request）。
@@ -1262,6 +1358,9 @@ private var lastRelocPollMs = 0L
                 val trigger = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                     addTarget(ps)
                     addTarget(readerSurface)
+                    if (multiCam?.active == true) {
+                        multiCam?.secondarySurface?.let { addTarget(it) }
+                    }
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                     focusRegion?.let { region ->
@@ -1898,6 +1997,7 @@ private var lastRelocPollMs = 0L
         sb.appendLine("    depthBackend=${if (::depthProvider.isInitialized) depthProvider.backendName else "n/a"}")
         sb.appendLine("    depthProviderAvailable=${if (::depthProvider.isInitialized) depthProvider.available else false}")
         sb.appendLine("    hardwareDepthProbe=${depthProbe.note}")
+        multiCam?.report(sb)
         sb.appendLine("    " + depthCalibrationSummary())
         sb.appendLine("    " + meshStatsSummary("meshStats"))
         sb.appendLine("    meshSummary=$lastMeshSummary")
@@ -2120,6 +2220,7 @@ private var lastRelocPollMs = 0L
 
     private fun stopScan() {
         scanning = false
+        multiCam?.updateScanState(false, sessionId, false)
         // V0.5：停扫后不再派发深度推理 / TSDF 融合（见 processImage 的
         // nativeFrameActive），但 **VINS 必须继续跑** —— cameraToView 靠它更新，
         // 网格才会钉在真实世界里。所以这里先把 arMeshViewing 打开，网格若构建
@@ -2617,6 +2718,15 @@ private var lastRelocPollMs = 0L
             hqCapture.onFrameTick(ts, scanning, cameraDevice, captureSession)
             syncCaptureStateFromController()
         }
+        multiCam?.updateScanState(
+            enabled = scanning && scanNativeReady,
+            sessionId = sessionId,
+            allowTeleTexture = scanning &&
+                scanNativeReady &&
+                ::hqCapture.isInitialized &&
+                hqCapture.stats.threeAReady &&
+                hqCapture.stats.stableFrames >= 5
+        )
         if (scanning) {
             sampleDepthScale(ts)
         }
@@ -2671,6 +2781,7 @@ private var lastRelocPollMs = 0L
                 " 当前帧 ${renderer.drawnDebug}" +
                 (if (renderer.drawnMeshTriangles > 0) " 网格 ${renderer.drawnMeshTriangles}" else "") +
                 "\n" + depthCalibrationSummary() +
+                "\n" + (multiCam?.hudSummary() ?: "MultiCam: n/a") +
                 "\n网格 " + (if (lastMeshSummary == "n/a") "未生成" else lastMeshSummary) +
                 "\n" + if (renderer.poseFromTimestamp) {
                 "AR 按帧时间戳取 pose"
@@ -2971,7 +3082,16 @@ private var lastRelocPollMs = 0L
         cameraDevice?.close(); cameraDevice = null
         try { previewSurface?.release() } catch (_: Exception) {}
         previewSurface = null
-        reader?.close(); reader = null
+        val mc = multiCam
+        if (mc != null && mc.ownsPrimaryReader(reader)) {
+            mc.close()
+            reader = null
+        } else {
+            reader?.close()
+            reader = null
+            mc?.close()
+        }
+        multiCam = null
         if (::hqCapture.isInitialized) {
             hqCapture.close()
         }

@@ -25,6 +25,7 @@ add_library(mobilescan3d SHARED
     ar_textured_asset.cpp
     persistent_relocalizer.cpp
     hq_fusion.cpp
+    multicam_fusion.cpp
     vins_prelude.cpp
     vins_ceres_check.cpp
     vins_opencv_check.cpp

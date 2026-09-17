@@ -56,6 +56,8 @@ object NativeBridge {
     const val TARGET_STATE_REACQUIRING = 5
 
     const val RENDER_POSE_SLOTS = 12
+    /** V0.8 physical multi-camera diagnostic slots. */
+    const val MULTICAM_STATS_SLOTS = 16
 
     /** 点云/调试层每个点 6 个浮点：x, y, z, r, g, b */
     const val POINT_SLOTS = 6
@@ -220,6 +222,30 @@ object NativeBridge {
      * 一转起来点云就漂。时间戳超出 80ms 会返回 false，调用方应回退。
      */
     external fun nativeGetRenderPoseAt(timestampNs: Long, out: FloatArray): Boolean
+    // -------------------------------------------------------------- V0.8 MultiCam
+    external fun nativeMultiCamConfigure(
+        primaryK: FloatArray,
+        secondaryK: FloatArray,
+        primaryPoseRotation: FloatArray,
+        primaryPoseTranslation: FloatArray,
+        secondaryPoseRotation: FloatArray,
+        secondaryPoseTranslation: FloatArray,
+        width: Int,
+        height: Int,
+        calibratedSync: Boolean
+    ): Boolean
+
+    external fun nativeMultiCamOnPair(
+        primaryGray: ByteArray,
+        secondaryGray: ByteArray,
+        width: Int,
+        height: Int,
+        primaryTimestampNs: Long,
+        secondaryTimestampNs: Long
+    ): Boolean
+
+    external fun nativeGetMultiCamStats(out: FloatArray): Boolean
+    external fun nativeMultiCamReset()
     external fun nativeConfigureTrackerModels(backbonePath: String, headPath: String): Boolean
     external fun nativeFuseBurst(inputPaths: Array<String>, outputPath: String, exposureMs: Float, iso: Int, minAcceptedFrames: Int, stats: FloatArray, frameStats: FloatArray): Boolean
     external fun nativeVinsInit(fx: Float, fy: Float, cx: Float, cy: Float, w: Int, h: Int, ric: FloatArray, tic: FloatArray, accN: Float, accW: Float, gyrN: Float, gyrW: Float)
