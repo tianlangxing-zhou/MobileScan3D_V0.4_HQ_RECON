@@ -26,6 +26,7 @@
 #include "object_tracker.h"
 #include "target_mask_engine.h"
 #include "depth_calib.h"
+#include "stereo_anchor_bridge.h"
 #include "mesh/mesh_engine.h"
 #include "export/gltf_exporter.h"
 #include "v06/mesh_postprocess.h"
@@ -430,6 +431,191 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     }
 }
 
+// ------------------------------------------------------------- V0.9 stereo anchors
+static constexpr int64_t kStereoAnchorPoseMaxDiffNs = 12'000'000LL;
+static constexpr uint64_t kStereoAnchorMaxAgeNs = 420'000'000ULL;
+static constexpr int64_t kStereoTargetMaskMaxDiffNs = 45'000'000LL;
+
+static const FrameSnap* findStereoAnchorSnap(
+        uint64_t timestampNs,
+        int64_t* outDiffNs) {
+    const FrameSnap* best = nullptr;
+    int64_t bestDiff = kStereoAnchorPoseMaxDiffNs;
+    for (const auto& snap : snaps) {
+        int64_t d =
+            static_cast<int64_t>(snap.ts) -
+            static_cast<int64_t>(timestampNs);
+        if (d < 0) d = -d;
+        if (d < bestDiff) {
+            bestDiff = d;
+            best = &snap;
+        }
+    }
+    if (outDiffNs) {
+        *outDiffNs = best ? bestDiff : -1;
+    }
+    return best;
+}
+
+static int buildStereoSparseDepth(
+        const mobilescan3d::stereo_anchor::WorldAnchorBatch& batch,
+        int outW,
+        int outH,
+        int pixelStep,
+        float minWeight,
+        const cv::Mat* normalizedMask,
+        std::vector<float>* outDepth) {
+    if (!outDepth || outW < 4 || outH < 4) return 0;
+
+    outDepth->assign(
+        static_cast<size_t>(outW) * outH,
+        0.f);
+
+    const int step = std::clamp(pixelStep, 1, 4);
+    int accepted = 0;
+
+    for (const auto& a : batch.anchors) {
+        if (a.weight + 1e-4f < minWeight ||
+            !(a.zWorld > 0.05f) ||
+            !std::isfinite(a.zWorld)) {
+            continue;
+        }
+
+        if (normalizedMask &&
+            !normalizedMask->empty() &&
+            normalizedMask->type() == CV_8U) {
+            const int mx = std::clamp(
+                static_cast<int>(std::lround(
+                    a.u * static_cast<float>(normalizedMask->cols - 1))),
+                0,
+                normalizedMask->cols - 1);
+            const int my = std::clamp(
+                static_cast<int>(std::lround(
+                    a.v * static_cast<float>(normalizedMask->rows - 1))),
+                0,
+                normalizedMask->rows - 1);
+            if (!normalizedMask->at<uint8_t>(my, mx)) {
+                continue;
+            }
+        }
+
+        int x = std::clamp(
+            static_cast<int>(std::lround(
+                a.u * static_cast<float>(outW - 1))),
+            0,
+            outW - 1);
+        int y = std::clamp(
+            static_cast<int>(std::lround(
+                a.v * static_cast<float>(outH - 1))),
+            0,
+            outH - 1);
+
+        // TsdfEngine visits only the pixelStep lattice.
+        x = (x / step) * step;
+        y = (y / step) * step;
+
+        const size_t idx =
+            static_cast<size_t>(y) * outW + x;
+
+        // MultiCam exports strongest-first; preserve the first collision.
+        if ((*outDepth)[idx] > 0.f) {
+            continue;
+        }
+        (*outDepth)[idx] = a.zWorld;
+        accepted++;
+    }
+
+    return accepted;
+}
+
+static int integrateStereoAnchorBatch(
+        TsdfEngine& dst,
+        const mobilescan3d::stereo_anchor::WorldAnchorBatch& batch,
+        const FrameSnap& snap,
+        const cv::Mat* normalizedMask,
+        int* outPasses) {
+    if (outPasses) *outPasses = 0;
+    if (batch.anchors.empty() ||
+        batch.imageWidth < 4 ||
+        batch.imageHeight < 4 ||
+        snap.rgb.empty()) {
+        return 0;
+    }
+
+    // Sparse constraints do not need a full 1280x960 zero-filled depth map.
+    // Keep the same rays/intrinsics but cap the lattice at a 640px long edge.
+    const int sourceMax =
+        std::max(batch.imageWidth, batch.imageHeight);
+    const float sparseScale =
+        sourceMax > 640
+            ? 640.f / static_cast<float>(sourceMax)
+            : 1.f;
+    const int bw =
+        std::max(
+            4,
+            static_cast<int>(
+                std::lround(batch.imageWidth * sparseScale)));
+    const int bh =
+        std::max(
+            4,
+            static_cast<int>(
+                std::lround(batch.imageHeight * sparseScale)));
+
+    const float sx =
+        static_cast<float>(bw) /
+        static_cast<float>(std::max(1, gV07InputW));
+    const float sy =
+        static_cast<float>(bh) /
+        static_cast<float>(std::max(1, gV07InputH));
+
+    const float fx = gFx * sx;
+    const float fy = gFy * sy;
+    const float cx = gCx * sx;
+    const float cy = gCy * sy;
+
+    int uniqueAccepted = 0;
+    int passes = 0;
+    std::vector<float> sparse;
+
+    // TsdfEngine clamps a single observation confidence to <=1. Weight therefore
+    // becomes repeated sparse observations: all anchors once, strong anchors 2-3x.
+    for (int pass = 1; pass <= 3; ++pass) {
+        const int n = buildStereoSparseDepth(
+            batch,
+            bw,
+            bh,
+            dst.pixelStep(),
+            static_cast<float>(pass),
+            normalizedMask,
+            &sparse);
+        if (pass == 1) {
+            uniqueAccepted = n;
+        }
+        if (n <= 0) {
+            continue;
+        }
+
+        dst.integrateDepth(
+            sparse.data(),
+            bw,
+            bh,
+            snap.rgb.data(),
+            snap.w,
+            snap.h,
+            fx,
+            fy,
+            cx,
+            cy,
+            snap.R,
+            snap.t,
+            1.0f);
+        passes++;
+    }
+
+    if (outPasses) *outPasses = passes;
+    return uniqueAccepted;
+}
+
 // ------------------------------------------------------------- 目标专用融合
 /**
  * 清空目标专用模型与它的全部诊断状态。
@@ -449,6 +635,8 @@ static void resetMeshPipeline() {
     uvUnwrapStats = UvUnwrapStats{};
     meshDirty = true;
     depthCalibrator.reset();
+    // V0.9: invalidate stereo world-scale whenever depth calibration resets.
+    mobilescan3d::stereo_anchor::reset();
     lastCalibScale = 1.f;
     lastCalibShift = 0.f;
     lastCalibConfidence = 0.f;
@@ -704,6 +892,7 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     vinsQ[0] = vinsQ[1] = vinsQ[2] = 0;
     vinsQ[3] = 1;
     snaps.clear();
+    mobilescan3d::stereo_anchor::reset();
     vinsFrames = depthFrames = 0;
     lastVinsMs = 0.0;
 
@@ -746,6 +935,7 @@ Java_com_mobilescan3d_NativeBridge_nativeDestroy(JNIEnv*, jobject) {
     kf.reset();
     objectTracker.reset();
     snaps.clear();
+    mobilescan3d::stereo_anchor::reset();
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1233,6 +1423,13 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     std::vector<float> d((size_t)w * h);
     e->GetFloatArrayRegion(depth, 0, w * h, d.data());
 
+    // V0.9: raw model depth retained briefly for exact-timestamp stereo pairing.
+    mobilescan3d::stereo_anchor::onDepthFrame(
+        static_cast<uint64_t>(t),
+        d.data(),
+        w,
+        h);
+
     {
         std::shared_ptr<ObjectTracker> tracker;
         {
@@ -1281,55 +1478,168 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         }
     }
 
-    // ---- 深度标定：用 VINS 稀疏三角化深度做鲁棒回归 ----
+    // ---- V0.9 深度标定：VINS 稀疏深度 + stereo metric anchors ----
     //
-    // 必须放在**进入 gStateMutex 之前**：vinsFeatureSamples() 内部持 g_vinsMutex，
-    // 嵌进主临界区就会形成 gStateMutex -> g_vinsMutex 的嵌套锁序，而
-    // nativeOnCameraFrame 是「先拿 gStateMutex 做统计、VINS 计算放在锁外」，
-    // 两者锁序不一致迟早互相等。
+    // VINS is still the pose/world scale. Stereo first passes a robust physical
+    // meter -> VINS-world scale gate. Until that scale is stable, stereo is
+    // diagnostics-only. Once stable, clean stereo samples enter the existing
+    // MAD + Huber IRLS + EMA calibrator at 2-3x sample weight.
     if (depthCalibrationEnabled) {
-        const int ns = vinsFeatureSamples(gCalibSampleBuf, kMaxCalibSamples);
-        if (ns >= depthCalibrator.config().minSamples) {
-            std::vector<float> dPairs;
-            std::vector<float> zPairs;
-            dPairs.reserve((size_t)ns);
-            zPairs.reserve((size_t)ns);
-            for (int i = 0; i < ns; ++i) {
-                const float nu = gCalibSampleBuf[i * 3 + 0];
-                const float nv = gCalibSampleBuf[i * 3 + 1];
-                const float vz = gCalibSampleBuf[i * 3 + 2];
-                if (!(nu >= 0.f && nu <= 1.f && nv >= 0.f && nv <= 1.f)) {
-                    continue;
-                }
-                if (!std::isfinite(vz) || !(vz > 0.05f)) {
-                    continue;
-                }
-                const int px = std::min(w - 1, std::max(0, (int)(nu * (float)w)));
-                const int py = std::min(h - 1, std::max(0, (int)(nv * (float)h)));
-                const float dv = d[(size_t)py * w + px];
-                if (!std::isfinite(dv)) {
-                    continue;
-                }
-                dPairs.push_back(dv);
-                zPairs.push_back(vz);
+        const int ns =
+            vinsFeatureSamples(
+                gCalibSampleBuf,
+                kMaxCalibSamples);
+
+        std::vector<float> dPairs;
+        std::vector<float> zPairs;
+        dPairs.reserve(
+            static_cast<size_t>(std::max(0, ns)) + 288u);
+        zPairs.reserve(
+            static_cast<size_t>(std::max(0, ns)) + 288u);
+
+        for (int i = 0; i < ns; ++i) {
+            const float nu =
+                gCalibSampleBuf[i * 3 + 0];
+            const float nv =
+                gCalibSampleBuf[i * 3 + 1];
+            const float vz =
+                gCalibSampleBuf[i * 3 + 2];
+
+            if (!(nu >= 0.f && nu <= 1.f &&
+                  nv >= 0.f && nv <= 1.f)) {
+                continue;
             }
-            if (!dPairs.empty()) {
-                if (depthCalibrator.update(dPairs, zPairs)) {
-                    calibFrames++;
-                } else {
-                    calibRejectFrames++;
+            if (!std::isfinite(vz) ||
+                !(vz > 0.05f)) {
+                continue;
+            }
+
+            const int px = std::min(
+                w - 1,
+                std::max(
+                    0,
+                    static_cast<int>(
+                        nu * static_cast<float>(w))));
+            const int py = std::min(
+                h - 1,
+                std::max(
+                    0,
+                    static_cast<int>(
+                        nv * static_cast<float>(h))));
+
+            const float dv =
+                d[static_cast<size_t>(py) * w + px];
+            if (!std::isfinite(dv)) {
+                continue;
+            }
+
+            dPairs.push_back(dv);
+            zPairs.push_back(vz);
+        }
+
+        int stereoUniqueSamples = 0;
+        int stereoWeightedCopies = 0;
+
+        mobilescan3d::stereo_anchor::CalibrationBatch stereoBatch;
+        while (
+            mobilescan3d::stereo_anchor::takeCalibrationBatch(
+                &stereoBatch)) {
+
+            const DepthCalibration base =
+                depthCalibrator.calibration();
+
+            mobilescan3d::stereo_anchor::updateWorldScale(
+                base,
+                stereoBatch);
+
+            if (!mobilescan3d::stereo_anchor::worldScaleUsable()) {
+                // Calibration warmup is not a geometry drop: recent geometry
+                // batches remain queued until scale becomes stable.
+                continue;
+            }
+
+            const float stereoToWorld =
+                mobilescan3d::stereo_anchor::worldPerMeter();
+
+            const size_t stereoN = std::min({
+                stereoBatch.rawDepth.size(),
+                stereoBatch.metricDepth.size(),
+                stereoBatch.quality.size()});
+
+            for (size_t i = 0; i < stereoN; ++i) {
+                const float dv =
+                    stereoBatch.rawDepth[i];
+                const float zm =
+                    stereoBatch.metricDepth[i];
+                const float q =
+                    stereoBatch.quality[i];
+
+                if (!std::isfinite(dv) ||
+                    !std::isfinite(zm) ||
+                    !(zm > 0.12f) ||
+                    q < 0.45f) {
+                    continue;
+                }
+
+                const float zWorld =
+                    zm * stereoToWorld;
+                if (!std::isfinite(zWorld) ||
+                    !(zWorld > 0.05f) ||
+                    zWorld > 12.f) {
+                    continue;
+                }
+
+                const int copies =
+                    q >= 0.80f ? 3 : 2;
+
+                for (int c = 0; c < copies; ++c) {
+                    if (dPairs.size() >= 768u) {
+                        break;
+                    }
+                    dPairs.push_back(dv);
+                    zPairs.push_back(zWorld);
+                    stereoWeightedCopies++;
+                }
+                stereoUniqueSamples++;
+                if (dPairs.size() >= 768u) {
+                    break;
                 }
             }
         }
-        lastCalibValid = depthCalibrator.usable();
-        const DepthCalibration& c = depthCalibrator.calibration();
+
+        bool calibAccepted = false;
+        if (dPairs.size() >=
+            static_cast<size_t>(
+                depthCalibrator.config().minSamples)) {
+            calibAccepted =
+                depthCalibrator.update(
+                    dPairs,
+                    zPairs);
+            if (calibAccepted) {
+                calibFrames++;
+            } else {
+                calibRejectFrames++;
+            }
+        }
+
+        if (stereoUniqueSamples > 0) {
+            mobilescan3d::stereo_anchor::noteCalibratorContribution(
+                stereoUniqueSamples,
+                stereoWeightedCopies,
+                calibAccepted);
+        }
+
+        lastCalibValid =
+            depthCalibrator.usable();
+        const DepthCalibration& c =
+            depthCalibrator.calibration();
         lastCalibScale = c.scale;
         lastCalibShift = c.shift;
         lastCalibConfidence = c.confidence;
         lastCalibSamples = c.samples;
-        lastCalibInverse = c.inverseDepthModel;
+        lastCalibInverse =
+            c.inverseDepthModel;
     }
-
     // 融合用的深度图：标定可用时逐像素映射到 VINS 尺度，否则原样透传
     // （tracker / mask 仍看未标定的 d，保持第八轮已验收的行为不变）。
     const bool calibratedNow = depthCalibrationEnabled && depthCalibrator.usable();
@@ -1490,6 +1800,75 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             fuseTargetDepth(depthForFusion, w, h, *match, targetMaskMat, conf);
         }
 
+        // ---- V0.9 sparse stereo high-confidence TSDF constraints ----
+        auto stereoWorldBatches =
+            mobilescan3d::stereo_anchor::takeWorldAnchorBatches(
+                static_cast<uint64_t>(t),
+                kStereoAnchorMaxAgeNs,
+                2);
+
+        for (const auto& batch : stereoWorldBatches) {
+            int64_t stereoPoseDiffNs = -1;
+            const FrameSnap* stereoSnap =
+                findStereoAnchorSnap(
+                    batch.timestampNs,
+                    &stereoPoseDiffNs);
+
+            if (!stereoSnap) {
+                mobilescan3d::stereo_anchor::noteGeometryDropNoPose(
+                    static_cast<int>(batch.anchors.size()));
+                continue;
+            }
+
+            int scenePasses = 0;
+            const int sceneAccepted =
+                integrateStereoAnchorBatch(
+                    tsdf,
+                    batch,
+                    *stereoSnap,
+                    nullptr,
+                    &scenePasses);
+
+            mobilescan3d::stereo_anchor::noteSceneTsdf(
+                static_cast<int>(batch.anchors.size()),
+                sceneAccepted,
+                scenePasses,
+                true);
+
+            int64_t targetDt =
+                static_cast<int64_t>(batch.timestampNs) -
+                static_cast<int64_t>(t);
+            if (targetDt < 0) targetDt = -targetDt;
+
+            const bool targetMaskUsable =
+                haveTi &&
+                presenceOk &&
+                maskOk &&
+                targetDt <= kStereoTargetMaskMaxDiffNs;
+
+            if (targetMaskUsable) {
+                int targetPasses = 0;
+                const int targetAccepted =
+                    integrateStereoAnchorBatch(
+                        targetTsdf,
+                        batch,
+                        *stereoSnap,
+                        &targetMaskMat,
+                        &targetPasses);
+
+                mobilescan3d::stereo_anchor::noteTargetTsdf(
+                    static_cast<int>(batch.anchors.size()),
+                    targetAccepted,
+                    targetPasses,
+                    true);
+            } else {
+                mobilescan3d::stereo_anchor::noteTargetTsdf(
+                    static_cast<int>(batch.anchors.size()),
+                    0,
+                    0,
+                    false);
+            }
+        }
 
         // 记录本帧，供下一帧做时序一致性检查
         lastFusedDepth.assign(depthForFusion, depthForFusion + (size_t)w * h);
@@ -2164,6 +2543,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " buildMs=" << meshStats.totalMs
       << " note=" << meshStats.note << "\n"
       << "Vulkan: " << (vk ? "available" : "unavailable") << "\n"
+      << mobilescan3d::stereo_anchor::summary() << "\n"
       << "Next view: " << kf.guidance();
     return e->NewStringUTF(s.str().c_str());
 }

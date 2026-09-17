@@ -26,6 +26,7 @@ add_library(mobilescan3d SHARED
     persistent_relocalizer.cpp
     hq_fusion.cpp
     multicam_fusion.cpp
+    stereo_anchor_bridge.cpp
     vins_prelude.cpp
     vins_ceres_check.cpp
     vins_opencv_check.cpp

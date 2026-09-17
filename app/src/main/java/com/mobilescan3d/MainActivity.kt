@@ -343,6 +343,7 @@ private var lastRelocPollMs = 0L
                 result.get(android.hardware.camera2.CaptureResult.CONTROL_AE_STATE)
             lastAwbState =
                 result.get(android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE)
+            multiCam?.onCaptureResult(result)
             if (::hqCapture.isInitialized) {
                 hqCapture.onCaptureResult(result)
             }

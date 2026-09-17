@@ -8,15 +8,28 @@
 #include <cmath>
 #include <cstdint>
 #include <mutex>
+#include <numeric>
 #include <vector>
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/features2d.hpp>
+#include <opencv2/imgproc.hpp>
 
 namespace {
 
+using mobilescan3d::multicam::kAnchorStride;
+using mobilescan3d::multicam::kMaxStereoAnchors;
 using mobilescan3d::multicam::kStatsSlots;
+
+struct StereoAnchor {
+    float u = 0.f;
+    float v = 0.f;
+    float zMetric = 0.f;
+    float reprojectionPx = 0.f;
+    float confidence = 0.f;
+    float parallaxDeg = 0.f;
+};
 
 struct State {
     bool configured = false;
@@ -34,6 +47,10 @@ struct State {
 
     std::uint64_t pairCount = 0;
     std::uint64_t goodPairCount = 0;
+    std::uint64_t pairsWithAnchors = 0;
+    std::uint64_t anchorCandidates = 0;
+    std::uint64_t anchorsExported = 0;
+    std::uint64_t anchorsRejectedQuality = 0;
 
     float lastMatches = 0.0f;
     float lastInliers = 0.0f;
@@ -44,6 +61,10 @@ struct State {
     float lastDeltaMs = 0.0f;
     float lastProcessingMs = 0.0f;
     float lastMedianReprojectionPx = 0.0f;
+    float lastMedianParallaxDeg = 0.0f;
+    float lastMedianAnchorConfidence = 0.0f;
+
+    std::vector<StereoAnchor> lastAnchors;
 };
 
 std::mutex gMutex;
@@ -115,6 +136,37 @@ double epipolarDistancePx(
     const double denom = std::sqrt(l2[0]*l2[0] + l2[1]*l2[1]);
     if (denom < 1e-12) return 1e9;
     return std::abs(x2.dot(l2)) / denom;
+}
+
+double angleDeg(const cv::Vec3d& a, const cv::Vec3d& b) {
+    const double na = cv::norm(a);
+    const double nb = cv::norm(b);
+    if (na < 1e-12 || nb < 1e-12) return 0.0;
+    const double d = std::clamp(a.dot(b) / (na * nb), -1.0, 1.0);
+    return std::acos(d) * 180.0 / CV_PI;
+}
+
+cv::Mat downsampleForOrb(const cv::Mat& src, double* scaleOut) {
+    constexpr int kMaxDim = 800;
+    const int maxDim = std::max(src.cols, src.rows);
+    if (maxDim <= kMaxDim) {
+        if (scaleOut) *scaleOut = 1.0;
+        return src;
+    }
+
+    const double scale =
+        static_cast<double>(kMaxDim) /
+        static_cast<double>(maxDim);
+    cv::Mat dst;
+    cv::resize(
+        src,
+        dst,
+        cv::Size(),
+        scale,
+        scale,
+        cv::INTER_AREA);
+    if (scaleOut) *scaleOut = scale;
+    return dst;
 }
 
 }  // namespace
@@ -190,7 +242,7 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamConfigure(
     next.focalRatio = k1[0] > 1e-6 ? k2[0] / k1[0] : 1.0;
 
     std::lock_guard<std::mutex> lock(gMutex);
-    gState = next;
+    gState = std::move(next);
     return JNI_TRUE;
 }
 
@@ -237,8 +289,6 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamOnPair(
 
     const auto start = std::chrono::steady_clock::now();
 
-    // Pair processing is intentionally serialized by the Kotlin fusion thread.
-    // Holding this lock keeps reconfigure/reset simple and makes stats coherent.
     std::lock_guard<std::mutex> lock(gMutex);
     if (!gState.configured ||
         gState.width != width ||
@@ -246,12 +296,24 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamOnPair(
         return JNI_FALSE;
     }
 
-    cv::Mat im1(height, width, CV_8UC1, g1.data());
-    cv::Mat im2(height, width, CV_8UC1, g2.data());
+    gState.lastAnchors.clear();
 
-    // Eight levels cover the large main -> ~3.5x tele scale change.
+    cv::Mat full1(height, width, CV_8UC1, g1.data());
+    cv::Mat full2(height, width, CV_8UC1, g2.data());
+
+    double orbScale1 = 1.0;
+    double orbScale2 = 1.0;
+    cv::Mat im1 = downsampleForOrb(full1, &orbScale1);
+    cv::Mat im2 = downsampleForOrb(full2, &orbScale2);
+
+    // Both physical readers are configured to the same analysis size, so scales
+    // should be identical. Keep them separate for robustness.
+    const double invScale1 = 1.0 / std::max(1e-9, orbScale1);
+    const double invScale2 = 1.0 / std::max(1e-9, orbScale2);
+
+    // 8 pyramid levels still cover the main -> 3.5x tele scale change.
     auto orb = cv::ORB::create(
-        1400,
+        1200,
         1.20f,
         8,
         19,
@@ -268,6 +330,20 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamOnPair(
     cv::Mat d2;
     orb->detectAndCompute(im1, cv::noArray(), kp1, d1);
     orb->detectAndCompute(im2, cv::noArray(), kp2, d2);
+
+    // Bring keypoint coordinates back to the calibrated full-resolution image.
+    if (orbScale1 != 1.0) {
+        for (auto& k : kp1) {
+            k.pt.x = static_cast<float>(k.pt.x * invScale1);
+            k.pt.y = static_cast<float>(k.pt.y * invScale1);
+        }
+    }
+    if (orbScale2 != 1.0) {
+        for (auto& k : kp2) {
+            k.pt.x = static_cast<float>(k.pt.x * invScale2);
+            k.pt.y = static_cast<float>(k.pt.y * invScale2);
+        }
+    }
 
     gState.pairCount++;
     gState.lastDeltaMs = static_cast<float>(
@@ -357,8 +433,22 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamOnPair(
 
     std::vector<float> depths;
     std::vector<float> reprojection;
+    std::vector<float> parallaxes;
+    std::vector<float> confidences;
     depths.reserve(p1.size());
     reprojection.reserve(p1.size());
+    parallaxes.reserve(p1.size());
+    confidences.reserve(p1.size());
+
+    std::vector<StereoAnchor> anchors;
+    anchors.reserve(std::min<std::size_t>(p1.size(), kMaxStereoAnchors));
+
+    const double syncScore = gState.calibratedSync
+        ? 1.0
+        : std::clamp(
+            1.0 - static_cast<double>(gState.lastDeltaMs) / 12.0,
+            0.20,
+            1.0);
 
     for (int i = 0; i < points64.cols; ++i) {
         const double w = points64.at<double>(3, i);
@@ -400,12 +490,56 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamOnPair(
             u2 - p2[static_cast<std::size_t>(i)].x,
             v2 - p2[static_cast<std::size_t>(i)].y
         );
-        const double e = 0.5 * (e1 + e2);
+        const double reproj = 0.5 * (e1 + e2);
 
-        if (!std::isfinite(e) || e > 3.0) continue;
+        if (!std::isfinite(reproj) || reproj > 3.0) continue;
+
+        // Compare the two viewing rays in primary-camera coordinates.
+        const cv::Vec3d ray1 = X;
+        const cv::Vec3d ray2Primary = gState.R21.t() * X2;
+        const double parallax = angleDeg(ray1, ray2Primary);
+        if (!std::isfinite(parallax) || parallax < 0.20) continue;
 
         depths.push_back(static_cast<float>(X[2]));
-        reprojection.push_back(static_cast<float>(e));
+        reprojection.push_back(static_cast<float>(reproj));
+        parallaxes.push_back(static_cast<float>(parallax));
+
+        const double reprojScore = std::exp(-reproj / 1.25);
+        const double parallaxScore =
+            std::clamp((parallax - 0.20) / 1.50, 0.0, 1.0);
+        const float anchorConfidence = static_cast<float>(
+            std::clamp(
+                reprojScore * parallaxScore * syncScore,
+                0.0,
+                1.0)
+        );
+        confidences.push_back(anchorConfidence);
+
+        gState.anchorCandidates++;
+
+        if (reproj > 2.5 ||
+            parallax < 0.30 ||
+            anchorConfidence < 0.30) {
+            gState.anchorsRejectedQuality++;
+            continue;
+        }
+
+        StereoAnchor a;
+        a.u = std::clamp(
+            p1[static_cast<std::size_t>(i)].x /
+                static_cast<float>(std::max(1, width - 1)),
+            0.f,
+            1.f);
+        a.v = std::clamp(
+            p1[static_cast<std::size_t>(i)].y /
+                static_cast<float>(std::max(1, height - 1)),
+            0.f,
+            1.f);
+        a.zMetric = static_cast<float>(X[2]);
+        a.reprojectionPx = static_cast<float>(reproj);
+        a.confidence = anchorConfidence;
+        a.parallaxDeg = static_cast<float>(parallax);
+        anchors.push_back(a);
     }
 
     gState.lastTriangulated = static_cast<float>(depths.size());
@@ -413,10 +547,33 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamOnPair(
     gState.lastP10Depth = percentile(depths, 0.10);
     gState.lastP90Depth = percentile(depths, 0.90);
     gState.lastMedianReprojectionPx = percentile(reprojection, 0.50);
+    gState.lastMedianParallaxDeg = percentile(parallaxes, 0.50);
+    gState.lastMedianAnchorConfidence = percentile(confidences, 0.50);
 
     if (depths.size() >= 12 &&
         gState.lastMedianReprojectionPx <= 2.0f) {
         gState.goodPairCount++;
+    }
+
+    // Keep only the strongest geometry constraints; too many low-value anchors
+    // add CPU/memory pressure and can over-constrain one textured patch.
+    std::sort(
+        anchors.begin(),
+        anchors.end(),
+        [](const StereoAnchor& a, const StereoAnchor& b) {
+            if (a.confidence != b.confidence) {
+                return a.confidence > b.confidence;
+            }
+            return a.reprojectionPx < b.reprojectionPx;
+        });
+    if (anchors.size() > static_cast<std::size_t>(kMaxStereoAnchors)) {
+        anchors.resize(kMaxStereoAnchors);
+    }
+
+    gState.lastAnchors = std::move(anchors);
+    gState.anchorsExported += gState.lastAnchors.size();
+    if (!gState.lastAnchors.empty()) {
+        gState.pairsWithAnchors++;
     }
 
     const auto end = std::chrono::steady_clock::now();
@@ -424,7 +581,44 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamOnPair(
         std::chrono::duration<double, std::milli>(end - start).count()
     );
 
-    return depths.size() >= 10 ? JNI_TRUE : JNI_FALSE;
+    return gState.lastAnchors.size() >= 6 ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeMultiCamGetAnchors(
+        JNIEnv* env,
+        jobject,
+        jfloatArray outArray) {
+    if (!outArray) return 0;
+
+    std::lock_guard<std::mutex> lock(gMutex);
+    const int cap = env->GetArrayLength(outArray) / kAnchorStride;
+    const int count = std::min(
+        cap,
+        static_cast<int>(gState.lastAnchors.size()));
+    if (count <= 0) return 0;
+
+    std::vector<jfloat> out(
+        static_cast<std::size_t>(count) * kAnchorStride,
+        0.f);
+
+    for (int i = 0; i < count; ++i) {
+        const StereoAnchor& a = gState.lastAnchors[static_cast<std::size_t>(i)];
+        const int o = i * kAnchorStride;
+        out[static_cast<std::size_t>(o + 0)] = a.u;
+        out[static_cast<std::size_t>(o + 1)] = a.v;
+        out[static_cast<std::size_t>(o + 2)] = a.zMetric;
+        out[static_cast<std::size_t>(o + 3)] = a.reprojectionPx;
+        out[static_cast<std::size_t>(o + 4)] = a.confidence;
+        out[static_cast<std::size_t>(o + 5)] = a.parallaxDeg;
+    }
+
+    env->SetFloatArrayRegion(
+        outArray,
+        0,
+        count * kAnchorStride,
+        out.data());
+    return env->ExceptionCheck() ? 0 : count;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -432,11 +626,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetMultiCamStats(
         JNIEnv* env,
         jobject,
         jfloatArray outArray) {
-
-    if (!outArray ||
-        env->GetArrayLength(outArray) < kStatsSlots) {
-        return JNI_FALSE;
-    }
+    if (!outArray || env->GetArrayLength(outArray) < kStatsSlots) return JNI_FALSE;
 
     std::array<jfloat, kStatsSlots> out{};
     {
@@ -457,14 +647,17 @@ Java_com_mobilescan3d_NativeBridge_nativeGetMultiCamStats(
         out[13] = 0.0f; // Kotlin owns timestamp-pair rejection count.
         out[14] = gState.lastMedianReprojectionPx;
         out[15] = gState.calibratedSync ? 1.0f : 0.0f;
+        out[16] = static_cast<float>(gState.anchorCandidates);
+        out[17] = static_cast<float>(gState.lastAnchors.size());
+        out[18] = gState.lastMedianParallaxDeg;
+        out[19] = gState.lastMedianAnchorConfidence;
+        out[20] = static_cast<float>(gState.pairsWithAnchors);
+        out[21] = static_cast<float>(gState.anchorsExported);
+        out[22] = static_cast<float>(gState.anchorsRejectedQuality);
+        out[23] = static_cast<float>(gState.lastAnchors.size() >= 6 ? 1 : 0);
     }
 
-    env->SetFloatArrayRegion(
-        outArray,
-        0,
-        kStatsSlots,
-        out.data()
-    );
+    env->SetFloatArrayRegion(outArray, 0, kStatsSlots, out.data());
     return env->ExceptionCheck() ? JNI_FALSE : JNI_TRUE;
 }
 

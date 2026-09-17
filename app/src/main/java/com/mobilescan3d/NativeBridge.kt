@@ -57,7 +57,11 @@ object NativeBridge {
 
     const val RENDER_POSE_SLOTS = 12
     /** V0.8 physical multi-camera diagnostic slots. */
-    const val MULTICAM_STATS_SLOTS = 16
+    const val MULTICAM_STATS_SLOTS = 24
+    /** V0.9 stereo metric-anchor diagnostic protocol. */
+    const val STEREO_ANCHOR_STRIDE = 6
+    const val STEREO_ANCHOR_MAX = 96
+    const val STEREO_ANCHOR_STATS_SLOTS = 48
 
     /** 点云/调试层每个点 6 个浮点：x, y, z, r, g, b */
     const val POINT_SLOTS = 6
@@ -244,8 +248,20 @@ object NativeBridge {
         secondaryTimestampNs: Long
     ): Boolean
 
+    external fun nativeMultiCamGetAnchors(out: FloatArray): Int
     external fun nativeGetMultiCamStats(out: FloatArray): Boolean
     external fun nativeMultiCamReset()
+
+    // --------------------------------------------------------- V0.9 Stereo metric anchors
+    external fun nativeSubmitStereoAnchors(
+        anchors: FloatArray,
+        count: Int,
+        timestampNs: Long,
+        imageWidth: Int,
+        imageHeight: Int
+    ): Boolean
+    external fun nativeGetStereoAnchorStats(out: FloatArray): Int
+    external fun nativeResetStereoAnchors()
     external fun nativeConfigureTrackerModels(backbonePath: String, headPath: String): Boolean
     external fun nativeFuseBurst(inputPaths: Array<String>, outputPath: String, exposureMs: Float, iso: Int, minAcceptedFrames: Int, stats: FloatArray, frameStats: FloatArray): Boolean
     external fun nativeVinsInit(fx: Float, fy: Float, cx: Float, cy: Float, w: Int, h: Int, ric: FloatArray, tic: FloatArray, accN: Float, accW: Float, gyrN: Float, gyrW: Float)

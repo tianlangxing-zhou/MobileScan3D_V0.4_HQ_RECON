@@ -9,6 +9,8 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.Image
@@ -55,6 +57,8 @@ class MultiCameraFusionController(
         private const val MAX_TELE_TEXTURE_KEYFRAMES = 24
         private const val CALIBRATED_PAIR_TOLERANCE_NS = 4_000_000L
         private const val APPROX_PAIR_TOLERANCE_NS = 12_000_000L
+        private const val STEREO_ANCHOR_STRIDE = 6
+        private const val MAX_STEREO_ANCHORS = 96
     }
 
     private data class CameraModel(
@@ -70,6 +74,23 @@ class MultiCameraFusionController(
     private data class GrayFrame(
         val timestampNs: Long,
         val gray: ByteArray
+    )
+
+    private data class PhysicalCaptureStats(
+        var frames: Long = 0L,
+        var timestampCompared: Long = 0L,
+        var timestampAbsDeltaSumNs: Double = 0.0,
+        var timestampAbsDeltaMaxNs: Long = 0L,
+        var lastSensorTimestampNs: Long = 0L,
+        var lastExposureNs: Long = 0L,
+        var lastFrameDurationNs: Long = 0L,
+        var lastRollingShutterSkewNs: Long = 0L,
+        var lastIso: Int = -1,
+        var lastFocalMm: Float = 0f,
+        var lastFocusDistance: Float = 0f,
+        var lastCrop: String = "n/a",
+        var lastDistortionMode: Int = -1,
+        var lastZoomRatio: Float = 1f
     )
 
     @Volatile
@@ -102,6 +123,15 @@ class MultiCameraFusionController(
 
     @Volatile
     private var status = "not configured"
+
+    private val physicalResultLock = Any()
+    private val physicalCaptureStats = LinkedHashMap<String, PhysicalCaptureStats>()
+
+    @Volatile
+    private var physicalResultCallbacks = 0L
+
+    @Volatile
+    private var physicalResultEntries = 0L
 
     private val fusionThread = HandlerThread("MultiCamFusion").apply { start() }
     private val fusionHandler = Handler(fusionThread.looper)
@@ -136,6 +166,18 @@ class MultiCameraFusionController(
 
     @Volatile
     private var pairDroppedForTimestamp = 0L
+
+    private val stereoAnchorBuffer =
+        FloatArray(MAX_STEREO_ANCHORS * STEREO_ANCHOR_STRIDE)
+
+    @Volatile
+    private var anchorSubmitCalls = 0L
+
+    @Volatile
+    private var anchorSubmitAnchors = 0L
+
+    @Volatile
+    private var anchorSubmitFailures = 0L
 
     fun ownsPrimaryReader(candidate: ImageReader?): Boolean =
         candidate != null && candidate === primaryReader
@@ -358,9 +400,94 @@ class MultiCameraFusionController(
         runCatching { secondaryReader?.close() }
         secondaryReader = null
         runCatching { NativeBridge.nativeMultiCamReset() }
+        runCatching { NativeBridge.nativeResetStereoAnchors() }
         status = "fallback to logical camera: $reason"
         Log.w(TAG, status)
         onHint("多镜头会话不被 HAL 接受，已自动回退单摄")
+    }
+
+    /**
+     * Capture-result telemetry for the actual physical streams.
+     *
+     * Static camera characteristics are not enough: OEM HALs may crop/zoom a
+     * non-active physical stream. These values let the feedback report prove
+     * whether the K used by stereo still matches the delivered YUV images.
+     */
+    fun onCaptureResult(result: TotalCaptureResult) {
+        if (!active) return
+        physicalResultCallbacks++
+
+        val logicalTimestamp =
+            result.get(CaptureResult.SENSOR_TIMESTAMP)
+
+        fun record(id: String, physical: CaptureResult) {
+            val sensorTs =
+                physical.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L
+            val exposure =
+                physical.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+            val frameDuration =
+                physical.get(CaptureResult.SENSOR_FRAME_DURATION) ?: 0L
+            val skew =
+                physical.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW) ?: 0L
+            val iso =
+                physical.get(CaptureResult.SENSOR_SENSITIVITY) ?: -1
+            val focal =
+                physical.get(CaptureResult.LENS_FOCAL_LENGTH) ?: 0f
+            val focus =
+                physical.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
+            val crop =
+                physical.get(CaptureResult.SCALER_CROP_REGION)
+            val distortion =
+                physical.get(CaptureResult.DISTORTION_CORRECTION_MODE) ?: -1
+            val zoom =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    physical.get(CaptureResult.CONTROL_ZOOM_RATIO) ?: 1f
+                } else {
+                    1f
+                }
+
+            synchronized(physicalResultLock) {
+                val st = physicalCaptureStats.getOrPut(id) {
+                    PhysicalCaptureStats()
+                }
+                st.frames++
+                st.lastSensorTimestampNs = sensorTs
+                st.lastExposureNs = exposure
+                st.lastFrameDurationNs = frameDuration
+                st.lastRollingShutterSkewNs = skew
+                st.lastIso = iso
+                st.lastFocalMm = focal
+                st.lastFocusDistance = focus
+                st.lastCrop = crop?.let {
+                    "${it.left},${it.top},${it.right},${it.bottom}"
+                } ?: "n/a"
+                st.lastDistortionMode = distortion
+                st.lastZoomRatio = zoom
+
+                if (logicalTimestamp != null &&
+                    logicalTimestamp > 0L &&
+                    sensorTs > 0L
+                ) {
+                    val delta = abs(sensorTs - logicalTimestamp)
+                    st.timestampCompared++
+                    st.timestampAbsDeltaSumNs += delta.toDouble()
+                    st.timestampAbsDeltaMaxNs =
+                        maxOf(st.timestampAbsDeltaMaxNs, delta)
+                }
+                physicalResultEntries++
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            result.physicalCameraTotalResults.forEach { (id, physical) ->
+                record(id, physical)
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            result.physicalCameraResults.forEach { (id, physical) ->
+                record(id, physical)
+            }
+        }
     }
 
     fun updateScanState(
@@ -374,6 +501,15 @@ class MultiCameraFusionController(
             teleTextureRegistered = 0
             teleTexturePoseMiss = 0
             teleTextureWriteFail = 0
+            anchorSubmitCalls = 0L
+            anchorSubmitAnchors = 0L
+            anchorSubmitFailures = 0L
+            physicalResultCallbacks = 0L
+            physicalResultEntries = 0L
+            synchronized(physicalResultLock) {
+                physicalCaptureStats.clear()
+            }
+            runCatching { NativeBridge.nativeResetStereoAnchors() }
         }
         scanEnabled = enabled && active
         teleTextureGate =
@@ -394,10 +530,21 @@ class MultiCameraFusionController(
         }.getOrDefault(false)
 
         return if (active && have) {
+            val stereoStats = FloatArray(NativeBridge.STEREO_ANCHOR_STATS_SLOTS)
+            val stereoCount = runCatching {
+                NativeBridge.nativeGetStereoAnchorStats(stereoStats)
+            }.getOrDefault(0)
+            val scaleText =
+                if (stereoCount > 14 && stereoStats[14] > 0.5f) {
+                    "scale ${"%.3f".format(stereoStats[9])}✓"
+                } else {
+                    "scale warmup"
+                }
             "MultiCam ${p.id}→${s.id} · " +
                 "Δ${"%.2f".format(stats[9])}ms · " +
-                "match ${stats[2].toInt()}/${stats[3].toInt()} · " +
-                "tri ${stats[4].toInt()} · teleTex $teleTextureRegistered"
+                "inlier ${stats[3].toInt()} · " +
+                "anchor ${stats[17].toInt()} · $scaleText · " +
+                "teleTex $teleTextureRegistered"
         } else if (active) {
             "MultiCam ${p.id}→${s.id} · geometry=${if (geometryReady) "ready" else "n/a"}"
         } else {
@@ -406,7 +553,7 @@ class MultiCameraFusionController(
     }
 
     fun report(sb: StringBuilder) {
-        sb.appendLine("[MULTICAM V0.8]")
+        sb.appendLine("[MULTICAM V0.9]")
         sb.appendLine("logicalCameraId=$logicalCameraId")
         sb.appendLine("active=$active")
         sb.appendLine("geometryReady=$geometryReady")
@@ -431,8 +578,22 @@ class MultiCameraFusionController(
                 }
         )
         sb.appendLine("pairToleranceMs=${pairToleranceNs / 1_000_000f}")
+        sb.appendLine("analysisSize=${configuredSize?.width ?: -1}x${configuredSize?.height ?: -1}")
+        sb.appendLine("primaryK=${primaryModel?.k?.joinToString(",") ?: "n/a"}")
+        sb.appendLine("secondaryK=${secondaryModel?.k?.joinToString(",") ?: "n/a"}")
+        sb.appendLine("primaryPoseReference=${primaryModel?.poseReference ?: -1}")
+        sb.appendLine("secondaryPoseReference=${secondaryModel?.poseReference ?: -1}")
+        sb.appendLine("primaryPoseRotation=${primaryModel?.poseRotation?.joinToString(",") ?: "n/a"}")
+        sb.appendLine("primaryPoseTranslationM=${primaryModel?.poseTranslation?.joinToString(",") ?: "n/a"}")
+        sb.appendLine("secondaryPoseRotation=${secondaryModel?.poseRotation?.joinToString(",") ?: "n/a"}")
+        sb.appendLine("secondaryPoseTranslationM=${secondaryModel?.poseTranslation?.joinToString(",") ?: "n/a"}")
+        appendPhysicalCameraInventory(sb)
+        appendPhysicalCaptureResults(sb)
         sb.appendLine("pairDispatchCount=$pairDispatchCount")
         sb.appendLine("pairDroppedForTimestamp=$pairDroppedForTimestamp")
+        sb.appendLine("anchorSubmitCalls=$anchorSubmitCalls")
+        sb.appendLine("anchorSubmitAnchors=$anchorSubmitAnchors")
+        sb.appendLine("anchorSubmitFailures=$anchorSubmitFailures")
         sb.appendLine("teleTextureRegistered=$teleTextureRegistered")
         sb.appendLine("teleTexturePoseMiss=$teleTexturePoseMiss")
         sb.appendLine("teleTextureWriteFail=$teleTextureWriteFail")
@@ -454,7 +615,87 @@ class MultiCameraFusionController(
             sb.appendLine("goodStereoPairs=${stats[12].toLong()}")
             sb.appendLine("medianReprojectionPx=${stats[14]}")
             sb.appendLine("nativeCalibratedSync=${stats[15] > 0.5f}")
+            sb.appendLine("anchorCandidatesTotal=${stats[16].toLong()}")
+            sb.appendLine("lastAnchorCount=${stats[17].toInt()}")
+            sb.appendLine("lastMedianParallaxDeg=${stats[18]}")
+            sb.appendLine("lastMedianAnchorConfidence=${stats[19]}")
+            sb.appendLine("pairsWithAnchors=${stats[20].toLong()}")
+            sb.appendLine("anchorsExportedTotal=${stats[21].toLong()}")
+            sb.appendLine("anchorsRejectedQuality=${stats[22].toLong()}")
+            sb.appendLine("lastPairAnchorSufficient=${stats[23] > 0.5f}")
         }
+
+        val stereoStats = FloatArray(NativeBridge.STEREO_ANCHOR_STATS_SLOTS)
+        val stereoCount = runCatching {
+            NativeBridge.nativeGetStereoAnchorStats(stereoStats)
+        }.getOrDefault(0)
+        if (stereoCount >= 41) {
+            sb.appendLine()
+            sb.appendLine("[STEREO METRIC ANCHORS V0.9]")
+            sb.appendLine("submittedBatches=${stereoStats[0].toLong()}")
+            sb.appendLine("submittedAnchors=${stereoStats[1].toLong()}")
+            sb.appendLine("inputRejected=${stereoStats[2].toLong()}")
+            sb.appendLine("pendingDropped=${stereoStats[3].toLong()}")
+            sb.appendLine("depthFramesSeen=${stereoStats[4].toLong()}")
+            sb.appendLine("depthMatchedBatches=${stereoStats[5].toLong()}")
+            sb.appendLine("depthMatchedAnchors=${stereoStats[6].toLong()}")
+            sb.appendLine("depthMatchMisses=${stereoStats[7].toLong()}")
+            sb.appendLine("lastDepthMatchDeltaMs=${stereoStats[8]}")
+            sb.appendLine("worldPerMeter=${stereoStats[9]}")
+            sb.appendLine("lastFrameWorldPerMeter=${stereoStats[10]}")
+            sb.appendLine("lastScaleMedianRel=${stereoStats[11]}")
+            sb.appendLine("lastDenseStereoMedianRel=${stereoStats[12]}")
+            sb.appendLine("lastScaleSamples=${stereoStats[13].toInt()}")
+            sb.appendLine("worldScaleStable=${stereoStats[14] > 0.5f}")
+            sb.appendLine("scaleAcceptedFrames=${stereoStats[15].toLong()}")
+            sb.appendLine("scaleRejectedFrames=${stereoStats[16].toLong()}")
+            sb.appendLine("scaleRejectedNoBaseCalib=${stereoStats[17].toLong()}")
+            sb.appendLine("scaleRejectedFewSamples=${stereoStats[18].toLong()}")
+            sb.appendLine("scaleRejectedResidual=${stereoStats[19].toLong()}")
+            sb.appendLine("scaleRejectedJump=${stereoStats[20].toLong()}")
+            sb.appendLine("calibratorStereoFrames=${stereoStats[21].toLong()}")
+            sb.appendLine("calibratorStereoAccepted=${stereoStats[22].toLong()}")
+            sb.appendLine("calibratorStereoRejected=${stereoStats[23].toLong()}")
+            sb.appendLine("calibratorUniqueStereoSamples=${stereoStats[24].toLong()}")
+            sb.appendLine("calibratorWeightedCopies=${stereoStats[25].toLong()}")
+            sb.appendLine("geometryBatchesPopped=${stereoStats[26].toLong()}")
+            sb.appendLine("geometryStaleBatches=${stereoStats[27].toLong()}")
+            sb.appendLine("geometryDropNoPose=${stereoStats[28].toLong()}")
+            sb.appendLine("geometryDropNoScale=${stereoStats[29].toLong()}")
+            sb.appendLine("geometryDropResidual=${stereoStats[30].toLong()}")
+            sb.appendLine("sceneTsdfBatches=${stereoStats[31].toLong()}")
+            sb.appendLine("sceneTsdfInputAnchors=${stereoStats[32].toLong()}")
+            sb.appendLine("sceneTsdfAcceptedAnchors=${stereoStats[33].toLong()}")
+            sb.appendLine("sceneTsdfPasses=${stereoStats[34].toLong()}")
+            sb.appendLine("targetTsdfBatches=${stereoStats[35].toLong()}")
+            sb.appendLine("targetTsdfInputAnchors=${stereoStats[36].toLong()}")
+            sb.appendLine("targetTsdfAcceptedAnchors=${stereoStats[37].toLong()}")
+            sb.appendLine("targetTsdfPasses=${stereoStats[38].toLong()}")
+            sb.appendLine("lastAnchorMedianMetricM=${stereoStats[39]}")
+            sb.appendLine("lastAnchorMedianQuality=${stereoStats[40]}")
+            if (stereoCount >= 48) {
+                sb.appendLine("pendingAnchorQueue=${stereoStats[41].toInt()}")
+                sb.appendLine("recentDepthQueue=${stereoStats[42].toInt()}")
+                sb.appendLine("readyCalibrationQueue=${stereoStats[43].toInt()}")
+                sb.appendLine("geometryQueue=${stereoStats[44].toInt()}")
+                sb.appendLine("exactDepthMatchToleranceMs=${stereoStats[45]}")
+                sb.appendLine("scaleGoodStreak=${stereoStats[46].toInt()}")
+                sb.appendLine("scaleBadStreak=${stereoStats[47].toInt()}")
+                sb.appendLine("scaleStableFramesRequired=3")
+                sb.appendLine("stereoAnchorSchemaVersion=0.9")
+            }
+
+            val diagnosis = when {
+                !active -> "DISABLED_OR_FALLBACK"
+                stereoStats[1] < 1f -> "NO_STEREO_ANCHORS_SUBMITTED"
+                stereoStats[5] < 1f -> "STEREO_DEPTH_TIMESTAMP_NOT_MATCHED"
+                stereoStats[14] < 0.5f -> "STEREO_TO_VINS_SCALE_WARMUP_OR_REJECTED"
+                stereoStats[33] < 1f -> "SCALE_OK_BUT_NO_SCENE_TSDF_ANCHOR_ACCEPTED"
+                else -> "STEREO_METRIC_TSDF_ACTIVE"
+            }
+            sb.appendLine("v09Diagnosis=$diagnosis")
+        }
+        appendRuntimeDiagnostics(sb)
         sb.appendLine()
     }
 
@@ -488,7 +729,7 @@ class MultiCameraFusionController(
             val size = configuredSize ?: return
             fusionHandler.post {
                 runCatching {
-                    NativeBridge.nativeMultiCamOnPair(
+                    val goodPair = NativeBridge.nativeMultiCamOnPair(
                         p.gray,
                         s.gray,
                         size.width,
@@ -496,8 +737,35 @@ class MultiCameraFusionController(
                         p.timestampNs,
                         s.timestampNs
                     )
+
+                    // V0.9: only submit geometry while an actual scan is active.
+                    // The anchor timestamp is the PRIMARY physical camera timestamp,
+                    // which is also the timestamp used by processImage()/DepthProvider.
+                    if (goodPair && scanEnabled) {
+                        val count = NativeBridge.nativeMultiCamGetAnchors(
+                            stereoAnchorBuffer
+                        ).coerceIn(0, MAX_STEREO_ANCHORS)
+
+                        if (count > 0) {
+                            anchorSubmitCalls++
+                            val submitted =
+                                NativeBridge.nativeSubmitStereoAnchors(
+                                    stereoAnchorBuffer,
+                                    count,
+                                    p.timestampNs,
+                                    size.width,
+                                    size.height
+                                )
+                            if (submitted) {
+                                anchorSubmitAnchors += count.toLong()
+                            } else {
+                                anchorSubmitFailures++
+                            }
+                        }
+                    }
                 }.onFailure {
-                    Log.w(TAG, "native stereo pair failed", it)
+                    Log.w(TAG, "native stereo metric-anchor pair failed", it)
+                    anchorSubmitFailures++
                 }
             }
         } else {
@@ -619,6 +887,241 @@ class MultiCameraFusionController(
             teleTextureRegistered++
         } else {
             runCatching { file.delete() }
+        }
+    }
+
+    private fun appendPhysicalCaptureResults(sb: StringBuilder) {
+        sb.appendLine()
+        sb.appendLine("[PHYSICAL CAPTURE RESULT V0.9]")
+        sb.appendLine("physicalResultCallbacks=$physicalResultCallbacks")
+        sb.appendLine("physicalResultEntries=$physicalResultEntries")
+
+        synchronized(physicalResultLock) {
+            if (physicalCaptureStats.isEmpty()) {
+                sb.appendLine("physicalResults=EMPTY")
+                return
+            }
+
+            physicalCaptureStats.toSortedMap().forEach { (id, st) ->
+                val avgDeltaMs =
+                    if (st.timestampCompared > 0L) {
+                        st.timestampAbsDeltaSumNs /
+                            st.timestampCompared.toDouble() /
+                            1_000_000.0
+                    } else {
+                        -1.0
+                    }
+
+                sb.appendLine("physicalResult[$id].frames=${st.frames}")
+                sb.appendLine(
+                    "physicalResult[$id].lastSensorTimestampNs=" +
+                        st.lastSensorTimestampNs
+                )
+                sb.appendLine(
+                    "physicalResult[$id].timestampCompared=" +
+                        st.timestampCompared
+                )
+                sb.appendLine(
+                    "physicalResult[$id].avgAbsTimestampDeltaToLogicalMs=" +
+                        avgDeltaMs
+                )
+                sb.appendLine(
+                    "physicalResult[$id].maxAbsTimestampDeltaToLogicalMs=" +
+                        st.timestampAbsDeltaMaxNs / 1_000_000.0
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastExposureNs=" +
+                        st.lastExposureNs
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastFrameDurationNs=" +
+                        st.lastFrameDurationNs
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastRollingShutterSkewNs=" +
+                        st.lastRollingShutterSkewNs
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastIso=" +
+                        st.lastIso
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastFocalMm=" +
+                        st.lastFocalMm
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastFocusDistanceDiopters=" +
+                        st.lastFocusDistance
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastCropLTRB=" +
+                        st.lastCrop
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastDistortionMode=" +
+                        st.lastDistortionMode
+                )
+                sb.appendLine(
+                    "physicalResult[$id].lastZoomRatio=" +
+                        st.lastZoomRatio
+                )
+            }
+        }
+    }
+
+    private fun appendPhysicalCameraInventory(sb: StringBuilder) {
+        sb.appendLine()
+        sb.appendLine("[PHYSICAL CAMERA INVENTORY V0.9]")
+        sb.appendLine(
+            "logicalHardwareLevel=" +
+                (logicalCharacteristics.get(
+                    CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL
+                ) ?: -1)
+        )
+        // 公开 SDK 没有 REQUEST_MAX_NUM_OUTPUT_STREAMS（那是 native metadata 的
+        // ANDROID_REQUEST_MAX_NUM_OUTPUT_STREAMS 旧 tag）。Java 侧把「最大输出流数」
+        // 拆成 processed / processed-stalling / raw 三个 key，这里按 processed 两类求和
+        // 并在括号里附带 raw —— 纯诊断字段，不参与任何会话装配决策。
+        val maxProcStreams = logicalCharacteristics.get(
+            CameraCharacteristics.REQUEST_MAX_NUM_OUTPUT_PROC
+        ) ?: 0
+        val maxProcStallingStreams = logicalCharacteristics.get(
+            CameraCharacteristics.REQUEST_MAX_NUM_OUTPUT_PROC_STALLING
+        ) ?: 0
+        val maxRawStreams = logicalCharacteristics.get(
+            CameraCharacteristics.REQUEST_MAX_NUM_OUTPUT_RAW
+        ) ?: 0
+        sb.appendLine(
+            "logicalMaxOutputStreams=" +
+                (maxProcStreams + maxProcStallingStreams) +
+                " (raw=" + maxRawStreams + ")"
+        )
+        sb.appendLine(
+            "logicalMaxInputStreams=" +
+                (logicalCharacteristics.get(
+                    CameraCharacteristics.REQUEST_MAX_NUM_INPUT_STREAMS
+                ) ?: -1)
+        )
+        sb.appendLine(
+            "logicalTimestampSource=" +
+                (logicalCharacteristics.get(
+                    CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE
+                ) ?: -1)
+        )
+
+        for (id in logicalCharacteristics.physicalCameraIds.sorted()) {
+            val c = runCatching {
+                cameraManager.getCameraCharacteristics(id)
+            }.getOrNull()
+
+            if (c == null) {
+                sb.appendLine("physical[$id].readFailed=true")
+                continue
+            }
+
+            val map = c.get(
+                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
+            )
+            val yuv = runCatching {
+                map?.getOutputSizes(ImageFormat.YUV_420_888)
+                    ?.sortedWith(
+                        compareByDescending<Size> { it.width * it.height }
+                            .thenByDescending { it.width }
+                    )
+            }.getOrNull()
+
+            sb.appendLine("physical[$id].hardwareLevel=" +
+                (c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: -1))
+            sb.appendLine("physical[$id].focalLengthsMm=" +
+                (c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    ?.joinToString(",") ?: "n/a"))
+            sb.appendLine("physical[$id].apertures=" +
+                (c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)
+                    ?.joinToString(",") ?: "n/a"))
+            sb.appendLine("physical[$id].pixelArray=" +
+                (c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+                    ?.let { "${it.width}x${it.height}" } ?: "n/a"))
+            sb.appendLine("physical[$id].sensorSizeMm=" +
+                (c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                    ?.let { "${it.width}x${it.height}" } ?: "n/a"))
+            sb.appendLine("physical[$id].activeArray=" +
+                (c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    ?.let { "${it.width()}x${it.height()}" } ?: "n/a"))
+            sb.appendLine("physical[$id].preCorrectionArray=" +
+                (c.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+                    ?.let { "${it.width()}x${it.height()}" } ?: "n/a"))
+            sb.appendLine("physical[$id].intrinsic=" +
+                (c.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
+                    ?.joinToString(",") ?: "n/a"))
+            sb.appendLine("physical[$id].distortion=" +
+                (c.get(CameraCharacteristics.LENS_DISTORTION)
+                    ?.joinToString(",") ?: "n/a"))
+            sb.appendLine("physical[$id].distortionCorrectionModes=" +
+                (c.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)
+                    ?.joinToString(",") ?: "n/a"))
+            sb.appendLine("physical[$id].poseReference=" +
+                (c.get(CameraCharacteristics.LENS_POSE_REFERENCE) ?: -1))
+            sb.appendLine("physical[$id].poseRotation=" +
+                (c.get(CameraCharacteristics.LENS_POSE_ROTATION)
+                    ?.joinToString(",") ?: "n/a"))
+            sb.appendLine("physical[$id].poseTranslationM=" +
+                (c.get(CameraCharacteristics.LENS_POSE_TRANSLATION)
+                    ?.joinToString(",") ?: "n/a"))
+            sb.appendLine("physical[$id].timestampSource=" +
+                (c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ?: -1))
+            sb.appendLine("physical[$id].yuv420Sizes=" +
+                (yuv?.joinToString(",") { "${it.width}x${it.height}" } ?: "n/a"))
+            sb.appendLine(
+                "physical[$id].supportsAnalysisSize=" +
+                    (configuredSize?.let { wanted ->
+                        yuv?.any {
+                            it.width == wanted.width &&
+                                it.height == wanted.height
+                        } == true
+                    } ?: false)
+            )
+            val minDurationNs = configuredSize?.let { wanted ->
+                runCatching {
+                    map?.getOutputMinFrameDuration(
+                        ImageFormat.YUV_420_888,
+                        wanted
+                    )
+                }.getOrNull()
+            }
+            sb.appendLine(
+                "physical[$id].analysisMinFrameDurationNs=" +
+                    (minDurationNs ?: -1L)
+            )
+            sb.appendLine(
+                "physical[$id].analysisTheoreticalMaxFps=" +
+                    if (minDurationNs != null && minDurationNs > 0L) {
+                        1_000_000_000.0 / minDurationNs.toDouble()
+                    } else {
+                        -1.0
+                    }
+            )
+        }
+    }
+
+    private fun appendRuntimeDiagnostics(sb: StringBuilder) {
+        sb.appendLine()
+        sb.appendLine("[RUNTIME V0.9]")
+        sb.appendLine("sdk=${Build.VERSION.SDK_INT}")
+        sb.appendLine("manufacturer=${Build.MANUFACTURER}")
+        sb.appendLine("model=${Build.MODEL}")
+        sb.appendLine("device=${Build.DEVICE}")
+        sb.appendLine("hardware=${Build.HARDWARE}")
+        sb.appendLine("displayBuild=${Build.DISPLAY}")
+        sb.appendLine("fingerprint=${Build.FINGERPRINT}")
+        sb.appendLine("availableProcessors=${Runtime.getRuntime().availableProcessors()}")
+        val rt = Runtime.getRuntime()
+        sb.appendLine("javaHeapUsedMb=${(rt.totalMemory() - rt.freeMemory()) / 1048576f}")
+        sb.appendLine("javaHeapMaxMb=${rt.maxMemory() / 1048576f}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+            sb.appendLine("thermalStatus=${pm?.currentThermalStatus ?: -1}")
+        } else {
+            sb.appendLine("thermalStatus=-1")
         }
     }
 
@@ -935,6 +1438,7 @@ class MultiCameraFusionController(
         latestPrimary = null
         latestSecondary = null
         runCatching { NativeBridge.nativeMultiCamReset() }
+        runCatching { NativeBridge.nativeResetStereoAnchors() }
         fusionThread.quitSafely()
     }
 }
