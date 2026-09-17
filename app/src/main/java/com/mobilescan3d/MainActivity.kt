@@ -989,8 +989,40 @@ private var lastRelocPollMs = 0L
 
                         val mc = multiCam
                         if (mc != null && mc.active) {
-                            // Preview/JPEG/RAW stay logical. Only the two analysis
-                            // YUV outputs are explicitly associated with physical IDs.
+                            fun startDualWithoutHq() {
+                                val startedNoHq = mc.createPhysicalSession(
+                                    camera,
+                                    listOf(previewSurface!!),
+                                    object : CameraCaptureSession.StateCallback() {
+                                        override fun onConfigured(
+                                            session: CameraCaptureSession
+                                        ) {
+                                            mc.noteSessionMode("dual-physical-noHQ")
+                                            finishSession(session, false)
+                                        }
+
+                                        override fun onConfigureFailed(
+                                            session: CameraCaptureSession
+                                        ) {
+                                            runCatching { session.close() }
+                                            mc.fallbackToLogical(
+                                                "HAL rejected dual physical without HQ"
+                                            )
+                                            startLegacySessionWithHq()
+                                        }
+                                    }
+                                )
+                                if (!startedNoHq) {
+                                    mc.fallbackToLogical(
+                                        "dual physical no-HQ createCaptureSession failed"
+                                    )
+                                    startLegacySessionWithHq()
+                                }
+                            }
+
+                            // Tier 1: preserve V0.9 HQ path when HAL accepts all streams.
+                            // Tier 2: if stream-count/bandwidth is too high, keep BOTH
+                            // physical analysis streams and sacrifice HQ still surfaces.
                             val logicalSurfaces = listOf(previewSurface!!) + hqSurfaces
                             val dualStarted = mc.createPhysicalSession(
                                 camera,
@@ -999,6 +1031,7 @@ private var lastRelocPollMs = 0L
                                     override fun onConfigured(
                                         session: CameraCaptureSession
                                     ) {
+                                        mc.noteSessionMode("dual-physical+HQ")
                                         finishSession(session, true)
                                     }
 
@@ -1006,19 +1039,13 @@ private var lastRelocPollMs = 0L
                                         session: CameraCaptureSession
                                     ) {
                                         runCatching { session.close() }
-                                        mc.fallbackToLogical(
-                                            "HAL rejected physical + HQ outputs"
-                                        )
-                                        startLegacySessionWithHq()
+                                        startDualWithoutHq()
                                     }
                                 }
                             )
 
                             if (!dualStarted) {
-                                mc.fallbackToLogical(
-                                    "createCaptureSession failed"
-                                )
-                                startLegacySessionWithHq()
+                                startDualWithoutHq()
                             }
                         } else {
                             startLegacySessionWithHq()
@@ -1729,7 +1756,9 @@ private var lastRelocPollMs = 0L
         if (NativeBridge.nativeVinsInitialized()) sb.appendLine("PASS VINS") else warns.add("VINS not initialized")
         if (targetState == 4) warns.add("TARGET_LOST")
         if (targetTrackedPoints in 1..19) warns.add("TARGET_LOW_FEATURES")
-        if (previewRot != 0) warns.add("DISPLAY_ROTATION_NOT_APPLIED")
+        if (!cameraToViewReady) warns.add("DISPLAY_TRANSFORM_NOT_READY")
+        if (lastPlyVertexCount == 0) warns.add("PLY_EMPTY")
+        if (lastPlySessionId != null && lastPlySessionId != sessionId) warns.add("PLY_SESSION_MISMATCH")
         if (frameMetaMiss > frameMetaHit / 20L && frameMetaHit > 0) warns.add("CAMERA_METADATA_LOSS")
         if (::hqCapture.isInitialized && hqCapture.stats.lastCaptureRejectReason.isNotEmpty()) {
             warns.add("HQ_CAPTURE_REJECT")
@@ -2151,11 +2180,8 @@ private var lastRelocPollMs = 0L
         sessionStartTs = System.currentTimeMillis()
         val formatter = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
         sessionId = formatter.format(java.util.Date()) + "_" + (sessionStartTs % 100000L)
-        lastPlyFilename = null
-        lastPlyVertexCount = null
-        lastPlyFileBytes = null
-        lastPlyExportTs = null
-        lastPlySessionId = null
+        // V0.10: preserve previous PLY metadata. plySessionMatch tells us
+        // whether it belongs to this scan instead of replacing diagnostics with unknown.
         lastGlbFilename = null
         lastGlbTriangles = 0
         lastGlbBytes = 0L

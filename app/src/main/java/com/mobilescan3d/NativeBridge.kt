@@ -57,7 +57,7 @@ object NativeBridge {
 
     const val RENDER_POSE_SLOTS = 12
     /** V0.8 physical multi-camera diagnostic slots. */
-    const val MULTICAM_STATS_SLOTS = 24
+    const val MULTICAM_STATS_SLOTS = 32
     /** V0.9 stereo metric-anchor diagnostic protocol. */
     const val STEREO_ANCHOR_STRIDE = 6
     const val STEREO_ANCHOR_MAX = 96

@@ -52,7 +52,12 @@ struct DepthCalibration {
 
     /** 模型输出 d -> 米制深度。未标定或结果非正时返回 fallback。 */
     float toMetric(float d, float fallback) const {
-        if (!valid || !(scale > 0.f) || !std::isfinite(scale)) {
+        // V0.10 FIX: inverse-depth 1/z = a*d+b may have a negative slope.
+        // Gate the resulting value, not the sign of a.
+        if (!valid ||
+            !std::isfinite(scale) ||
+            !std::isfinite(shift) ||
+            !std::isfinite(d)) {
             return fallback;
         }
         const float v = scale * d + shift;

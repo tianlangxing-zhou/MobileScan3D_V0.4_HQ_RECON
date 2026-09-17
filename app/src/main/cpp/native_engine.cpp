@@ -117,6 +117,13 @@ static bool lastCalibValid = false;
 static bool lastCalibInverse = false;
 static uint64_t calibFrames = 0;
 static uint64_t calibRejectFrames = 0;
+// V0.10: exact depth field entering TSDF after calibration.
+static bool lastFusionDepthCalibrated = false;
+static float lastFusionDepthMin = 0.f;
+static float lastFusionDepthMax = 0.f;
+static float lastFusionDepthMean = 0.f;
+static uint64_t lastFusionDepthValid = 0;
+static uint64_t lastFusionDepthConversionFallback = 0;
 static constexpr int kMaxCalibSamples = 256;
 static float gCalibSampleBuf[kMaxCalibSamples * 3];
 
@@ -645,6 +652,12 @@ static void resetMeshPipeline() {
     lastCalibInverse = false;
     calibFrames = 0;
     calibRejectFrames = 0;
+    lastFusionDepthCalibrated = false;
+    lastFusionDepthMin = 0.f;
+    lastFusionDepthMax = 0.f;
+    lastFusionDepthMean = 0.f;
+    lastFusionDepthValid = 0;
+    lastFusionDepthConversionFallback = 0;
     lastFusedDepth.clear();
     haveLastFusePose = false;
     lastFuseCalibrated = false;
@@ -1661,7 +1674,40 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         depthForFusion = zCal.data();
     }
 
+    // V0.10: measure the exact depth field about to enter TSDF.
+    float fusionDepthMinFrame = 1e30f;
+    float fusionDepthMaxFrame = 0.f;
+    double fusionDepthSumFrame = 0.0;
+    uint64_t fusionDepthValidFrame = 0;
+    uint64_t fusionDepthFallbackFrame = 0;
+    const size_t fusionCount = static_cast<size_t>(w) * h;
+    for (size_t i = 0; i < fusionCount; ++i) {
+        const float zf = depthForFusion[i];
+        if (zf > 0.f && std::isfinite(zf)) {
+            fusionDepthMinFrame = std::min(fusionDepthMinFrame, zf);
+            fusionDepthMaxFrame = std::max(fusionDepthMaxFrame, zf);
+            fusionDepthSumFrame += static_cast<double>(zf);
+            fusionDepthValidFrame++;
+        } else if (calibratedNow && std::isfinite(d[i])) {
+            fusionDepthFallbackFrame++;
+        }
+    }
+    if (fusionDepthValidFrame == 0) {
+        fusionDepthMinFrame = 0.f;
+    }
+
     std::lock_guard<std::mutex> lk(gStateMutex);
+    lastFusionDepthCalibrated = calibratedNow && fusionDepthValidFrame > 0;
+    lastFusionDepthMin = fusionDepthMinFrame;
+    lastFusionDepthMax = fusionDepthMaxFrame;
+    lastFusionDepthMean =
+        fusionDepthValidFrame > 0
+            ? static_cast<float>(
+                fusionDepthSumFrame /
+                static_cast<double>(fusionDepthValidFrame))
+            : 0.f;
+    lastFusionDepthValid = fusionDepthValidFrame;
+    lastFusionDepthConversionFallback = fusionDepthFallbackFrame;
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
     haveExternalDepth = true;
     depthFrames++;
@@ -2529,6 +2575,12 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " samples=" << lastCalibSamples
       << " accepted=" << calibFrames
       << " rejected=" << calibRejectFrames << "\n"
+      << "DepthFusionApplied: calibrated=" << (lastFusionDepthCalibrated ? 1 : 0)
+      << " min=" << lastFusionDepthMin
+      << " max=" << lastFusionDepthMax
+      << " mean=" << lastFusionDepthMean
+      << " valid=" << lastFusionDepthValid
+      << " conversionFallback=" << lastFusionDepthConversionFallback << "\n"
       << "Temporal: ratio=" << lastTemporalRatio
       << " checks=" << temporalChecks
       << " rejects=" << temporalRejects << "\n"

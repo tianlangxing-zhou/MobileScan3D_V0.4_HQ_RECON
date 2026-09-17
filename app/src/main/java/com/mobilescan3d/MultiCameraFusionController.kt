@@ -31,7 +31,7 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
- * V0.8 physical multi-camera helper.
+ * V0.10 OnePlus physical multi-camera helper with empirical relative-pose calibration.
  *
  * The existing primary-camera VIO/depth/TSDF path remains unchanged. This helper
  * explicitly binds two YUV outputs to two physical cameras of one logical camera,
@@ -51,7 +51,7 @@ class MultiCameraFusionController(
     private val onHint: (String) -> Unit
 ) {
     companion object {
-        private const val TAG = "MultiCamV08"
+        private const val TAG = "MultiCamV10"
         private const val PAIR_PERIOD_NS = 160_000_000L
         private const val TELE_TEXTURE_PERIOD_NS = 1_100_000_000L
         private const val MAX_TELE_TEXTURE_KEYFRAMES = 24
@@ -74,6 +74,13 @@ class MultiCameraFusionController(
     private data class GrayFrame(
         val timestampNs: Long,
         val gray: ByteArray
+    )
+
+    private data class GeometryCandidate(
+        val model: CameraModel,
+        val baselineMeters: Float,
+        val overlap: Float,
+        val score: Float
     )
 
     private data class PhysicalCaptureStats(
@@ -121,8 +128,18 @@ class MultiCameraFusionController(
     private var baselineMeters = 0f
     private var focalRatio = 1f
 
+    /**
+     * PLK110 feedback showed vendor pose rotations that cannot be trusted blindly
+     * for triangulation. Factory translation is used only as baseline magnitude.
+     */
+    private var factoryGeometryTrusted = false
+    private var pairSelectionReason = "not selected"
+
     @Volatile
     private var status = "not configured"
+
+    @Volatile
+    private var sessionMode = "not-created"
 
     private val physicalResultLock = Any()
     private val physicalCaptureStats = LinkedHashMap<String, PhysicalCaptureStats>()
@@ -219,9 +236,8 @@ class MultiCameraFusionController(
             return false
         }
 
-        // Prefer Camera2's PRIMARY_CAMERA origin (usually translation ~= 0) as VIO/main.
-        // If the OEM uses a shared gyroscope reference, fall back to the physical lens
-        // whose horizontal FOV is closest to OnePlus 15's official ~84° main camera.
+        // Prefer the factory PRIMARY_CAMERA origin as the VIO/main stream.
+        // The PLK110 feedback identified physical 2 this way.
         val primary = models
             .filter {
                 it.poseReference == CameraCharacteristics.LENS_POSE_REFERENCE_PRIMARY_CAMERA &&
@@ -230,18 +246,62 @@ class MultiCameraFusionController(
             .minByOrNull { vectorNorm(it.poseTranslation!!) }
             ?: models
                 .filter { it.horizontalFovDeg > 1f }
-                .minByOrNull { abs(it.horizontalFovDeg - 84f) }
+                .minByOrNull { abs(it.horizontalFovDeg - 72f) }
             ?: return false
 
-        // OnePlus 15's useful second lens is the longest focal-length periscope tele.
-        val secondary = models
+        // V0.10 pair selection is geometry-first, not focal-length-first.
+        // Useful stereo needs a plausible physical baseline AND overlap.
+        val geometryCandidates = models
             .filter { it.id != primary.id }
-            .maxByOrNull { it.focalMm }
-            ?: return false
+            .mapNotNull { candidate ->
+                val b = factoryBaselineMeters(primary, candidate)
+                    ?: return@mapNotNull null
+                if (b < 0.004f || b > 0.080f) {
+                    return@mapNotNull null
+                }
+                val a = primary.horizontalFovDeg
+                val c = candidate.horizontalFovDeg
+                val overlap =
+                    if (a > 1f && c > 1f) {
+                        (minOf(a, c) / maxOf(a, c)).coerceIn(0.05f, 1f)
+                    } else {
+                        0.35f
+                    }
+                val coverageBoost =
+                    if (c >= a * 0.95f) 1.25f else 1.0f
+                val score = (b * 1000f) * overlap * coverageBoost
+                GeometryCandidate(candidate, b, overlap, score)
+            }
 
+        val chosen = geometryCandidates.maxByOrNull { it.score }
+        if (chosen == null) {
+            status = "no physical pair has plausible 4-80mm factory baseline"
+            return false
+        }
+
+        val secondary = chosen.model
         primaryModel = primary
         secondaryModel = secondary
         configuredSize = size
+        baselineMeters = chosen.baselineMeters
+        focalRatio =
+            if (primary.k[0] > 1e-3f) secondary.k[0] / primary.k[0] else 1f
+        pairSelectionReason = buildString {
+            append("geometry-score picked ")
+            append(primary.id).append("->").append(secondary.id)
+            append(" baselineMm=").append("%.2f".format(baselineMeters * 1000f))
+            append(" overlap=").append("%.3f".format(chosen.overlap))
+            append(" score=").append("%.3f".format(chosen.score))
+            if (geometryCandidates.isNotEmpty()) {
+                append(" candidates=")
+                append(
+                    geometryCandidates.joinToString(";") {
+                        "${it.model.id}:${"%.2f".format(it.baselineMeters * 1000f)}mm/" +
+                            "${"%.2f".format(it.overlap)}/${"%.2f".format(it.score)}"
+                    }
+                )
+            }
+        }
 
         syncType = logicalCharacteristics.get(
             CameraCharacteristics.LOGICAL_MULTI_CAMERA_SENSOR_SYNC_TYPE
@@ -254,36 +314,30 @@ class MultiCameraFusionController(
             APPROX_PAIR_TOLERANCE_NS
         }
 
-        val extrinsics = computePrimaryFromSecondary(primary, secondary)
-        relativeRPrimaryFromSecondary = extrinsics?.first
-        relativeTPrimaryFromSecondary = extrinsics?.second
-        baselineMeters = extrinsics?.third ?: 0f
-        focalRatio = if (primary.k[0] > 1e-3f) secondary.k[0] / primary.k[0] else 1f
-
+        // Do NOT use vendor LENS_POSE_ROTATION directly for geometry on PLK110.
+        // Native V0.10 recovers relative R and translation direction from actual
+        // synchronized images. Camera2 translation supplies baseline norm only.
+        relativeRPrimaryFromSecondary = null
+        relativeTPrimaryFromSecondary = null
+        factoryGeometryTrusted = false
         geometryReady = false
-        if (extrinsics != null && baselineMeters >= 0.003f) {
-            geometryReady = runCatching {
-                NativeBridge.nativeMultiCamConfigure(
-                    primary.k,
-                    secondary.k,
-                    primary.poseRotation!!,
-                    primary.poseTranslation!!,
-                    secondary.poseRotation!!,
-                    secondary.poseTranslation!!,
-                    size.width,
-                    size.height,
-                    calibratedSync
-                )
-            }.getOrDefault(false)
-        } else {
-            runCatching { NativeBridge.nativeMultiCamReset() }
-        }
 
-        // No trustworthy factory geometry means the second stream cannot safely
-        // contribute either stereo anchors or a transformed tele texture pose.
-        // In that case preserve the original logical-camera pipeline.
-        if (!geometryReady) {
-            status = "physical factory calibration is unavailable/inconsistent"
+        val nativeConfigured = runCatching {
+            NativeBridge.nativeMultiCamConfigure(
+                primary.k,
+                secondary.k,
+                primary.poseRotation ?: floatArrayOf(0f, 0f, 0f, 1f),
+                primary.poseTranslation ?: floatArrayOf(0f, 0f, 0f),
+                secondary.poseRotation ?: floatArrayOf(0f, 0f, 0f, 1f),
+                secondary.poseTranslation ?: floatArrayOf(0f, 0f, 0f),
+                size.width,
+                size.height,
+                calibratedSync
+            )
+        }.getOrDefault(false)
+
+        if (!nativeConfigured) {
+            status = "empirical multi-camera bootstrap rejected baseline/intrinsics"
             return false
         }
 
@@ -327,14 +381,18 @@ class MultiCameraFusionController(
 
         active = true
         status = buildString {
-            append("dual physical YUV ready ")
+            append("dual physical YUV self-calibration ready ")
             append(primary.id).append(" -> ").append(secondary.id)
-            append(", baseline=").append("%.1f".format(baselineMeters * 1000f)).append("mm")
+            append(", baselineSeed=").append("%.1f".format(baselineMeters * 1000f)).append("mm")
             append(", sync=").append(if (calibratedSync) "CALIBRATED" else "APPROXIMATE")
-            if (!geometryReady) append(", geometry metadata incomplete")
+            append(", waiting empirical R/t")
         }
-        onHint("多镜头已启用：主摄 ${primary.id} + 长焦 ${secondary.id}")
+        onHint("V0.10 多镜头自标定：physical ${primary.id} + ${secondary.id}")
         return true
+    }
+
+    fun noteSessionMode(mode: String) {
+        sessionMode = mode
     }
 
     /**
@@ -401,6 +459,7 @@ class MultiCameraFusionController(
         secondaryReader = null
         runCatching { NativeBridge.nativeMultiCamReset() }
         runCatching { NativeBridge.nativeResetStereoAnchors() }
+        sessionMode = "logical-fallback"
         status = "fallback to logical camera: $reason"
         Log.w(TAG, status)
         onHint("多镜头会话不被 HAL 接受，已自动回退单摄")
@@ -512,9 +571,12 @@ class MultiCameraFusionController(
             runCatching { NativeBridge.nativeResetStereoAnchors() }
         }
         scanEnabled = enabled && active
+        // V0.10 geometry pair on PLK110 is expected to be main+ultrawide.
+        // Do not turn an empirical stereo pose into a texture-camera world pose.
         teleTextureGate =
             scanEnabled &&
                 allowTeleTexture &&
+                factoryGeometryTrusted &&
                 geometryReady &&
                 teleTextureRegistered < MAX_TELE_TEXTURE_KEYFRAMES
     }
@@ -553,11 +615,14 @@ class MultiCameraFusionController(
     }
 
     fun report(sb: StringBuilder) {
-        sb.appendLine("[MULTICAM V0.9]")
+        sb.appendLine("[MULTICAM V0.10]")
         sb.appendLine("logicalCameraId=$logicalCameraId")
         sb.appendLine("active=$active")
         sb.appendLine("geometryReady=$geometryReady")
         sb.appendLine("status=$status")
+        sb.appendLine("sessionMode=$sessionMode")
+        sb.appendLine("pairSelectionReason=$pairSelectionReason")
+        sb.appendLine("factoryGeometryTrusted=$factoryGeometryTrusted")
         sb.appendLine("allPhysicalIds=${logicalCharacteristics.physicalCameraIds.joinToString(",")}")
         sb.appendLine("primaryPhysicalId=${primaryModel?.id ?: "n/a"}")
         sb.appendLine("secondaryPhysicalId=${secondaryModel?.id ?: "n/a"}")
@@ -623,6 +688,16 @@ class MultiCameraFusionController(
             sb.appendLine("anchorsExportedTotal=${stats[21].toLong()}")
             sb.appendLine("anchorsRejectedQuality=${stats[22].toLong()}")
             sb.appendLine("lastPairAnchorSufficient=${stats[23] > 0.5f}")
+            if (stats.size >= 32) {
+                sb.appendLine("empiricalGeometryReady=${stats[24] > 0.5f}")
+                sb.appendLine("empiricalAttempts=${stats[25].toLong()}")
+                sb.appendLine("empiricalAccepted=${stats[26].toLong()}")
+                sb.appendLine("empiricalGoodStreak=${stats[27].toInt()}")
+                sb.appendLine("empiricalBadStreak=${stats[28].toInt()}")
+                sb.appendLine("lastEmpiricalInliers=${stats[29].toInt()}")
+                sb.appendLine("lastEmpiricalRotationDeltaDeg=${stats[30]}")
+                sb.appendLine("lastEmpiricalTranslationDot=${stats[31]}")
+            }
         }
 
         val stereoStats = FloatArray(NativeBridge.STEREO_ANCHOR_STATS_SLOTS)
@@ -631,7 +706,7 @@ class MultiCameraFusionController(
         }.getOrDefault(0)
         if (stereoCount >= 41) {
             sb.appendLine()
-            sb.appendLine("[STEREO METRIC ANCHORS V0.9]")
+            sb.appendLine("[STEREO METRIC ANCHORS V0.10]")
             sb.appendLine("submittedBatches=${stereoStats[0].toLong()}")
             sb.appendLine("submittedAnchors=${stereoStats[1].toLong()}")
             sb.appendLine("inputRejected=${stereoStats[2].toLong()}")
@@ -687,20 +762,21 @@ class MultiCameraFusionController(
 
             val diagnosis = when {
                 !active -> "DISABLED_OR_FALLBACK"
+                !geometryReady -> "EMPIRICAL_GEOMETRY_WARMUP_OR_REJECTED"
                 stereoStats[1] < 1f -> "NO_STEREO_ANCHORS_SUBMITTED"
                 stereoStats[5] < 1f -> "STEREO_DEPTH_TIMESTAMP_NOT_MATCHED"
                 stereoStats[14] < 0.5f -> "STEREO_TO_VINS_SCALE_WARMUP_OR_REJECTED"
                 stereoStats[33] < 1f -> "SCALE_OK_BUT_NO_SCENE_TSDF_ANCHOR_ACCEPTED"
                 else -> "STEREO_METRIC_TSDF_ACTIVE"
             }
-            sb.appendLine("v09Diagnosis=$diagnosis")
+            sb.appendLine("v10Diagnosis=$diagnosis")
         }
         appendRuntimeDiagnostics(sb)
         sb.appendLine()
     }
 
     private fun maybeQueuePrimaryPair(image: Image) {
-        if (!active || !geometryReady) return
+        if (!active) return
         val ts = image.timestamp
         if (lastPrimarySampleNs != 0L && ts - lastPrimarySampleNs < PAIR_PERIOD_NS) return
         lastPrimarySampleNs = ts
@@ -709,7 +785,7 @@ class MultiCameraFusionController(
     }
 
     private fun maybeQueueSecondaryPair(image: Image) {
-        if (!active || !geometryReady) return
+        if (!active) return
         val ts = image.timestamp
         if (lastSecondarySampleNs != 0L && ts - lastSecondarySampleNs < PAIR_PERIOD_NS) return
         lastSecondarySampleNs = ts
@@ -738,10 +814,19 @@ class MultiCameraFusionController(
                         s.timestampNs
                     )
 
-                    // V0.9: only submit geometry while an actual scan is active.
+                    // Native empirical calibration owns geometryReady and needs
+                    // multiple consistent synchronized pairs before anchors flow.
+                    val mcStats = FloatArray(NativeBridge.MULTICAM_STATS_SLOTS)
+                    if (NativeBridge.nativeGetMultiCamStats(mcStats) &&
+                        mcStats.size > 24
+                    ) {
+                        geometryReady = mcStats[24] > 0.5f
+                    }
+
+                    // V0.10: submit only after empirical geometry is stable.
                     // The anchor timestamp is the PRIMARY physical camera timestamp,
                     // which is also the timestamp used by processImage()/DepthProvider.
-                    if (goodPair && scanEnabled) {
+                    if (goodPair && geometryReady && scanEnabled) {
                         val count = NativeBridge.nativeMultiCamGetAnchors(
                             stereoAnchorBuffer
                         ).coerceIn(0, MAX_STEREO_ANCHORS)
@@ -779,7 +864,7 @@ class MultiCameraFusionController(
     }
 
     private fun maybeQueueTeleTexture(image: Image) {
-        if (!active || !geometryReady || !scanEnabled || !teleTextureGate) return
+        if (!active || !factoryGeometryTrusted || !geometryReady || !scanEnabled || !teleTextureGate) return
         if (teleTextureRegistered >= MAX_TELE_TEXTURE_KEYFRAMES) return
 
         val ts = image.timestamp
@@ -892,7 +977,7 @@ class MultiCameraFusionController(
 
     private fun appendPhysicalCaptureResults(sb: StringBuilder) {
         sb.appendLine()
-        sb.appendLine("[PHYSICAL CAPTURE RESULT V0.9]")
+        sb.appendLine("[PHYSICAL CAPTURE RESULT V0.10]")
         sb.appendLine("physicalResultCallbacks=$physicalResultCallbacks")
         sb.appendLine("physicalResultEntries=$physicalResultEntries")
 
@@ -971,17 +1056,18 @@ class MultiCameraFusionController(
 
     private fun appendPhysicalCameraInventory(sb: StringBuilder) {
         sb.appendLine()
-        sb.appendLine("[PHYSICAL CAMERA INVENTORY V0.9]")
+        sb.appendLine("[PHYSICAL CAMERA INVENTORY V0.10]")
         sb.appendLine(
             "logicalHardwareLevel=" +
                 (logicalCharacteristics.get(
                     CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL
                 ) ?: -1)
         )
-        // 公开 SDK 没有 REQUEST_MAX_NUM_OUTPUT_STREAMS（那是 native metadata 的
-        // ANDROID_REQUEST_MAX_NUM_OUTPUT_STREAMS 旧 tag）。Java 侧把「最大输出流数」
-        // 拆成 processed / processed-stalling / raw 三个 key，这里按 processed 两类求和
-        // 并在括号里附带 raw —— 纯诊断字段，不参与任何会话装配决策。
+        // 公开 SDK 没有 REQUEST_MAX_NUM_OUTPUT_STREAMS（那是 native metadata 的旧 tag
+        // ANDROID_REQUEST_MAX_NUM_OUTPUT_STREAMS）。V0.9 已修过一次，V0.10 overlay 是从
+        // V0.9 原版改的、把这处修复丢了，这里按同样的方式再修一次：Java 侧把「最大输出流数」
+        // 拆成 processed / processed-stalling / raw 三个 key，按 processed 两类求和并附带 raw。
+        // 纯诊断字段，不参与任何会话装配决策。
         val maxProcStreams = logicalCharacteristics.get(
             CameraCharacteristics.REQUEST_MAX_NUM_OUTPUT_PROC
         ) ?: 0
@@ -1105,7 +1191,7 @@ class MultiCameraFusionController(
 
     private fun appendRuntimeDiagnostics(sb: StringBuilder) {
         sb.appendLine()
-        sb.appendLine("[RUNTIME V0.9]")
+        sb.appendLine("[RUNTIME V0.10]")
         sb.appendLine("sdk=${Build.VERSION.SDK_INT}")
         sb.appendLine("manufacturer=${Build.MANUFACTURER}")
         sb.appendLine("model=${Build.MODEL}")
@@ -1295,6 +1381,28 @@ class MultiCameraFusionController(
             poseTranslation = c.get(CameraCharacteristics.LENS_POSE_TRANSLATION)?.copyOf(),
             poseReference = c.get(CameraCharacteristics.LENS_POSE_REFERENCE)
                 ?: CameraCharacteristics.LENS_POSE_REFERENCE_UNDEFINED
+        )
+    }
+
+    private fun factoryBaselineMeters(
+        a: CameraModel,
+        b: CameraModel
+    ): Float? {
+        if (a.poseReference == CameraCharacteristics.LENS_POSE_REFERENCE_UNDEFINED ||
+            b.poseReference == CameraCharacteristics.LENS_POSE_REFERENCE_UNDEFINED ||
+            a.poseReference != b.poseReference
+        ) {
+            return null
+        }
+        val ca = a.poseTranslation ?: return null
+        val cb = b.poseTranslation ?: return null
+        if (ca.size < 3 || cb.size < 3) return null
+        return vectorNorm(
+            floatArrayOf(
+                cb[0] - ca[0],
+                cb[1] - ca[1],
+                cb[2] - ca[2]
+            )
         )
     }
 
