@@ -47,6 +47,21 @@ struct TargetMaskStats {
     int searchPixels = 0;
     /** seed 周围是否取到了有效深度（false = 这一帧无法建 mask） */
     bool seedValid = false;
+    // ---- V0.13 Adaptive Target Mask 诊断 ----
+    // 上两层门（面积下限）只能挡「太小」，挡不住「太大」。实测会出现
+    // mask 占 searchBox 69% 的情况：桌面 + 瓶子 + 显示器背景的 raw depth
+    // 几乎连续，±8% 的带通把整片背景连成了一个连通域，而 seed 又刚好落
+    // 在里面 —— 于是 mask 忠实地圈住了「一整片背景」，目标 TSDF 里自然
+    // 全是背景几何。下面三个量就是用来把这种失败**量化**出来的。
+    //   areaRatio     —— mask 面积 / searchBox 面积（>0.45 视为吞掉整个搜索框）
+    //   borderTouch   —— mask 像素中贴在搜索框边界带上的比例
+    //                    （高 = 连通域被框边界截断，本来会延伸得更远）
+    //   toleranceStep —— 多档收紧里实际采用的那一档（0 = 最松）
+    //   overExpanded  —— 收到最紧仍超出面积/边界门，供上层做时序门控与融合拦截
+    float areaRatio = 0.f;
+    float borderTouch = 0.f;
+    int toleranceStep = 0;
+    bool overExpanded = false;
     /** 拒绝原因，直接进报告 */
     const char* rejectReason = "";
 };
@@ -69,6 +84,18 @@ public:
 
     /** mask 面积下限：低于这个值不足以说明找到了目标（可能只是几个噪点）。 */
     static constexpr int kMinMaskArea = 100;
+    /**
+     * V0.13 Adaptive Mask：mask 面积 / searchBox 面积的上限。
+     * 超过它就说明连通域已经吞掉了整个搜索框 —— 那多半是**背景**连成一片，
+     * 而不是目标真的填满了框。此时收紧深度容差再试。
+     */
+    static constexpr float kMaxAreaRatio = 0.45f;
+    /**
+     * V0.13 Adaptive Mask：mask 像素落在搜索框边界带上的比例上限。
+     * 目标在框中央时这个值应该很低；一旦很高，说明连通域被框边截断了
+     * （本来还会继续延伸）—— 典型就是桌面 / 墙面连成一片。
+     */
+    static constexpr float kMaxBorderTouch = 0.35f;
 
 private:
     /** seed 周围 (2*radius+1)^2 窗口内的深度中位数；没有有效值时返回 0 */

@@ -58,8 +58,8 @@ android {
         applicationId = "com.mobilescan3d"
         minSdk = 26
         targetSdk = 36
-        versionCode = 120
-        versionName = "0.12.0-live-ar-fusion-epoch"
+        versionCode = 130
+        versionName = "0.13.0-target-identity-sticky-fusion"
         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
         ndk { abiFilters += listOf("arm64-v8a") }

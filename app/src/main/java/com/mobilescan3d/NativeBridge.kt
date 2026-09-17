@@ -31,7 +31,7 @@ object NativeBridge {
      * 真实目标离开后，tracker 常常在背景纹理上继续输出一个「看起来正常」的框，
      * 所以绿框的可见性必须由 presenceValid 决定，而不是 bbox 的几何位置。
      */
-    const val TARGET_STATE_SLOTS = 16
+    const val TARGET_STATE_SLOTS = 20
     /** [nativeGetTargetState] 输出的下标，避免调用方再手写数字。 */
     const val TARGET_STATE_INDEX_STATE = 0
     const val TARGET_STATE_INDEX_VISIBLE_FRACTION = 10
@@ -42,6 +42,27 @@ object NativeBridge {
     const val TARGET_STATE_INDEX_PRESENCE_VALID = 14
     /** 外观后端是否可用（0/1，仅诊断） */
     const val TARGET_STATE_INDEX_APPEARANCE_OK = 15
+
+    // ---- V0.13 Immutable Target Identity ----
+    // 这四项的存在理由：V0.12 的故障形态里，Nano 报了 0.944、KLT 报了
+    // inlierRatio=1.0 / 83 点，**所有旧字段都显示「跟踪得非常健康」**，
+    // 而实际上两个 tracker 已经一起漂到同一块背景纹理上了 —— 它们被设计成
+    // 互相确认（Nano 框会重新播种 KLT，并把 inlierRatio 写回 1.0），
+    // 所以「它们彼此一致」根本不构成任何证据。唯一独立的判据是
+    // 「候选框还像不像最初框住的那个东西」，也就是下面这个分。
+    /**
+     * 候选框与初始外观锚点的归一化互相关（NCC）。
+     * **-1 表示无法判定**（锚点不可用 / 目标大半出界），与「分数低」是两回事。
+     * 与 nanoScore 一起看才有意义：`nanoScore 高 + identityScore 低`
+     * 就是「跟错目标」的直接读数。
+     */
+    const val TARGET_STATE_INDEX_IDENTITY_SCORE = 16
+    /** 因身份不通过而拒绝采纳 Nano 的累计次数。 */
+    const val TARGET_STATE_INDEX_IDENTITY_REJECTS = 17
+    /** 当前候选框相对初始框的膨胀倍数（长宽取大者）。>2.0 会被 BBox guard 拦下。 */
+    const val TARGET_STATE_INDEX_BBOX_SCALE = 18
+    /** 身份锚点是否可用（0/1）。框太小或太糊时为 0，此时身份门自动退出。 */
+    const val TARGET_STATE_INDEX_IDENTITY_ANCHOR_READY = 19
 
     /**
      * 与 C++ `TargetState` 枚举逐项对应（顺序即数值）。
@@ -145,7 +166,7 @@ object NativeBridge {
      * （那会表现为 mesh 双层/撕裂）。`currentUsable` 才是「现在这一刻的
      * 在线标定还可用吗」，它只用于漂移监控，不参与融合。
      */
-    const val FUSION_EPOCH_STATS_SLOTS = 16
+    const val FUSION_EPOCH_STATS_SLOTS = 20
     const val FUSION_EPOCH_INDEX_ACTIVE = 0
     const val FUSION_EPOCH_INDEX_SERIAL = 1
     const val FUSION_EPOCH_INDEX_GOOD_STREAK = 2
@@ -162,6 +183,22 @@ object NativeBridge {
     const val FUSION_EPOCH_INDEX_INVERSE = 13
     const val FUSION_EPOCH_INDEX_CURRENT_USABLE = 14
     const val FUSION_EPOCH_INDEX_START_FRAMES = 15
+    // ---- V0.13 Sticky Fusion Epoch ----
+    // V0.12 实测 12 opens / 11 rebuilds：每 ~2.5s 清一次几何，屏幕上永远只剩
+    // 一块残片。根因是在线标定在 linear / inverse 之间来回跳（估计器的形式
+    // 差异），而旧判据把它当成了「现实尺度变了 11 次」。
+    // V0.13 起：冻结后不一致**只暂停新融合**，几何保持不动。
+    /** 1 = 当前 epoch 已被暂停（新融合停止、已建模型保留）。 */
+    const val FUSION_EPOCH_INDEX_SUSPENDED = 16
+    /** 累计进入/退出暂停的次数（每进入一次 +1）。 */
+    const val FUSION_EPOCH_INDEX_SUSPEND_EVENTS = 17
+    /** 因暂停而被门控掉的融合帧数。 */
+    const val FUSION_EPOCH_INDEX_SUSPENDED_FRAMES = 18
+    /**
+     * 只有「映射相对差 > 75% 且持续 30 帧」才计入的极端重建次数。
+     * 这个值**长期为 0 才是健康的** —— 它涨一次就意味着真的不得已清过几何。
+     */
+    const val FUSION_EPOCH_INDEX_CATASTROPHIC_REBUILDS = 19
     const val CALIB_INDEX_SCALE = 0
     const val CALIB_INDEX_SHIFT = 1
     const val CALIB_INDEX_CONFIDENCE = 2

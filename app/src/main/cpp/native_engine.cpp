@@ -149,10 +149,28 @@ static float gCalibSampleBuf[kMaxCalibSamples * 3];
 //     双层撕裂」的来源。
 //   * 标定**短暂**失效不再立即停融合：epoch 生效期间继续用冻结参数融合，
 //     连续 kEpochCalibLossFrames 帧都拿不到可用标定才重建。
-static constexpr int kEpochStableFrames = 5;
+// ---- V0.13 Sticky Fusion Epoch ----
+// V0.12 实测：12 opens / 11 rebuilds，等于每 ~2.5s 把几何清一次，屏幕上
+// 自然永远只剩一块残片。根因是**在线标定在 linear / inverse 两种候选之间
+// 来回跳**（linear scale=0.105 vs frozen inverse scale=-1.714），而 epoch
+// 判据 `|liveCal.toMetric(ref) - epochCal.toMetric(ref)| / zFrozen` 把这个
+// **估计器形式差异**误读成了「现实尺度变了 11 次」。
+//
+// V0.13 的处理：选定 mapping 后**冻结到底**；在线标定降级为纯诊断。
+//   * 不一致时只**暂停新融合**，绝不清空已建模型；
+//   * 只有映射差到荒谬程度且持续很久（真极端失效）才允许重建 epoch。
+static constexpr int kEpochStableFrames = 8;
 static constexpr int kEpochDriftBadFrames = 2;
 static constexpr int kEpochCalibLossFrames = 5;
 static constexpr float kEpochRebuildRatio = 0.08f;
+/** V0.13：连续多少帧漂移超标 -> 暂停新融合（几何保持不动）。 */
+static constexpr int kEpochDriftSuspendFrames = 3;
+/** V0.13：漂移连续恢复正常多少帧 -> 解除暂停。 */
+static constexpr int kEpochResumeFrames = 6;
+/** V0.13：极端失效判据 1（映射相对差）。只有它才允许重建 epoch。 */
+static constexpr float kEpochCatastrophicRatio = 0.75f;
+/** V0.13：极端失效判据 2（必须持续这么多帧才算真的塌了，不是抖动）。 */
+static constexpr int kEpochCatastrophicFrames = 30;
 static bool epochActive = false;
 static DepthCalibration epochCalib{};
 static float epochRefRaw = 0.f;
@@ -175,6 +193,14 @@ static uint64_t epochOpens = 0;
 static uint64_t epochRebuilds = 0;
 static uint64_t fusionFusedFrames = 0;
 static uint64_t fusionGatedFrames = 0;
+// V0.13 Sticky 状态：冻结之后「暂停融合 / 恢复融合」而不是清几何。
+static bool epochSuspended = false;
+static int epochSuspendStreak = 0;
+static int epochResumeStreak = 0;
+static int epochCatastrophicStreak = 0;
+static uint64_t epochSuspendEvents = 0;
+static uint64_t epochCatastrophicRebuilds = 0;
+static uint64_t fusionSuspendedFrames = 0;
 
 static void resetFusionEpoch() {
     epochActive = false;
@@ -192,6 +218,13 @@ static void resetFusionEpoch() {
     epochRebuilds = 0;
     fusionFusedFrames = 0;
     fusionGatedFrames = 0;
+    epochSuspended = false;
+    epochSuspendStreak = 0;
+    epochResumeStreak = 0;
+    epochCatastrophicStreak = 0;
+    epochSuspendEvents = 0;
+    epochCatastrophicRebuilds = 0;
+    fusionSuspendedFrames = 0;
 }
 
 /**
@@ -231,6 +264,28 @@ static uint64_t temporalChecks = 0;
 static uint64_t temporalRejects = 0;
 static cv::Mat targetMaskMat;        // 与 depth 同尺寸的 CV_8U，目标内 255
 static TargetMaskStats targetMaskStats;
+
+// ---- V0.13 Mask temporal gate ----
+// Adaptive Mask 只管住了「一帧之内的面积 / 边界」，两帧之间还可能整块跳变
+// （目标被遮挡、mask 从瓶子跳到桌面）。这种帧进 TSDF 会在体素场里留下一个
+// 位置错误的面，所以宁可这一帧不融合。
+static constexpr float kMaskTemporalMinIou = 0.30f;
+static constexpr float kMaskAreaJumpRatio = 0.60f;
+static constexpr float kMaskCenterJumpFrac = 0.15f;
+static cv::Mat prevTargetMask;
+static int prevTargetMaskArea = 0;
+static float prevTargetMaskCx = 0.f;
+static float prevTargetMaskCy = 0.f;
+static float maskTemporalIou = 0.f;
+static uint64_t maskTemporalRejects = 0;
+static bool maskTemporalOk = true;
+
+// ---- V0.13 Strict target-only LIVE ----
+// 一旦本会话**锁定过目标**，累计层就只允许读目标模型。旧行为是
+// `(targetG.count() > 0) ? targetG : g`，于是「目标点云还是 0」时屏幕
+// 上会静默出现**全场景点云** —— 用户以为自己看到的实时目标几何，
+// 其实是墙和桌子。锁定过就必须诚实：0 就是 0。
+static bool targetLockEverArmed = false;
 // PresenceGate 连续失败帧数（只在 gStateMutex 下访问）
 static int presenceFailStreak = 0;
 // 目标专属深度尺度：scaleTarget = vinsRoiMedian / rawDepthMedian，EMA 平滑。
@@ -808,6 +863,14 @@ static void resetTargetModel() {
     targetTsdf.reset();
     targetMaskMat.release();
     targetMaskStats = TargetMaskStats{};
+    // V0.13：换目标/新会话时 mask 时序历史必须一起作废，否则第一帧就会
+    // 拿新目标的 mask 去和上一个目标的 mask 求 IoU，白白触发一次时序拒绝。
+    prevTargetMask.release();
+    prevTargetMaskArea = 0;
+    prevTargetMaskCx = 0.f;
+    prevTargetMaskCy = 0.f;
+    maskTemporalIou = 0.f;
+    maskTemporalOk = true;
     presenceFailStreak = 0;
     targetDepthScaleEma = 0.f;
     targetDepthScaleSamples = 0;
@@ -967,6 +1030,70 @@ static PresenceDecision evaluatePresence(const TargetTrackInfo& ti,
     return d;
 }
 
+/** 当前帧没有可用 mask（目标出界 / 无目标）时清掉时序历史。 */
+static void resetMaskTemporalGate() {
+    prevTargetMask.release();
+    prevTargetMaskArea = 0;
+    prevTargetMaskCx = 0.f;
+    prevTargetMaskCy = 0.f;
+    maskTemporalIou = 0.f;
+    maskTemporalOk = true;
+}
+
+/**
+ * V0.13 Mask temporal gate。
+ *
+ * Adaptive Mask（多档深度容差 + 面积比/边界门）解决的是「**一帧之内** mask
+ * 吞掉整个搜索框」；但连续两帧之间仍可能整块跳变：目标被手挡住时 mask 会
+ * 短暂消失，或者 mask 从瓶子跳到后面的桌面。这类帧一旦进 TSDF，就会在体素
+ * 场里留下一个**位置错误的面**，而且越扫越多。
+ *
+ * 判据刻意用三个都容易被理解的量：IoU、面积相对变化、质心位移（按 bbox
+ * 对角线归一化）。任一超标就这一帧不融合 —— 代价只是少一帧数据，
+ * 而放进错误几何的代价是整个模型残掉。
+ */
+static void updateMaskTemporalGate(const TargetTrackInfo& ti, int depthW, int depthH) {
+    maskTemporalOk = true;
+    if (targetMaskMat.empty() || !targetMaskStats.valid ||
+        targetMaskStats.area < kPresenceMinMaskArea) {
+        resetMaskTemporalGate();
+        return;
+    }
+    if (!prevTargetMask.empty() && prevTargetMask.size() == targetMaskMat.size() &&
+        prevTargetMask.type() == targetMaskMat.type() && prevTargetMaskArea > 0) {
+        cv::Mat inter;
+        cv::Mat uni;
+        cv::bitwise_and(prevTargetMask, targetMaskMat, inter);
+        cv::bitwise_or(prevTargetMask, targetMaskMat, uni);
+        const int ia = cv::countNonZero(inter);
+        const int ua = cv::countNonZero(uni);
+        maskTemporalIou = ua > 0 ? static_cast<float>(ia) / static_cast<float>(ua) : 0.f;
+
+        const float areaJump =
+            std::fabs(static_cast<float>(targetMaskStats.area - prevTargetMaskArea)) /
+            static_cast<float>(prevTargetMaskArea);
+
+        const float bw = (ti.x1 - ti.x0) * static_cast<float>(depthW);
+        const float bh = (ti.y1 - ti.y0) * static_cast<float>(depthH);
+        const float diag = std::sqrt(bw * bw + bh * bh);
+        const float cdx = targetMaskStats.centerX - prevTargetMaskCx;
+        const float cdy = targetMaskStats.centerY - prevTargetMaskCy;
+        const float centerJump =
+            diag > 1.f ? std::sqrt(cdx * cdx + cdy * cdy) / diag : 0.f;
+
+        if (maskTemporalIou < kMaskTemporalMinIou ||
+            areaJump > kMaskAreaJumpRatio ||
+            centerJump > kMaskCenterJumpFrac) {
+            maskTemporalOk = false;
+            ++maskTemporalRejects;
+        }
+    }
+    prevTargetMask = targetMaskMat.clone();
+    prevTargetMaskArea = targetMaskStats.area;
+    prevTargetMaskCx = targetMaskStats.centerX;
+    prevTargetMaskCy = targetMaskStats.centerY;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h,
                                                 jfloat fx, jfloat fy, jfloat cx, jfloat cy) {
@@ -1003,6 +1130,11 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     targetMaskMat.release();
     targetMaskStats = TargetMaskStats{};
     targetMaskEngine = TargetMaskEngine();
+    resetMaskTemporalGate();
+    // V0.13：新会话 = 还没锁定过目标，累计层可以（也应该）先显示全场景，
+    // 免得开屏就是全黑。一旦用户框过目标，这条就永久关掉。
+    targetLockEverArmed = false;
+    maskTemporalRejects = 0;
     presenceFailStreak = 0;
     targetDepthScaleEma = 0.f;
     targetDepthScaleSamples = 0;
@@ -1890,12 +2022,15 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
                 epochStableStreak = 0;
                 haveEpochPrevZ = false;
             } else if (epochBadStreak >= kEpochCalibLossFrames) {
-                clearGeometryForFusionEpochRestart();
-                epochActive = false;
-                epochStableStreak = 0;
-                haveEpochPrevZ = false;
-                epochBadStreak = 0;
-                ++epochRebuilds;
+                // V0.13 Sticky：标定连续失效**只暂停新融合，绝不清几何**。
+                // 现有体素场是用这个 epoch 的冻结参数建的，它是自洽的；
+                // 因为「这几帧拟合不出来」就把整棵几何抹掉，等于每几秒
+                // 抹一次屏幕 —— 那正是 V0.12「屏幕上永远只有残片」的成因。
+                if (!epochSuspended) {
+                    epochSuspended = true;
+                    ++epochSuspendEvents;
+                }
+                epochSuspendStreak = epochBadStreak;
             }
         } else if (!epochActive) {
             // 还没开 epoch：要求连续 kEpochStableFrames 帧稳定（相邻帧之间
@@ -1916,6 +2051,11 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
                 epochStableStreak = 0;
                 epochBadStreak = 0;
                 epochLastDriftRel = 0.f;
+                // V0.13：刚冻结的 epoch 一定处于「未暂停」状态。
+                epochSuspended = false;
+                epochSuspendStreak = 0;
+                epochResumeStreak = 0;
+                epochCatastrophicStreak = 0;
                 ++epochIndex;
                 ++epochOpens;
             }
@@ -1929,21 +2069,53 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
                                 std::isfinite(zLiveAtRef) && zLiveAtRef > 0.f;
             if (bothOk) {
                 epochLastDriftRel = std::fabs(zLiveAtRef - zFrozen) / zFrozen;
-                if (epochLastDriftRel > kEpochRebuildRatio) {
-                    ++epochDriftRejects;
-                    ++epochBadStreak;
-                } else {
-                    epochBadStreak = 0;
-                }
             }
-            if (epochBadStreak >= kEpochDriftBadFrames) {
-                clearGeometryForFusionEpochRestart();
-                epochActive = false;
-                epochStableStreak = 0;
-                haveEpochPrevZ = true;
-                epochPrevZ = zLiveNow;
+            if (bothOk && epochLastDriftRel > kEpochRebuildRatio) {
+                ++epochDriftRejects;
+                ++epochBadStreak;
+                ++epochSuspendStreak;
+                epochResumeStreak = 0;
+                // V0.13 Sticky：连续 kEpochDriftSuspendFrames 帧漂移超标
+                // -> **暂停新融合**。不清几何、不开新 epoch。
+                if (!epochSuspended && epochSuspendStreak >= kEpochDriftSuspendFrames) {
+                    epochSuspended = true;
+                    ++epochSuspendEvents;
+                }
+                // 极端失效才允许重建 epoch（连同几何一起清）。
+                // 附加「持续 kEpochCatastrophicFrames 帧」这个条件，是因为
+                // 在线标定偶尔会在两种模型之间跳一下 —— 那是估计器的形式
+                // 差异，不是现实尺度变了，绝不能拿它去判一个 epoch 作废。
+                if (epochLastDriftRel > kEpochCatastrophicRatio) {
+                    ++epochCatastrophicStreak;
+                } else {
+                    epochCatastrophicStreak = 0;
+                }
+                if (epochCatastrophicStreak >= kEpochCatastrophicFrames) {
+                    clearGeometryForFusionEpochRestart();
+                    epochActive = false;
+                    epochSuspended = false;
+                    epochStableStreak = 0;
+                    haveEpochPrevZ = true;
+                    epochPrevZ = zLiveNow;
+                    epochBadStreak = 0;
+                    epochSuspendStreak = 0;
+                    epochResumeStreak = 0;
+                    epochCatastrophicStreak = 0;
+                    ++epochRebuilds;
+                    ++epochCatastrophicRebuilds;
+                }
+            } else if (bothOk) {
+                // 漂移回到门限内：连续 kEpochResumeFrames 帧正常就解除暂停。
                 epochBadStreak = 0;
-                ++epochRebuilds;
+                epochSuspendStreak = 0;
+                epochCatastrophicStreak = 0;
+                if (epochSuspended) {
+                    ++epochResumeStreak;
+                    if (epochResumeStreak >= kEpochResumeFrames) {
+                        epochSuspended = false;
+                        epochResumeStreak = 0;
+                    }
+                }
             }
         }
     }
@@ -1951,7 +2123,8 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     // epoch 生效时才做「冻结参数」的第二份换算 —— 这一份才是真正进 TSDF 的。
     std::vector<float> zEpoch;
     const float* epochFusionDepth = nullptr;
-    if (epochActive) {
+    // V0.13：暂停期间不生成 epoch 深度 -> 融合门控自然这一帧不融合。
+    if (epochActive && !epochSuspended) {
         zEpoch.assign((size_t)w * h, 0.f);
         for (size_t i = 0; i < zEpoch.size(); ++i) {
             const float dv = d[i];
@@ -1999,11 +2172,15 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             targetMaskFrames++;
             maskOk = targetMaskStats.valid &&
                      targetMaskStats.area >= kPresenceMinMaskArea;
+            // V0.13 Mask temporal gate：Adaptive Mask 管住了「一帧之内的
+            // 面积/边界」，这里再管住「两帧之间的跳变」。
+            updateMaskTemporalGate(ti, w, h);
         } else {
             // 目标整块出界：searchBox 退化成空矩形，无从建 mask
             targetMaskStats = TargetMaskStats{};
             targetMaskStats.rejectReason = "target bbox off screen";
             targetMaskMat.release();
+            resetMaskTemporalGate();
         }
 
         const PresenceDecision pd = evaluatePresence(ti, targetMaskStats, w, h);
@@ -2025,6 +2202,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     } else {
         targetMaskStats = TargetMaskStats{};
         targetMaskMat.release();
+        resetMaskTemporalGate();
         presenceFailStreak = 0;
     }
 
@@ -2120,14 +2298,20 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             // 全场景地图
             fuseDepth(fusionDepth, w, h, *match, conf);
 
-            // 目标专用模型：**只有 presenceOk 且 mask 有效才允许融合**。
-            // 这是「墙/天花板/桌子进不了目标点云」的落地点。
-            if (haveTi && presenceOk && maskOk) {
+            // 目标专用模型：**只有 presenceOk、mask 有效、且 mask 时序稳定
+            // 才允许融合**。这是「墙/天花板/桌子进不了目标点云」的落地点；
+            // V0.13 又加了一道 —— mask 单帧整块跳变的那一帧也不进。
+            if (haveTi && presenceOk && maskOk && maskTemporalOk) {
                 fuseTargetDepth(fusionDepth, w, h, *match, targetMaskMat, conf);
             }
             fusionFusedFrames++;
         } else {
             fusionGatedFrames++;
+            // V0.13：把「因为 epoch 被暂停而不融合」和「因为还没到稳定期」
+            // 分开计数 —— 前者是主动选择，后者是等待，排查时含义完全不同。
+            if (epochActive && epochSuspended) {
+                fusionSuspendedFrames++;
+            }
         }
 
         // ---- V0.9 sparse stereo high-confidence TSDF constraints ----
@@ -2685,6 +2869,35 @@ Java_com_mobilescan3d_NativeBridge_nativeSetMode(JNIEnv*, jobject, jint m) {
     mode = m;
 }
 
+// V0.13：把 ObjectTracker 的身份诊断镜像到 native 报告里。
+struct TargetIdentityMirror {
+    bool anchorReady = false;
+    float score = -1.f;
+    uint64_t rejects = 0;
+    float bboxScale = 1.f;
+};
+static TargetIdentityMirror gTargetIdentityMirror;
+
+/**
+ * 刷新身份诊断镜像。
+ *
+ * ★ 必须在**已持有 gStateMutex** 的上下文中调用 —— std::mutex 不可重入，
+ * 这里再去 lock 一次 gStateMutex 就是自锁死（本项目曾经因为这一点把 APP
+ * 整卡住过）。所以本函数只读全局 objectTracker 指针本身，不再取锁；
+ * `ObjectTracker::info()` 内部有自己的 mutex_，与外层不冲突
+ * （nativeOnDepthMap 里在持 gStateMutex 的情况下也是这么读的）。
+ */
+static void refreshTargetIdentityMirrorLocked() {
+    if (!objectTracker) {
+        return;
+    }
+    const TargetTrackInfo i = objectTracker->info();
+    gTargetIdentityMirror.anchorReady = i.identityAnchorReady;
+    gTargetIdentityMirror.score = i.identityScore;
+    gTargetIdentityMirror.rejects = i.identityRejects;
+    gTargetIdentityMirror.bboxScale = i.bboxScaleFromInitial;
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
     std::lock_guard<std::mutex> lk(gStateMutex);
@@ -2798,6 +3011,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
           << " novel=" << k->novelty << " feats=" << k->features
           << " t=(" << k->tx << ", " << k->ty << ", " << k->tz << ")\n";
     }
+    refreshTargetIdentityMirrorLocked();
     s << "Gaussian: " << g.count() << " stable=" << g.stableCount()
       << " merged=" << g.mergedCount()
       << " confirmed2=" << g.confirmedCount(2)
@@ -2825,12 +3039,27 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " seedDepth=" << targetMaskStats.seedDepth
       << " tolerance=" << targetMaskStats.tolerance
       << " center=(" << targetMaskStats.centerX << ", " << targetMaskStats.centerY << ")"
+      // V0.13 Adaptive Mask：面积比是「mask 有没有吞掉整个搜索框」的直接读数，
+      // 边界接触比例是「连通域是不是被框边截断（本来会延伸更远）」的读数。
+      // 这两个值加起来才能判断「mask 忠实地圈住了背景」这件事。
+      << " areaRatio=" << targetMaskStats.areaRatio
+      << " borderTouch=" << targetMaskStats.borderTouch
+      << " tolStep=" << targetMaskStats.toleranceStep
+      << " overExpanded=" << (targetMaskStats.overExpanded ? 1 : 0)
       << " reason=" << targetMaskStats.rejectReason << "\n"
+      << "MaskTemporal: iou=" << maskTemporalIou
+      << " rejects=" << maskTemporalRejects
+      << " ok=" << (maskTemporalOk ? 1 : 0) << "\n"
+      << "TargetIdentity: anchor=" << (gTargetIdentityMirror.anchorReady ? 1 : 0)
+      << " score=" << gTargetIdentityMirror.score
+      << " rejects=" << gTargetIdentityMirror.rejects
+      << " bboxScale=" << gTargetIdentityMirror.bboxScale << "\n"
       << "TargetModel: gaussians=" << targetG.count()
       << " confirmed2=" << targetG.confirmedCount(2)
       << " stable=" << targetG.confirmedCount(3)
       << " tsdfVoxels=" << targetTsdf.voxels()
-      << " fuseFrames=" << targetFuseFrames << "\n"
+      << " fuseFrames=" << targetFuseFrames
+      << " liveSource=" << (targetLockEverArmed ? "target-only" : "auto") << "\n"
       << "TargetPresence: failStreak=" << presenceFailStreak
       << " lostFrames=" << presenceLostFrames << "\n"
       << "TargetDepthScale: samples=" << targetDepthScaleSamples
@@ -2867,7 +3096,16 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " mean=" << lastFusionDepthMean
       << " valid=" << lastFusionDepthValid
       << " conversionFallback=" << lastFusionDepthConversionFallback << "\n"
-      << "V12FusionEpoch: active=" << (epochActive ? 1 : 0)
+      << "V13FusionEpoch: active=" << (epochActive ? 1 : 0)
+      // V0.13：sticky=1 表示这一代 epoch **冻结后不再因为漂移清几何**，
+      // suspended=1 表示当前只是暂停了新融合（几何还在）。
+      << " sticky=1"
+      << " suspended=" << (epochSuspended ? 1 : 0)
+      << " suspendEvents=" << epochSuspendEvents
+      << " suspendedFrames=" << fusionSuspendedFrames
+      << " catastrophicRebuilds=" << epochCatastrophicRebuilds
+      << " catastrophicRatio=" << kEpochCatastrophicRatio
+      << " catastrophicFrames=" << kEpochCatastrophicFrames
       << " index=" << epochIndex
       << " opens=" << epochOpens
       << " rebuilds=" << epochRebuilds
@@ -2886,7 +3124,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " refZ=" << epochRefZ
       << " fusedFrames=" << fusionFusedFrames
       << " gatedFrames=" << fusionGatedFrames << "\n"
-      << "V12DepthCalibReset: meshPipelineResets=" << depthCalibKeptAcrossTarget
+      << "V13DepthCalibReset: meshPipelineResets=" << depthCalibKeptAcrossTarget
       << " fullResets=" << depthCalibFullResets << "\n"
       << "Temporal: ratio=" << lastTemporalRatio
       << " checks=" << temporalChecks
@@ -2935,8 +3173,21 @@ Java_com_mobilescan3d_NativeBridge_nativeGetGaussians(JNIEnv* e, jobject,
         gArMinHits = need;
         // Renderer 只读**目标模型**：背景点云根本没有进入 targetG 的代码路径。
         // 还没有目标（用户没锁定过）时退回全场景 g，避免一上来屏幕全空。
-        SurfelEngine& src = (targetG.count() > 0) ? targetG : g;
-        n = src.copyPoints(dst, (size_t)maxPoints, need);
+        //
+        // V0.13 Strict target-only：**一旦本会话锁定过目标就彻底禁止回退**。
+        // 旧行为下 `targetG.count()==0` 会静默退回全场景 g —— 用户以为看到的
+        // 是「实时目标几何」，其实是墙和桌子（实机截图里底部那一片累计点）。
+        // 锁定过就必须诚实：目标点云是 0，那就返回 0 个点。
+        if (targetLockEverArmed) {
+            if (targetG.count() > 0) {
+                n = targetG.copyPoints(dst, (size_t)maxPoints, need);
+            } else {
+                n = 0;
+            }
+        } else {
+            SurfelEngine& src = (targetG.count() > 0) ? targetG : g;
+            n = src.copyPoints(dst, (size_t)maxPoints, need);
+        }
         gArDrawnPoints = n;
     }
     e->ReleaseFloatArrayElements(out, dst, 0);
@@ -2960,7 +3211,14 @@ Java_com_mobilescan3d_NativeBridge_nativeGetHudMetrics(JNIEnv* e, jobject) {
       << " · 深度 " << depthFrames << " 帧";
     // 只报一个「总量」没有意义：实机出现过 600000 总点里 stable 只有 28，
     // 那种情况下屏幕上几乎全是一次性噪声，而总数看起来却很壮观。
-    if (targetG.count() > 0) {
+    if (targetLockEverArmed) {
+        // V0.13 Strict target-only：锁定过目标就只报目标模型，哪怕它是 0。
+        // 这里绝不能落回 g.count() —— 那会让 HUD 和屏幕上的实际内容对不上。
+        s << " · 目标 " << targetG.count()
+          << " 确认 " << targetG.confirmedCount(2)
+          << " 绘制 " << gArDrawnPoints
+          << " (target-only)";
+    } else if (targetG.count() > 0) {
         s << " · 目标 " << targetG.count()
           << " 确认 " << targetG.confirmedCount(2)
           << " 绘制 " << gArDrawnPoints;
@@ -2992,12 +3250,25 @@ static constexpr int kDepthDiagSlots = 7;
 // 旧协议只给裁剪后的 bbox，目标完全出界时 bbox 退化成空矩形，UI 只能干等。
 // 14/15 是这一轮新增：**box 还在画面里 != 物体还在**，绿框的可见性必须由
 // presenceValid 决定，而不是 bbox 的几何位置。
-static constexpr int kTargetStateSlots = 16;
+// V0.13 起 16..19 新增：
+//   16 identityScore        候选框与初始外观锚点的 NCC（-1 = 无法判定）
+//   17 identityRejects      因身份不通过而拒绝采纳 Nano 的累计次数
+//   18 bboxScaleFromInitial 当前候选框相对初始框的膨胀倍数
+//   19 identityAnchorReady  身份锚点是否可用（0/1）
+// 这四个值的作用是让「Nano 分数很高、但框已经不在目标上」这件事故
+// 在 UI 上可读：旧协议里只能看到 Nano score 与 KLT inlier，两者会
+// 一起漂走、互相确认，从数字上完全看不出问题。
+static constexpr int kTargetStateSlots = 20;
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetPointCount(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(gStateMutex);
     // 目标模型优先：UI 上的「点数」应该反映将要导出的东西
+    // V0.13：锁定过目标之后不再把全场景点数顶上来，否则 HUD 会显示一个
+    // 和目标无关的大数字，和屏幕上真正画出来的 0 个点互相矛盾。
+    if (targetLockEverArmed) {
+        return (jint)targetG.count();
+    }
     return (jint)((targetG.count() > 0) ? targetG.count() : g.count());
 }
 
@@ -3010,6 +3281,8 @@ Java_com_mobilescan3d_NativeBridge_nativeSelectTarget(JNIEnv*, jobject, jfloat u
         if (ok) {
             // 新目标：目标专用模型必须清零重建，否则新旧目标会混在同一个点云里
             resetTargetModel();
+            // V0.13：从此累计层只读目标模型（见 nativeGetGaussians）。
+            targetLockEverArmed = true;
         }
         return ok ? JNI_TRUE : JNI_FALSE;
     } catch (...) {
@@ -3035,6 +3308,8 @@ Java_com_mobilescan3d_NativeBridge_nativeSelectTargetRect(
             // 新目标：目标专用模型清零重建
             std::lock_guard<std::mutex> lk(gStateMutex);
             resetTargetModel();
+            // V0.13：从此累计层只读目标模型（见 nativeGetGaussians）。
+            targetLockEverArmed = true;
         }
         return ok ? JNI_TRUE : JNI_FALSE;
     } catch (...) {
@@ -3054,6 +3329,8 @@ Java_com_mobilescan3d_NativeBridge_nativeClearTarget(JNIEnv*, jobject) {
         // 清目标 = 清目标模型：否则下一次锁定会继承上一轮的点云
         std::lock_guard<std::mutex> lk(gStateMutex);
         resetTargetModel();
+        // V0.13：用户主动解除锁定 -> 回到「自动」显示模式（全场景）。
+        targetLockEverArmed = false;
     }
 }
 
@@ -3101,6 +3378,12 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jf
         dst[13] = static_cast<float>(info.edgeLostFrames);
         dst[14] = info.presenceValid ? 1.f : 0.f;
         dst[15] = info.appearanceAvailable ? 1.f : 0.f;
+        // V0.13 身份/几何诊断。UI 才能把「Nano 说 0.94 但身份只有 0.12」
+        // 这种「两个 tracker 一起漂走」的形态显示出来。
+        dst[16] = info.identityScore;
+        dst[17] = static_cast<float>(info.identityRejects);
+        dst[18] = info.bboxScaleFromInitial;
+        dst[19] = info.identityAnchorReady ? 1.f : 0.f;
         env->ReleaseFloatArrayElements(out, dst, 0);
     }
     return static_cast<jint>(info.state);
@@ -3433,10 +3716,10 @@ Java_com_mobilescan3d_NativeBridge_nativeGetFusionEpochStats(
         return 0;
     }
     const jsize cap = e->GetArrayLength(out);
-    if (cap < 16) {
+    if (cap < 20) {
         return 0;
     }
-    jfloat v[16];
+    jfloat v[20];
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
         const DepthCalibration& current = depthCalibrator.calibration();
@@ -3456,9 +3739,14 @@ Java_com_mobilescan3d_NativeBridge_nativeGetFusionEpochStats(
         v[13] = epochCalib.inverseDepthModel ? 1.f : 0.f;
         v[14] = (depthCalibrator.usable() && current.valid) ? 1.f : 0.f;
         v[15] = static_cast<jfloat>(kEpochStableFrames);
+        // V0.13 Sticky Fusion Epoch：16..19 是新增的「暂停/极端重建」统计。
+        v[16] = epochSuspended ? 1.f : 0.f;
+        v[17] = static_cast<jfloat>(epochSuspendEvents);
+        v[18] = static_cast<jfloat>(fusionSuspendedFrames);
+        v[19] = static_cast<jfloat>(epochCatastrophicRebuilds);
     }
-    e->SetFloatArrayRegion(out, 0, 16, v);
-    return e->ExceptionCheck() ? 0 : 16;
+    e->SetFloatArrayRegion(out, 0, 20, v);
+    return e->ExceptionCheck() ? 0 : 20;
 }
 
 extern "C" JNIEXPORT jint JNICALL

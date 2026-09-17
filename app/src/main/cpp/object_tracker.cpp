@@ -55,6 +55,32 @@ constexpr float kNanoStressVisible = 0.70f;
 // 以前出现过的 bbox collapse 就会回来 —— 那个问题比「框大小略滞后」严重得多。
 constexpr float kNanoSizeWeight = 0.15f;
 
+// ---------- V0.13 Immutable Target Identity + BBox growth guard ----------
+// 身份锚点模板的高度（像素）。宽度按初始框长宽比推出并夹到 [min,max]，
+// 这样匹配时只需一次 resize，不需要多尺度金字塔。
+constexpr int kIdentityTemplateH = 48;
+constexpr int kIdentityMinW = 24;
+constexpr int kIdentityMaxW = 96;
+// 取模板时只保留初始框中心这一块：用户点选回退到 240x240 时框里大半是
+// 背景，全框当模板会让「另一块相似的背景」也拿到高分，身份门就白设了。
+constexpr float kIdentityCenterCrop = 0.70f;
+// 候选框外扩比例（位置容差）。matchTemplate 的滑窗负责吸收这点位移。
+constexpr float kIdentitySearchScale = 1.30f;
+// 通过身份验证的归一化互相关(NCC)下限。实测正确目标 0.6~0.9、
+// 不同背景纹理通常 < 0.3，0.45 留了光照/视角变化的余量。
+constexpr float kIdentityAcceptMin = 0.45f;
+// 允许 Nano **慢融合**纠偏的下限。比采纳门略低：慢融合权重只有
+// 0.15~0.55，略微放宽不会立刻把框带跑，但比完全不纠偏好。
+constexpr float kIdentitySlowMixMin = 0.42f;
+// 模板方差下限：纯色/极糊的模板匹配无意义，宁可如实标记锚点不可用，
+// 也不要拿它去门控 —— 那会把正常跟踪全判成「身份不符」。
+constexpr float kIdentityMinTemplateVar = 1.0f;
+// BBox growth guard：候选框最多涨到初始框的 2.0 倍（长宽各自比较，取大者）。
+// 「Nano recovery 把框膨胀成数倍、吞掉整块背景」是 V0.12 截图里的直接形态。
+constexpr float kIdentityMaxBBoxScale = 2.00f;
+// 长宽比漂移上限：候选框 w/h 相对初始值最多 2.2 倍（双向）。
+constexpr float kIdentityMaxAspectDrift = 2.20f;
+
 } // namespace
 
 void ObjectTracker::reset()
@@ -84,6 +110,7 @@ void ObjectTracker::reset()
     nanoBoxAge_ = -1;
     appearanceMismatchFrames_ = 0;
     nanoKltRejects_ = 0;
+    releaseIdentityAnchor();
     info_.nanoKltIou = 1.0f;
     info_.nanoKltRejects = 0;
     colorFrame_.release();
@@ -175,6 +202,9 @@ void ObjectTracker::clearTarget()
     info_.centerXNorm = 0.f;
     info_.centerYNorm = 0.f;
     info_.visibleFraction = 1.0f;
+    // V0.13：清目标 = 身份锚点也作废。下一次框选会重新建立，
+    // 绝不能把上一个物体的外观拿来门控新目标。
+    releaseIdentityAnchor();
     info_.state = enabled_ ? TargetState::ARMED : TargetState::OFF;
 }
 
@@ -195,6 +225,7 @@ void ObjectTracker::setEnabled(bool enabled)
         info_.edgeLostFrames = 0;
         info_.state = TargetState::OFF;
         targetTemplate_.release();
+        releaseIdentityAnchor();
         mask_.release();
         prevGray_.release();
         prevPoints_.clear();
@@ -444,6 +475,10 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         prevGray_.release();
         prevPoints_.clear();
         havePrev_ = false;
+        // V0.13：把**用户框的这一帧**的外观固化成不可变身份锚点。
+        // 必须在这里、必须在 tracker 开始漂之前 —— 之后无论 Nano 还是 KLT
+        // 说什么，都要拿它回答「这还是当初那个目标吗」。
+        captureIdentityAnchor(owned, roi);
     }
 
     if (info_.state == TargetState::ACQUIRING) {
@@ -559,16 +594,21 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                 cv::Rect nanoRect;
                 if (runNanoUpdate(nanoFrame, nanoFrame.cols, nanoFrame.rows, nanoRect) &&
                     nanoScore_ >= kNanoReacquireScore) {
-                    adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp);
-                    ++nanoRecoveries_;
-                    info_.nanoRecoveries = nanoRecoveries_;
-                    info_.state = TargetState::TRACKING;
-                    info_.lastEvent = "target reacquired";
-                    info_.lastError.clear();
-                    info_.trackSuccess++;
-                    reacquireFrames_ = 0;
-                    info_.timestamp = timestamp;
-                    return;
+                    // V0.13：Nano 的分数只说明「它自己很确信」，不说明「这就是
+                    // 当初那个目标」。找回路径必须再过一次不可变身份锚点 ——
+                    // V0.12 的实机故障正是 Nano 把背景纹理当成目标找了回来。
+                    if (adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp)) {
+                        ++nanoRecoveries_;
+                        info_.nanoRecoveries = nanoRecoveries_;
+                        info_.state = TargetState::TRACKING;
+                        info_.lastEvent = "target reacquired";
+                        info_.lastError.clear();
+                        info_.trackSuccess++;
+                        reacquireFrames_ = 0;
+                        info_.timestamp = timestamp;
+                        return;
+                    }
+                    info_.lastEvent = "reacquire blocked by identity gate";
                 }
             }
         }
@@ -650,17 +690,20 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                 if (runNanoUpdate(nanoFrame, nanoFrame.cols, nanoFrame.rows, nanoRect)) {
                     info_.nanoUsedRealColor = usedColor;
                     if (nanoScore_ >= kNanoWeakScore) {
-                        adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp);
-                        ++nanoRecoveries_;
-                        ++nanoWeakRecoveries_;
-                        info_.nanoRecoveries = nanoRecoveries_;
-                        info_.nanoWeakRecoveries = nanoWeakRecoveries_;
-                        clearWeakKlt();
-                        info_.lastError.clear();
-                        info_.lastEvent = "Nano recovered weak KLT";
-                        info_.trackSuccess++;
-                        info_.timestamp = timestamp;
-                        return;
+                        // V0.13：这里的 0.35 分非常低（背景纹理也能刷出来），
+                        // 身份锚点是唯一能挡住「Nano 说找到了、其实换了东西」的门。
+                        if (adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp)) {
+                            ++nanoRecoveries_;
+                            ++nanoWeakRecoveries_;
+                            info_.nanoRecoveries = nanoRecoveries_;
+                            info_.nanoWeakRecoveries = nanoWeakRecoveries_;
+                            clearWeakKlt();
+                            info_.lastError.clear();
+                            info_.lastEvent = "Nano recovered weak KLT";
+                            info_.trackSuccess++;
+                            info_.timestamp = timestamp;
+                            return;
+                        }
                     }
                 }
             }
@@ -872,6 +915,18 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                         std::hypot(nanoCx - trackCx_, nanoCy - trackCy_) / kltDiag;
                     info_.nanoKltIou = nanoKltIouNow;
 
+                    // V0.13：给 Nano 候选框单独算一次身份分。它有两个用途：
+                    //   1) 决定下面那次「慢融合纠偏」要不要执行；
+                    //   2) 进报告，让「Nano 说 score=0.94 但身份只有 0.12」
+                    //      这种「结构性共谋」一眼可见。
+                    const float nanoIdentityNow = computeIdentityScore(
+                        cv::Rect(static_cast<int>(std::lround(nanoBox.x)),
+                                 static_cast<int>(std::lround(nanoBox.y)),
+                                 std::max(1, static_cast<int>(std::lround(nanoBox.width))),
+                                 std::max(1, static_cast<int>(std::lround(nanoBox.height)))),
+                        owned);
+                    info_.identityScore = nanoIdentityNow;
+
                     const bool hardAppearanceMismatch =
                         nanoScore_ >= kNanoMismatchMinScore &&
                         (nanoKltCenterDiag > kNanoMismatchMaxCenterDiag ||
@@ -907,7 +962,13 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                         nanoWeight = std::max(nanoWeight, kNanoWeightNearEdge);
                     }
 
-                    if (nanoScore_ > 0.45f && info_.confidence > 0.45f) {
+                    // V0.13：慢融合也必须过身份门。否则「Nano 已经漂到背景、
+                    // KLT 还挂在目标上」时，这里的 0.15~0.55 权重会主动把 KLT
+                    // 一起拖到背景去 —— 这正是「两个 tracker 一起漂到同一块
+                    // 背景纹理」的动力学来源，也是 V0.12 截图里跟错目标的成因。
+                    const bool nanoIdentityOk =
+                        (nanoIdentityNow < 0.f) || (nanoIdentityNow >= kIdentitySlowMixMin);
+                    if (nanoScore_ > 0.45f && info_.confidence > 0.45f && nanoIdentityOk) {
                         trackCx_ = trackCx_ * (1.f - nanoWeight) + nanoCx * nanoWeight;
                         trackCy_ = trackCy_ * (1.f - nanoWeight) + nanoCy * nanoWeight;
                         // 尺寸也要纠，但必须比中心慢得多：0.85/0.15。
@@ -922,10 +983,13 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                         trackHalfH_ = std::clamp(trackHalfH_, minHalf,
                                                  static_cast<float>(height) * 0.5f);
                     } else if (nanoScore_ > 0.60f && prevPoints_.size() < 20) {
-                        adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp);
-                        ++nanoRecoveries_;
-                        info_.nanoRecoveries = nanoRecoveries_;
-                        info_.lastEvent = "Nano reseeded KLT";
+                        // V0.13：re-seed 会把 KLT 的特征点**整批换到 Nano 框里**，
+                        // 是「两个 tracker 一起漂走」最主要的动力学入口，必须过身份门。
+                        if (adoptNanoBox(nanoRect, nanoFrame.cols, nanoFrame.rows, owned, timestamp)) {
+                            ++nanoRecoveries_;
+                            info_.nanoRecoveries = nanoRecoveries_;
+                            info_.lastEvent = "Nano reseeded KLT";
+                        }
                     }
                 }
             }
@@ -1116,6 +1180,148 @@ cv::Rect ObjectTracker::normToRect(float x0, float y0, float x1, float y1, int w
     return cv::Rect(px0, py0, px1 - px0, py1 - py0);
 }
 
+// ---------------------------------------------------------------- V0.13 identity
+void ObjectTracker::releaseIdentityAnchor()
+{
+    identityTemplate_.release();
+    identityReady_ = false;
+    identityAspect_ = 1.f;
+    identityHalfWpx_ = 1.f;
+    identityHalfHpx_ = 1.f;
+    identityRejects_ = 0;
+    info_.identityScore = -1.f;
+    info_.identityRejects = 0;
+    info_.bboxScaleFromInitial = 1.f;
+    info_.identityAnchorReady = false;
+}
+
+/**
+ * V0.13：把用户框选那一帧的外观存成**永不更新**的身份锚点。
+ *
+ * 只保留框的中心 kIdentityCenterCrop 区域：用户点选时会回退到固定
+ * 240x240，框里大半是背景，把整框当模板会让「另一块相似的背景」也拿高分，
+ * 身份门就形同虚设。中心裁剪让模板更贴近目标本身。
+ */
+void ObjectTracker::captureIdentityAnchor(const cv::Mat& gray, const cv::Rect& roi)
+{
+    releaseIdentityAnchor();
+    if (gray.empty() || roi.width < 16 || roi.height < 16) {
+        return;
+    }
+    cv::Rect r = roi & cv::Rect(0, 0, gray.cols, gray.rows);
+    if (r.width < 16 || r.height < 16) {
+        return;
+    }
+    // 初始框尺寸（**未裁剪**）：bbox growth guard 的比较基准。
+    identityHalfWpx_ = static_cast<float>(r.width) * 0.5f;
+    identityHalfHpx_ = static_cast<float>(r.height) * 0.5f;
+    identityAspect_ = static_cast<float>(r.width) / static_cast<float>(r.height);
+
+    const int cw = std::max(16, static_cast<int>(std::lround(r.width * kIdentityCenterCrop)));
+    const int ch = std::max(16, static_cast<int>(std::lround(r.height * kIdentityCenterCrop)));
+    cv::Rect core(r.x + (r.width - cw) / 2, r.y + (r.height - ch) / 2, cw, ch);
+    core &= cv::Rect(0, 0, gray.cols, gray.rows);
+    if (core.width < 16 || core.height < 16) {
+        return;
+    }
+
+    cv::Mat patch = gray(core).clone();
+    const float aspect = static_cast<float>(core.width) / static_cast<float>(core.height);
+    const int th = kIdentityTemplateH;
+    const int tw = std::clamp(static_cast<int>(std::lround(th * aspect)),
+                              kIdentityMinW, kIdentityMaxW);
+    cv::Mat tmpl;
+    cv::resize(patch, tmpl, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
+    if (tmpl.empty() || tmpl.type() != CV_8U) {
+        return;
+    }
+    cv::Scalar m, s;
+    cv::meanStdDev(tmpl, m, s);
+    // 方差太小（纯色/极糊）-> 锚点不可用。如实标记，让身份门自动退出，
+    // 而不是拿一个没信息量的模板去把正常跟踪全判成「不像」。
+    if (!(s[0] * s[0] >= kIdentityMinTemplateVar)) {
+        return;
+    }
+    identityTemplate_ = tmpl;
+    identityReady_ = true;
+    info_.identityAnchorReady = true;
+    info_.lastEvent = "identity anchor captured " +
+                      std::to_string(tmpl.cols) + "x" + std::to_string(tmpl.rows);
+}
+
+/**
+ * V0.13：候选框与身份锚点的归一化互相关峰值。
+ *
+ * **这是全工程唯一一个不依赖 KLT 历史、也不依赖 Nano 内部状态的判据** ——
+ * 另外两个 tracker 会互相确认（Nano 重新播种 KLT 并把 inlierRatio 写回 1.0），
+ * 只有「和最初那个东西长得像不像」是独立证据。
+ *
+ * 位置容差由 matchTemplate 的滑窗给出，尺度差异由 resize 消除，
+ * 所以它只回答「是不是同一个外观」，不回答「框得准不准」——
+ * 后者仍然交给 KLT。
+ *
+ * @return [0,1] 的 NCC 峰值；**-1 表示无法判定**（调用方必须放行而不是拒绝）。
+ */
+float ObjectTracker::computeIdentityScore(const cv::Rect& box, const cv::Mat& gray) const
+{
+    if (!identityReady_ || identityTemplate_.empty() || gray.empty()) {
+        return -1.f;
+    }
+    if (box.width <= 0 || box.height <= 0) {
+        return -1.f;
+    }
+
+    // 候选框大半出界时搜索窗里几乎没有目标，硬算只会得到「不像」的假结论。
+    const cv::Rect inside = box & cv::Rect(0, 0, gray.cols, gray.rows);
+    const float boxArea = static_cast<float>(box.width) * static_cast<float>(box.height);
+    if (boxArea <= 0.f ||
+        static_cast<float>(inside.area()) / boxArea < 0.55f) {
+        return -1.f;
+    }
+
+    const float cx = static_cast<float>(box.x) + static_cast<float>(box.width) * 0.5f;
+    const float cy = static_cast<float>(box.y) + static_cast<float>(box.height) * 0.5f;
+    const float hw = static_cast<float>(box.width) * 0.5f * kIdentitySearchScale;
+    const float hh = static_cast<float>(box.height) * 0.5f * kIdentitySearchScale;
+    cv::Rect search(static_cast<int>(std::floor(cx - hw)),
+                    static_cast<int>(std::floor(cy - hh)),
+                    static_cast<int>(std::ceil(hw * 2.f)),
+                    static_cast<int>(std::ceil(hh * 2.f)));
+    search &= cv::Rect(0, 0, gray.cols, gray.rows);
+    if (search.width < 16 || search.height < 16) {
+        return -1.f;
+    }
+
+    cv::Mat patch = gray(search).clone();
+    if (patch.empty() || patch.type() != CV_8U) {
+        return -1.f;
+    }
+    // 把搜索窗缩放到「模板尺寸 x kIdentitySearchScale」，多出来的那一圈
+    // 就是位置容差。
+    const int pw = std::max(8, static_cast<int>(std::lround(identityTemplate_.cols * kIdentitySearchScale)));
+    const int ph = std::max(8, static_cast<int>(std::lround(identityTemplate_.rows * kIdentitySearchScale)));
+    cv::Mat scaled;
+    cv::resize(patch, scaled, cv::Size(pw, ph), 0, 0, cv::INTER_AREA);
+    if (scaled.empty() || scaled.cols < identityTemplate_.cols ||
+        scaled.rows < identityTemplate_.rows) {
+        return -1.f;
+    }
+
+    cv::Mat resp;
+    try {
+        cv::matchTemplate(scaled, identityTemplate_, resp, cv::TM_CCOEFF_NORMED);
+    } catch (const cv::Exception&) {
+        return -1.f;
+    }
+    if (resp.empty()) {
+        return -1.f;
+    }
+    double minV = 0.0;
+    double maxV = 0.0;
+    cv::minMaxLoc(resp, &minV, &maxV);
+    return static_cast<float>(std::clamp(maxV, -1.0, 1.0));
+}
+
 bool ObjectTracker::runNanoUpdate(const cv::Mat& frame, int width, int height, cv::Rect& outRect)
 {
     // ---- 外观后端接缝 ----
@@ -1210,12 +1416,12 @@ bool ObjectTracker::runNanoUpdate(const cv::Mat& frame, int width, int height, c
     }
 }
 
-void ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
+bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
                                  const cv::Mat& grayOwned, uint64_t timestamp)
 {
     if (nanoW <= 0 || nanoH <= 0 || grayOwned.empty() || nanoBox.width <= 0 ||
         nanoBox.height <= 0) {
-        return;
+        return false;
     }
 
     const int width = grayOwned.cols;
@@ -1229,10 +1435,53 @@ void ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
     const float hwNorm = std::max(0.02f, 0.5f * nanoBox.width / static_cast<float>(nanoW));
     const float hhNorm = std::max(0.02f, 0.5f * nanoBox.height / static_cast<float>(nanoH));
 
+    const float candHalfW = std::max(8.f, std::min(hwNorm * width, width * 0.5f));
+    const float candHalfH = std::max(8.f, std::min(hhNorm * height, height * 0.5f));
+
+    // ---- V0.13 Immutable Target Identity + BBox growth guard ----
+    // 顺序很重要：这两项判定必须在**任何状态字节被写入之前**完成。
+    // 不通过时直接 return false，调用方会保留原来的 KLT 状态继续跟踪 ——
+    // 身份门只切断「Nano -> 状态机」，绝不切断 KLT 主链，所以它不会死锁。
+    if (identityReady_) {
+        const cv::Rect candBox(
+            static_cast<int>(std::floor(cxNorm * width - candHalfW)),
+            static_cast<int>(std::floor(cyNorm * height - candHalfH)),
+            std::max(1, static_cast<int>(std::round(candHalfW * 2.f))),
+            std::max(1, static_cast<int>(std::round(candHalfH * 2.f))));
+        const float idScore = computeIdentityScore(candBox, grayOwned);
+        info_.identityScore = idScore;
+
+        const float sW = candHalfW / std::max(1.f, identityHalfWpx_);
+        const float sH = candHalfH / std::max(1.f, identityHalfHpx_);
+        const float scaleFromInitial = std::max(sW, sH);
+        info_.bboxScaleFromInitial = scaleFromInitial;
+        const float candAspect = candHalfW / std::max(1.f, candHalfH);
+        const float aspectDrift = (candAspect > identityAspect_)
+            ? (candAspect / identityAspect_)
+            : (identityAspect_ / std::max(0.0001f, candAspect));
+
+        // idScore < 0 = 无法判定（锚点/搜索窗/出界），**放行**：
+        // 拒绝只留给「有明确证据说明不像」的情形，否则目标贴边时会误杀。
+        const bool idOk = (idScore < 0.f) || (idScore >= kIdentityAcceptMin);
+        // 膨胀/长宽比守卫**不受 -1 影响**：它们是纯几何判据，永远有效。
+        const bool sizeOk = scaleFromInitial <= kIdentityMaxBBoxScale;
+        const bool aspectOk = aspectDrift <= kIdentityMaxAspectDrift;
+
+        if (!idOk || !sizeOk || !aspectOk) {
+            ++identityRejects_;
+            info_.identityRejects = identityRejects_;
+            info_.lastEvent = !sizeOk ? "identity reject: bbox growth"
+                                      : (!aspectOk ? "identity reject: aspect drift"
+                                                   : "identity reject: appearance");
+            info_.lastError.clear();
+            return false;
+        }
+    }
+
     trackCx_ = std::clamp(cxNorm * width, 0.f, static_cast<float>(std::max(0, width - 1)));
     trackCy_ = std::clamp(cyNorm * height, 0.f, static_cast<float>(std::max(0, height - 1)));
-    trackHalfW_ = std::max(8.f, std::min(hwNorm * width, width * 0.5f));
-    trackHalfH_ = std::max(8.f, std::min(hhNorm * height, height * 0.5f));
+    trackHalfW_ = candHalfW;
+    trackHalfH_ = candHalfH;
 
     // 用 Nano 框重新播种 KLT 特征：恢复后仍由 KLT 做精细跟踪，
     // Nano 只在 KLT 失效时兜底，避免长期依赖 CNN 导致漂移。
@@ -1294,4 +1543,5 @@ void ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
     info_.lastAffineScale = 1.0f;
     info_.affineScaleEMA = 1.0f;
     info_.lastError.clear();
+    return true;
 }

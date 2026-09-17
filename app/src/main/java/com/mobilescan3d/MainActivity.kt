@@ -701,8 +701,14 @@ private var lastRelocPollMs = 0L
         renderer.drawMode = arDrawMode
         renderer.setMeshAlpha(scanMeshAlpha)
         // 点大小按屏幕密度缩放：固定 3px 在高 DPI 屏上细得几乎看不见。
-        // LIVE 用 4/6：半透明网格之下还要能看清点，稍大一点对比度更好。
-        renderer.setPointSizes(4f * density, 6f * density)
+        //
+        // V0.13：绿色「当前帧 target depth」调试点从 6f 降到 3f（560dpi 下
+        // 21px -> 约 10px）。原因不是审美 —— debug 层的取点数上限是 2000，
+        // 在 228x357 的 ROI 上 step 会走到 7，也就是**相邻点只隔 7px 而点径
+        // 有 21px**，整片区域会被画成一坨连成片的绿色马赛克，看上去像「模型
+        // 在这里长歪了」。点径略小于点间距，形状才能被读出来。
+        // 累计层保持 4f：两层不仅要颜色不同，尺寸上也要能一眼分开。
+        renderer.setPointSizes(4f * density, 3f * density)
 
         // 目标离开画面时震一下。取不到（无马达 / 无权限）就静默降级，
         // 绝不因为震动失败影响追踪。
@@ -2018,6 +2024,20 @@ private var lastRelocPollMs = 0L
             out.getOrElse(NativeBridge.TARGET_STATE_INDEX_APPEARANCE_OK) { 0f } > 0.5f
         sb.appendLine("    presenceValid=$reportPresence (box in frame != object present)")
         sb.appendLine("    appearanceBackendOk=$reportAppearance")
+        // V0.13：身份 / 膨胀守卫读数。**必须和 nanoScore 放在一起读** ——
+        // 「nanoScore 0.94 而 identityScore 0.12」正是 V0.12 那个故障的
+        // 指纹：两个 tracker 彼此确认得很漂亮，但都已经不在目标上了。
+        val identityScore = out.getOrElse(NativeBridge.TARGET_STATE_INDEX_IDENTITY_SCORE) { -1f }
+        val identityRejects =
+            out.getOrElse(NativeBridge.TARGET_STATE_INDEX_IDENTITY_REJECTS) { 0f }.toLong()
+        val bboxScaleFromInitial =
+            out.getOrElse(NativeBridge.TARGET_STATE_INDEX_BBOX_SCALE) { 1f }
+        val identityAnchorReady =
+            out.getOrElse(NativeBridge.TARGET_STATE_INDEX_IDENTITY_ANCHOR_READY) { 0f } > 0.5f
+        sb.appendLine("    identityAnchorReady=$identityAnchorReady")
+        sb.appendLine("    identityScore=$identityScore (-1 = 无法判定，不参与门控)")
+        sb.appendLine("    identityRejects=$identityRejects")
+        sb.appendLine("    bboxScaleFromInitial=$bboxScaleFromInitial (上限 2.0，超了直接拒采纳)")
         sb.appendLine("    overlayPeriodNs=$targetUiPeriodNs (30Hz)")
         sb.appendLine("    centerTransform=(fx ${cameraToViewReady} via cameraToView)")
         sb.appendLine("    AF state=$lastAfState lensFocusDistance=$lastLensFocusDistance focusLocked=$targetFocusLocked relockCount=$focusRelockCount")
@@ -2612,7 +2632,17 @@ private var lastRelocPollMs = 0L
         }
         if (n < NativeBridge.FUSION_EPOCH_STATS_SLOTS) return "融合Epoch n/a"
         val active = fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] > 0.5f
-        return "融合Epoch ${if (active) "ACTIVE" else "WARMUP"}" +
+        // V0.13：PAUSED 是**新状态**，必须和 WARMUP 区分开 ——
+        // WARMUP 是「还没选好尺度，先不建」，PAUSED 是「尺度已经冻结、
+        // 只是当前几帧的在线标定对不上，所以先停一停」。两者的处置完全
+        // 不同（前者等，后者等它自己恢复），合成一个词就再也排查不出来了。
+        val suspended = fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SUSPENDED] > 0.5f
+        val epochLabel = when {
+            suspended -> "PAUSED"
+            active -> "ACTIVE"
+            else -> "WARMUP"
+        }
+        return "融合Epoch $epochLabel" +
             " #${fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SERIAL].toInt()}" +
             " good=${fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_GOOD_STREAK].toInt()}" +
             " bad=${fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_BAD_STREAK].toInt()}" +
@@ -2705,6 +2735,28 @@ private var lastRelocPollMs = 0L
         sb.appendLine(
             "startGoodFramesRequired=" +
                 fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_START_FRAMES].toInt()
+        )
+        // ---- V0.13 Sticky Fusion Epoch ----
+        // 读法：suspended=true 但 restarts 不再增长 = sticky 在正常工作
+        // （暂停融合而不是清几何）。catastrophicRebuilds 长期为 0 才是健康。
+        sb.appendLine(
+            "stickyMode=true (drift suspends fusion, never clears geometry)"
+        )
+        sb.appendLine(
+            "suspended=" +
+                (fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SUSPENDED] > 0.5f)
+        )
+        sb.appendLine(
+            "suspendEvents=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SUSPEND_EVENTS].toLong()
+        )
+        sb.appendLine(
+            "suspendedFrames=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_SUSPENDED_FRAMES].toLong()
+        )
+        sb.appendLine(
+            "catastrophicRebuilds=" +
+                fusionEpochBuf[NativeBridge.FUSION_EPOCH_INDEX_CATASTROPHIC_REBUILDS].toLong()
         )
     }
 

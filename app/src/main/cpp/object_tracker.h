@@ -130,6 +130,20 @@ struct TargetTrackInfo
     //   presenceLostCount  —— 累计被判「目标不在」的次数
     bool presenceValid = true;
     uint64_t presenceLostCount = 0;
+    // ---- V0.13 Immutable Target Identity ----
+    // 首次框选那一刻保存的**永不更新**的目标外观锚点。Nano 和 KLT 会被
+    // 设计成互相确认（adoptNanoBox 用 Nano 框重新播种 KLT，并把 inlierRatio
+    // 写回 1.0），所以它们的「一致性」完全不能证明目标正确 —— 实机上两个
+    // tracker 会一起漂到同一块背景纹理上，IoU 0.78 / inlier 1.0 却已经跟错人。
+    // 唯一独立的判据是：候选框的样子还像不像**当初被框住的那个东西**。
+    //   identityScore        —— 本帧对候选框的身份匹配分（-1 = 无法判定）
+    //   identityRejects      —— 因身份不通过而拒绝采纳 Nano 的累计次数
+    //   bboxScaleFromInitial —— 当前候选框相对初始框的膨胀倍数（取长宽较大者）
+    //   identityAnchorReady  —— 锚点是否可用（框太小/太糊时为 false，此时不门控）
+    float identityScore = -1.f;
+    uint64_t identityRejects = 0;
+    float bboxScaleFromInitial = 1.f;
+    bool identityAnchorReady = false;
     // 外观后端接缝（见 appearance_tracker.h）。当前实际生效的是 nanotrack，
     // lighttrack-ncnn 因未链接 ncnn 而如实回退。
     bool appearanceAvailable = false;
@@ -240,6 +254,14 @@ private:
     // V0.12: 一致性门控触发次数。
     uint64_t nanoKltRejects_ = 0;
 
+    // ---- V0.13：不可变身份锚点（只在用户框选那一帧写入，之后只读）----
+    cv::Mat identityTemplate_;      // 归一化尺寸的灰度外观锚点（固定高度）
+    bool identityReady_ = false;
+    float identityAspect_ = 1.f;    // 初始框 w/h
+    float identityHalfWpx_ = 1.f;   // 初始框半宽（灰度帧像素坐标）
+    float identityHalfHpx_ = 1.f;
+    uint64_t identityRejects_ = 0;
+
     // 外观后端接缝（见 appearance_tracker.h）。
     // 当前工厂只会返回 nanotrack，lighttrack-ncnn 因本工程未链接 ncnn 而回退，
     // 所以这里为 nullptr 时行为与改造前**完全一致**。
@@ -271,7 +293,25 @@ private:
     cv::Mat resolveNanoFrame(const cv::Mat& grayOwned, bool* usedColor) const;
     static cv::Rect normToRect(float x0, float y0, float x1, float y1, int w, int h);
     bool runNanoUpdate(const cv::Mat& frame, int width, int height, cv::Rect& outRect);
-    void adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
+    /**
+     * 采纳 Nano 框并**用它重新播种 KLT**。
+     *
+     * V0.13 起返回是否真的采纳：门控不通过时提前 return false、
+     * **一个状态字节都不写**，调用方据此保持原来的 KLT 状态继续跟踪。
+     * 这是「身份门只切断 Nano -> 状态机这条路径，绝不切断 KLT 主链」的
+     * 落地方式 —— 所以身份门不会变成新的死锁（V0.7.0.1 的教训）。
+     */
+    bool adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
                       const cv::Mat& grayOwned, uint64_t timestamp);
     void clearWeakKlt();
+
+    // ---- V0.13 Immutable Target Identity ----
+    // 保存身份锚点。只在 updateFrame() 里「用户给了新 ROI」那一帧调用。
+    void captureIdentityAnchor(const cv::Mat& gray, const cv::Rect& roi);
+    // 候选框与身份锚点的归一化互相关峰值；返回 -1 表示**无法判定**
+    // （锚点不可用 / 搜索窗太小 / 目标大半出界）—— 调用方必须把 -1 与
+    // 「分数低」区分对待：前者放行，后者拒绝，否则贴边时会误杀。
+    float computeIdentityScore(const cv::Rect& box, const cv::Mat& gray) const;
+    // 释放身份锚点（新目标 / 关锁 / 会话重置）。
+    void releaseIdentityAnchor();
 };
