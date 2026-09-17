@@ -113,6 +113,14 @@ struct TargetTrackInfo
     // 连续「可见比例 < 12%」的帧数，native 用它判定是否进入 REACQUIRING。
     // 上报给 UI 是为了让报告能区分「刚出界」和「出界很久了」。
     int edgeLostFrames = 0;
+    // ---- V0.12 外观/KLT 一致性门控（camera-rate）----
+    // Nano box 与 KLT box 的 IoU（同一帧、灰度帧归一化坐标）。目标离开画面后
+    // KLT 常常继续在背景纹理上跟出一个「看起来很正常的框」，而 Nano（外观判别）
+    // 会立刻给出一个完全不同的位置 —— 两者长期不一致就是最直接的「跟丢了」证据，
+    // 比等 PresenceGate（要 mask + 深度，慢好几帧）快得多。
+    float nanoKltIou = 1.0f;
+    // 因一致性门控而直接进入 REACQUIRING 的累计次数。
+    uint64_t nanoKltRejects = 0;
     // ---- PresenceGate（目标存在性判定）----
     // **box 还在画面里 != 物体还在**。目标离开后 tracker 常常在背景纹理上继续
     // 找到一个「看起来正常」的框（OpenCV tracking #619 / NanoTrack 均有记录），
@@ -222,6 +230,12 @@ private:
     uint64_t nanoWeakAttempts_ = 0;
     uint64_t nanoWeakRecoveries_ = 0;
     float lastNanoScore_ = 0.f;
+    // V0.12: Nano box 的「新鲜度」（距上次成功更新过了多少帧）。
+    // 一致性门控只在 Nano **刚刚**更新过的那一帧可信 —— Nano 正常态每 5 帧才跑
+    // 一次，拿一个 5 帧前的框去和当前 KLT 框比对会天天误报。
+    int nanoBoxAge_ = -1;
+    // V0.12: 一致性门控触发次数。
+    uint64_t nanoKltRejects_ = 0;
 
     // 外观后端接缝（见 appearance_tracker.h）。
     // 当前工厂只会返回 nanotrack，lighttrack-ncnn 因本工程未链接 ncnn 而回退，

@@ -84,6 +84,14 @@ object NativeBridge {
      */
     const val AR_MIN_HITS_CONFIRMED = 2
     const val AR_MIN_HITS_STABLE = 3
+    /**
+     * V0.12 扫描期的 hits 门限。
+     *
+     * 扫描过程中必须让用户**立刻**看到模型在长出来，所以 LIVE 图层用 1：
+     * 每个只被看过一次的点也画。导出 / 最终查看期再回到 CONFIRMED(2) 以上
+     * —— 那时候要看的是几何质量，一次性点就是噪声。
+     */
+    const val AR_MIN_HITS_RAW = 1
 
     // ------------------------------------------------------------------
     //  网格 / GLB / 深度标定

@@ -43,6 +43,15 @@ constexpr float kNanoStressVisible = 0.70f;
 // 以前出现过的 bbox collapse 就会回来 —— 那个问题比「框大小略滞后」严重得多。
 constexpr float kNanoSizeWeight = 0.15f;
 
+// ---- V0.12 外观/KLT 一致性门控（camera-rate）----
+// Nano box 与 KLT box 的 IoU 低于此值，或两者中心距离超过 KLT bbox 对角线的
+// 这个比例，就认为 KLT 已经跟到背景上，立刻进 REACQUIRING。
+constexpr float kNanoKltMinIou = 0.22f;
+constexpr float kNanoKltCenterFrac = 0.35f;
+// 只有 Nano 分数不低于此值时才相信「两者不一致」这个结论 ——
+// 分数低说明 Nano 自己也没把握，此时的分歧不构成证据（会误伤正常跟踪）。
+constexpr float kNanoKltTrustScore = 0.50f;
+
 } // namespace
 
 void ObjectTracker::reset()
@@ -69,6 +78,10 @@ void ObjectTracker::reset()
     nanoScore_ = 0.f;
     lastNanoScore_ = 0.f;
     nanoBoxFull_ = cv::Rect2f();
+    nanoBoxAge_ = -1;
+    nanoKltRejects_ = 0;
+    info_.nanoKltIou = 1.0f;
+    info_.nanoKltRejects = 0;
     colorFrame_.release();
     colorFrameValid_ = false;
     colorFrameTs_ = 0;
@@ -568,6 +581,12 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         return;
     }
 
+    // V0.12: Nano box 新鲜度。nanoBoxAge_ >= 0 表示「有框」，每帧 +1；
+    // runNanoUpdate() 成功时归零。
+    if (nanoBoxAge_ >= 0) {
+        ++nanoBoxAge_;
+    }
+
     if (!havePrev_ || prevGray_.empty() || prevGray_.size() != owned.size() || prevGray_.type() != owned.type() || prevPoints_.empty()) {
         markLost("track: invalid previous frame");
         return;
@@ -731,7 +750,10 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     // 目标整块滑出画面：不再直接判 LOST，先进 REACQUIRING 给 Nano 一个
     // 约 1.5s 的找回窗口。这样「扫出去再扫回来」不需要用户重新点一次。
     // 真正的终态 LOST 只留给「窗口内没找回来」这一种情况。
-    if (edgeLostFrames_ >= 3) {
+    // V0.12: 3 -> 2 帧。目标整块滑出画面时 3 帧太慢（相机 ~30fps 也要 100ms，
+    // 加上 mask/depth 那一段更久），用户感受就是「物体都出画了才警告」。
+    // 配合 UI 侧 0.65/0.30 两级 camera-rate 预警，慢的那一层只做语义确认。
+    if (edgeLostFrames_ >= 2) {
         info_.state = TargetState::REACQUIRING;
         reacquireFrames_ = 0;
         info_.lastEvent = "target left frame, reacquiring";
@@ -834,6 +856,63 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                     }
                 }
             }
+        }
+    }
+
+    // ---- V0.12 外观/KLT 一致性门控（camera-rate）----
+    // 目标离开画面后 KLT 常常**继续**在背景纹理上跟出一个「看起来很正常的框」，
+    // 而 Nano（外观判别）会立刻给出完全不同的位置。两者长期不一致 = KLT 跟丢了，
+    // 此时不必等 PresenceGate（它要 mask + 深度，慢好几帧），直接进 REACQUIRING。
+    //
+    // 只在 Nano **刚刚**更新过（<=1 帧）且分数够高时判定；Nano 正常态每 5 帧才跑
+    // 一次，拿陈旧框比对会天天误报。
+    //
+    // 坐标系说明：nanoBoxFull_ 是 Nano 输入帧的归一化坐标。上面的 Nano 纠偏代码
+    // 本来就假定 Nano 帧与灰度帧长宽比一致（用 width/nanoFrame.cols 线性换算），
+    // 这里沿用同一假定，所以两套归一化框可以直接比。
+    if (nanoBoxFull_.area() > 0.f && nanoBoxAge_ >= 0 && nanoBoxAge_ <= 1 &&
+        nanoScore_ >= kNanoKltTrustScore) {
+        const float fw = static_cast<float>(width);
+        const float fh = static_cast<float>(height);
+        const float kx0 = static_cast<float>(fullBox.x) / fw;
+        const float ky0 = static_cast<float>(fullBox.y) / fh;
+        const float kx1 =
+            static_cast<float>(fullBox.x + fullBox.width) / fw;
+        const float ky1 =
+            static_cast<float>(fullBox.y + fullBox.height) / fh;
+        const float nx0 = nanoBoxFull_.x;
+        const float ny0 = nanoBoxFull_.y;
+        const float nx1 = nanoBoxFull_.x + nanoBoxFull_.width;
+        const float ny1 = nanoBoxFull_.y + nanoBoxFull_.height;
+
+        const float ix0 = std::max(kx0, nx0);
+        const float iy0 = std::max(ky0, ny0);
+        const float ix1 = std::min(kx1, nx1);
+        const float iy1 = std::min(ky1, ny1);
+        const float inter =
+            std::max(0.f, ix1 - ix0) * std::max(0.f, iy1 - iy0);
+        const float uni =
+            std::max(0.f, kx1 - kx0) * std::max(0.f, ky1 - ky0) +
+            std::max(0.f, nx1 - nx0) * std::max(0.f, ny1 - ny0) - inter;
+        const float iou = uni > 1e-6f ? inter / uni : 0.f;
+        const float dcx = (kx0 + kx1) * 0.5f - (nx0 + nx1) * 0.5f;
+        const float dcy = (ky0 + ky1) * 0.5f - (ny0 + ny1) * 0.5f;
+        const float diag = std::hypot(kx1 - kx0, ky1 - ky0);
+        const float centerDist = std::hypot(dcx, dcy);
+
+        info_.nanoKltIou = iou;
+        const bool inconsistent =
+            iou < kNanoKltMinIou ||
+            (diag > 1e-4f && centerDist > kNanoKltCenterFrac * diag);
+        if (inconsistent) {
+            ++nanoKltRejects_;
+            info_.nanoKltRejects = nanoKltRejects_;
+            info_.state = TargetState::REACQUIRING;
+            reacquireFrames_ = 0;
+            info_.confidence = 0.f;
+            info_.lastEvent = "Nano/KLT box mismatch, reacquiring";
+            info_.lastError = "track: nano/klt inconsistent";
+            return;
         }
     }
 
@@ -1053,6 +1132,7 @@ bool ObjectTracker::runNanoUpdate(const cv::Mat& frame, int width, int height, c
                            static_cast<int>(std::lround(box.height)));
         nanoBoxFull_ = cv::Rect2f(box.x / width, box.y / height,
                                   box.width / width, box.height / height);
+        nanoBoxAge_ = 0;
         return true;
     }
 
@@ -1097,6 +1177,7 @@ bool ObjectTracker::runNanoUpdate(const cv::Mat& frame, int width, int height, c
             static_cast<float>(rect.y) / height,
             static_cast<float>(rect.width) / width,
             static_cast<float>(rect.height) / height);
+        nanoBoxAge_ = 0;
         return true;
     } catch (const cv::Exception& e) {
         ++nanoFailures_;

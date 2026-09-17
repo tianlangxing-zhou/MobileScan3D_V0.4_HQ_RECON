@@ -61,6 +61,8 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     private var uFarLoc = 0
     private var uPointSizeLoc = 0
     private var uPointSpaceLoc = 0
+    private var uForceColorLoc = 0
+    private var uTintLoc = 0
     private var viewportW = 1
     private var viewportH = 1
 
@@ -166,6 +168,18 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         texturedMeshRenderer.alpha = a
     }
 
+    /**
+     * V0.12：扫描预览的诊断色。`enabled=true` 时忽略顶点色，整片网格统一着色
+     * （青绿色），这样「模型长到哪儿了」比看真实颜色清楚得多。
+     * `enabled=false` 恢复真实逐顶点颜色（验收几何质量时用）。
+     */
+    fun setMeshTint(r: Float, g: Float, b: Float, enabled: Boolean) {
+        meshRenderer.tintR = r
+        meshRenderer.tintG = g
+        meshRenderer.tintB = b
+        meshRenderer.useTint = enabled
+    }
+
     private val poseBuf = FloatArray(NativeBridge.RENDER_POSE_SLOTS)
     private val accumData = FloatArray(NativeBridge.AR_MAX_POINTS * NativeBridge.POINT_SLOTS)
     private val debugData =
@@ -244,6 +258,8 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         uFarLoc = GLES20.glGetUniformLocation(program, "uFar")
         uPointSizeLoc = GLES20.glGetUniformLocation(program, "uPointSize")
         uPointSpaceLoc = GLES20.glGetUniformLocation(program, "uPointSpace")
+        uForceColorLoc = GLES20.glGetUniformLocation(program, "uForceColor")
+        uTintLoc = GLES20.glGetUniformLocation(program, "uTint")
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
         GLES20.glDepthFunc(GLES20.GL_LEQUAL)
@@ -297,9 +313,11 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         // 三个图层的需求用显式判断表达，而不是 `!= 某一种」：
         // 图层从 3 种变成 4 种（多了网格）之后，`!=` 那种写法会悄悄
         // 把新图层也算成「要画点云」，多查一次 native 白费一次拷贝。
-        val wantMesh = drawMode == DRAW_MESH
-        val wantAccum = drawMode == DRAW_ACCUMULATED || drawMode == DRAW_BOTH
-        val wantDebug = drawMode == DRAW_TARGET_DEBUG || drawMode == DRAW_BOTH
+        val wantMesh = drawMode == DRAW_MESH || drawMode == DRAW_LIVE
+        val wantAccum = drawMode == DRAW_ACCUMULATED || drawMode == DRAW_BOTH ||
+            drawMode == DRAW_LIVE
+        val wantDebug = drawMode == DRAW_TARGET_DEBUG || drawMode == DRAW_BOTH ||
+            drawMode == DRAW_LIVE
 
         var accumCount = 0
         if (wantAccum) {
@@ -359,7 +377,13 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
                         0
                     }
                 }
-            return
+            // V0.12: 这里**不再** return。
+            //
+            // 旧代码画完网格就直接返回，于是「网格 + 点云」的任何组合都画不出
+            // 点云 —— 而 LIVE 图层要的正是三者同时显示（半透明网格 + 累计
+            // surfel + 当前帧 target depth 点）。
+            // 对 DRAW_MESH 而言 accum/debug 都是 0，下面那句 return 仍然会拦住，
+            // 所以原来的行为一字不变。
         }
 
         if (accumCount <= 0 && debugCount <= 0) return
@@ -388,12 +412,20 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         GLES20.glUniform1f(uNearLoc, NEAR_PLANE)
         GLES20.glUniform1f(uFarLoc, FAR_PLANE)
 
+        // V0.12 LIVE 图层专用配色：累计点青色、当前帧新点亮绿色。
+        // 真实颜色在「模型长到哪儿了」这件事上几乎没有对比度，
+        // 统一着色后一眼就能分辨「历史累计」与「这一帧新加的」。
+        val liveColors = drawMode == DRAW_LIVE
+
         if (accumCount > 0) {
             accumBuffer.clear()
             accumBuffer.put(accumData, 0, accumCount * NativeBridge.POINT_SLOTS)
             accumBuffer.flip()
             // 累计模型是 world 空间：需要 Rwc^T (Pw - twc) 换到相机系
-            drawPoints(accumBuffer, accumCount, accumPointSize, POINT_SPACE_WORLD)
+            drawPoints(
+                accumBuffer, accumCount, accumPointSize, POINT_SPACE_WORLD,
+                if (liveColors) LIVE_ACCUM_COLOR else null
+            )
             drawnAccumulated = accumCount
         }
         if (debugCount > 0) {
@@ -401,7 +433,10 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
             debugBuffer.put(debugData, 0, debugCount * NativeBridge.POINT_SLOTS)
             debugBuffer.flip()
             // 当前帧目标 live 点是**相机坐标**：直接投影，完全不经过 VINS 位姿
-            drawPoints(debugBuffer, debugCount, debugPointSize, POINT_SPACE_CAMERA)
+            drawPoints(
+                debugBuffer, debugCount, debugPointSize, POINT_SPACE_CAMERA,
+                if (liveColors) LIVE_FRAME_COLOR else null
+            )
             drawnDebug = debugCount
         }
 
@@ -409,9 +444,24 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         GLES20.glDisableVertexAttribArray(colorLoc)
     }
 
-    private fun drawPoints(buffer: FloatBuffer, count: Int, size: Float, pointSpace: Float) {
+    /**
+     * @param tint V0.12：非 null 时忽略顶点色、整层统一着色（LIVE 图层用）。
+     */
+    private fun drawPoints(
+        buffer: FloatBuffer,
+        count: Int,
+        size: Float,
+        pointSpace: Float,
+        tint: FloatArray?
+    ) {
         GLES20.glUniform1f(uPointSizeLoc, size)
         GLES20.glUniform1f(uPointSpaceLoc, pointSpace)
+        if (tint != null) {
+            GLES20.glUniform1f(uForceColorLoc, 1f)
+            GLES20.glUniform3f(uTintLoc, tint[0], tint[1], tint[2])
+        } else {
+            GLES20.glUniform1f(uForceColorLoc, 0f)
+        }
         buffer.position(0)
         GLES20.glVertexAttribPointer(
             posLoc, 3, GLES20.GL_FLOAT, false, NativeBridge.POINT_SLOTS * 4, buffer
@@ -460,6 +510,21 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
          * 比点云这种本来就没有明确边界的显示方式敏感得多。
          */
         const val DRAW_MESH = 3
+
+        /**
+         * V0.12 LIVE：**扫描期的默认图层**。
+         *
+         * 半透明网格 + 累计 surfel(hits>=1) + 当前帧 target depth 点，三者同时画。
+         * 为什么必须同时：扫描过程中用户唯一需要立刻回答的问题是
+         * 「模型到底有没有在长」，而它由两件事共同决定 ——
+         * 网格说明 TSDF 在收敛，当前帧点说明这一帧的数据真的到了。
+         * 分开看任一图层都无法判断「没长」是几何没收敛还是数据没进来。
+         */
+        const val DRAW_LIVE = 4
+
+        /** LIVE 层配色：累计点青色 / 当前帧新点亮绿色。 */
+        private val LIVE_ACCUM_COLOR = floatArrayOf(0.10f, 0.95f, 1.00f)
+        private val LIVE_FRAME_COLOR = floatArrayOf(0.20f, 1.00f, 0.30f)
 
         /** 视锥裁剪用的近/远平面。只影响点云自身的深度排序，不影响屏幕位置。 */
         private const val NEAR_PLANE = 0.05f
@@ -549,8 +614,14 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
             #version 100
             precision mediump float;
             varying vec3 vColor;
+            // V0.12 LIVE 图层：uForceColor>0.5 时忽略顶点色，整层用 uTint 着色。
+            // 用 mix 而不是三元 —— GLSL ES 1.00 下的向量三元运算各驱动实现
+            // 支持程度不一，mix 是核心函数，没有兼容风险。
+            uniform float uForceColor;
+            uniform vec3 uTint;
             void main() {
-                gl_FragColor = vec4(vColor, 1.0);
+                vec3 c = mix(vColor, uTint, uForceColor);
+                gl_FragColor = vec4(c, 1.0);
             }
         """.trimIndent()
     }

@@ -127,6 +127,79 @@ static uint64_t lastFusionDepthConversionFallback = 0;
 static constexpr int kMaxCalibSamples = 256;
 static float gCalibSampleBuf[kMaxCalibSamples * 3];
 
+// ------------------------------------------- V0.12 Fusion Calibration Epoch
+// V0.11 的实测结论：标定器本身没问题，问题是它**每帧都在动**（EMA）。
+// TSDF 需要的是「一段时间内恒定」的尺度 —— 同一面墙如果先按 scale=A 灌进去、
+// 下几帧又按 scale=B 灌进去，体素场里会同时存在两套零交叉面，mesh 就长成
+// 双层 / 撕裂，而且这种错误**越扫越严重**。
+//
+// 做法：标定连续稳定 kEpochStableFrames 帧后**冻结**一套 scale/shift/inverse，
+// 冻结期间只用它换算；一旦「同一个 raw 深度工作点按当前标定算出的 z」相对冻结
+// 时漂移超过 kEpochRebuildRatio，就作废并重新等稳定 —— 而不是把不同的尺度
+// 继续往旧 TSDF 里灌。
+//
+// 判据刻意选「同一 raw 值下两条映射的差」而不是「本帧深度均值」：
+// 后者在用户走近走远时会剧烈变化，那和标定漂移完全是两回事。
+static constexpr int kEpochStableFrames = 5;
+static constexpr float kEpochRebuildRatio = 0.06f;
+static bool epochActive = false;
+static DepthCalibration epochCalib{};
+static float epochRefRaw = 0.f;
+static float epochRefZ = 0.f;
+static int epochStableStreak = 0;
+static bool haveEpochPrevZ = false;
+static float epochPrevZ = 0.f;
+// V0.12: 诊断用 —— 换目标时**保留**标定的次数 vs 真正整会话重置的次数。
+// 「点云一直是 0」的排查里，这两个数字能一眼区分
+// 「标定被锁目标清掉了」和「标定本来就没收敛」。
+static uint64_t depthCalibKeptAcrossTarget = 0;
+static uint64_t depthCalibFullResets = 0;
+static uint64_t epochIndex = 0;
+static uint64_t epochOpens = 0;
+static uint64_t epochRebuilds = 0;
+static uint64_t fusionFusedFrames = 0;
+static uint64_t fusionGatedFrames = 0;
+
+static void resetFusionEpoch() {
+    epochActive = false;
+    epochCalib = DepthCalibration{};
+    epochRefRaw = 0.f;
+    epochRefZ = 0.f;
+    epochStableStreak = 0;
+    haveEpochPrevZ = false;
+    epochPrevZ = 0.f;
+    epochIndex = 0;
+    epochOpens = 0;
+    epochRebuilds = 0;
+    fusionFusedFrames = 0;
+    fusionGatedFrames = 0;
+}
+
+/**
+ * raw 深度的稀疏采样中位数。**只**用来给 epoch 挑一个参考工作点：
+ * 必须是一个「与场景无关、只与映射有关」的输入值，才能用
+ * `toMetric(raw)` 的前后差判断标定是否漂了。
+ */
+static float rawDepthSampleMedian(const float* d, int w, int h) {
+    if (!d || w < 4 || h < 4) {
+        return 0.f;
+    }
+    std::vector<float> s;
+    s.reserve(static_cast<size_t>(w / 4 + 1) * static_cast<size_t>(h / 4 + 1));
+    for (int y = 2; y < h; y += 4) {
+        for (int x = 2; x < w; x += 4) {
+            const float v = d[static_cast<size_t>(y) * w + x];
+            if (std::isfinite(v) && v > 0.05f && v < 60.f) {
+                s.push_back(v);
+            }
+        }
+    }
+    if (s.empty()) {
+        return 0.f;
+    }
+    return medianOf(s);
+}
+
 // 时序一致性：上一帧深度按相对位姿重投影到当前帧，比较逐像素一致性，
 // 不一致就压低这一帧的融合权重（消「毛刺 / 浮点 / 重影」）。
 static std::vector<float> lastFusedDepth;
@@ -631,17 +704,17 @@ static int integrateStereoAnchorBatch(
  * 必须在 gStateMutex 下调用。
  */
 /**
- * 重置 mesh 管线与深度标定。调用点：新建会话 / 销毁 / 换目标。
+ * 重置深度标定（含 V0.12 的 Fusion Calibration Epoch 与 V0.9 的 stereo world scale）。
+ *
+ * V0.12 起**调用点只有两个**：新会话（nativeCreate）/ 销毁会话（nativeDestroy）。
+ * 「换目标」不再清标定 —— 标定描述的是「深度模型输出 -> VINS world 尺度」，
+ * 与当前锁的是哪个目标无关；而 V0.12 的融合门控要求标定可用，
+ * 把清标定挂在换目标上会直接变成「锁定目标后点云一直是 0」。
+ *
  * 必须在 gStateMutex 下调用。
  */
-static void resetMeshPipeline() {
-    meshEngine = MeshEngine();
-    meshStats = MeshBuildStats{};
-    meshCleanupStats = MeshPostProcessStats{};
-    gTextureKeyframes.clear();
-    textureBakeStats = TextureBakeStats{};
-    uvUnwrapStats = UvUnwrapStats{};
-    meshDirty = true;
+static void resetDepthCalibration() {
+    ++depthCalibFullResets;
     depthCalibrator.reset();
     // V0.9: invalidate stereo world-scale whenever depth calibration resets.
     mobilescan3d::stereo_anchor::reset();
@@ -665,6 +738,27 @@ static void resetMeshPipeline() {
     lastTemporalRatio = 1.f;
     temporalChecks = 0;
     temporalRejects = 0;
+    resetFusionEpoch();
+}
+
+static void resetMeshPipeline() {
+    meshEngine = MeshEngine();
+    meshStats = MeshBuildStats{};
+    meshCleanupStats = MeshPostProcessStats{};
+    gTextureKeyframes.clear();
+    textureBakeStats = TextureBakeStats{};
+    uvUnwrapStats = UvUnwrapStats{};
+    meshDirty = true;
+    // V0.12: 这里**不再**重置深度标定。
+    //
+    // 旧代码把 depthCalibrator.reset() 放在这里，而 resetTargetModel() 又会调
+    // resetMeshPipeline() —— 于是「用户每锁一次目标就把深度标定清零」。
+    // 标定描述的是「深度模型输出 -> VINS world 尺度」，与当前锁的是哪个目标
+    // 毫无关系；而 V0.12 起「标定未就绪不融合」，于是这个旧行为会直接变成
+    // 「锁定目标后点云一直是 0」。
+    //
+    // 需要清标定的场合只有一个：新会话 / 销毁会话 —— 见 resetDepthCalibration()。
+    ++depthCalibKeptAcrossTarget;
 }
 
 static void resetTargetModel() {
@@ -859,6 +953,8 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     tsdf.setVoxelSize(0.020f);
     targetTsdf.setVoxelSize(0.008f);
     resetMeshPipeline();
+    // V0.12: 新会话 = 新相机/新深度源，深度标定必须从头来。
+    resetDepthCalibration();
     // 目标专用模型与诊断：新会话必须从头开始，否则会残留上一轮的目标点云
     targetG.reset();
     targetTsdf.reset();
@@ -946,6 +1042,8 @@ Java_com_mobilescan3d_NativeBridge_nativeDestroy(JNIEnv*, jobject) {
     targetDepthScaleSamples = 0;
     targetDepthScaleEma = 0.f;
     resetMeshPipeline();
+    // V0.12: 销毁会话 —— 标定随会话一起作废。
+    resetDepthCalibration();
     kf.reset();
     objectTracker.reset();
     snaps.clear();
@@ -1709,6 +1807,76 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             : 0.f;
     lastFusionDepthValid = fusionDepthValidFrame;
     lastFusionDepthConversionFallback = fusionDepthFallbackFrame;
+
+    // ---- V0.12 Fusion Calibration Epoch 状态机 ----
+    // 判据一律在**同一个 raw 工作点**上比较，这样场景远近变化不会污染结论。
+    {
+        const float rawNow = rawDepthSampleMedian(d.data(), w, h);
+        const DepthCalibration liveCal = depthCalibrator.calibration();
+        const float zLiveNow =
+            (calibratedNow && rawNow > 0.f) ? liveCal.toMetric(rawNow, 0.f) : 0.f;
+        const bool liveOk = std::isfinite(zLiveNow) && zLiveNow > 0.f;
+
+        if (!calibratedNow || !liveOk) {
+            // 标定不可用 -> epoch 立即作废，融合暂停（见下面的门控）。
+            epochActive = false;
+            epochStableStreak = 0;
+            haveEpochPrevZ = false;
+        } else if (!epochActive) {
+            // 还没开 epoch：要求连续 kEpochStableFrames 帧稳定（相邻帧之间
+            // 同一工作点算出的 z 变化不超过 kEpochRebuildRatio）。
+            const bool stableStep =
+                haveEpochPrevZ && epochPrevZ > 0.f &&
+                std::fabs(zLiveNow - epochPrevZ) / epochPrevZ <= kEpochRebuildRatio;
+            epochStableStreak = stableStep ? (epochStableStreak + 1) : 1;
+            epochPrevZ = zLiveNow;
+            haveEpochPrevZ = true;
+            if (epochStableStreak >= kEpochStableFrames) {
+                epochCalib = liveCal;
+                epochCalib.valid = true;
+                epochRefRaw = rawNow;
+                epochRefZ = zLiveNow;
+                epochActive = true;
+                epochStableStreak = 0;
+                ++epochIndex;
+                ++epochOpens;
+            }
+        } else {
+            // epoch 生效中：监控漂移。冻结参数与当前参数在 epochRefRaw 上算出的
+            // z 相差超过 kEpochRebuildRatio -> 作废并重新等稳定。
+            const float zFrozen = epochCalib.toMetric(epochRefRaw, 0.f);
+            const float zLiveAtRef = liveCal.toMetric(epochRefRaw, 0.f);
+            const bool bothOk = std::isfinite(zFrozen) && zFrozen > 0.f &&
+                                std::isfinite(zLiveAtRef) && zLiveAtRef > 0.f;
+            if (bothOk &&
+                std::fabs(zLiveAtRef - zFrozen) / zFrozen > kEpochRebuildRatio) {
+                epochActive = false;
+                epochStableStreak = 0;
+                haveEpochPrevZ = true;
+                epochPrevZ = zLiveNow;
+                ++epochRebuilds;
+            }
+        }
+    }
+
+    // epoch 生效时才做「冻结参数」的第二份换算 —— 这一份才是真正进 TSDF 的。
+    std::vector<float> zEpoch;
+    const float* epochFusionDepth = nullptr;
+    if (epochActive) {
+        zEpoch.assign((size_t)w * h, 0.f);
+        for (size_t i = 0; i < zEpoch.size(); ++i) {
+            const float dv = d[i];
+            if (!std::isfinite(dv)) {
+                continue;
+            }
+            const float zz = epochCalib.toMetric(dv, 0.f);
+            if (zz > 0.f && std::isfinite(zz)) {
+                zEpoch[i] = zz;
+            }
+        }
+        epochFusionDepth = zEpoch.data();
+    }
+
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
     haveExternalDepth = true;
     depthFrames++;
@@ -1838,13 +2006,31 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
             conf = confidence * std::clamp(lastTemporalRatio, 0.25f, 1.f);
         }
 
-        // 全场景地图
-        fuseDepth(depthForFusion, w, h, *match, conf);
+        // V0.12 融合门控：只有「标定已连续稳定、尺度已冻结」的 epoch 才允许写
+        // TSDF 与累计 surfel。标定没到位时深度还是 raw 量级（实机 ~4.4），
+        // 而 TSDF 的体素尺寸是按 VINS world 尺度选的 —— 灌进去只会得到一堆
+        // 位置错误的体素。宁可这一帧不建，也不要把垃圾建进去。
+        //
+        // 注意：这条门控**只管 dense depth 融合**。V0.9 的稀疏 stereo anchor
+        // 自带米制尺度（走 stereo_anchor_bridge 的 world scale），不受影响。
+        // 退路：`nativeSetDepthCalibrationEnabled(false)` 时退回旧行为 ——
+        // 直接融合 `depthForFusion`（未标定的 raw 尺度）。否则「关掉标定」
+        // 会静默变成「永远不融合」，那是比标定不准更糟的失败形态。
+        const float* fusionDepth =
+            depthCalibrationEnabled ? epochFusionDepth : depthForFusion;
 
-        // 目标专用模型：**只有 presenceOk 且 mask 有效才允许融合**。
-        // 这是「墙/天花板/桌子进不了目标点云」的落地点。
-        if (haveTi && presenceOk && maskOk) {
-            fuseTargetDepth(depthForFusion, w, h, *match, targetMaskMat, conf);
+        if (fusionDepth != nullptr) {
+            // 全场景地图
+            fuseDepth(fusionDepth, w, h, *match, conf);
+
+            // 目标专用模型：**只有 presenceOk 且 mask 有效才允许融合**。
+            // 这是「墙/天花板/桌子进不了目标点云」的落地点。
+            if (haveTi && presenceOk && maskOk) {
+                fuseTargetDepth(fusionDepth, w, h, *match, targetMaskMat, conf);
+            }
+            fusionFusedFrames++;
+        } else {
+            fusionGatedFrames++;
         }
 
         // ---- V0.9 sparse stereo high-confidence TSDF constraints ----
@@ -2584,6 +2770,22 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " mean=" << lastFusionDepthMean
       << " valid=" << lastFusionDepthValid
       << " conversionFallback=" << lastFusionDepthConversionFallback << "\n"
+      << "V12FusionEpoch: active=" << (epochActive ? 1 : 0)
+      << " index=" << epochIndex
+      << " opens=" << epochOpens
+      << " rebuilds=" << epochRebuilds
+      << " stableFrames=" << kEpochStableFrames
+      << " stableStreak=" << epochStableStreak
+      << " rebuildRatio=" << kEpochRebuildRatio
+      << " frozenScale=" << epochCalib.scale
+      << " frozenShift=" << epochCalib.shift
+      << " frozenInverse=" << (epochCalib.inverseDepthModel ? 1 : 0)
+      << " refRaw=" << epochRefRaw
+      << " refZ=" << epochRefZ
+      << " fusedFrames=" << fusionFusedFrames
+      << " gatedFrames=" << fusionGatedFrames << "\n"
+      << "V12DepthCalibReset: meshPipelineResets=" << depthCalibKeptAcrossTarget
+      << " fullResets=" << depthCalibFullResets << "\n"
       << "Temporal: ratio=" << lastTemporalRatio
       << " checks=" << temporalChecks
       << " rejects=" << temporalRejects << "\n"
@@ -2872,6 +3074,8 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "nanoFailures=" << i.nanoFailures << "\n"
       << "nanoRecoveries=" << i.nanoRecoveries << "\n"
       << "nanoScore=" << i.nanoScore << "\n"
+      << "nanoKltIou=" << i.nanoKltIou << "\n"
+      << "nanoKltRejects=" << i.nanoKltRejects << "\n"
       << "nanoLastMs=" << i.nanoLastMs << "\n"
       << "weakKltFrames=" << i.weakKltFrames << "\n"
       << "kltGoodPoints=" << i.kltGoodPoints << "\n"

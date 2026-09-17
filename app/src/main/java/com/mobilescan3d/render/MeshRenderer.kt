@@ -64,6 +64,8 @@ class MeshRenderer {
     private var uNear = -1
     private var uFar = -1
     private var uAlpha = -1
+    private var uUseTint = -1
+    private var uTint = -1
 
     private var vbo = 0
     private var ibo = 0
@@ -83,6 +85,23 @@ class MeshRenderer {
     /** 渲染不透明度的可调项（AR 预览默认半透明，方便看到相机画面）。 */
     @Volatile
     var alpha = 0.85f
+
+    /**
+     * V0.12：扫描预览的诊断色。
+     *
+     * `useTint = true` 时**忽略逐顶点颜色**，整片网格统一用 (tintR, tintG, tintB)
+     * 着色。实机上原始顶点色在同一面墙上几乎没有对比度，「模型长到哪儿了」
+     * 完全看不出来；改成青绿诊断色 + 低 alpha 之后一眼可辨。
+     * 停扫验收几何时关掉，恢复真实颜色。
+     */
+    @Volatile
+    var useTint = false
+    @Volatile
+    var tintR = 0.15f
+    @Volatile
+    var tintG = 0.95f
+    @Volatile
+    var tintB = 1.00f
 
     // ---- 待上传数据。setMesh() 可能从任意线程调用，真正的上传推迟到 GL 线程 ----
     @Volatile private var pendingVertices: FloatArray? = null
@@ -123,6 +142,8 @@ class MeshRenderer {
         uNear = GLES20.glGetUniformLocation(program, "uNear")
         uFar = GLES20.glGetUniformLocation(program, "uFar")
         uAlpha = GLES20.glGetUniformLocation(program, "uAlpha")
+        uUseTint = GLES20.glGetUniformLocation(program, "uUseTint")
+        uTint = GLES20.glGetUniformLocation(program, "uTint")
 
         val exts = GLES20.glGetString(GLES20.GL_EXTENSIONS) ?: ""
         supportsUintIndex = exts.contains("GL_OES_element_index_uint")
@@ -220,6 +241,8 @@ class MeshRenderer {
         GLES20.glUniform1f(uFar, farPlane)
         val a = alpha.coerceIn(0.05f, 1f)
         GLES20.glUniform1f(uAlpha, a)
+        GLES20.glUniform1f(uUseTint, if (useTint) 1f else 0f)
+        GLES20.glUniform3f(uTint, tintR, tintG, tintB)
 
         val blended = a < 0.999f
         if (blended) {
@@ -446,8 +469,13 @@ class MeshRenderer {
             varying vec3 vColor;
             varying float vShade;
             uniform float uAlpha;
+            uniform float uUseTint;
+            uniform vec3 uTint;
             void main() {
-                gl_FragColor = vec4(vColor * vShade, uAlpha);
+                // V0.12：用 mix 而不是向量三元 —— GLSL ES 1.00 下各驱动对
+                // 向量三元的支持程度不一，mix 是核心函数，没有兼容风险。
+                vec3 base = mix(vColor, uTint, step(0.5, uUseTint));
+                gl_FragColor = vec4(base * vShade, uAlpha);
             }
         """.trimIndent()
     }

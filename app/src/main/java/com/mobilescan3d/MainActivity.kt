@@ -198,6 +198,20 @@ private var lastRelocPollMs = 0L
     private var arLayerButton: android.widget.Button? = null
     /** AR 绘制模式，见 PointCloudRenderer.DRAW_* */
     @Volatile private var arDrawMode = PointCloudRenderer.DRAW_TARGET_DEBUG
+    // V0.12 扫描期 AR 材质：青绿色半透明网格。
+    // 0.30–0.40 是「看得清形状、又不把真实画面糊掉」的折中。
+    private val scanMeshAlpha = 0.35f
+    private val scanMeshTintR = 0.15f
+    private val scanMeshTintG = 0.95f
+    private val scanMeshTintB = 1.00f
+    /**
+     * V0.12 ⑧：选目标后**一次性**检查初始框离画面边缘的距离。
+     * 值是一个 deadline（System.nanoTime），过期自动失效 —— 否则用户点完很久
+     * 之后框才出现，会莫名其妙弹一句「请把目标放入画面中间」。
+     */
+    private var edgeMarginCheckUntilNs = 0L
+    /** 判定「贴到边缘」的归一化门限（文档给的 3–5% 取中位 4%）。 */
+    private val targetEdgeMarginWarn = 0.04f
     private var cameraIds: List<String> = emptyList()
     private var currentCameraId = ""
     private var cameraIndex = 0
@@ -740,6 +754,14 @@ private var lastRelocPollMs = 0L
                     // —— 两者不同时刻，手机一转点云就会漂/甩。
                     previewTimestampNs = st.timestamp
                     renderer.setPreviewTimestamp(previewTimestampNs)
+                    // V0.12: 相机每来一帧就请求一次 AR 重绘。
+                    //
+                    // 之前 overlay 只在 depth result 到达时才 requestRender ——
+                    // 相机约 30fps，而 mask/depth 只有约 3fps，于是模型看起来
+                    // 「滞后、跳动、追着画面跑」。渲染模式仍是 RENDERMODE_WHEN_DIRTY，
+                    // 只是把驱动信号从「深度帧」换成「相机帧」。
+                    // requestRender() 本身线程安全，这里是相机线程。
+                    if (::glView.isInitialized) glView.requestRender()
                     val f = stMatrixFloats
                     // 4x4 中作用于 UV 的 2D 仿射部分：
                     // u' = m0·u + m4·v + m12 ; v' = m1·u + m5·v + m13
@@ -1469,6 +1491,8 @@ private var lastRelocPollMs = 0L
         // focusAt(x, y)
         targetFocusLocked = false
         targetFocusDistance = null
+        // V0.12 ⑧：锁定后检查一次初始框离画面边缘的距离（见 updateTargetOverlay）。
+        edgeMarginCheckUntilNs = System.nanoTime() + 3_000_000_000L
         updateTargetOverlay()
     }
 
@@ -1529,6 +1553,12 @@ private var lastRelocPollMs = 0L
         )
         targetFocusLocked = false
         targetFocusDistance = null
+        // V0.12 ⑧：拖框时可以直接用用户给的框判，比等 native 回框更快。
+        val margin = minOf(lx, ly, 1f - hx, 1f - hy)
+        edgeMarginCheckUntilNs = 0L
+        if (margin < targetEdgeMarginWarn) {
+            toast("请把目标完整放入画面中间再锁定（当前框贴到画面边缘）")
+        }
         updateTargetOverlay()
     }
 
@@ -1581,6 +1611,27 @@ private var lastRelocPollMs = 0L
             presenceValid = presenceValid
         )
         targetOverlay.invalidate()
+
+        // V0.12 ⑧：点选（单点）走的是 native 的固定 ROI，只有等 native 把 bbox
+        // 回上来才知道框有没有贴边；所以这里做一次性检查，3s 内没拿到就作废。
+        if (edgeMarginCheckUntilNs != 0L) {
+            if (System.nanoTime() > edgeMarginCheckUntilNs) {
+                edgeMarginCheckUntilNs = 0L
+            } else {
+                val bx0 = out.getOrElse(1) { 0f }
+                val by0 = out.getOrElse(2) { 0f }
+                val bx1 = out.getOrElse(3) { 0f }
+                val by1 = out.getOrElse(4) { 0f }
+                if (bx1 > bx0 && by1 > by0) {
+                    edgeMarginCheckUntilNs = 0L
+                    val margin = minOf(bx0, by0, 1f - bx1, 1f - by1)
+                    if (margin < targetEdgeMarginWarn) {
+                        toast("请把目标完整放入画面中间再锁定（当前框贴到画面边缘）")
+                    }
+                }
+            }
+        }
+
         updateTargetWarning(state, visibleFraction, centerX, centerY, presenceValid)
     }
 
@@ -1602,8 +1653,13 @@ private var lastRelocPollMs = 0L
      * 目标接近边缘 / 已离开画面的**持续**提示。
      *
      * native 早就有 `visibleFraction < 0.40 -> near frame edge` 和
-     * `< 0.12 x 3 帧 -> 出界`，但旧的 UI 只把 state==4 画成红框 —— 而目标
-     * 完全出界时 bbox 是 0x0，红框也画不出来，用户看到的就是「什么都没发生」。
+     * `< 0.12 x 2 帧 -> 出界`（V0.12 由 3 帧改为 2 帧），但旧的 UI 只把
+     * state==4 画成红框 —— 而目标完全出界时 bbox 是 0x0，红框也画不出来，
+     * 用户看到的就是「什么都没发生」。
+     *
+     * V0.12 改成**两级 camera-rate**：本函数由 updateTargetOverlay() 以 30Hz
+     * 调用，所以直接拿本帧的 visibleFraction 判就有了「第一时间」的时效，
+     * 不再依赖 native 的 slow state 转换。
      */
     private fun updateTargetWarning(state: Int, visibleFraction: Float, cx: Float, cy: Float,
                                     presenceValid: Boolean) {
@@ -1629,7 +1685,14 @@ private var lastRelocPollMs = 0L
             state == NativeBridge.TARGET_STATE_TRACKING && !presenceValid ->
                 "目标暂时丢失，正在自动找回…"
 
-            state == NativeBridge.TARGET_STATE_TRACKING && visibleFraction < 0.40f ->
+            // V0.12 两级预警：**不等 native state**，直接用本帧（30Hz camera-rate）
+            // 的 visibleFraction 判。旧的单一 0.40 阈值太晚，用户感受就是
+            // 「物体都快出画了才警告」。慢的那一层（PresenceGate / 几何出界）
+            // 保留做语义确认，不再承担「第一时间提醒」的职责。
+            state == NativeBridge.TARGET_STATE_TRACKING && visibleFraction < 0.30f ->
+                "⛔ 目标即将离开画面" + edgeHint(cx, cy)
+
+            state == NativeBridge.TARGET_STATE_TRACKING && visibleFraction < 0.65f ->
                 "⚠ 目标接近边缘" + edgeHint(cx, cy)
 
             else -> null
@@ -1639,6 +1702,13 @@ private var lastRelocPollMs = 0L
             targetWarningText.visibility = android.view.View.GONE
         } else {
             targetWarningText.text = text
+            // V0.12: 两级配色 —— 「接近边缘」琥珀底，「即将/已经离开」红底。
+            // 底色比文字更快传达严重程度（余光就能看见）。
+            val severe = text.startsWith("⛔")
+            targetWarningText.setBackgroundColor(
+                if (severe) android.graphics.Color.argb(225, 210, 40, 40)
+                else android.graphics.Color.argb(215, 190, 120, 0)
+            )
             targetWarningText.visibility = android.view.View.VISIBLE
         }
     }
@@ -2271,8 +2341,42 @@ private var lastRelocPollMs = 0L
             }
             scanNativeReady = true
         }
+        // V0.12: 扫描期默认进 LIVE 图层 —— 半透明网格 + 累计 surfel(hits>=1)
+        // + 当前帧 target depth 点，三者同时显示，用户立刻能看到模型「长出来」。
+        applyScanArLayer(true)
         primaryButton.text = "停止实验扫描"
         updateHeader()
+    }
+
+    /**
+     * V0.12：扫描期 / 查看期的 AR 图层 + 材质切换。
+     *
+     * 扫描期（LIVE）要三样同时可见：半透明网格、累计 surfel（hits>=1）、
+     * 当前帧 target depth 点。查看期退回「网格」档 —— 不透明 + 真实顶点色，
+     * 那时要看的是几何质量，一次性点和诊断色只会干扰判断。
+     */
+    private fun applyScanArLayer(scanNow: Boolean) {
+        if (scanNow) {
+            arDrawMode = PointCloudRenderer.DRAW_LIVE
+            renderer.drawMode = arDrawMode
+            renderer.accumulatedMinHits = NativeBridge.AR_MIN_HITS_RAW
+            renderer.setMeshAlpha(scanMeshAlpha)
+            renderer.setMeshTint(
+                scanMeshTintR, scanMeshTintG, scanMeshTintB, true
+            )
+            try {
+                NativeBridge.nativeSetTargetDebugEnabled(true)
+            } catch (_: Throwable) {
+            }
+        } else {
+            arDrawMode = PointCloudRenderer.DRAW_MESH
+            renderer.drawMode = arDrawMode
+            renderer.accumulatedMinHits = NativeBridge.AR_MIN_HITS_CONFIRMED
+            renderer.setMeshAlpha(1.0f)
+            renderer.setMeshTint(0f, 0f, 0f, false)
+        }
+        arLayerButton?.text = arDrawModeLabel()
+        if (::glView.isInitialized) glView.requestRender()
     }
 
     private fun stopScan() {
@@ -2296,6 +2400,8 @@ private var lastRelocPollMs = 0L
             hqCapture.endScan()
         }
         applyCaptureSettings()
+        // V0.12: 停扫后回到「网格」档（不透明 + 真实顶点色）做几何验收。
+        applyScanArLayer(false)
         primaryButton.text = "实验扫描（非测量）"
         exportModel()
         // 会话结束顺手产出真正的 AR 模型：带索引三角面 + 逐顶点法线 + 逐顶点
@@ -2883,6 +2989,7 @@ private var lastRelocPollMs = 0L
         PointCloudRenderer.DRAW_ACCUMULATED -> "累计"
         PointCloudRenderer.DRAW_BOTH -> "两者"
         PointCloudRenderer.DRAW_MESH -> "网格"
+        PointCloudRenderer.DRAW_LIVE -> "实时"
         else -> "当前帧"
     }
 
@@ -2894,17 +3001,20 @@ private var lastRelocPollMs = 0L
      * 投影错了，还是 depth scale / 精度 / fusion 的问题。
      */
     private fun cycleArLayer() {
-        arDrawMode = (arDrawMode + 1) % 4
+        arDrawMode = (arDrawMode + 1) % 5
         renderer.drawMode = arDrawMode
         val wantDebug = arDrawMode == PointCloudRenderer.DRAW_TARGET_DEBUG ||
-            arDrawMode == PointCloudRenderer.DRAW_BOTH
+            arDrawMode == PointCloudRenderer.DRAW_BOTH ||
+            arDrawMode == PointCloudRenderer.DRAW_LIVE
         try {
             NativeBridge.nativeSetTargetDebugEnabled(wantDebug)
         } catch (_: Throwable) {
         }
         // 切到网格图层时，如果 GPU 上还没有网格就先弄一个出来
         // —— 否则用户会看到一个「图层是网格但屏幕上什么都没有」的状态。
-        if (arDrawMode == PointCloudRenderer.DRAW_MESH && (renderer.meshUploadedTriangles <= 0 && renderer.texturedMeshUploadedTriangles <= 0)) {
+        if ((arDrawMode == PointCloudRenderer.DRAW_MESH ||
+                arDrawMode == PointCloudRenderer.DRAW_LIVE) &&
+            (renderer.meshUploadedTriangles <= 0 && renderer.texturedMeshUploadedTriangles <= 0)) {
             val cached = if (::exportManager.isInitialized) exportManager.lastMesh else null
             if (cached != null) {
                 renderer.setMesh(cached.vertices, cached.indices)
@@ -2921,6 +3031,8 @@ private var lastRelocPollMs = 0L
                 PointCloudRenderer.DRAW_BOTH -> "两层都画：绿色 = 当前帧调试层"
                 PointCloudRenderer.DRAW_MESH ->
                     "只画重建网格（TSDF 零交叉面 -> Marching Tetrahedra）"
+                PointCloudRenderer.DRAW_LIVE ->
+                    "实时预览：半透明网格 + 累计点(青) + 当前帧点(亮绿)"
                 else -> "只画当前帧 target depth 调试层（验证 AR 坐标链）"
             }
         )
@@ -3223,8 +3335,13 @@ private var lastRelocPollMs = 0L
                         android.graphics.Color.RED
                     s.state == NativeBridge.TARGET_STATE_REACQUIRING ->
                         android.graphics.Color.rgb(255, 160, 0)
+                    // V0.12: 与常驻提示的两级阈值对齐（<0.30 红 / <0.65 黄）。
+                    // 框的颜色是最快被余光捕捉到的信号，不能和文字说两套话。
                     s.state == NativeBridge.TARGET_STATE_TRACKING &&
-                        s.visibleFraction < 0.40f ->
+                        s.visibleFraction < 0.30f ->
+                        android.graphics.Color.RED
+                    s.state == NativeBridge.TARGET_STATE_TRACKING &&
+                        s.visibleFraction < 0.65f ->
                         android.graphics.Color.YELLOW
                     s.confidence < 0.5f ->
                         android.graphics.Color.YELLOW
