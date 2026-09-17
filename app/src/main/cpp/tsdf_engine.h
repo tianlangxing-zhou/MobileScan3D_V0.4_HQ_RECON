@@ -55,11 +55,12 @@ constexpr float kTsdfMaxWeight = 64.f;
 /** 截断距离 = 几个体素。4 个体素是 TSDF 的常见取值。 */
 constexpr int kTsdfTruncVoxels = 4;
 
-/** 单个体素 6 字节。 */
+/** V0.11: 颜色权重与几何权重分离；体素从 6 字节增至 8 字节。 */
 struct TsdfVoxel {
-    int16_t tsdf = 0;       // 归一化有符号距离 * kTsdfValueScale
-    uint16_t weight = 0;    // 观测权重 * kTsdfWeightScale
-    uint16_t color565 = 0;  // 表面颜色，只在 |tsdf| 接近 0 时累积
+    int16_t tsdf = 0;
+    uint16_t weight = 0;
+    uint16_t color565 = 0;
+    uint16_t colorWeight = 0;
 };
 
 /** 8x8x8 的体素块，一次性分配。 */
@@ -84,7 +85,7 @@ public:
     void setTruncation(float meters);
     float truncation() const { return trunc_; }
 
-    /** 块数上限（控制内存）。每块 sizeof(TsdfBlock) = 3072 字节。 */
+    /** 块数上限（控制内存）。每块 sizeof(TsdfBlock) = 4096 字节。 */
     void setMaxBlocks(size_t n) { maxBlocks_ = n < 64 ? 64 : n; }
     size_t maxBlocks() const { return maxBlocks_; }
 
@@ -112,6 +113,7 @@ public:
 
     /** 已经分配且 weight > 0 的体素数。 */
     uint64_t voxels() const { return liveVoxels_; }
+    uint64_t coloredVoxels() const { return liveColoredVoxels_; }
     uint64_t blocks() const { return static_cast<uint64_t>(blocks_.size()); }
     bool surfacePresent() const { return liveVoxels_ > 0; }
     size_t memoryBytes() const { return blocks_.size() * sizeof(TsdfBlock); }
@@ -125,6 +127,7 @@ public:
     uint16_t weightAt(int vx, int vy, int vz) const;
     /** 体素颜色（RGB565）。未分配时返回 0。 */
     uint16_t color565At(int vx, int vy, int vz) const;
+    uint16_t colorWeightAt(int vx, int vy, int vz) const;
     bool allocated(int vx, int vy, int vz) const;
     /** 有内容时把体素坐标闭区间写进 mn/mx 并返回 true。 */
     bool voxelBounds(int mn[3], int mx[3]) const;
@@ -166,8 +169,9 @@ private:
     float minDepth_ = 0.08f;
     float maxDepth_ = 8.0f;
     int pixelStep_ = 4;        // 与旧实现一致：depth 本身就是 256x256 上采样的，密集采样无收益
-    size_t maxBlocks_ = 8192;  // ~24MB 上限
+    size_t maxBlocks_ = 8192;  // V0.11: 8-byte voxel -> ~32MB 上限
     uint64_t liveVoxels_ = 0;
+    uint64_t liveColoredVoxels_ = 0;
     bool hasBounds_ = false;
     int minV_[3] = {0, 0, 0};
     int maxV_[3] = {0, 0, 0};

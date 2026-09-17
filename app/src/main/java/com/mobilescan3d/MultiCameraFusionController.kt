@@ -51,7 +51,7 @@ class MultiCameraFusionController(
     private val onHint: (String) -> Unit
 ) {
     companion object {
-        private const val TAG = "MultiCamV10"
+        private const val TAG = "MultiCamV11"
         private const val PAIR_PERIOD_NS = 160_000_000L
         private const val TELE_TEXTURE_PERIOD_NS = 1_100_000_000L
         private const val MAX_TELE_TEXTURE_KEYFRAMES = 24
@@ -65,6 +65,7 @@ class MultiCameraFusionController(
         val id: String,
         val focalMm: Float,
         val horizontalFovDeg: Float,
+        val factoryK: FloatArray,
         val k: FloatArray,
         val poseRotation: FloatArray?,
         val poseTranslation: FloatArray?,
@@ -97,7 +98,9 @@ class MultiCameraFusionController(
         var lastFocusDistance: Float = 0f,
         var lastCrop: String = "n/a",
         var lastDistortionMode: Int = -1,
-        var lastZoomRatio: Float = 1f
+        var lastZoomRatio: Float = 1f,
+        var lastCropRect: android.graphics.Rect? = null,
+        var cropStableFrames: Int = 0
     )
 
     @Volatile
@@ -134,6 +137,17 @@ class MultiCameraFusionController(
      */
     private var factoryGeometryTrusted = false
     private var pairSelectionReason = "not selected"
+
+    /** V0.11: runtime crop-aware intrinsics epoch. */
+    @Volatile
+    private var runtimeIntrinsicEpoch = 0
+
+    @Volatile
+    private var runtimeCropApplied = false
+
+    private var runtimePrimaryK: FloatArray? = null
+    private var runtimeSecondaryK: FloatArray? = null
+    private var runtimeCropReason = "not evaluated"
 
     @Volatile
     private var status = "not configured"
@@ -520,6 +534,13 @@ class MultiCameraFusionController(
                 st.lastCrop = crop?.let {
                     "${it.left},${it.top},${it.right},${it.bottom}"
                 } ?: "n/a"
+                val cropCopy = crop?.let { android.graphics.Rect(it) }
+                if (cropCopy != null && cropCopy == st.lastCropRect) {
+                    st.cropStableFrames++
+                } else {
+                    st.lastCropRect = cropCopy
+                    st.cropStableFrames = if (cropCopy != null) 1 else 0
+                }
                 st.lastDistortionMode = distortion
                 st.lastZoomRatio = zoom
 
@@ -547,6 +568,12 @@ class MultiCameraFusionController(
                 record(id, physical)
             }
         }
+
+        // The PLK110 V0.10 run proved that physical[3] is delivered with a
+        // centered 112,84-3984,2988 crop while static K was scaled from the
+        // full 4096x3072 active array. Wait until both crops are stable, then
+        // start a new empirical-geometry epoch with crop-aware K.
+        maybeApplyRuntimeCropIntrinsics()
     }
 
     fun updateScanState(
@@ -565,6 +592,11 @@ class MultiCameraFusionController(
             anchorSubmitFailures = 0L
             physicalResultCallbacks = 0L
             physicalResultEntries = 0L
+            runtimeIntrinsicEpoch = 0
+            runtimeCropApplied = false
+            runtimePrimaryK = primaryModel?.factoryK?.copyOf()
+            runtimeSecondaryK = secondaryModel?.factoryK?.copyOf()
+            runtimeCropReason = "waiting stable physical crop"
             synchronized(physicalResultLock) {
                 physicalCaptureStats.clear()
             }
@@ -615,7 +647,7 @@ class MultiCameraFusionController(
     }
 
     fun report(sb: StringBuilder) {
-        sb.appendLine("[MULTICAM V0.10]")
+        sb.appendLine("[MULTICAM V0.11]")
         sb.appendLine("logicalCameraId=$logicalCameraId")
         sb.appendLine("active=$active")
         sb.appendLine("geometryReady=$geometryReady")
@@ -644,8 +676,15 @@ class MultiCameraFusionController(
         )
         sb.appendLine("pairToleranceMs=${pairToleranceNs / 1_000_000f}")
         sb.appendLine("analysisSize=${configuredSize?.width ?: -1}x${configuredSize?.height ?: -1}")
+        sb.appendLine("primaryFactoryK=${primaryModel?.factoryK?.joinToString(",") ?: "n/a"}")
+        sb.appendLine("secondaryFactoryK=${secondaryModel?.factoryK?.joinToString(",") ?: "n/a"}")
         sb.appendLine("primaryK=${primaryModel?.k?.joinToString(",") ?: "n/a"}")
         sb.appendLine("secondaryK=${secondaryModel?.k?.joinToString(",") ?: "n/a"}")
+        sb.appendLine("runtimeIntrinsicEpoch=$runtimeIntrinsicEpoch")
+        sb.appendLine("runtimeCropApplied=$runtimeCropApplied")
+        sb.appendLine("runtimeCropReason=$runtimeCropReason")
+        sb.appendLine("runtimePrimaryK=${runtimePrimaryK?.joinToString(",") ?: "n/a"}")
+        sb.appendLine("runtimeSecondaryK=${runtimeSecondaryK?.joinToString(",") ?: "n/a"}")
         sb.appendLine("primaryPoseReference=${primaryModel?.poseReference ?: -1}")
         sb.appendLine("secondaryPoseReference=${secondaryModel?.poseReference ?: -1}")
         sb.appendLine("primaryPoseRotation=${primaryModel?.poseRotation?.joinToString(",") ?: "n/a"}")
@@ -698,6 +737,10 @@ class MultiCameraFusionController(
                 sb.appendLine("lastEmpiricalRotationDeltaDeg=${stats[30]}")
                 sb.appendLine("lastEmpiricalTranslationDot=${stats[31]}")
             }
+            if (stats.size >= 34) {
+                sb.appendLine("nativeIntrinsicEpoch=${stats[32].toLong()}")
+                sb.appendLine("nativeSecondaryFx=${stats[33]}")
+            }
         }
 
         val stereoStats = FloatArray(NativeBridge.STEREO_ANCHOR_STATS_SLOTS)
@@ -706,7 +749,7 @@ class MultiCameraFusionController(
         }.getOrDefault(0)
         if (stereoCount >= 41) {
             sb.appendLine()
-            sb.appendLine("[STEREO METRIC ANCHORS V0.10]")
+            sb.appendLine("[STEREO METRIC ANCHORS V0.11]")
             sb.appendLine("submittedBatches=${stereoStats[0].toLong()}")
             sb.appendLine("submittedAnchors=${stereoStats[1].toLong()}")
             sb.appendLine("inputRejected=${stereoStats[2].toLong()}")
@@ -757,6 +800,17 @@ class MultiCameraFusionController(
                 sb.appendLine("scaleGoodStreak=${stereoStats[46].toInt()}")
                 sb.appendLine("scaleBadStreak=${stereoStats[47].toInt()}")
                 sb.appendLine("scaleStableFramesRequired=3")
+            }
+            if (stereoCount >= 56) {
+                sb.appendLine("depthExactMatchedBatches=${stereoStats[48].toLong()}")
+                sb.appendLine("depthNearMatchedBatches=${stereoStats[49].toLong()}")
+                sb.appendLine("depthAvgMatchDeltaMs=${stereoStats[50]}")
+                sb.appendLine("depthMaxMatchDeltaMs=${stereoStats[51]}")
+                sb.appendLine("lastTemporalPairScore=${stereoStats[52]}")
+                sb.appendLine("stereoResetSerial=${stereoStats[53].toLong()}")
+                sb.appendLine("depthNearestMatchToleranceMs=${stereoStats[54]}")
+                sb.appendLine("stereoAnchorSchemaVersion=${stereoStats[55]}")
+            } else {
                 sb.appendLine("stereoAnchorSchemaVersion=0.9")
             }
 
@@ -769,7 +823,7 @@ class MultiCameraFusionController(
                 stereoStats[33] < 1f -> "SCALE_OK_BUT_NO_SCENE_TSDF_ANCHOR_ACCEPTED"
                 else -> "STEREO_METRIC_TSDF_ACTIVE"
             }
-            sb.appendLine("v10Diagnosis=$diagnosis")
+            sb.appendLine("v11Diagnosis=$diagnosis")
         }
         appendRuntimeDiagnostics(sb)
         sb.appendLine()
@@ -977,7 +1031,7 @@ class MultiCameraFusionController(
 
     private fun appendPhysicalCaptureResults(sb: StringBuilder) {
         sb.appendLine()
-        sb.appendLine("[PHYSICAL CAPTURE RESULT V0.10]")
+        sb.appendLine("[PHYSICAL CAPTURE RESULT V0.11]")
         sb.appendLine("physicalResultCallbacks=$physicalResultCallbacks")
         sb.appendLine("physicalResultEntries=$physicalResultEntries")
 
@@ -1043,6 +1097,10 @@ class MultiCameraFusionController(
                         st.lastCrop
                 )
                 sb.appendLine(
+                    "physicalResult[$id].cropStableFrames=" +
+                        st.cropStableFrames
+                )
+                sb.appendLine(
                     "physicalResult[$id].lastDistortionMode=" +
                         st.lastDistortionMode
                 )
@@ -1056,7 +1114,7 @@ class MultiCameraFusionController(
 
     private fun appendPhysicalCameraInventory(sb: StringBuilder) {
         sb.appendLine()
-        sb.appendLine("[PHYSICAL CAMERA INVENTORY V0.10]")
+        sb.appendLine("[PHYSICAL CAMERA INVENTORY V0.11]")
         sb.appendLine(
             "logicalHardwareLevel=" +
                 (logicalCharacteristics.get(
@@ -1064,9 +1122,9 @@ class MultiCameraFusionController(
                 ) ?: -1)
         )
         // 公开 SDK 没有 REQUEST_MAX_NUM_OUTPUT_STREAMS（那是 native metadata 的旧 tag
-        // ANDROID_REQUEST_MAX_NUM_OUTPUT_STREAMS）。V0.9 已修过一次，V0.10 overlay 是从
-        // V0.9 原版改的、把这处修复丢了，这里按同样的方式再修一次：Java 侧把「最大输出流数」
-        // 拆成 processed / processed-stalling / raw 三个 key，按 processed 两类求和并附带 raw。
+        // ANDROID_REQUEST_MAX_NUM_OUTPUT_STREAMS）。V0.9 修过一次、V0.10 与 V0.11 的
+        // overlay 又各带回一次 → 这里第三次修，并已固化进 _patch/p_v11_*.py 便于重放。
+        // Java 侧把「最大输出流数」拆成 processed / processed-stalling / raw 三个 key。
         // 纯诊断字段，不参与任何会话装配决策。
         val maxProcStreams = logicalCharacteristics.get(
             CameraCharacteristics.REQUEST_MAX_NUM_OUTPUT_PROC
@@ -1191,7 +1249,7 @@ class MultiCameraFusionController(
 
     private fun appendRuntimeDiagnostics(sb: StringBuilder) {
         sb.appendLine()
-        sb.appendLine("[RUNTIME V0.10]")
+        sb.appendLine("[RUNTIME V0.11]")
         sb.appendLine("sdk=${Build.VERSION.SDK_INT}")
         sb.appendLine("manufacturer=${Build.MANUFACTURER}")
         sb.appendLine("model=${Build.MODEL}")
@@ -1376,12 +1434,147 @@ class MultiCameraFusionController(
             id = id,
             focalMm = focalMm,
             horizontalFovDeg = horizontalFovDeg,
+            factoryK = k.copyOf(),
             k = k,
             poseRotation = c.get(CameraCharacteristics.LENS_POSE_ROTATION)?.copyOf(),
             poseTranslation = c.get(CameraCharacteristics.LENS_POSE_TRANSLATION)?.copyOf(),
             poseReference = c.get(CameraCharacteristics.LENS_POSE_REFERENCE)
                 ?: CameraCharacteristics.LENS_POSE_REFERENCE_UNDEFINED
         )
+    }
+
+    /**
+     * Convert Camera2's actual SCALER_CROP_REGION into the intrinsics of the
+     * delivered analysis YUV. This is only applied when active/pre-correction
+     * arrays share the same coordinate system; otherwise empirical calibration
+     * stays on factory K and the report says why.
+     */
+    private fun cropAwareK(
+        model: CameraModel,
+        crop: android.graphics.Rect,
+        output: Size
+    ): FloatArray? {
+        val c = runCatching {
+            cameraManager.getCameraCharacteristics(model.id)
+        }.getOrNull() ?: return null
+
+        val active =
+            c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                ?: return null
+        val pre =
+            c.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+                ?: active
+
+        if (active.left != pre.left ||
+            active.top != pre.top ||
+            active.right != pre.right ||
+            active.bottom != pre.bottom
+        ) {
+            runtimeCropReason =
+                "active/preCorrection coordinates differ; crop-aware K skipped"
+            return null
+        }
+
+        if (crop.width() <= 0 || crop.height() <= 0 ||
+            crop.left < active.left || crop.top < active.top ||
+            crop.right > active.right || crop.bottom > active.bottom
+        ) {
+            return null
+        }
+
+        val intrinsic =
+            c.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
+                ?: return null
+        if (intrinsic.size < 4) return null
+
+        val sx = output.width.toFloat() / crop.width().toFloat()
+        val sy = output.height.toFloat() / crop.height().toFloat()
+
+        return floatArrayOf(
+            intrinsic[0] * sx,
+            intrinsic[1] * sy,
+            (intrinsic[2] - crop.left.toFloat()) * sx,
+            (intrinsic[3] - crop.top.toFloat()) * sy
+        )
+    }
+
+    private fun kRelativeChange(a: FloatArray, b: FloatArray): Float {
+        if (a.size < 4 || b.size < 4) return Float.POSITIVE_INFINITY
+        var m = 0f
+        for (i in 0 until 4) {
+            val denom = maxOf(1f, abs(a[i]))
+            m = maxOf(m, abs(b[i] - a[i]) / denom)
+        }
+        return m
+    }
+
+    private fun maybeApplyRuntimeCropIntrinsics() {
+        val primary = primaryModel ?: return
+        val secondary = secondaryModel ?: return
+        val output = configuredSize ?: return
+
+        val pState: PhysicalCaptureStats
+        val sState: PhysicalCaptureStats
+        synchronized(physicalResultLock) {
+            pState = physicalCaptureStats[primary.id]?.copy() ?: return
+            sState = physicalCaptureStats[secondary.id]?.copy() ?: return
+        }
+
+        // 15 consecutive identical results is enough to avoid reacting to a
+        // transitional crop during session startup.
+        if (pState.cropStableFrames < 15 || sState.cropStableFrames < 15) {
+            runtimeCropReason =
+                "waiting stable crops p=${pState.cropStableFrames} s=${sState.cropStableFrames}"
+            return
+        }
+
+        val pCrop = pState.lastCropRect ?: return
+        val sCrop = sState.lastCropRect ?: return
+        val pk = cropAwareK(primary, pCrop, output) ?: return
+        val sk = cropAwareK(secondary, sCrop, output) ?: return
+
+        val pChange = kRelativeChange(primary.k, pk)
+        val sChange = kRelativeChange(secondary.k, sk)
+        if (maxOf(pChange, sChange) < 0.0025f) {
+            runtimePrimaryK = pk
+            runtimeSecondaryK = sk
+            runtimeCropApplied = true
+            runtimeCropReason =
+                "stable crop K already current"
+            return
+        }
+
+        val updated = runCatching {
+            NativeBridge.nativeMultiCamUpdateIntrinsics(pk, sk)
+        }.getOrDefault(false)
+
+        if (!updated) {
+            runtimeCropReason = "native runtime-K update rejected"
+            return
+        }
+
+        pk.copyInto(primary.k)
+        sk.copyInto(secondary.k)
+        runtimePrimaryK = pk
+        runtimeSecondaryK = sk
+        runtimeIntrinsicEpoch++
+        runtimeCropApplied = true
+        geometryReady = false
+        focalRatio =
+            if (pk[0] > 1e-3f) sk[0] / pk[0] else 1f
+
+        // Any metric anchor created with the previous K belongs to the previous
+        // calibration epoch and must not be mixed with the new one.
+        runCatching { NativeBridge.nativeResetStereoAnchors() }
+
+        runtimeCropReason = buildString {
+            append("crop-aware K epoch ").append(runtimeIntrinsicEpoch)
+            append(" pChange=").append("%.4f".format(pChange))
+            append(" sChange=").append("%.4f".format(sChange))
+            append(" pCrop=").append(pCrop)
+            append(" sCrop=").append(sCrop)
+        }
+        Log.i(TAG, runtimeCropReason)
     }
 
     private fun factoryBaselineMeters(

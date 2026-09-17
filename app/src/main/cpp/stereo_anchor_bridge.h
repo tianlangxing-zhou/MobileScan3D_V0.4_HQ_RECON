@@ -25,7 +25,7 @@ constexpr int kMaxAnchorsPerBatch = 96;
  * NativeBridge.nativeGetStereoAnchorStats() float slots.
  * Keep in sync with NativeBridge.STEREO_ANCHOR_STATS_SLOTS.
  */
-constexpr int kStatsSlots = 48;
+constexpr int kStatsSlots = 56;
 
 struct Anchor {
     float u = 0.f;
@@ -46,6 +46,7 @@ struct AnchorBatch {
 struct CalibrationBatch {
     std::uint64_t timestampNs = 0;
     std::int64_t matchDeltaNs = -1;
+    float temporalQualityScale = 1.f;
     std::vector<float> rawDepth;
     std::vector<float> metricDepth;
     std::vector<float> quality;

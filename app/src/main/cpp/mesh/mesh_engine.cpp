@@ -446,25 +446,42 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
         mesh.normals[i * 3 + 2] = gz * inv;
     }
 
-    // 颜色：从体素 565 直接取（顶点落在棱上，取两个端点的近似平均）
+    // V0.11: interpolate only real color observations on both edge endpoints.
+    // If neither endpoint has color, keep the neutral-gray initialization.
     mesh.colors.assign(mesh.positions.size(), 0.6f);
     for (size_t i = 0; i < vertEdge.size(); ++i) {
         const EdgeKey& e = vertEdge[i];
-        int vx = e.x, vy = e.y, vz = e.z;
+        int ax = e.x, ay = e.y, az = e.z;
+        int bx = ax, by = ay, bz = az;
         if (e.axis == 0) {
-            vx += 1;
+            bx += 1;
         } else if (e.axis == 1) {
-            vy += 1;
+            by += 1;
         } else {
-            vz += 1;
+            bz += 1;
         }
-        const uint16_t c = tsdf.color565At(vx, vy, vz);
-        const int r5 = (c >> 11) & 0x1F;
-        const int g6 = (c >> 5) & 0x3F;
-        const int b5 = c & 0x1F;
-        mesh.colors[i * 3 + 0] = r5 / 31.f;
-        mesh.colors[i * 3 + 1] = g6 / 63.f;
-        mesh.colors[i * 3 + 2] = b5 / 31.f;
+
+        const uint16_t c0 = tsdf.color565At(ax, ay, az);
+        const uint16_t c1 = tsdf.color565At(bx, by, bz);
+        const uint16_t w0 = tsdf.colorWeightAt(ax, ay, az);
+        const uint16_t w1 = tsdf.colorWeightAt(bx, by, bz);
+        if (w0 == 0 && w1 == 0) {
+            continue;
+        }
+
+        const float fw0 = static_cast<float>(w0);
+        const float fw1 = static_cast<float>(w1);
+        const float inv = 1.f / std::max(1.f, fw0 + fw1);
+
+        mesh.colors[i * 3 + 0] =
+            (((c0 >> 11) & 0x1F) * fw0 +
+             ((c1 >> 11) & 0x1F) * fw1) * inv / 31.f;
+        mesh.colors[i * 3 + 1] =
+            (((c0 >> 5) & 0x3F) * fw0 +
+             ((c1 >> 5) & 0x3F) * fw1) * inv / 63.f;
+        mesh.colors[i * 3 + 2] =
+            ((c0 & 0x1F) * fw0 +
+             (c1 & 0x1F) * fw1) * inv / 31.f;
     }
 }
 

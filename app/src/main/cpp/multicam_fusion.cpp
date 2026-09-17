@@ -62,6 +62,7 @@ struct State {
 
     std::uint64_t empiricalAttempts = 0;
     std::uint64_t empiricalAccepted = 0;
+    std::uint64_t intrinsicEpoch = 0;
     int empiricalGoodStreak = 0;
     int empiricalBadStreak = 0;
     int lastEmpiricalInliers = 0;
@@ -714,6 +715,53 @@ Java_com_mobilescan3d_NativeBridge_nativeMultiCamOnPair(
     return finish(gState.lastAnchors.size() >= 6);
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeMultiCamUpdateIntrinsics(
+        JNIEnv* env,
+        jobject,
+        jfloatArray primaryKArray,
+        jfloatArray secondaryKArray) {
+    std::vector<float> k1;
+    std::vector<float> k2;
+    if (!readFloats(env, primaryKArray, 4, &k1) ||
+        !readFloats(env, secondaryKArray, 4, &k2)) {
+        return JNI_FALSE;
+    }
+
+    if (!(k1[0] > 100.f) || !(k1[1] > 100.f) ||
+        !(k2[0] > 100.f) || !(k2[1] > 100.f)) {
+        return JNI_FALSE;
+    }
+
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!gState.configured) return JNI_FALSE;
+
+    gState.K1 = cv::Matx33d(
+        k1[0], 0.0, k1[2],
+        0.0, k1[1], k1[3],
+        0.0, 0.0, 1.0
+    );
+    gState.K2 = cv::Matx33d(
+        k2[0], 0.0, k2[2],
+        0.0, k2[1], k2[3],
+        0.0, 0.0, 1.0
+    );
+    gState.focalRatio =
+        k1[0] > 1e-6 ? k2[0] / k1[0] : 1.0;
+
+    // New intrinsics = new calibration epoch.
+    gState.geometryReady = false;
+    gState.empiricalAccepted = 0;
+    gState.empiricalGoodStreak = 0;
+    gState.empiricalBadStreak = 0;
+    gState.lastEmpiricalInliers = 0;
+    gState.lastEmpiricalRotationDeltaDeg = 0.f;
+    gState.lastEmpiricalTranslationDot = 0.f;
+    gState.lastAnchors.clear();
+    gState.intrinsicEpoch++;
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeMultiCamGetAnchors(
         JNIEnv* env,
@@ -797,6 +845,8 @@ Java_com_mobilescan3d_NativeBridge_nativeGetMultiCamStats(
         out[29] = static_cast<float>(gState.lastEmpiricalInliers);
         out[30] = gState.lastEmpiricalRotationDeltaDeg;
         out[31] = gState.lastEmpiricalTranslationDot;
+        out[32] = static_cast<float>(gState.intrinsicEpoch);
+        out[33] = static_cast<float>(gState.K2(0,0));
     }
 
     env->SetFloatArrayRegion(outArray, 0, kStatsSlots, out.data());

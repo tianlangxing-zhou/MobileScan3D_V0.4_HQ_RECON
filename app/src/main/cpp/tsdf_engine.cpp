@@ -55,6 +55,7 @@ static inline uint16_t blendRgb565(uint16_t a, uint16_t b, float wa, float wb) {
 void TsdfEngine::reset() {
     blocks_.clear();
     liveVoxels_ = 0;
+    liveColoredVoxels_ = 0;
     hasBounds_ = false;
     minV_[0] = minV_[1] = minV_[2] = 0;
     maxV_[0] = maxV_[1] = maxV_[2] = 0;
@@ -119,6 +120,10 @@ uint16_t TsdfEngine::weightAt(int vx, int vy, int vz) const {
 uint16_t TsdfEngine::color565At(int vx, int vy, int vz) const {
     TsdfVoxel* v = const_cast<TsdfEngine*>(this)->voxelFor(vx, vy, vz, false);
     return v ? v->color565 : 0;
+}
+uint16_t TsdfEngine::colorWeightAt(int vx, int vy, int vz) const {
+    TsdfVoxel* v = const_cast<TsdfEngine*>(this)->voxelFor(vx, vy, vz, false);
+    return v ? v->colorWeight : 0;
 }
 
 bool TsdfEngine::allocated(int vx, int vy, int vz) const {
@@ -254,11 +259,17 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                 }
 
                 if (haveColor && std::fabs(sdf) < colorBand) {
-                    if (wasEmpty) {
+                    const float colorOld = dequantWeight(v->colorWeight);
+                    const bool hadColor = v->colorWeight != 0;
+                    if (!hadColor) {
                         v->color565 = obsColor;
+                        ++liveColoredVoxels_;
                     } else {
-                        v->color565 = blendRgb565(v->color565, obsColor, wOld, baseWeight);
+                        v->color565 = blendRgb565(
+                            v->color565, obsColor, colorOld, baseWeight);
                     }
+                    v->colorWeight = quantWeight(
+                        std::min(colorOld + baseWeight, kTsdfMaxWeight));
                 }
 
                 if (!hasBounds_) {
@@ -306,7 +317,13 @@ bool TsdfEngine::exportPly(const std::string& path) const {
                         continue;
                     }
                     int cr, cg, cb;
-                    unpackRgb565(v.color565, cr, cg, cb);
+                    if (v.colorWeight == 0) {
+                        cr = 19;
+                        cg = 38;
+                        cb = 19;
+                    } else {
+                        unpackRgb565(v.color565, cr, cg, cb);
+                    }
                     const int x = bx + lx;
                     const int y = by + ly;
                     const int z = bz + lz;

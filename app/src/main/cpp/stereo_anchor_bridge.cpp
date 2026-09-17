@@ -13,8 +13,13 @@
 namespace mobilescan3d::stereo_anchor {
 namespace {
 
-constexpr std::int64_t kExactDepthMatchNs = 2'000'000LL;   // same primary frame
-constexpr std::size_t kRecentDepthFrames = 3;
+constexpr std::int64_t kExactDepthMatchNs = 2'000'000LL;
+// V0.11: depth inference is ~2-3Hz while stereo anchors are independent.
+// Nearest-frame pairing is allowed only inside this conservative window;
+// quality is reduced by temporal distance before robust scale fitting.
+constexpr std::int64_t kDepthMatchToleranceNs = 180'000'000LL;
+constexpr float kDepthMatchTemporalTauNs = 300'000'000.f;
+constexpr std::size_t kRecentDepthFrames = 6;
 constexpr std::size_t kPendingBatches = 24;
 constexpr std::size_t kReadyCalibrationBatches = 12;
 constexpr std::size_t kGeometryBatches = 24;
@@ -46,6 +51,12 @@ struct Diagnostics {
     std::uint64_t depthMatchedAnchors = 0;
     std::uint64_t depthMatchMisses = 0;
     std::int64_t lastDepthMatchDeltaNs = -1;
+    std::uint64_t depthExactMatchedBatches = 0;
+    std::uint64_t depthNearMatchedBatches = 0;
+    double depthMatchDeltaSumNs = 0.0;
+    std::int64_t depthMatchDeltaMaxNs = 0;
+    float lastTemporalPairScore = 1.f;
+    std::uint64_t resetSerial = 0;
 
     std::uint64_t scaleAcceptedFrames = 0;
     std::uint64_t scaleRejectedFrames = 0;
@@ -95,6 +106,7 @@ std::deque<DepthFrame> gDepthFrames;
 std::deque<CalibrationBatch> gReadyCalibration;
 std::deque<AnchorBatch> gGeometry;
 Diagnostics gDiag;
+std::uint64_t gResetSerial = 0;
 
 float median(std::vector<float> values) {
     if (values.empty()) return 0.f;
@@ -168,6 +180,12 @@ bool buildCalibrationBatchLocked(
     CalibrationBatch b;
     b.timestampNs = anchors.timestampNs;
     b.matchDeltaNs = absDelta(anchors.timestampNs, depth.timestampNs);
+    b.temporalQualityScale = std::clamp(
+        std::exp(
+            -static_cast<float>(b.matchDeltaNs) /
+            kDepthMatchTemporalTauNs),
+        0.50f,
+        1.0f);
     b.rawDepth.reserve(anchors.anchors.size());
     b.metricDepth.reserve(anchors.anchors.size());
     b.quality.reserve(anchors.anchors.size());
@@ -186,8 +204,12 @@ bool buildCalibrationBatchLocked(
 
         if (!std::isfinite(raw)) continue;
 
-        // Stereo-side quality already includes sync, reprojection and parallax.
-        const float q = std::clamp(a.confidence, 0.f, 1.f);
+        // Stereo-side quality already includes sync/reprojection/parallax.
+        // V0.11 additionally discounts a nearest (not exact) depth frame.
+        const float q = std::clamp(
+            a.confidence * b.temporalQualityScale,
+            0.f,
+            1.f);
         if (q < 0.30f) continue;
 
         b.rawDepth.push_back(raw);
@@ -203,7 +225,7 @@ bool buildCalibrationBatchLocked(
 void tryMatchLocked() {
     for (auto ai = gPending.begin(); ai != gPending.end();) {
         auto best = gDepthFrames.end();
-        std::int64_t bestDelta = kExactDepthMatchNs + 1;
+        std::int64_t bestDelta = kDepthMatchToleranceNs + 1;
 
         for (auto di = gDepthFrames.begin(); di != gDepthFrames.end(); ++di) {
             const std::int64_t d = absDelta(ai->timestampNs, di->timestampNs);
@@ -213,20 +235,46 @@ void tryMatchLocked() {
             }
         }
 
-        if (best != gDepthFrames.end() && bestDelta <= kExactDepthMatchNs) {
+        if (best != gDepthFrames.end() &&
+            bestDelta <= kDepthMatchToleranceNs) {
             CalibrationBatch paired;
             if (buildCalibrationBatchLocked(*ai, *best, &paired)) {
                 gDiag.depthMatchedBatches++;
                 gDiag.depthMatchedAnchors += paired.rawDepth.size();
                 gDiag.lastDepthMatchDeltaNs = paired.matchDeltaNs;
+                gDiag.lastTemporalPairScore = paired.temporalQualityScale;
+                gDiag.depthMatchDeltaSumNs +=
+                    static_cast<double>(paired.matchDeltaNs);
+                gDiag.depthMatchDeltaMaxNs = std::max(
+                    gDiag.depthMatchDeltaMaxNs,
+                    paired.matchDeltaNs);
+                if (paired.matchDeltaNs <= kExactDepthMatchNs) {
+                    gDiag.depthExactMatchedBatches++;
+                } else {
+                    gDiag.depthNearMatchedBatches++;
+                }
                 gReadyCalibration.push_back(std::move(paired));
             } else {
                 gDiag.depthMatchMisses++;
             }
             ai = gPending.erase(ai);
-        } else {
-            ++ai;
+            continue;
         }
+
+        // If the newest completed depth frame is already later than this
+        // anchor by more than the tolerance, no future depth frame can become
+        // a better match. Expire it instead of keeping a misleading queue.
+        if (!gDepthFrames.empty()) {
+            const std::uint64_t newestTs = gDepthFrames.back().timestampNs;
+            if (newestTs > ai->timestampNs &&
+                newestTs - ai->timestampNs >
+                    static_cast<std::uint64_t>(kDepthMatchToleranceNs)) {
+                gDiag.depthMatchMisses++;
+                ai = gPending.erase(ai);
+                continue;
+            }
+        }
+        ++ai;
     }
     trimQueuesLocked();
 }
@@ -240,6 +288,7 @@ void reset() {
     gReadyCalibration.clear();
     gGeometry.clear();
     gDiag = Diagnostics{};
+    gDiag.resetSerial = ++gResetSerial;
 }
 
 void onDepthFrame(
@@ -625,6 +674,20 @@ void fillStats(float out[kStatsSlots]) {
     out[45] = static_cast<float>(kExactDepthMatchNs / 1.0e6);
     out[46] = static_cast<float>(gDiag.scaleGoodStreak);
     out[47] = static_cast<float>(gDiag.scaleBadStreak);
+
+    out[48] = static_cast<float>(gDiag.depthExactMatchedBatches);
+    out[49] = static_cast<float>(gDiag.depthNearMatchedBatches);
+    out[50] = gDiag.depthMatchedBatches > 0
+        ? static_cast<float>(
+            gDiag.depthMatchDeltaSumNs /
+            static_cast<double>(gDiag.depthMatchedBatches) /
+            1.0e6)
+        : -1.f;
+    out[51] = static_cast<float>(gDiag.depthMatchDeltaMaxNs / 1.0e6);
+    out[52] = gDiag.lastTemporalPairScore;
+    out[53] = static_cast<float>(gDiag.resetSerial);
+    out[54] = static_cast<float>(kDepthMatchToleranceNs / 1.0e6);
+    out[55] = 1.1f;
 }
 
 std::string summary() {

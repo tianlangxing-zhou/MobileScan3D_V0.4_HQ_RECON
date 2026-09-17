@@ -58,8 +58,8 @@ android {
         applicationId = "com.mobilescan3d"
         minSdk = 26
         targetSdk = 36
-        versionCode = 100
-        versionName = "0.10.0-oneplus15-selfcalib"
+        versionCode = 110
+        versionName = "0.11.0-stereo-depth-color"
         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
         ndk { abiFilters += listOf("arm64-v8a") }

@@ -57,11 +57,11 @@ object NativeBridge {
 
     const val RENDER_POSE_SLOTS = 12
     /** V0.8 physical multi-camera diagnostic slots. */
-    const val MULTICAM_STATS_SLOTS = 32
+    const val MULTICAM_STATS_SLOTS = 34
     /** V0.9 stereo metric-anchor diagnostic protocol. */
     const val STEREO_ANCHOR_STRIDE = 6
     const val STEREO_ANCHOR_MAX = 96
-    const val STEREO_ANCHOR_STATS_SLOTS = 48
+    const val STEREO_ANCHOR_STATS_SLOTS = 56
 
     /** 点云/调试层每个点 6 个浮点：x, y, z, r, g, b */
     const val POINT_SLOTS = 6
@@ -248,6 +248,10 @@ object NativeBridge {
         secondaryTimestampNs: Long
     ): Boolean
 
+    external fun nativeMultiCamUpdateIntrinsics(
+        primaryK: FloatArray,
+        secondaryK: FloatArray
+    ): Boolean
     external fun nativeMultiCamGetAnchors(out: FloatArray): Int
     external fun nativeGetMultiCamStats(out: FloatArray): Boolean
     external fun nativeMultiCamReset()

@@ -318,6 +318,9 @@ private var lastRelocPollMs = 0L
     private val frameMeta = LinkedHashMap<Long, FrameMeta>()
     private var frameMetaHit = 0L
     private var frameMetaMiss = 0L
+    private var frameMetaLateHit = 0L
+    private var frameMetaExpired = 0L
+    private val pendingFrameMeta = LinkedHashSet<Long>()
 
     private val captureResultCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
@@ -355,8 +358,15 @@ private var lastRelocPollMs = 0L
                 val crop = lastCropRegion
                 val physicalId = activePhysicalCameraId
                 synchronized(frameMetaLock) {
-                    frameMeta[sensorTs] = FrameMeta(exposure, skew, crop, physicalId)
-                    while (frameMeta.size > 64) {
+                    // ImageReader may deliver the image before the capture result.
+                    if (pendingFrameMeta.remove(sensorTs)) {
+                        frameMetaLateHit++
+                        frameMetaHit++
+                    } else {
+                        frameMeta[sensorTs] =
+                            FrameMeta(exposure, skew, crop, physicalId)
+                    }
+                    while (frameMeta.size > 96) {
                         val key = frameMeta.entries.first().key
                         frameMeta.remove(key)
                     }
@@ -1861,6 +1871,12 @@ private var lastRelocPollMs = 0L
             sb.appendLine("    Lens distortion: " + (lensDistortion?.joinToString(", ") ?: "unknown"))
             sb.appendLine("    Frame metadata matched: $frameMetaHit")
             sb.appendLine("    Frame metadata missed: $frameMetaMiss")
+            sb.appendLine("    Frame metadata lateMatched: $frameMetaLateHit")
+            sb.appendLine("    Frame metadata expired: $frameMetaExpired")
+            sb.appendLine(
+                "    Frame metadata pending: " +
+                    synchronized(frameMetaLock) { pendingFrameMeta.size }
+            )
             val poseRef = ch.get(CameraCharacteristics.LENS_POSE_REFERENCE)
             val poseRot = ch.get(CameraCharacteristics.LENS_POSE_ROTATION)
             val poseTrans = ch.get(CameraCharacteristics.LENS_POSE_TRANSLATION)
@@ -2095,8 +2111,22 @@ private var lastRelocPollMs = 0L
                     if (::hqCapture.isInitialized) {
                         hqCapture.onPreviewLuma(y, image.width, image.height, p[0].rowStride)
                     }
-                    val meta = synchronized(frameMetaLock) { frameMeta.remove(ts) }
-                    if (meta != null) frameMetaHit++ else frameMetaMiss++
+                    val meta = synchronized(frameMetaLock) {
+                        val ready = frameMeta.remove(ts)
+                        if (ready == null) {
+                            pendingFrameMeta.add(ts)
+                            while (pendingFrameMeta.size > 96) {
+                                val oldest = pendingFrameMeta.first()
+                                pendingFrameMeta.remove(oldest)
+                                frameMetaMiss++
+                                frameMetaExpired++
+                            }
+                        }
+                        ready
+                    }
+                    if (meta != null) {
+                        frameMetaHit++
+                    }
                 }
                 val vinsTs = ts
                 NativeBridge.nativeOnCameraFrame(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts, vinsTs)

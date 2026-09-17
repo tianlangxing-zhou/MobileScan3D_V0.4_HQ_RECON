@@ -2,7 +2,7 @@
 
 namespace mobilescan3d::multicam {
 
-constexpr int kStatsSlots = 32;
+constexpr int kStatsSlots = 34;
 
 /** u, v, zMetricM, reprojectionPx, confidence, parallaxDeg */
 constexpr int kAnchorStride = 6;

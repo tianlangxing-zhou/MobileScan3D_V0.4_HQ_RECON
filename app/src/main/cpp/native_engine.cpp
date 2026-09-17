@@ -348,7 +348,8 @@ static void storeSnap(uint64_t ts, int w, int h, int rs, int urs, int ups,
         }
     }
     snaps.push_back(std::move(s));
-    while (snaps.size() > 10) {
+    // V0.11: delayed stereo/depth association needs a longer RGB/pose history.
+    while (snaps.size() > 60) {
         snaps.pop_front();
     }
 }
@@ -440,7 +441,7 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
 
 // ------------------------------------------------------------- V0.9 stereo anchors
 static constexpr int64_t kStereoAnchorPoseMaxDiffNs = 12'000'000LL;
-static constexpr uint64_t kStereoAnchorMaxAgeNs = 420'000'000ULL;
+static constexpr uint64_t kStereoAnchorMaxAgeNs = 1'200'000'000ULL;
 static constexpr int64_t kStereoTargetMaskMaxDiffNs = 45'000'000LL;
 
 static const FrameSnap* findStereoAnchorSnap(
@@ -2564,7 +2565,9 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " blocks=" << tsdf.blocks()
       << " voxelSize=" << tsdf.voxelSize()
       << " memMB=" << (tsdf.memoryBytes() / (1024 * 1024))
+      << " coloredVoxels=" << tsdf.coloredVoxels()
       << " targetVoxels=" << targetTsdf.voxels()
+      << " targetColoredVoxels=" << targetTsdf.coloredVoxels()
       << " targetVoxelSize=" << targetTsdf.voxelSize() << "\n"
       << "DepthCalib: enabled=" << (depthCalibrationEnabled ? 1 : 0)
       << " valid=" << (lastCalibValid ? 1 : 0)
