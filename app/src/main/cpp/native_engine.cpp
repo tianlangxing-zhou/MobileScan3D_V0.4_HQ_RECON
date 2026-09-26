@@ -1702,9 +1702,9 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
     targetDebugBuilds++;
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
-        JNIEnv* e, jobject, jfloatArray depth, jint w, jint h,
+/** nativeOnDepthMap 的实现体；JNI 包装负责兜住所有 C++ 异常。 */
+static void nativeOnDepthMapImpl(
+        JNIEnv* e, jfloatArray depth, jint w, jint h,
         jfloat confidence, jlong t) {
     if (!depth || w <= 0 || h <= 0) {
         return;
@@ -2403,6 +2403,35 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     if (!targetDebugEnabled) {
         // 关掉时把上一帧的残留清空，否则切换开关后屏幕上会留着旧点
         targetDebugPointCount = 0;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
+        JNIEnv* e, jobject, jfloatArray depth, jint w, jint h,
+        jfloat confidence, jlong t) {
+    // JNI 边界是所有 native 异常的最后一道防线。
+    //
+    // C++ 异常一旦越过 JNI 回到 ART，Kotlin 侧任何 try/catch 都抓不到
+    // （JNI 没有异常传播机制），只会走到 std::terminate 直接杀进程 ——
+    // 表现就是「点一下目标立刻闪退」，而且 logcat 里往往只有一句
+    // "terminating with uncaught exception of type cv::Exception"。
+    //
+    // 已知实例：target_mask_engine.cpp 里 centroids_.at<cv::Vec2d>()
+    // 在 Debug 构建下命中 elemSize()==sizeof(_Tp) 断言抛 cv::Exception，
+    // 就是从这条深度线程路径逃出去的。修复了根因之后，这里仍然保留兜底：
+    // 30Hz 的深度回调里任何一个 OpenCV/STL 异常都不该带走整个 APP。
+    try {
+        nativeOnDepthMapImpl(e, depth, w, h, confidence, t);
+    } catch (const cv::Exception& ex) {
+        __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Depth",
+                            "nativeOnDepthMap OpenCV exception: %s", ex.what());
+    } catch (const std::exception& ex) {
+        __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Depth",
+                            "nativeOnDepthMap exception: %s", ex.what());
+    } catch (...) {
+        __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Depth",
+                            "nativeOnDepthMap unknown exception");
     }
 }
 

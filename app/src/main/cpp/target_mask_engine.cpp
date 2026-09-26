@@ -287,15 +287,42 @@ bool TargetMaskEngine::build(const float* depth, int width, int height,
             ? static_cast<float>(borderCount) / static_cast<float>(total)
             : 0.f;
 
-        const cv::Vec2d c = centroids_.at<cv::Vec2d>(chosen);
+        // ---- 质心读取 ----
+        //
+        // connectedComponentsWithStats 的 centroids 输出是 CV_64F、
+        // nlabels x 2 的**两列单通道**矩阵：每个元素只是一个 double。
+        //
+        // 旧写法 centroids_.at<cv::Vec2d>(chosen) 是错的：Vec2d 的
+        // sizeof 是 16，而矩阵 elemSize() 只有 8。Mat::at<T>() 内联在
+        // 头文件里，会带着**我们自己的编译选项**展开 —— Debug 构建没有
+        // NDEBUG，CV_DbgAssert(elemSize() == sizeof(_Tp)) 生效，
+        // 于是一旦锁定目标就抛 cv::Exception。该异常穿过 JNI 边界无人
+        // 捕获，直接 std::terminate 杀进程，外层 Kotlin try/catch 完全
+        // 兜不住（表现就是「点一下目标立刻闪退」）。
+        //
+        // Release 下断言被编译掉，读到的地址又恰好是行首（行长 2*8=16
+        // 字节，与 Vec2d 同宽），所以结果"碰巧正确" —— 这让它长期没被
+        // 发现。但按类型规则这属于越界读取的未定义行为，必须按 double
+        // 逐列取。
+        double ccx = 0.0;
+        double ccy = 0.0;
+        if (centroids_.type() == CV_64F && centroids_.cols == 2 &&
+            chosen >= 0 && chosen < centroids_.rows) {
+            ccx = centroids_.at<double>(chosen, 0);
+            ccy = centroids_.at<double>(chosen, 1);
+        } else {
+            // 退化回 box 中心：宁可给一个几何上说得过去的值，也不要抛异常。
+            ccx = static_cast<double>(box.width) * 0.5;
+            ccy = static_cast<double>(box.height) * 0.5;
+        }
         chosenStep = step;
         chosenArea = area;
         chosenCand = cand;
         chosenTol = tolerance;
         chosenAreaRatio = areaRatio;
         chosenBorderTouch = borderTouch;
-        chosenCx = static_cast<float>(c[0]) + static_cast<float>(box.x);
-        chosenCy = static_cast<float>(c[1]) + static_cast<float>(box.y);
+        chosenCx = static_cast<float>(ccx) + static_cast<float>(box.x);
+        chosenCy = static_cast<float>(ccy) + static_cast<float>(box.y);
         chosenMaskRoi = maskRoi.clone();
 
         if (areaRatio <= TargetMaskEngine::kMaxAreaRatio &&
