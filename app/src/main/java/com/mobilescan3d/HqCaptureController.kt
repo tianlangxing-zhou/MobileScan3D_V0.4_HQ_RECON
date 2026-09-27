@@ -481,9 +481,12 @@ class HqCaptureController(
         private const val MIN_FUSION_FRAMES = 3
         /**
          * 每多少个 HQ keyframe 捕一张独立 RAW 参考。
-         * 1 = 每轮都拍（当前）。想进一步降低 Camera HAL 压力就改成 3。
+         * V0.13.8：1 → 3。实测（190333/190525 两轮短扫）每轮 burst 都拍 25MB DNG，
+         * 但两次导出全走 fallback-single 路径——DNG 参考从未被消费，却实打实拖慢
+         * still 流水线、拉长 burst 周期（周期越长，每分钟关键帧越少，纹理覆盖率越低）。
+         * 改为每 3 轮拍一张；融合成功路径真正需要线性参考时仍能覆盖。
          */
-        private const val RAW_REFERENCE_EVERY_N_BURSTS = 1
+        private const val RAW_REFERENCE_EVERY_N_BURSTS = 3
         /**
          * still 与 preview 必须用同一套曝光判据。
          *
@@ -591,6 +594,13 @@ class HqCaptureController(
     private var burstExpectedFrames = 0
     private var burstCompletedThisRound = 0
     private var burstFailedThisRound = 0
+
+    // V0.13.8 「停顿拍纹理」提示：实测短扫描里用户持续环绕不停顿时，
+    // stable 窗口永远不满足 → 每会话仅 1 个关键帧 → cov 只有 12.9%。
+    // 关键帧数量才是覆盖率的第一杠杆，所以扫描 40s 仍 0 关键帧时提示一次。
+    private var scanBeginNs = 0L
+    private var keyframesRegistered = 0
+    private var pauseHintShown = false
 
     // 新视角判定
     private var haveLastBurstPose = false
@@ -781,6 +791,10 @@ class HqCaptureController(
         stats.aeParamsStable = false
         stats.afParamsStable = false
         cleanupAllBurstTmp(currentSessionId)
+        // V0.13.8 提示状态复位
+        scanBeginNs = System.nanoTime()
+        keyframesRegistered = 0
+        pauseHintShown = false
     }
 
     fun endScan() {
@@ -1358,6 +1372,20 @@ class HqCaptureController(
         sweepPendingCaptures(nowNs)
         if (currentPhase == STATE_IDLE) {
             setPhase(STATE_WAIT_3A)
+        }
+
+        // V0.13.8：扫描 40s 仍 0 关键帧且当前没有 burst 在处理 →
+        // 提示用户「短暂停顿可拍高清纹理」（每会话最多一次，不刷屏）。
+        // 数据依据：190525 会话 kf=1 时 cov 仅 12.9%，border=7117 拒绝
+        // 本质是「单视角根本照不到的三角形」——多关键帧是唯一正解。
+        if (!pauseHintShown &&
+            keyframesRegistered == 0 &&
+            !burstInFlight && !processingInFlight &&
+            scanBeginNs > 0L &&
+            nowNs - scanBeginNs > 40_000_000_000L
+        ) {
+            pauseHintShown = true
+            onHint("短暂停顿约 1 秒，可自动拍摄高清纹理")
         }
 
         // 一次 burst 从拍摄到「融合结束 + 临时目录清理完」之间不允许再开新的：
@@ -2427,6 +2455,7 @@ class HqCaptureController(
             android.util.Log.i("HqTexture",
                 "register ok: ${file.name} idx=$frameIndex " +
                     "q=%.2f ts=${ctx.frameSensorTs[frameIndex]}".format(quality))
+            keyframesRegistered++
         } catch (t: Throwable) {
             android.util.Log.w("HqTexture", "register keyframe failed: ${t.message}")
         }

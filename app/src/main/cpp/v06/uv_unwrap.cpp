@@ -5,6 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <android/log.h>
+
+// V0.13.8：xatlas 失败退 fallback 时必须留下原因。实测（190525 会话）出现
+// uv=fallback，但旧代码在 AddMesh 失败 / atlas 维度异常 / 顶点校验失败三条
+// 路径上都静默直落 fallback，无法区分是网格质量还是库内问题。
+#define UW_LOGW(...) \
+    __android_log_print(ANDROID_LOG_WARN, "MobileScan3D", __VA_ARGS__)
+
 #if defined(MOBILESCAN_HAS_XATLAS)
 #include "xatlas.h"
 #endif
@@ -46,6 +54,14 @@ bool UvUnwrapper::unwrap(
         const auto addResult =
             xatlas::AddMesh(atlas, decl, 1);
 
+        if (addResult != xatlas::AddMeshError::Success) {
+            // V0.13.8：AddMesh 失败是 fallback 的一条独立路径，必须留下原因
+            UW_LOGW("uv_unwrap: AddMesh failed err=%d verts=%u idx=%u",
+                    static_cast<int>(addResult),
+                    static_cast<std::uint32_t>(mesh.vertices.size()),
+                    static_cast<std::uint32_t>(mesh.indices.size()));
+        }
+
         if (addResult == xatlas::AddMeshError::Success) {
             xatlas::ChartOptions chart;
             chart.maxIterations = 2;
@@ -69,6 +85,18 @@ bool UvUnwrapper::unwrap(
 
             xatlas::Generate(atlas, chart, pack);
 
+            if (atlas->meshCount != 1 ||
+                atlas->atlasCount != 1 ||
+                atlas->width <= 0 ||
+                atlas->height <= 0) {
+                UW_LOGW("uv_unwrap: Generate unusable meshCount=%u "
+                        "atlasCount=%u %dx%d charts=%u",
+                        static_cast<std::uint32_t>(atlas->meshCount),
+                        static_cast<std::uint32_t>(atlas->atlasCount),
+                        atlas->width, atlas->height,
+                        static_cast<std::uint32_t>(atlas->chartCount));
+            }
+
             if (atlas->meshCount == 1 &&
                 atlas->atlasCount == 1 &&
                 atlas->width > 0 &&
@@ -90,6 +118,10 @@ bool UvUnwrapper::unwrap(
                     const auto& xv = xm.vertexArray[i];
                     if (xv.xref >= mesh.vertices.size() ||
                         xv.atlasIndex < 0) {
+                        UW_LOGW("uv_unwrap: vertex invalid i=%u "
+                                "xref=%u(verts=%zu) atlasIndex=%d",
+                                i, xv.xref, mesh.vertices.size(),
+                                xv.atlasIndex);
                         valid = false;
                         break;
                     }
