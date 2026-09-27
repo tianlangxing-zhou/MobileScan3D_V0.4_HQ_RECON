@@ -1,0 +1,30 @@
+{
+  "sessionId": "20260927_205243_63977",
+  "ts": 1790513690134,
+  "textured": true,
+  "vertices": 51900,
+  "triangles": 17300,
+  "fileBytes": 2238200,
+  "message": "HQ 纹理模型已导出：\/storage\/emulated\/0\/Android\/data\/com.mobilescan3d\/files\/scan_20260927_205243_63977.glb",
+  "registeredKeyframes": 3,
+  "loadedKeyframes": 3,
+  "usedKeyframes": 3,
+  "atlasW": 999,
+  "atlasH": 998,
+  "texturedTriangles": 9404,
+  "fallbackTriangles": 7896,
+  "coveragePercent": 50.9,
+  "usedXatlas": true,
+  "meshCleanupStats": [
+    17220,
+    17503,
+    61,
+    6,
+    54,
+    58,
+    51,
+    448,
+    0,
+    9595
+  ]
+}
