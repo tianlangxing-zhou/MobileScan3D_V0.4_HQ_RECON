@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <array>
 
 #include <opencv2/core.hpp>
 
@@ -61,6 +62,9 @@ struct TextureBakeStats {
     std::size_t paintedTexels = 0;   // all chart texels, including vertex-color fallback
     std::size_t hqTexels = 0;        // texels supported by >=1 HQ camera view
     float coveragePercent = 0.0f;    // hqTexels / paintedTexels * 100
+    // V0.13.2 诊断：逐关键帧拒绝统计（与 keyframes 下标对应）。
+    // [0]=project [1]=border [2]=depth [3]=facing [4]=area [5]=pass
+    std::vector<std::array<std::size_t, 6>> frameRejects;
 };
 
 class TextureBaker {

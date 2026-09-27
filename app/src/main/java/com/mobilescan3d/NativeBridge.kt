@@ -312,6 +312,21 @@ object NativeBridge {
      * 一转起来点云就漂。时间戳超出 80ms 会返回 false，调用方应回退。
      */
     external fun nativeGetRenderPoseAt(timestampNs: Long, out: FloatArray): Boolean
+
+    /**
+     * V0.13.2：[nativeGetRenderPoseAt] 的关键帧专用宽松版。
+     *
+     * 12MP burst 期间预览停摆，位姿历史在 burst 时间戳处有空洞，strict 80ms
+     * 永远查不到 —— HQ 纹理关键帧因此被全部静默丢弃。burst 前提是稳定持机，
+     * 用「最近的位姿样本」作近似，容差由调用方传入（关键帧路径 500ms）。
+     * AR 渲染路径**不要**用这个，请继续走 strict 版本。
+     */
+    external fun nativeGetRenderPoseAtTol(
+        timestampNs: Long,
+        maxAgeNs: Long,
+        out: FloatArray
+    ): Boolean
+
     // -------------------------------------------------------------- V0.8 MultiCam
     external fun nativeMultiCamConfigure(
         primaryK: FloatArray,

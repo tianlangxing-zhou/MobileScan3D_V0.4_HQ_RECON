@@ -452,6 +452,12 @@ class HqCaptureController(
          * 报告里会同时输出实际值，便于实机标定。
          */
         private const val MIN_SHARPEST_SCORE = 20.0f
+        /**
+         * V0.13.2：关键帧位姿查询的宽松容差。12MP burst 期间预览停摆，
+         * strict 80ms 窗口在位姿历史里查不到 burst 时间戳；burst 前提是
+         * 稳定持机，所以「最近的位姿样本」是可接受近似。
+         */
+        private const val POSE_RELAXED_TOL_NS = 500_000_000L
         private const val MAX_EXPOSURE_RECOVERY_ATTEMPTS = 2
         private const val EXPOSURE_RECOVERY_COOLDOWN_NS = 3_000_000_000L
         /** 新视角判定：平移或转角超过其一才值得再拍 */
@@ -916,6 +922,22 @@ class HqCaptureController(
                 NativeBridge.nativeGetRenderPoseAt(sensorTs, pose)
             } catch (t: Throwable) {
                 false
+            }
+            // V0.13.2：12MP burst 期间预览管线停摆，位姿历史在 burst 时间戳处
+            // 有空洞，strict 80ms 查不到（实机：poseValid=false poseAtOk=false，
+            // 全部 HQ 关键帧被丢、GLB 永远 plain）。burst 触发前提就是稳定持机，
+            // 退一步用 500ms 宽容窗口取最近位姿作近似。
+            if (!atOk) {
+                atOk = try {
+                    NativeBridge.nativeGetRenderPoseAtTol(sensorTs, POSE_RELAXED_TOL_NS, pose)
+                } catch (t: Throwable) {
+                    false
+                }
+                if (atOk) {
+                    android.util.Log.i("HqTexture",
+                        "pose relaxed: idx=$i ts=$sensorTs " +
+                            "tol=${POSE_RELAXED_TOL_NS / 1_000_000}ms")
+                }
             }
         }
         if (atOk) {
@@ -2314,16 +2336,41 @@ class HqCaptureController(
         frameIndex: Int,
         sharpness: Float
     ) {
-        if (!file.exists() ||
-            frameIndex !in 0 until BURST_FRAME_SLOTS ||
-            !ctx.framePoseValid[frameIndex] ||
-            !ctx.framePoseAtOk[frameIndex]
-        ) {
+        // V0.13.2 诊断：实机出现「fused 关键帧已产出但导出 keyframes=0」——
+        // 这三道守卫任一失败都会**静默**丢弃，事后无法区分是哪一道拦的。
+        // 12MP burst 期间预览管线停摆会让 VINS 位姿历史在 burst 时间戳处
+        // 出现空洞，framePoseAtOk 大概率就是真凶；必须把丢弃原因打进日志。
+        if (!file.exists()) {
+            android.util.Log.w("HqTexture",
+                "register skip: file missing ${file.name}")
+            return
+        }
+        if (frameIndex !in 0 until BURST_FRAME_SLOTS) {
+            android.util.Log.w("HqTexture",
+                "register skip: frameIndex=$frameIndex out of slots")
+            return
+        }
+        if (!ctx.framePoseValid[frameIndex] || !ctx.framePoseAtOk[frameIndex]) {
+            android.util.Log.w("HqTexture",
+                "register skip: pose gate ${file.name} idx=$frameIndex " +
+                    "poseValid=${ctx.framePoseValid[frameIndex]} " +
+                    "poseAtOk=${ctx.framePoseAtOk[frameIndex]} " +
+                    "sensorTs=${ctx.frameSensorTs[frameIndex]}")
+            stats.lastCaptureRejectReason =
+                "关键帧${file.name}位姿不可用(poseValid=" +
+                    "${ctx.framePoseValid[frameIndex]},poseAtOk=" +
+                    "${ctx.framePoseAtOk[frameIndex]})"
             return
         }
 
-        val size = jpegSize ?: return
-        val intr = textureIntrinsics(size) ?: return
+        val size = jpegSize ?: run {
+            android.util.Log.w("HqTexture", "register skip: jpegSize unknown")
+            return
+        }
+        val intr = textureIntrinsics(size) ?: run {
+            android.util.Log.w("HqTexture", "register skip: no intrinsics for $size")
+            return
+        }
         val pose = ctx.framePose[frameIndex].copyOf()
 
         // Laplacian 方差跨度很大，压到 0.25..2.5 这个紧凑区间交给 native；
@@ -2343,6 +2390,10 @@ class HqCaptureController(
                 quality,
                 ctx.frameSensorTs[frameIndex]
             )
+            // V0.13.2 诊断：与上面的 skip 日志配对，确认注册真的进了 native。
+            android.util.Log.i("HqTexture",
+                "register ok: ${file.name} idx=$frameIndex " +
+                    "q=%.2f ts=${ctx.frameSensorTs[frameIndex]}".format(quality))
         } catch (t: Throwable) {
             android.util.Log.w("HqTexture", "register keyframe failed: ${t.message}")
         }

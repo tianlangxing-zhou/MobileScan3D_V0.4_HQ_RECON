@@ -326,12 +326,23 @@ bool visible(
     return z <= ref + tol;
 }
 
+// V0.13.2 诊断：texTris 远低于在帧率预期时，逐关卡统计拒绝原因。
+struct FrameRejectStats {
+    std::size_t project = 0;
+    std::size_t border = 0;
+    std::size_t depth = 0;
+    std::size_t facing = 0;
+    std::size_t area = 0;
+    std::size_t pass = 0;
+};
+
 float triangleFrameScore(
         const UvVertex& a,
         const UvVertex& b,
         const UvVertex& c,
         const LoadedFrame& f,
-        const TextureBakeOptions& options) {
+        const TextureBakeOptions& options,
+        FrameRejectStats* rej = nullptr) {
     const Vec3 pa = pos(a);
     const Vec3 pb = pos(b);
     const Vec3 pc = pos(c);
@@ -339,26 +350,37 @@ float triangleFrameScore(
     const Vec3 n = normalize(cross(pb-pa, pc-pa));
 
     float u,v,z;
-    if (!project(f.meta, centroid, &u,&v,&z)) return 0.0f;
+    if (!project(f.meta, centroid, &u,&v,&z)) {
+        if (rej) ++rej->project;
+        return 0.0f;
+    }
 
     const int border = std::max(0, options.imageBorderPixels);
     if (u < border || v < border ||
         u >= f.bgr.cols - border ||
         v >= f.bgr.rows - border) {
+        if (rej) ++rej->border;
         return 0.0f;
     }
 
-    if (!visible(f,u,v,z,options)) return 0.0f;
+    if (!visible(f,u,v,z,options)) {
+        if (rej) ++rej->depth;
+        return 0.0f;
+    }
 
     const Vec3 view =
         normalize(cameraPosition(f.meta) - centroid);
     const float facing = dot(n, view);
-    if (facing < options.minViewCos) return 0.0f;
+    if (facing < options.minViewCos) {
+        if (rej) ++rej->facing;
+        return 0.0f;
+    }
 
     float u0,v0,z0,u1,v1,z1,u2,v2,z2;
     if (!project(f.meta, pa, &u0,&v0,&z0) ||
         !project(f.meta, pb, &u1,&v1,&z1) ||
         !project(f.meta, pc, &u2,&v2,&z2)) {
+        if (rej) ++rej->project;
         return 0.0f;
     }
 
@@ -367,7 +389,12 @@ float triangleFrameScore(
             (u1-u0)*(v2-v0) -
             (v1-v0)*(u2-u0)) * 0.5f;
 
-    if (projectedArea < 2.0f) return 0.0f;
+    if (projectedArea < 2.0f) {
+        if (rej) ++rej->area;
+        return 0.0f;
+    }
+
+    if (rej) ++rej->pass;
 
     const float resolutionScore =
         std::sqrt(projectedArea);
@@ -651,6 +678,9 @@ bool TextureBaker::bake(
     const int blendCount =
         std::max(1, options.maxBlendFrames);
 
+    // V0.13.2 诊断：逐关键帧拒绝统计。
+    std::vector<FrameRejectStats> rejectStats(frames.size());
+
     for (std::size_t t = 0; t < triCount; ++t) {
         const auto ia = mesh.indices[t*3u+0u];
         const auto ib = mesh.indices[t*3u+1u];
@@ -676,7 +706,8 @@ bool TextureBaker::bake(
                 triangleFrameScore(
                     a,b,c,
                     frames[fi],
-                    options);
+                    options,
+                    &rejectStats[fi]);
             if (s > 0.0f) {
                 scored.emplace_back(s, fi);
             }
@@ -842,6 +873,13 @@ bool TextureBaker::bake(
                 100.0 *
                 static_cast<double>(stats.hqTexels) /
                 static_cast<double>(stats.paintedTexels));
+    }
+
+    // V0.13.2 诊断：透出逐关键帧拒绝统计。
+    for (const FrameRejectStats& r : rejectStats) {
+        stats.frameRejects.push_back(
+            {r.project, r.border, r.depth,
+             r.facing, r.area, r.pass});
     }
 
     if (outStats) *outStats = stats;

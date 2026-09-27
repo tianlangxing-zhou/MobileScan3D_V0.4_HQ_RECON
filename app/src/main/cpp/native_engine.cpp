@@ -3690,6 +3690,79 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAt(JNIEnv* env, jobject,
     return JNI_TRUE;
 }
 
+/**
+ * V0.13.2：nativeGetRenderPoseAt 的关键帧专用宽松版。
+ *
+ * 12MP still burst 期间预览管线停摆，VINS 位姿历史（renderPoseHistory，
+ * 只在预览帧的 VINS pose 被接受时追加）在 burst 时间戳处出现空洞 ——
+ * strict 80ms 窗口永远查不到，实机日志「poseValid=false poseAtOk=false」
+ * 由此而来，所有 HQ 纹理关键帧被静默丢弃，导出 GLB 永远 plain。
+ *
+ * burst 的触发前提就是「用户已稳定持机」（3A 稳定门 + 运动门控），所以
+ * 「burst 开始前最后一个位姿」对 burst 内任何一帧都是可接受的近似。
+ * 容差由调用方传入（关键帧路径用 500ms）；AR 渲染仍走 strict 80ms 版。
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject,
+                                                            jlong timestampNs,
+                                                            jlong maxAgeNs,
+                                                            jfloatArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 12) {
+        return JNI_FALSE;
+    }
+    const int64_t tol = maxAgeNs > 0
+        ? static_cast<int64_t>(maxAgeNs)
+        : kRenderPoseMaxAgeNs;
+    float pose[12];
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        if (renderPoseHistory.empty()) {
+            return JNI_FALSE;
+        }
+        const int64_t want = static_cast<int64_t>(timestampNs);
+        const RenderPoseSample* best = nullptr;
+        int64_t bestDelta = 0;
+        for (const RenderPoseSample& rp : renderPoseHistory) {
+            int64_t d = static_cast<int64_t>(rp.ts) - want;
+            if (d < 0) {
+                d = -d;
+            }
+            if (best == nullptr || d < bestDelta) {
+                best = &rp;
+                bestDelta = d;
+            }
+        }
+        if (best == nullptr || bestDelta > tol) {
+            return JNI_FALSE;
+        }
+        // V0.13.2 诊断：cov 异常低时需要区分「宽容窗口拿到了过期位姿（扫描中
+        // 手机已转动）」与「旋转约定错误」。年龄大 => 过期；年龄小但投影仍偏 =>
+        // 约定错误。只在宽容查询路径打日志（AR 用的 strict 版不打，避免刷屏）。
+        LOGI("renderPoseAtTol match: deltaMs=%.0f newestAgeMs=%.0f hist=%zu",
+             bestDelta / 1e6,
+             (want - static_cast<int64_t>(renderPoseHistory.back().ts)) / 1e6,
+             renderPoseHistory.size());
+        for (int i = 0; i < 9; ++i) {
+            pose[i] = best->R[i];
+        }
+        pose[9] = best->t[0];
+        pose[10] = best->t[1];
+        pose[11] = best->t[2];
+    }
+    float savedR[9];
+    float savedT[3];
+    if (!gPersistentRelocalizer.transformPose(
+            pose, pose + 9, savedR, savedT)) {
+        return JNI_FALSE;
+    }
+    for (int i = 0; i < 9; ++i) pose[i] = savedR[i];
+    pose[9] = savedT[0];
+    pose[10] = savedT[1];
+    pose[11] = savedT[2];
+    env->SetFloatArrayRegion(out, 0, 12, pose);
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeConfigureTrackerModels(JNIEnv* env, jobject, jstring backbone, jstring head) {
     std::shared_ptr<ObjectTracker> tracker;
@@ -4283,6 +4356,64 @@ Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
          uvStats.atlasWidth, uvStats.atlasHeight,
          bakeStats.usedKeyframes, bakeStats.requestedKeyframes,
          bakeStats.coveragePercent, jpeg.size());
+    // V0.13.2 诊断：cov=0.1% 时无法区分「视角本来就该只盖一点」与
+    // 「投影系统性失效（位姿错 / 空间不一致）」。把逐三角形命中统计和
+    // 每个关键帧的位姿/内参打出来，下一轮日志直接定位。
+    LOGI("bakeDiag texTris=%zu fbTris=%zu painted=%zu hq=%zu kf=%d",
+         bakeStats.texturedTriangles, bakeStats.fallbackTriangles,
+         bakeStats.paintedTexels, bakeStats.hqTexels,
+         bakeStats.loadedKeyframes);
+    // V0.13.2 诊断：texTris 远低于在帧率预期，逐关卡统计拒绝原因。
+    // [0]=project [1]=border [2]=depth [3]=facing [4]=area [5]=pass
+    for (std::size_t ri = 0; ri < bakeStats.frameRejects.size(); ++ri) {
+        const auto& r = bakeStats.frameRejects[ri];
+        LOGI("bakeDiag reject kf=%zu project=%zu border=%zu depth=%zu "
+             "facing=%zu area=%zu pass=%zu",
+             ri, r[0], r[1], r[2], r[3], r[4], r[5]);
+    }
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        for (const auto& kf : gTextureKeyframes) {
+            // V0.13.2 诊断：把网格顶点按烘焙同一套投影公式投进关键帧画幅，
+            // 统计在帧率。若在帧率~0 而照片里物体明明可见，则位姿/约定有错。
+            int inFront = 0;
+            int inFrame = 0;
+            const int total = static_cast<int>(meshCopy.vertices.size());
+            float bmin[3] = {0,0,0}, bmax[3] = {0,0,0};
+            for (int axis = 0; axis < 3; ++axis) { bmin[axis] = 1e9f; bmax[axis] = -1e9f; }
+            for (const auto& v : meshCopy.vertices) {
+                const float p[3] = {v.px, v.py, v.pz};
+                for (int axis = 0; axis < 3; ++axis) {
+                    if (p[axis] < bmin[axis]) bmin[axis] = p[axis];
+                    if (p[axis] > bmax[axis]) bmax[axis] = p[axis];
+                }
+                const float d[3] = {v.px - kf.twc[0],
+                                    v.py - kf.twc[1],
+                                    v.pz - kf.twc[2]};
+                const float pcx = kf.Rwc[0]*d[0] + kf.Rwc[3]*d[1] + kf.Rwc[6]*d[2];
+                const float pcy = kf.Rwc[1]*d[0] + kf.Rwc[4]*d[1] + kf.Rwc[7]*d[2];
+                const float pcz = kf.Rwc[2]*d[0] + kf.Rwc[5]*d[1] + kf.Rwc[8]*d[2];
+                if (pcz <= 0.02f) continue;
+                ++inFront;
+                const float u = kf.fx * pcx / pcz + kf.cx;
+                const float vv = kf.fy * pcy / pcz + kf.cy;
+                if (u >= 0.f && u < static_cast<float>(kf.width) &&
+                    vv >= 0.f && vv < static_cast<float>(kf.height)) {
+                    ++inFrame;
+                }
+            }
+            LOGI("bakeDiag kf %dx%d fx=%.0f fy=%.0f t=(%.3f,%.3f,%.3f) "
+                 "fwd=(%.3f,%.3f,%.3f) q=%.2f "
+                 "verts=%d inFront=%d inFrame=%d "
+                 "bbox=[(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f)]",
+                 kf.width, kf.height, kf.fx, kf.fy,
+                 kf.twc[0], kf.twc[1], kf.twc[2],
+                 kf.Rwc[2], kf.Rwc[5], kf.Rwc[8],
+                 kf.quality,
+                 total, inFront, inFrame,
+                 bmin[0], bmin[1], bmin[2], bmax[0], bmax[1], bmax[2]);
+        }
+    }
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 

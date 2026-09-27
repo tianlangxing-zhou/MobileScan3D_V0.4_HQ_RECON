@@ -2594,6 +2594,22 @@ private var lastRelocPollMs = 0L
      * **`usable` 才是「可以当米制用」的判据**，`valid` 只是「这一帧拟合成功」。
      * 把两者混为一谈会让人以为标定已经在生效，而实际上尺度并没有被施加。
      */
+    /**
+     * 折叠 HUD 的尺度标签。旧实现是一句硬编码「非米制」——不管标定是否
+     * 生效永远显示「非米制」，和「定位失锁」是同一类静态文案冒充动态状态。
+     * 真实判据与 depthCalibrationSummary 一致：usable > 0.5 才算米制。
+     */
+    private fun metricLabel(): String {
+        return try {
+            val n = NativeBridge.nativeGetDepthCalibration(calibBuf)
+            if (n >= NativeBridge.DEPTH_CALIBRATION_SLOTS &&
+                calibBuf[NativeBridge.CALIB_INDEX_USABLE] > 0.5f
+            ) "米制" else "非米制"
+        } catch (t: Throwable) {
+            "非米制"
+        }
+    }
+
     private fun depthCalibrationSummary(): String {
         val n = try {
             NativeBridge.nativeGetDepthCalibration(calibBuf)
@@ -3265,7 +3281,7 @@ private var lastRelocPollMs = 0L
         } else {
             "地图 $shown · 绘制 ${renderer.drawnAccumulated}" +
                 (if (renderer.drawnDebug > 0) " + ${renderer.drawnDebug}" else "") +
-                " · 非米制"
+                " · " + metricLabel()
         }
     }
 

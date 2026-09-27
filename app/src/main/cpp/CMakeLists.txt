@@ -171,7 +171,16 @@ if(EXISTS "${MOBILESCAN_XATLAS_DIR}/xatlas.cpp"
     target_sources(mobilescan3d PRIVATE "${MOBILESCAN_XATLAS_DIR}/xatlas.cpp")
     target_include_directories(mobilescan3d PRIVATE "${MOBILESCAN_XATLAS_DIR}")
     target_compile_definitions(mobilescan3d PRIVATE MOBILESCAN_HAS_XATLAS=1)
-    message(STATUS "MobileScan3D V0.6: xatlas enabled")
+    # V0.13.2 修复：真机实测 xatlas 多线程 TaskScheduler 存在组槽位复用竞态
+    # （wait() 置 group.free 后慢 worker 仍在旧任务 ref-- 上，污染新组计数），
+    # 表现为 nativeBakeTexturedGlb 在 ComputeCharts 里 sched_yield 永久自旋，
+    # MeshExport 线程死锁、GLB 永不产出（bugreport 线程栈实锤）。
+    # 强制单线程：无 worker 线程即无该竞态；2~4 万三角形网格单线程展开
+    # 1~3 秒，仅发生在停止扫描导出时，可接受。
+    set_source_files_properties(
+        "${MOBILESCAN_XATLAS_DIR}/xatlas.cpp" PROPERTIES
+        COMPILE_DEFINITIONS "XA_MULTITHREADED=0")
+    message(STATUS "MobileScan3D V0.6: xatlas enabled (single-threaded)")
 else()
     message(WARNING "MobileScan3D V0.6: xatlas missing; using UV fallback")
 endif()
