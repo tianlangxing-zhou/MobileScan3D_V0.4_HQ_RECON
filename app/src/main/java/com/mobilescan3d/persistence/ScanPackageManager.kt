@@ -55,6 +55,7 @@ object ScanPackageManager {
         }
     }
 
+    @Synchronized
     fun saveCurrent(
         context: Context,
         sessionId: String,
@@ -71,11 +72,9 @@ object ScanPackageManager {
             )
         }
 
-        val safeId =
-            sessionId.replace(
-                Regex("[^A-Za-z0-9_.-]"),
-                "_"
-            )
+        // Immutable publication: a failed re-export must not delete the previous package.
+        val safeId = sessionId.replace(Regex("[^A-Za-z0-9_-]"), "_").take(96) +
+            "_" + java.util.UUID.randomUUID().toString()
 
         val root = root(context)
         val tmp =
@@ -203,19 +202,15 @@ object ScanPackageManager {
                 Charsets.UTF_8
             )
 
-            if (finalDir.exists()) {
-                finalDir.deleteRecursively()
-            }
-
-            // Same filesystem under app external files: rename is atomic on
-            // Android's normal ext4/f2fs storage.
-            if (!tmp.renameTo(finalDir)) {
-                finalDir.mkdirs()
-                tmp.copyRecursively(
-                    finalDir,
-                    overwrite = true
-                )
+            if (readPackage(tmp) == null) {
                 tmp.deleteRecursively()
+                return Result(false, "扫描包发布前校验失败")
+            }
+            // Do not fall back to copying into a visible directory: readers could
+            // observe a partial package. Keep all publication on one filesystem.
+            if (finalDir.exists() || !tmp.renameTo(finalDir)) {
+                tmp.deleteRecursively()
+                return Result(false, "扫描包原子发布失败，旧扫描包已保留")
             }
 
             val info =
@@ -363,40 +358,16 @@ object ScanPackageManager {
                 return null
             }
 
-            val model =
-                File(
-                    dir,
-                    json.optString(
-                        "model",
-                        MODEL
-                    )
-                )
-
-            val asset =
-                File(
-                    dir,
-                    json.optString(
-                        "arAsset",
-                        AR_ASSET
-                    )
-                )
-
-            val map =
-                File(
-                    dir,
-                    json.optString(
-                        "vinsMap",
-                        VINS_MAP
-                    )
-                )
-
-            if (
-                !model.exists() ||
-                !asset.exists() ||
-                !map.exists()
-            ) {
-                return null
-            }
+            // Version 7 has fixed filenames; never follow paths supplied by a manifest.
+            if (json.optString("model", MODEL) != MODEL ||
+                json.optString("arAsset", AR_ASSET) != AR_ASSET ||
+                json.optString("vinsMap", VINS_MAP) != VINS_MAP) return null
+            val model = File(dir, MODEL)
+            val asset = File(dir, AR_ASSET)
+            val map = File(dir, VINS_MAP)
+            if (listOf(model, asset, map).any {
+                    !it.isFile || it.length() <= 0L || it.canonicalFile.parentFile != dir.canonicalFile
+                }) return null
 
             if (
                 sha256(model) !=

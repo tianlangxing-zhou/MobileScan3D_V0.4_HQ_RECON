@@ -38,6 +38,35 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
+    private var lastModelFile: java.io.File? = null
+    private var pendingModelCopy: java.io.File? = null
+    private val saveModelLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("model/gltf-binary")
+    ) { uri ->
+        val source = pendingModelCopy
+        pendingModelCopy = null
+        if (uri != null && source != null) {
+            val resolver = applicationContext.contentResolver
+            kotlin.concurrent.thread(name = "SaveGlb", isDaemon = true) {
+                val message = try {
+                    source.inputStream().use { input ->
+                        val output = resolver.openOutputStream(uri, "wt")
+                            ?: error("无法打开目标文件")
+                        output.use { input.copyTo(it) }
+                    }
+                    "GLB 模型已保存到所选位置"
+                } catch (t: Throwable) {
+                    "保存失败：${t.message}"
+                } finally {
+                    source.delete()
+                }
+                runOnUiThread { if (!isDestroyed) toast(message) }
+            }
+        } else {
+            source?.delete()
+        }
+    }
+
     private lateinit var cameraManager: CameraManager
     private lateinit var sensorManager: SensorManager
     private lateinit var texture: TextureView
@@ -83,6 +112,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     /** PLY / GLB 导出与网格构建（构建在后台线程，绝不占 UI 线程）。 */
     private lateinit var exportManager: ExportManager
+
+    // Main-thread guard spans reconstruction, texture baking, and package saving.
+    private var modelOperationBusy = false
 
     /** 最近一次网格构建结论（HUD / 报告）。 */
     @Volatile private var lastMeshSummary = "n/a"
@@ -226,6 +258,46 @@ private var lastRelocPollMs = 0L
     /** 已经因为「epoch 未激活」清过一次网格，避免逐帧重复清。 */
     private var liveMeshBlockedNotice = false
     /**
+     * V0.13.4：上一次上报给 native 的深度归一化映射版本号。
+     * 与 [MonoDepthProvider] 的 `normVersion` 对应；变化时才需要重参数化。
+     */
+    @Volatile private var lastDepthNormVersion = 0L
+
+    // ---- V0.13.4 P1：自由摆放 AR ----
+    /**
+     * 是否处于「自由摆放」模式。false（默认）= **原位恢复**：模型顶点在保存
+     * 时的世界坐标里，靠持久地图回到原物理位置。true = 模型被搬到当前世界
+     * 坐标下的锚点，不依赖旧地图，换地点也能放。
+     *
+     * 这两件事必须分开：混在一起会出现「换了个房间，模型却死死钉在旧坐标、
+     * 看起来像不存在」或者「想看原位却跟着手机跑」这两种互不兼容的抱怨。
+     */
+    @Volatile private var placeModeActive = false
+    /** 摆放模式按钮（进入/退出共用，文字随状态切换） */
+    private var placeButton: android.widget.Button? = null
+    /** 模型包围盒中心（模型坐标系），摆放时用它把模型「中心对齐锚点」。 */
+    private val placeCenter = FloatArray(3)
+    /** 锚点：当前世界坐标下模型中心要放到的位置。 */
+    private val placeAnchor = FloatArray(3)
+    /** 绕世界 Y 轴的偏航（弧度）与均匀缩放。 */
+    @Volatile private var placeYaw = 0f
+    @Volatile private var placeScale = 1f
+    /** 摆放手势状态 */
+    private var placeLastX = 0f
+    private var placeLastY = 0f
+
+    /**
+     * V0.13.4 P0-C：扫描会话令牌。
+     *
+     * 后台任务（最终重建、GLB 导出、扫描包恢复、后台建网格）都是异步回跳的，
+     * 而开新扫描会**重置 native TSDF 与 sessionId**。只靠 `modelOperationBusy`
+     * 这类「忙标志」挡不住所有交错（忙标志只覆盖「提交」那一刻），所以每个
+     * 异步任务都要在提交时捕获令牌、在**发布结果前**再校验一次；令牌变了就
+     * 丢弃自己的结果 —— 旧结果一旦发布到新会话，用户看到的是「上一轮的模型
+     * 叠在这一轮的空场景上」，比什么都不显示更难排查。
+     */
+    @Volatile private var scanSessionToken = 0L
+    /**
      * V0.12: 扫描期网格快照周期。
      *
      * 网格**刻意不追 30FPS**：逐帧跑一次 TSDF -> Marching Tetrahedra 会把
@@ -242,6 +314,13 @@ private var lastRelocPollMs = 0L
      * 在 UI 线程上跑，共用一个数组会让报告里出现半新半旧的混合读数。
      */
     private val epochProbeBuf = FloatArray(NativeBridge.FUSION_EPOCH_STATS_SLOTS)
+    /**
+     * V0.13.4：UI 线程专用的 epoch 探测缓冲。
+     * 不复用 [epochProbeBuf] —— 那个是相机回调线程的，1Hz 的 UI 轮询
+     * 同时写同一数组会读到另一线程写的槽位。native 侧已持 gStateMutex，
+     * 所以多线程查询本身是安全的，争的只是这个 Kotlin 数组。
+     */
+    private val epochUiProbeBuf = FloatArray(NativeBridge.FUSION_EPOCH_STATS_SLOTS)
     // V0.12 扫描期 AR 材质：青绿色半透明网格。
     // 0.30–0.40 是「看得清形状、又不把真实画面糊掉」的折中。
     private val scanMeshAlpha = 0.34f
@@ -527,9 +606,16 @@ private var lastRelocPollMs = 0L
         //   - 按下后立刻拖动 -> 旋转（yaw/pitch）
         //   - 按住不动 300ms 后再拖 -> 平移（物体跟手）
         glView.setOnTouchListener { _, event ->
-            if (!modelViewerActive) return@setOnTouchListener false
-            handleModelViewerTouch(event)
-            true
+            if (modelViewerActive) {
+                handleModelViewerTouch(event)
+                return@setOnTouchListener true
+            }
+            // V0.13.4 P1：自由摆放模式的手势（左右=旋转，上下=缩放）。
+            if (placeModeActive) {
+                handlePlacementTouch(event)
+                return@setOnTouchListener true
+            }
+            false
         }
         root.addView(glView, android.widget.FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -704,6 +790,12 @@ private var lastRelocPollMs = 0L
         // 先用它证明 VINS pose / 光轴 / 内参 / 竖屏旋转 / TextureView 裁剪 /
         // 时间戳同步 这一整条 AR 坐标链是对的，再切到累计点云；
         // 那时若累计点仍然散，问题就只剩 depth scale / 精度 / fusion。
+        placeButton = toolButton("摆放") { togglePlacement() }
+        toolbar.addView(placeButton,
+            android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 6 })
         arLayerButton = toolButton(arDrawModeLabel()) { cycleArLayer() }
         toolbar.addView(arLayerButton,
             android.widget.LinearLayout.LayoutParams(
@@ -2209,6 +2301,7 @@ private var lastRelocPollMs = 0L
         multiCam?.report(sb)
         sb.appendLine("    " + depthCalibrationSummary())
         sb.appendLine("    " + fusionEpochSummary())
+        sb.appendLine("    " + depthNormSummary())
         appendFusionEpochReport(sb)
         sb.appendLine("    " + meshStatsSummary("meshStats"))
         sb.appendLine("    meshSummary=$lastMeshSummary")
@@ -2343,6 +2436,19 @@ private var lastRelocPollMs = 0L
                     if (res != null && res.depth.isNotEmpty()) {
                         // 世代不一致说明这帧属于上一轮会话，必须丢弃。
                         if (generation == depthGeneration) {
+                            // V0.13.4 尺度漂移修复：深度数值域（归一化映射）
+                            // 变了就必须**先**让 native 重参数化标定，再喂
+                            // 这一帧。顺序反了的话，这一帧会带着新数值域的
+                            // d 被旧标定解释，几何当场跳一次。
+                            if (res.normVersion != lastDepthNormVersion) {
+                                lastDepthNormVersion = res.normVersion
+                                try {
+                                    NativeBridge.nativeSetDepthNormMapping(
+                                        res.normA, res.normB, res.normVersion
+                                    )
+                                } catch (_: Throwable) {
+                                }
+                            }
                             NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height, 0.5f, t)
                             glView.requestRender()
                         }
@@ -2367,7 +2473,15 @@ private var lastRelocPollMs = 0L
     }
 
     private fun startScan() {
+        if (modelOperationBusy) {
+            toast("模型正在生成或恢复，请稍候")
+            return
+        }
         scanning = true
+        // V0.13.4 P0-C：会话令牌必须先推进 —— 从这一刻起，所有仍在飞的
+        // 后台任务（上一轮的最终导出 / 恢复 / 后台建网格）回跳时都会发现
+        // 令牌变了，从而丢弃自己的结果而不是污染这一轮。
+        scanSessionToken++
         // V0.13.3：开新扫描必须退出模型查看器 —— 查看器的不透明背景会
         // 盖住相机预览，用户会以為相机坏了；且新扫描会清网格，查看器
         // 立刻变成空转。
@@ -2376,12 +2490,17 @@ private var lastRelocPollMs = 0L
         scanNativeReady = false
         arMeshViewing = false
         depthGeneration++
+        // Serialize with inference: session min/max must not leak from the previous scan.
+        depthHandler?.post {
+            if (::depthProvider.isInitialized) depthProvider.reset()
+        }
         sessionStartTs = System.currentTimeMillis()
         val formatter = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
         sessionId = formatter.format(java.util.Date()) + "_" + (sessionStartTs % 100000L)
         // V0.10: preserve previous PLY metadata. plySessionMatch tells us
         // whether it belongs to this scan instead of replacing diagnostics with unknown.
         lastGlbFilename = null
+        lastModelFile = null
         lastGlbTriangles = 0
         lastGlbBytes = 0L
         lastMeshSummary = "n/a"
@@ -2529,15 +2648,18 @@ private var lastRelocPollMs = 0L
      */
     private fun exportModel() {
         if (!::exportManager.isInitialized) return
-        val r = exportManager.exportPly(sessionId)
-        if (r.ok) {
-            lastPlyFilename = r.file.name
-            lastPlySessionId = sessionId
-            lastPlyVertexCount = r.vertexCount.toInt()
-            lastPlyFileBytes = r.fileBytes
-            lastPlyExportTs = System.currentTimeMillis()
+        val exportSession = sessionId
+        exportManager.exportPlyAsync(exportSession) { r ->
+            if (isDestroyed) return@exportPlyAsync
+            if (r.ok) {
+                lastPlyFilename = r.file.name
+                lastPlySessionId = exportSession
+                lastPlyVertexCount = r.vertexCount.toInt()
+                lastPlyFileBytes = r.fileBytes
+                lastPlyExportTs = System.currentTimeMillis()
+            }
+            toast(r.message)
         }
-        toast(r.message)
     }
 
     /**
@@ -2548,35 +2670,28 @@ private var lastRelocPollMs = 0L
      */
     private fun buildMeshAndExport(sessionId: String, quality: Int) {
         if (!::exportManager.isInitialized) return
+        if (scanning || modelOperationBusy) {
+            toast("请先停止扫描，并等待当前模型操作完成")
+            return
+        }
+        modelOperationBusy = true
         val label = meshQualityLabel(quality)
         toast("正在重建网格（$label），请稍候…")
         try {
             exportManager.buildAndExportGlb(sessionId, quality) { r ->
+                modelOperationBusy = false
+                if (isDestroyed || this.sessionId != sessionId) return@buildAndExportGlb
+                renderer.clearTexturedMesh()
                 val mesh = exportManager.lastMesh
                 if (r.ok && mesh != null) {
                     renderer.setMesh(mesh.vertices, mesh.indices)
 
-                    val texturedAr =
-                        TexturedArAssetLoader.loadInto(renderer)
-
-                    if (texturedAr.ok) {
-                        kotlin.concurrent.thread(
-                            start = true,
-                            isDaemon = true,
-                            name = "ScanPackageSave"
-                        ) {
-                            val persistent =
-                                ScanPackageManager.saveCurrent(
-                                    this,
-                                    sessionId,
-                                    r.file
-                                )
-
-                            runOnUiThread {
-                                toast(persistent.message)
-                            }
-                        }
+                    if (r.textured) {
+                        val texturedAr = TexturedArAssetLoader.loadInto(renderer)
+                        if (!texturedAr.ok) toast(texturedAr.message)
                     }
+                    r.persistenceMessage?.let { toast(it) }
+                    lastModelFile = r.file
                     lastGlbFilename = r.file.name
                     lastGlbTriangles = r.triangles
                     lastGlbBytes = r.fileBytes
@@ -2604,13 +2719,14 @@ private var lastRelocPollMs = 0L
                 toast(r.message)
             }
         } catch (t: Throwable) {
+            modelOperationBusy = false
             toast("网格导出异常：${t.javaClass.simpleName}")
         }
     }
 
     /** 只重建网格并挂到 AR 预览上，不落盘。 */
     private fun buildMeshForPreview() {
-        if (!::exportManager.isInitialized) return
+        if (!::exportManager.isInitialized || modelOperationBusy) return
         toast("正在生成网格（预览质量）…")
         try {
             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
@@ -2657,13 +2773,14 @@ private var lastRelocPollMs = 0L
             return
         }
         toast("正在生成模型，请稍候…")
+        val token = scanSessionToken
         try {
             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_NORMAL) { built ->
                 runOnUiThread {
-                    if (built != null && built.triangleCount > 0) {
-                        enterModelViewerWith(built)
-                    } else {
-                        toast("暂无可查看的模型（体素场不足以提取表面），请先扫描")
+                    when {
+                        token != scanSessionToken -> toast("已开始新的扫描，取消查看")
+                        built != null && built.triangleCount > 0 -> enterModelViewerWith(built)
+                        else -> toast("暂无可查看的模型（体素场不足以提取表面），请先扫描")
                     }
                 }
             }
@@ -2700,6 +2817,13 @@ private var lastRelocPollMs = 0L
                 (maxY - minY) * (maxY - minY) +
                 (maxZ - minZ) * (maxZ - minZ)
         )
+        // 查看器用的是合成轨道相机，摆放变换会把模型从包围球中心挪开 ——
+        // 必须清掉，否则一点「查看模型」模型就跑到画面外。
+        if (placeModeActive) {
+            placeModeActive = false
+            placeButton?.text = "摆放"
+            renderer.setModelMatrix(null)
+        }
         modelViewerPrevMode = arDrawMode
         renderer.setViewerFrame(cx, cy, cz, radius)
         renderer.drawMode = PointCloudRenderer.DRAW_MODEL_VIEWER
@@ -2720,6 +2844,100 @@ private var lastRelocPollMs = 0L
         renderer.drawMode = arDrawMode
         modelViewerButton?.text = "查看模型"
         glView.requestRender()
+    }
+
+    /**
+     * V0.13.4：把「模型坐标」映射到「当前世界坐标下的锚点」。
+     *
+     *   `P_world = anchor + Ry(yaw) * scale * (P_model - center)`
+     *
+     * 即列主序 4x4：线性部分 = `Ry*scale`，平移 = `anchor - scale*(Ry*center)`。
+     * 先减 center 再变换，模型才会**以它自己的中心**落在锚点上，而不是把
+     * 「扫描时的世界原点」搬过来（那样模型会偏到几米外）。
+     */
+    private fun computePlacementMatrix(): FloatArray {
+        val c = kotlin.math.cos(placeYaw)
+        val s = kotlin.math.sin(placeYaw)
+        val k = placeScale
+        val cx = placeCenter[0]; val cy = placeCenter[1]; val cz = placeCenter[2]
+        // Ry * center
+        val rx = c * cx + s * cz
+        val ry = cy
+        val rz = -s * cx + c * cz
+        return floatArrayOf(
+            k * c, 0f, -k * s, 0f,
+            0f, k, 0f, 0f,
+            k * s, 0f, k * c, 0f,
+            placeAnchor[0] - k * rx,
+            placeAnchor[1] - k * ry,
+            placeAnchor[2] - k * rz,
+            1f
+        )
+    }
+
+    private fun applyPlacementMatrix() {
+        renderer.setModelMatrix(if (placeModeActive) computePlacementMatrix() else null)
+        glView.requestRender()
+    }
+
+    /** 「摆放」按钮：把模型放到当前相机前方（新地点也能放）。 */
+    private fun togglePlacement() {
+        if (placeModeActive) {
+            // 回到原位恢复：清掉 model-to-world，模型回到保存时的世界坐标。
+            placeModeActive = false
+            placeButton?.text = "摆放"
+            renderer.setModelMatrix(null)
+            glView.isClickable = false
+            glView.requestRender()
+            toast("已回到原位恢复模式（模型回到原扫描位置）")
+            return
+        }
+        val mesh = if (::exportManager.isInitialized) exportManager.lastMesh else null
+        if (mesh == null || mesh.triangleCount <= 0) {
+            toast("还没有模型可摆放，请先扫描或恢复扫描包")
+            return
+        }
+        // 锚点 = 当前相机前方 1.2m、略低于视线（桌面高度感）。
+        val pose = FloatArray(NativeBridge.RENDER_POSE_SLOTS)
+        val ok = try {
+            NativeBridge.nativeGetRenderPose(pose)
+        } catch (_: Throwable) {
+            false
+        }
+        if (!ok) {
+            toast("还没有定位位姿，请缓慢移动手机建立定位后再摆放")
+            return
+        }
+        // 模型中心（顶点交错 9 floats：x,y,z,nx,ny,nz,r,g,b）
+        var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var minZ = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
+        val v = mesh.vertices
+        var i = 0
+        val n = v.size - 8
+        while (i < n) {
+            val x = v[i]; val y = v[i + 1]; val z = v[i + 2]
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+            if (z < minZ) minZ = z
+            if (z > maxZ) maxZ = z
+            i += 9
+        }
+        placeCenter[0] = (minX + maxX) * 0.5f
+        placeCenter[1] = (minY + maxY) * 0.5f
+        placeCenter[2] = (minZ + maxZ) * 0.5f
+        // pose: [R(9) 行主序, t(3)]，前向是 R 的第三列 (pose[2],pose[5],pose[8])
+        placeAnchor[0] = pose[9] + pose[2] * 1.2f
+        placeAnchor[1] = pose[10] + pose[5] * 1.2f - 0.20f
+        placeAnchor[2] = pose[11] + pose[8] * 1.2f
+        placeYaw = 0f
+        placeScale = 1f
+        placeModeActive = true
+        placeButton?.text = "原位"
+        glView.isClickable = true
+        applyPlacementMatrix()
+        toast("自由摆放：左右拖动=旋转，上下拖动=缩放 · 「原位」回到原扫描位置")
     }
 
     private fun cancelViewerLongPress() {
@@ -2787,6 +3005,34 @@ private var lastRelocPollMs = 0L
                 cancelViewerLongPress()
                 viewerPanMode = false
                 viewerMoved = false
+            }
+        }
+    }
+
+    /**
+     * V0.13.4 P1：自由摆放模式手势 —— 单指左右拖 = 绕 Y 轴旋转，
+     * 单指上下拖 = 均匀缩放（0.3x ~ 4x）。
+     *
+     * 刻意不做「双指缩放」：这套 AR 画面上单指已经被点选目标占用，
+     * 摆放模式下接管单指最省事，也不会和相机对焦抢事件。
+     */
+    private fun handlePlacementTouch(event: android.view.MotionEvent) {
+        when (event.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                placeLastX = event.x
+                placeLastY = event.y
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                val dx = event.x - placeLastX
+                val dy = event.y - placeLastY
+                placeLastX = event.x
+                placeLastY = event.y
+                if (dx != 0f || dy != 0f) {
+                    placeYaw += dx * 0.006f
+                    // 向上拖放大：屏幕上 dy 为负，取反号。
+                    placeScale = (placeScale * (1f - dy * 0.004f)).coerceIn(0.3f, 4f)
+                    applyPlacementMatrix()
+                }
             }
         }
     }
@@ -2991,6 +3237,45 @@ private var lastRelocPollMs = 0L
     }
 
     /**
+     * V0.13.4：深度数值域（归一化映射）一行摘要。
+     *
+     * 「尺度漂移」排查的第一步就是看这几个数：重参数化次数在涨说明数值域
+     * 一直在变（这是允许的，只要标定跟着重参数化了）；而
+     * 「冻结期间仍在变」> 0 说明 epoch 锁定后 provider 没冻住，需要查冻结
+     * 链路。版本号用于把任何一次尺度变化追溯到具体映射版本。
+     */
+    private fun depthNormSummary(): String {
+        val buf = FloatArray(NativeBridge.DEPTH_NORM_STATS_SLOTS)
+        val n = try {
+            NativeBridge.nativeGetDepthNormStats(buf)
+        } catch (_: Throwable) {
+            0
+        }
+        if (n < NativeBridge.DEPTH_NORM_STATS_SLOTS) return "depthNorm n/a"
+        val frozen = if (::depthProvider.isInitialized &&
+            depthProvider is com.mobilescan3d.depth.MonoDepthProvider
+        ) {
+            (depthProvider as com.mobilescan3d.depth.MonoDepthProvider).normalizationFrozen
+        } else {
+            false
+        }
+        return "depthNorm v=${buf[2].toLong()} A=${"%.3f".format(buf[0])} " +
+            "B=${"%.3f".format(buf[1])} reparam=${buf[3].toInt()} " +
+            "chgWhileEpoch=${buf[4].toInt()} frozen=$frozen"
+    }
+
+    /** V0.13.4：UI 线程版 epoch 激活查询（用独立缓冲，避开相机线程争用）。 */
+    private fun fusionEpochActiveUi(): Boolean {
+        val n = try {
+            NativeBridge.nativeGetFusionEpochStats(epochUiProbeBuf)
+        } catch (_: Throwable) {
+            0
+        }
+        return n >= NativeBridge.FUSION_EPOCH_STATS_SLOTS &&
+            epochUiProbeBuf[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] > 0.5f
+    }
+
+    /**
      * V0.12: 扫描期的「实时网格」快照。
      *
      * 只在 LIVE 图层 + 正在扫描 + epoch 已激活时做；否则**清掉**网格 ——
@@ -3136,91 +3421,55 @@ private var lastRelocPollMs = 0L
 // --------------------------------------------------------- V0.7 persistent AR
 
     private fun restoreLatestPersistentAr() {
-        if (scanning) {
-            toast("请先停止当前扫描，再恢复历史 AR")
+        if (scanning || modelOperationBusy) {
+            toast("请先停止扫描，并等待当前模型操作完成")
             return
         }
-
-        val packageInfo =
-            ScanPackageManager.latest(this)
-
-        if (packageInfo == null) {
-            toast("没有可恢复的 V0.7 扫描包")
-            return
-        }
-
-        // Immediately put Camera2/VINS into pose-only mode. The native pose
-        // getter will intentionally return false after map load until visual
-        // relocalization has actually locked, so the old model cannot flash
-        // at an arbitrary new-session origin.
+        modelOperationBusy = true
+        if (modelViewerActive) exitModelViewer()
         depthGeneration++
         scanNativeReady = false
         arMeshViewing = true
         lastRelocWasLocalized = false
         lastRelocPollMs = 0L
-
-        try {
-            NativeBridge.nativeSetPersistentMapCaptureEnabled(false)
-        } catch (_: Throwable) {
-        }
-
+        NativeBridge.nativeSetPersistentMapCaptureEnabled(false)
         renderer.clearMesh()
         renderer.clearTexturedMesh()
 
-        val handler =
-            depthHandler ?: cameraHandler
-
-        val work = Runnable {
-            val restored =
-                ScanPackageManager.restore(
-                    this,
-                    packageInfo
-                )
-
-            val asset =
-                if (restored.ok) {
-                    TexturedArAssetLoader.loadInto(
-                        renderer
-                    )
+        // latest() hashes every package: never call it on the UI thread.
+        // V0.13.4 P0-C：提交时捕获令牌，回跳时校验。
+        val token = scanSessionToken
+        kotlin.concurrent.thread(name = "ScanPackageRestore", isDaemon = true) {
+            val result = try {
+                val info = ScanPackageManager.latest(applicationContext)
+                if (info == null) {
+                    ScanPackageManager.Result(false, "没有可恢复的完整扫描包")
                 } else {
-                    null
+                    ScanPackageManager.restore(applicationContext, info)
                 }
-
+            } catch (t: Throwable) {
+                ScanPackageManager.Result(false, "恢复失败：${t.message}")
+            }
             runOnUiThread {
-                if (
-                    restored.ok &&
-                    asset?.ok == true
-                ) {
-                    arDrawMode =
-                        PointCloudRenderer.DRAW_MESH
-                    renderer.drawMode =
-                        arDrawMode
-
-                    arLayerButton?.text =
-                        arDrawModeLabel()
-
-                    glView.requestRender()
-
-                    toast(
-                        "已加载 ${packageInfo.sessionId} · " +
-                            "${packageInfo.mapPoints} 地图点；" +
-                            "请缓慢移动手机寻找原扫描区域"
-                    )
-                } else {
-                    arMeshViewing = false
-
-                    toast(
-                        asset?.message
-                            ?: restored.message
-                    )
+                try {
+                    // 恢复期间开了新扫描：这次恢复的结果属于旧会话，丢弃。
+                    if (!isDestroyed && token == scanSessionToken) {
+                        val asset = if (result.ok) TexturedArAssetLoader.loadInto(renderer) else null
+                        arMeshViewing = result.ok && asset?.ok == true
+                        if (arMeshViewing) {
+                            lastModelFile = result.packageInfo?.model
+                            applyScanArLayer(false)
+                            toast(result.message)
+                        } else {
+                            renderer.clearTexturedMesh()
+                            toast(asset?.message ?: result.message)
+                        }
+                        glView.requestRender()
+                    }
+                } finally {
+                    modelOperationBusy = false
                 }
             }
-        }
-
-        if (handler != null) {
-            handler.post(work)
-        } else {
-            work.run()
         }
     }
 
@@ -3489,6 +3738,21 @@ private var lastRelocPollMs = 0L
     }
 
     private fun updateStatusBar() {
+        // V0.13.4：epoch 冻结标定之后，把深度归一化映射一起冻住。
+        //
+        // 重参数化能保证「数值域变了标定也跟着变」，但每次变化都会给 epoch
+        // 的漂移监控带来一次扰动。epoch 一旦锁定，(a,b) 就是定死的，此时
+        // 让输入映射也定死，整个 epoch 内 d 的语义完全恒定 —— 这才是
+        // 「尺度不漂」的强保证。
+        // 只读一个 volatile 标志 + 一次 native 状态查询，1Hz 下开销可忽略。
+        if (scanning && ::depthProvider.isInitialized &&
+            depthProvider is com.mobilescan3d.depth.MonoDepthProvider
+        ) {
+            val mono = depthProvider as com.mobilescan3d.depth.MonoDepthProvider
+            if (!mono.normalizationFrozen && fusionEpochActiveUi()) {
+                mono.freezeNormalization()
+            }
+        }
         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
             .format(java.util.Date())
         val bat = try {
@@ -3579,6 +3843,10 @@ private var lastRelocPollMs = 0L
     }
 
     private fun switchCamera() {
+        if (scanning || modelOperationBusy) {
+            toast("请在扫描及模型保存完成后切换镜头")
+            return
+        }
         if (cameraIds.isEmpty()) return
         cameraIndex = (cameraIndex + 1) % cameraIds.size
         currentCameraId = cameraIds[cameraIndex]
@@ -3678,6 +3946,47 @@ private var lastRelocPollMs = 0L
         }
     }
 
+    private fun saveLatestGlb() {
+        if (!::exportManager.isInitialized || modelOperationBusy || pendingModelCopy != null) {
+            toast("请等待当前模型操作完成")
+            return
+        }
+        val source = lastModelFile
+        if (source == null || !source.isFile || source.length() == 0L) {
+            toast("请先停止扫描并生成 GLB 模型")
+            return
+        }
+        modelOperationBusy = true
+        // Snapshot before showing the system picker so a later export cannot change it.
+        kotlin.concurrent.thread(name = "PrepareGlbCopy", isDaemon = true) {
+            val copy = java.io.File(cacheDir, "share_${java.util.UUID.randomUUID()}.glb")
+            val error = try {
+                source.copyTo(copy, overwrite = false)
+                null
+            } catch (t: Throwable) {
+                copy.delete()
+                t.message ?: "无法准备模型文件"
+            }
+            runOnUiThread {
+                modelOperationBusy = false
+                if (isDestroyed) {
+                    copy.delete()
+                } else if (error != null) {
+                    toast(error)
+                } else {
+                    pendingModelCopy = copy
+                    try {
+                        saveModelLauncher.launch(source.name)
+                    } catch (t: Throwable) {
+                        pendingModelCopy = null
+                        copy.delete()
+                        toast("无法打开文件选择器：${t.message}")
+                    }
+                }
+            }
+        }
+    }
+
     private fun showExportDrawer() {
         android.app.AlertDialog.Builder(this)
             .setTitle("导出")
@@ -3687,7 +3996,8 @@ private var lastRelocPollMs = 0L
                     "导出实验 PLY（只有顶点，非最终模型）",
                     "生成网格 + 导出 GLB（常规）",
                     "生成网格 + 导出 GLB（HQ）",
-                    "只生成网格（AR 预览）"
+                    "只生成网格（AR 预览）",
+                    "保存 GLB 到文件…"
                 )
             ) { _, which ->
                 when (which) {
@@ -3695,6 +4005,7 @@ private var lastRelocPollMs = 0L
                     1 -> exportModel()
                     2 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_NORMAL)
                     3 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ)
+                    5 -> saveLatestGlb()
                     else -> {
                         // 预览网格不需要每次都重建：缓存命中就直接挂上去。
                         val cached = if (::exportManager.isInitialized) exportManager.lastMesh else null

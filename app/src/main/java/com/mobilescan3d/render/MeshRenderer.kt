@@ -66,6 +66,43 @@ class MeshRenderer {
     private var uAlpha = -1
     private var uUseTint = -1
     private var uTint = -1
+    // V0.13.4 P1：model-to-world 变换与其法线用的 mat3 线性部分
+    private var uModel = -1
+    private var uModelNormal = -1
+
+    /**
+     * V0.13.4 P1：model-to-world 变换（列主序 4x4，**默认单位矩阵**）。
+     *
+     * 两种 AR 模式靠它区分，绝不能混为一谈：
+     *   - **原位恢复**：单位矩阵。模型顶点本来就在「保存时的世界坐标」里，
+     *     用 VINS pose 一投影就回到当初扫描的物理位置，依赖持久地图。
+     *   - **自由摆放**：把模型搬到「当前世界坐标下的新锚点」（可旋转/缩放）。
+     *     它不修改、也不需要旧环境地图 —— 在新地点也能放。
+     *
+     * 之所以做成 uniform 而不是在 Kotlin 侧改顶点：摆放只在进入/手势时变一次，
+     * 而顶点可能几十万个，CPU 侧改一遍既慢又要重新上传 VBO。
+     */
+    @Volatile
+    private var modelMatrix = floatArrayOf(
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f
+    )
+
+    /** 设置 model-to-world 变换（列主序 4x4，16 个元素）。传 null 恢复单位矩阵。 */
+    fun setModelMatrix(m: FloatArray?) {
+        modelMatrix = if (m != null && m.size >= 16) {
+            m.copyOf()
+        } else {
+            floatArrayOf(
+                1f, 0f, 0f, 0f,
+                0f, 1f, 0f, 0f,
+                0f, 0f, 1f, 0f,
+                0f, 0f, 0f, 1f
+            )
+        }
+    }
 
     private var vbo = 0
     private var ibo = 0
@@ -144,6 +181,8 @@ class MeshRenderer {
         uAlpha = GLES20.glGetUniformLocation(program, "uAlpha")
         uUseTint = GLES20.glGetUniformLocation(program, "uUseTint")
         uTint = GLES20.glGetUniformLocation(program, "uTint")
+        uModel = GLES20.glGetUniformLocation(program, "uModel")
+        uModelNormal = GLES20.glGetUniformLocation(program, "uModelNormal")
 
         val exts = GLES20.glGetString(GLES20.GL_EXTENSIONS) ?: ""
         supportsUintIndex = exts.contains("GL_OES_element_index_uint")
@@ -222,6 +261,13 @@ class MeshRenderer {
 
         GLES20.glUseProgram(program)
 
+        // V0.13.4 P1：model-to-world（原位恢复时是单位矩阵，自由摆放时是锚点变换）
+        GLES20.glUniformMatrix4fv(uModel, 1, false, modelMatrix, 0)
+        // 法线只吃线性部分：本工程的摆放变换是「绕Y旋转 + 均匀缩放 + 平移」，
+        // 均匀缩放下方向向量只需重新归一化（着色器里本来就归一化了），
+        // 所以直接乘 mat3(uModel) 是正确的，不必再求逆转置。
+        GLES20.glUniformMatrix4fv(uModelNormal, 1, false, modelNormal3(), 0)
+
         // Pc = Rwc^T (Pw - twc)。pose 是行主序 R，所以 Rwc 的三列是
         // (R[0],R[3],R[6]) / (R[1],R[4],R[7]) / (R[2],R[5],R[8])。
         GLES20.glUniform3f(uCameraT, pose[9], pose[10], pose[11])
@@ -275,6 +321,16 @@ class MeshRenderer {
         if (blended) GLES20.glDisable(GLES20.GL_BLEND)
 
         return uploadedTriangleCount
+    }
+
+    /** model 矩阵的 mat3 线性部分（列主序 9 元素），给法线用。 */
+    private fun modelNormal3(): FloatArray {
+        val m = modelMatrix
+        return floatArrayOf(
+            m[0], m[1], m[2],
+            m[4], m[5], m[6],
+            m[8], m[9], m[10]
+        )
     }
 
     private fun uploadIfNeeded() {
@@ -420,17 +476,22 @@ class MeshRenderer {
             uniform vec3 uCameraToView1;
             uniform float uNear;
             uniform float uFar;
+            // V0.13.4 P1：model-to-world。原位恢复 = 单位矩阵；自由摆放 = 锚点变换。
+            uniform mat4 uModel;
+            uniform mat3 uModelNormal;
             varying vec3 vColor;
             varying float vShade;
             void main() {
                 vColor = aColor;
-                vec3 dw = aPosition - uCameraT;
+                // 先做 model->world，再走原来那条已验证的 world->camera 链。
+                vec3 pw = (uModel * vec4(aPosition, 1.0)).xyz;
+                vec3 dw = pw - uCameraT;
                 vec3 pc = vec3(
                     dot(dw, uCameraRight),
                     dot(dw, uCameraDown),
                     dot(dw, uCameraForward)
                 );
-                vec3 nw = aNormal;
+                vec3 nw = uModelNormal * aNormal;
                 vec3 nc = vec3(
                     dot(nw, uCameraRight),
                     dot(nw, uCameraDown),

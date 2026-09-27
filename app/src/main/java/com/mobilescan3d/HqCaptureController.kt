@@ -2289,6 +2289,23 @@ class HqCaptureController(
             CameraCharacteristics.LENS_INTRINSIC_CALIBRATION
         )
 
+        // V0.13.4 P0-B：厂商不给内参时上面的 `arrW*0.9f` 是**猜测值** ——
+        // 焦距猜错会让纹理投射整体缩放，且偏差随分辨率放大，症状是「纹理
+        // 边缘错位但看起来像有纹理」，极难事后判断。所以回退必须显式告警，
+        // 不能静默走下去。
+        if (calibration == null || calibration.size < 4) {
+            android.util.Log.w(
+                "HqTexture",
+                "intrinsics MISSING for camera: falling back to 0.9*arrayWidth " +
+                    "(texture projection scale will be approximate)"
+            )
+        } else if (!(calibration[0] > 1f) || !(calibration[1] > 1f)) {
+            android.util.Log.w(
+                "HqTexture",
+                "intrinsics implausible: fx=${calibration[0]} fy=${calibration[1]}"
+            )
+        }
+
         val fx0 = calibration?.getOrNull(0) ?: (arrW * 0.9f)
         val fy0 = calibration?.getOrNull(1) ?: (arrW * 0.9f)
         val cx0 = calibration?.getOrNull(2) ?: (arrW * 0.5f)

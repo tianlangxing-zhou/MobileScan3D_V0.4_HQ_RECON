@@ -202,6 +202,31 @@ static uint64_t epochSuspendEvents = 0;
 static uint64_t epochCatastrophicRebuilds = 0;
 static uint64_t fusionSuspendedFrames = 0;
 
+// ============================================================================
+//  V0.13.4 深度数值域（归一化映射）追踪
+// ============================================================================
+//
+// 非米制深度 provider 的输出是网络原始值 q 的仿射 `d = A*q + B`，A/B 由
+// 会话级 min/max 决定 —— 扫描推进时看到更近/更远的表面，范围会扩张，
+// 于是同一个 q 被映射成不同的 d。
+//
+// 而 Fusion Epoch 冻结的是 (a,b)：`z = a*d + b`。d 的语义悄悄变了而 (a,b)
+// 不变，几何就整体膨胀/收缩 —— 这是「扫到后面物体越来越大」的根因。
+//
+// 修法不是「不许范围扩张」（那会把远处表面压成常数），而是**每次扩张都
+// 显式重参数化标定**：见 DepthCalibration::reparameterizeLinearInput。
+// 下面是这套机制的基线状态与统计。
+static float gDepthNormA = 0.f;
+static float gDepthNormB = 0.f;
+static uint64_t gDepthNormVersion = 0;
+static bool gHaveDepthNorm = false;
+/** 因数值域变化而重参数化标定的次数（诊断：漂移是否来自数值域变化）。 */
+static uint64_t gDepthNormReparams = 0;
+/** 上一次重参数化时 a 的相对变化量（诊断：单次跳变幅度）。 */
+static float gDepthNormLastScaleRel = 0.f;
+/** epoch 已冻结但数值域仍在变化的次数（诊断：冻结是否真的生效）。 */
+static uint64_t gDepthNormChangesWhileEpoch = 0;
+
 static void resetFusionEpoch() {
     epochActive = false;
     epochCalib = DepthCalibration{};
@@ -3828,6 +3853,88 @@ Java_com_mobilescan3d_NativeBridge_nativeSetDepthCalibrationEnabled(JNIEnv*, job
 }
 
 /**
+ * V0.13.4：上报当前深度帧所用的归一化映射 `d = aNorm*q + bNorm`。
+ *
+ * Kotlin 侧（MonoDepthProvider）每帧都会带上这三个数；只要 `version` 变了，
+ * 就必须在**喂这一帧之前**调用本函数，让标定跟着换数值域。
+ *
+ * 谁会被重参数化：
+ *   - `depthCalibrator` 当前已收敛的标定（下一帧拟合的 EMA 基线）
+ *   - `epochCalib`（冻结中的 epoch 参数）
+ *   - `epochRefRaw`（漂移监控的工作点，它是旧数值域下的 d，必须换算）
+ *     —— 漏了它，漂移监控会拿「新 d」去比「旧 d 算出的 z」，永远误报漂移。
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetDepthNormMapping(JNIEnv*, jobject,
+                                                             jfloat aNorm,
+                                                             jfloat bNorm,
+                                                             jlong version) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    if (!std::isfinite(aNorm) || !std::isfinite(bNorm)) return;
+    if (std::fabs(aNorm) < 1e-12f) return;
+    if (version <= 0) return;
+
+    const bool first = !gHaveDepthNorm;
+    const bool changed = gHaveDepthNorm && (uint64_t)version != gDepthNormVersion;
+    if (!first && !changed) return;
+
+    if (first) {
+        gDepthNormA = aNorm;
+        gDepthNormB = bNorm;
+        gDepthNormVersion = (uint64_t)version;
+        gHaveDepthNorm = true;
+        return;
+    }
+
+    const float aOld = gDepthNormA;
+    const float bOld = gDepthNormB;
+    const float aNew = aNorm;
+    const float bNew = bNorm;
+    gDepthNormA = aNew;
+    gDepthNormB = bNew;
+    gDepthNormVersion = (uint64_t)version;
+    ++gDepthNormReparams;
+    // 诊断幅度：斜率相对变化。A 变大 -> d 的刻度被压缩 -> 标定要放大回去。
+    gDepthNormLastScaleRel = (aOld != 0.f)
+        ? std::fabs((aNew - aOld) / aOld) : 0.f;
+
+    depthCalibrator.reparameterizeInput(aOld, bOld, aNew, bNew);
+    epochCalib.reparameterizeLinearInput(aOld, bOld, aNew, bNew);
+    // epoch 参考工作点：旧域 -> 新域
+    if (epochActive && std::isfinite(epochRefRaw)) {
+        epochRefRaw = DepthCalibration::remapRaw(epochRefRaw, aOld, bOld, aNew, bNew);
+    }
+    // 冻结期间数值域还变，说明 provider 没被冻结（或映射来自其它 provider）；
+    // 如实记一笔，便于在报告里区分「重参数化生效」与「数值域一直在动」。
+    if (epochActive) ++gDepthNormChangesWhileEpoch;
+}
+
+/**
+ * V0.13.4 深度数值域诊断（[DEPTH_NORM_STATS_SLOTS] = 5 槽）：
+ *   0 当前 A（斜率）  1 当前 B（截距）  2 版本号  3 重参数化次数
+ *   4 「已冻结 epoch 期间仍在变化」的次数
+ * 版本号用于把任何一次尺度变化追溯到具体的归一化版本。
+ */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetDepthNormStats(JNIEnv* e, jobject,
+                                                           jfloatArray out) {
+    if (out == nullptr) return 0;
+    const jsize cap = e->GetArrayLength(out);
+    if (cap < 5) return 0;
+    jfloat v[5];
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        v[0] = gDepthNormA;
+        v[1] = gDepthNormB;
+        v[2] = static_cast<jfloat>(gDepthNormVersion);
+        v[3] = static_cast<jfloat>(gDepthNormReparams);
+        v[4] = static_cast<jfloat>(gDepthNormChangesWhileEpoch);
+    }
+    e->SetFloatArrayRegion(out, 0, 5, v);
+    return 5;
+}
+
+/**
  * 深度标定状态（12 槽）。
  *   0 scale   1 shift   2 confidence   3 samples       4 valid
  *   5 inverseModel  6 enabled  7 acceptedFrames  8 rejectedFrames
@@ -4256,6 +4363,8 @@ Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
     }
 
     AosMesh meshCopy;
+    float sourceVoxelSize = 0.f;
+    int sourceQuality = 1;
     std::vector<TextureKeyframe> keyframes;
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
@@ -4263,6 +4372,8 @@ Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
         if (src.empty()) {
             return JNI_FALSE;
         }
+        sourceVoxelSize = meshStats.voxelSize;
+        sourceQuality = meshQuality;
         meshCopy = toAosMesh(src);
         keyframes = gTextureKeyframes;
     }
@@ -4276,15 +4387,15 @@ Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
 
     // ---- 几何清理：weld / 去漂浮分量 / ear-clipping 补小洞 / QEM ----
     MeshPostProcessOptions cleanup;
-    cleanup.weldEpsilon = std::clamp(meshStats.voxelSize * 0.08f, 0.00030f, 0.00120f);
-    cleanup.minComponentTriangles = meshQuality >= 2 ? 24 : (meshQuality <= 0 ? 72 : 48);
-    cleanup.minComponentAreaRatio = meshQuality >= 2 ? 0.0020f : 0.0035f;
-    cleanup.maxHoleEdges = meshQuality >= 2 ? 72 : 56;
-    cleanup.maxHoleDiameterMeters = meshQuality >= 2 ? 0.060f : 0.075f;
-    cleanup.maxHoleDiameterBBoxRatio = meshQuality >= 2 ? 0.10f : 0.12f;
-    cleanup.targetTriangles = meshQuality >= 2 ? 180000 : (meshQuality <= 0 ? 30000 : 80000);
+    cleanup.weldEpsilon = std::clamp(sourceVoxelSize * 0.08f, 0.00030f, 0.00120f);
+    cleanup.minComponentTriangles = sourceQuality >= 2 ? 24 : (sourceQuality <= 0 ? 72 : 48);
+    cleanup.minComponentAreaRatio = sourceQuality >= 2 ? 0.0020f : 0.0035f;
+    cleanup.maxHoleEdges = sourceQuality >= 2 ? 72 : 56;
+    cleanup.maxHoleDiameterMeters = sourceQuality >= 2 ? 0.060f : 0.075f;
+    cleanup.maxHoleDiameterBBoxRatio = sourceQuality >= 2 ? 0.10f : 0.12f;
+    cleanup.targetTriangles = sourceQuality >= 2 ? 180000 : (sourceQuality <= 0 ? 30000 : 80000);
     cleanup.qemMaxPasses = 10;
-    cleanup.qemMaxNormalFlipDeg = meshQuality >= 2 ? 65.0f : 72.0f;
+    cleanup.qemMaxNormalFlipDeg = sourceQuality >= 2 ? 65.0f : 72.0f;
     cleanup.preserveBoundary = true;
 
     MeshPostProcessStats cleanupStats;

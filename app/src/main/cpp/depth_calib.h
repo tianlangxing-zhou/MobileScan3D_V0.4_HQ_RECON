@@ -50,6 +50,49 @@ struct DepthCalibration {
     bool inverseDepthModel = false;
     bool valid = false;
 
+    /**
+     * V0.13.4：**输入数值域变更时的显式重参数化**。
+     *
+     * 背景：非米制深度 provider 输出的是网络原始值 q 的仿射
+     *   `d = A*q + B`，而 A/B 由会话级 min/max 决定，会随扫描推进变化。
+     * 标定拟合的是 `z = a*d + b`（或 `1/z = a*d + b`），一旦 d 的含义变了
+     * 而 (a,b) 还冻结着，同一个物体就会随扫描推进整体膨胀/收缩。
+     *
+     * 设旧映射 `d_old = A_old*q + B_old`、新映射 `d_new = A_new*q + B_new`，
+     * 则 `d_old = (A_old/A_new)*(d_new - B_new) + B_old`，代入
+     * `z = a_old*d_old + b_old` 得
+     *
+     *   `a_new = a_old * A_old / A_new`
+     *   `b_new = b_old + a_old*B_old - a_new*B_new`
+     *
+     * 线性模型与逆深度模型都适用（两者对 d 都是仿射）。
+     *
+     * @return 是否真的改了（返回 false 表示输入不适定，调用方应保持原值）
+     */
+    bool reparameterizeLinearInput(float aOld, float bOld, float aNew, float bNew) {
+        if (!valid || !std::isfinite(scale) || !std::isfinite(shift)) return false;
+        if (!std::isfinite(aOld) || !std::isfinite(bOld) ||
+            !std::isfinite(aNew) || !std::isfinite(bNew)) return false;
+        if (std::fabs(aOld) < 1e-12f || std::fabs(aNew) < 1e-12f) return false;
+        const float k = aOld / aNew;
+        const float newScale = scale * k;
+        const float newShift = shift + scale * bOld - newScale * bNew;
+        if (!std::isfinite(newScale) || !std::isfinite(newShift)) return false;
+        scale = newScale;
+        shift = newShift;
+        return true;
+    }
+
+    /**
+     * V0.13.4：把一个「旧数值域下的 d」换算到新数值域。
+     * `d_new = (A_new/A_old)*(d_old - B_old) + B_new`
+     * 用于 epoch 参考深度等随帧携带的历史标量。
+     */
+    static float remapRaw(float d, float aOld, float bOld, float aNew, float bNew) {
+        if (!std::isfinite(d) || std::fabs(aOld) < 1e-12f) return d;
+        return (aNew / aOld) * (d - bOld) + bNew;
+    }
+
     /** 模型输出 d -> 米制深度。未标定或结果非正时返回 fallback。 */
     float toMetric(float d, float fallback) const {
         // V0.10 FIX: inverse-depth 1/z = a*d+b may have a negative slope.
@@ -114,6 +157,18 @@ public:
 
     /** 用一帧的配对样本更新。返回本次是否被接受。 */
     bool update(const std::vector<float>& d, const std::vector<float>& z);
+
+    /**
+     * V0.13.4：输入数值域变更时重参数化**已收敛的标定**。
+     *
+     * 与 [DepthCalibration::reparameterizeLinearInput] 同式，作用在内部
+     * 持有的 `calib_` 上。之所以必须显式支持：provider 的归一化范围在
+     * epoch 冻结之后仍可能扩张，若不重参数化，冻结的 (a,b) 会把新的 d
+     * 解释成完全不同的米制深度 —— 表现为几何随扫描推进持续漂移。
+     */
+    bool reparameterizeInput(float aOld, float bOld, float aNew, float bNew) {
+        return calib_.reparameterizeLinearInput(aOld, bOld, aNew, bNew);
+    }
 
     const DepthCalibration& calibration() const { return calib_; }
     uint64_t acceptedFrames() const { return acceptedFrames_; }

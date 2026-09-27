@@ -1,6 +1,11 @@
-# MobileScan3D V0.4 HQ Reconstruction
+# MobileScan3D HQ Reconstruction
 
 无 ARCore、纯 Android 本地 3D 重建工程继续版。
+
+当前构建版本以 `app/build.gradle.kts` 为准（本次审查基线为 0.13.0 / 130）。下方 V0.4/V0.7 内容为历史设计记录。
+
+扫描、GLB 导出和 AR 优化补丁说明：[检查结果与实施方案](docs/REVIEW_AND_AR_PLAN_ZH.md)。
+主机导出回归测试：`python3 tools/review_tests/run.py`（g++、Python、Pillow）。
 
 ## V0.4 核心
 

@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -55,6 +57,20 @@ bool TexturedGlbExporter::write(
     if (mesh.empty() || jpegBytes.size() < 4) {
         return false;
     }
+    if (mesh.indices.size() % 3 != 0 ||
+        std::any_of(mesh.indices.begin(), mesh.indices.end(),
+                    [&](std::uint32_t i) { return i >= mesh.vertices.size(); })) {
+        return false;
+    }
+    for (const auto& v : mesh.vertices) {
+        const auto& b = v.base;
+        if (!std::isfinite(b.px) || !std::isfinite(b.py) || !std::isfinite(b.pz) ||
+            !std::isfinite(b.nx) || !std::isfinite(b.ny) || !std::isfinite(b.nz) ||
+            !std::isfinite(v.u) || !std::isfinite(v.v)) return false;
+    }
+    const std::uint64_t payloadBytes = mesh.vertices.size() * 32ull +
+        mesh.indices.size() * 4ull + jpegBytes.size() + 16ull;
+    if (payloadBytes > std::numeric_limits<std::uint32_t>::max()) return false;
 
     // Basic JPEG SOI check. We intentionally do not parse the whole image.
     if (!(jpegBytes[0] == 0xFFu &&
@@ -134,8 +150,8 @@ bool TexturedGlbExporter::write(
     pad4(bin);
 
     std::ostringstream js;
-    js.setf(std::ios::fixed);
-    js << std::setprecision(7);
+    js.imbue(std::locale::classic());
+    js << std::setprecision(std::numeric_limits<float>::max_digits10);
 
     js
         << "{"
@@ -251,6 +267,8 @@ bool TexturedGlbExporter::write(
 
     std::string json = js.str();
     padJson4(json);
+    if (28ull + json.size() + bin.size() >
+        std::numeric_limits<std::uint32_t>::max()) return false;
 
     const std::uint32_t jsonLength =
         static_cast<std::uint32_t>(json.size());
@@ -297,5 +315,6 @@ bool TexturedGlbExporter::write(
         reinterpret_cast<const char*>(bin.data()),
         static_cast<std::streamsize>(bin.size()));
 
+    out.flush();
     return static_cast<bool>(out);
 }

@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import com.mobilescan3d.NativeBridge
+import com.mobilescan3d.persistence.ScanPackageManager
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.Executors
@@ -65,10 +66,12 @@ class ExportManager(context: Context) {
         val quality: Int,
         val message: String,
         /** V0.6：是否带 HQ 纹理（内嵌 JPEG atlas）。false = 退回 vertex color。 */
-        val textured: Boolean = false
+        val textured: Boolean = false,
+        val persistenceMessage: String? = null
     )
 
     private val outputDir: File = context.getExternalFilesDir(null) ?: context.filesDir
+    private val appContext = context.applicationContext
 
     private val io = Executors.newSingleThreadExecutor { r ->
         Thread(r, "MeshExport").apply { isDaemon = true }
@@ -105,6 +108,13 @@ class ExportManager(context: Context) {
             fileBytes = if (ok) file.length() else 0L,
             message = if (ok) "调试点云已导出：${file.absolutePath}" else "调试点云导出失败（数据不足）"
         )
+    }
+
+    fun exportPlyAsync(sessionId: String, onDone: (PlyResult) -> Unit) {
+        io.execute {
+            val result = exportPly(sessionId)
+            main.post { onDone(result) }
+        }
     }
 
     /**
@@ -238,12 +248,18 @@ class ExportManager(context: Context) {
         val q = quality.coerceIn(0, 2)
         io.execute {
             val file = File(outputDir, "scan_$sessionId.glb")
+            val staging = File(outputDir, "scan_$sessionId.pending.glb")
             var verts = 0
             var tris = 0
             var ok = false
             var textured = false
+            var persistenceMessage: String? = null
             var msg = ""
             try {
+                staging.delete()
+                lastMesh = null
+                // Never reuse an earlier bake when this export falls back to vertex color.
+                NativeBridge.nativeClearTexturedArAsset()
                 ok = NativeBridge.nativeBuildMesh(q)
                 if (ok) {
                     val mesh = pullMesh()
@@ -259,7 +275,7 @@ class ExportManager(context: Context) {
                     // 的 vertex color 网格，由 MeshEngine 自己那条链产生。
                     textured = try {
                         NativeBridge.nativeBakeTexturedGlb(
-                            file.absolutePath,
+                            staging.absolutePath,
                             ATLAS_RESOLUTION,
                             MAX_TEXTURE_KEYFRAMES
                         )
@@ -270,11 +286,23 @@ class ExportManager(context: Context) {
                     // 纹理失败不能连几何一起判废 —— 退回 V0.5 的 vertex color GLB。
                     ok = textured ||
                         try {
-                            NativeBridge.nativeExportGlb(file.absolutePath)
+                            NativeBridge.nativeExportGlb(staging.absolutePath)
                         } catch (t: Throwable) {
                             Log.w(TAG, "nativeExportGlb failed", t)
                             false
                         }
+                }
+                ok = ok && staging.isFile && staging.length() > 0L && staging.renameTo(file)
+                if (ok && textured) {
+                    val baked = NativeBridge.nativeGetTexturedArAssetStats()
+                    if (baked.size >= 2 && baked[0] > 0 && baked[1] >= 3) {
+                        verts = baked[0]
+                        tris = baked[1] / 3
+                    }
+                    // Save before the completion callback releases the UI operation guard.
+                    persistenceMessage = ScanPackageManager.saveCurrent(
+                        appContext, sessionId, file
+                    ).message
                 }
                 msg = when {
                     !ok && verts == 0 -> "网格构建失败（体素场不足以提取表面）"
@@ -286,6 +314,8 @@ class ExportManager(context: Context) {
                 Log.e(TAG, "buildAndExportGlb failed", t)
                 ok = false
                 msg = "网格导出异常：${t.javaClass.simpleName}: ${t.message}"
+            } finally {
+                staging.delete()
             }
             val res = GlbResult(
                 ok = ok && file.exists() && file.length() > 0,
@@ -295,7 +325,8 @@ class ExportManager(context: Context) {
                 fileBytes = if (file.exists()) file.length() else 0L,
                 quality = q,
                 message = msg,
-                textured = textured
+                textured = ok && textured,
+                persistenceMessage = persistenceMessage
             )
             main.post { onDone(res) }
         }

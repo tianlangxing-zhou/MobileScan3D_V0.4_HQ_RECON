@@ -179,6 +179,17 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         viewerTargetZ -= (rz * dxPx + dz * dyPx) * wpp
     }
 
+    /**
+     * V0.13.4 P1：设置 model-to-world 变换（同时作用于顶点色网格与纹理网格）。
+     * 传 null = 单位矩阵 = **原位恢复**（模型回到当初扫描的物理位置，依赖
+     * 持久地图）；非 null = **自由摆放**（模型搬到当前世界坐标下的锚点，
+     * 不需要旧地图，换地点也能放）。
+     */
+    fun setModelMatrix(m: FloatArray?) {
+        meshRenderer.setModelMatrix(m)
+        texturedMeshRenderer.setModelMatrix(m)
+    }
+
     /** 重置视角回到自动构图。 */
     fun resetViewerView() {
         viewerYaw = 0.9f

@@ -31,6 +31,23 @@ interface DepthProvider {
      *                    false = 模型原始 / 相对尺度（由 native 侧用 VINS
      *                            稀疏三角化深度做鲁棒标定后再用）。
      * @param timestampNs 对应的相机帧时间戳（不是推理完成时刻！）。
+     *
+     * @param normA / normB / normVersion
+     *        V0.13.4 尺度漂移修复：**这一帧深度所用归一化映射的元数据**。
+     *
+     *        非米制 provider 输出的 d 是网络原始值 q 的仿射：
+     *            `d = normA * q + normB`
+     *        而 `normA/normB` 由会话级 min/max 决定，**会随扫描推进变化**
+     *        （看到更近/更远的表面时范围扩张）。native 侧的标定拟合的是
+     *        `z = a*d + b`，一旦 d 的含义悄悄变了而 (a,b) 还冻结着，几何
+     *        就会整体膨胀或收缩 —— 这就是「同一物体扫到后面越来越大」的
+     *        根因。
+     *
+     *        所以每一帧都必须把它所用的映射带出去，`normVersion` 每次映射
+     *        变化 +1；调用方发现版本号变了，要在**喂这一帧之前**用
+     *        `nativeSetDepthNormMapping` 让 native 显式重参数化标定，
+     *        而不是让标定继续用旧映射去解释新数值。
+     *        米制 provider（硬件深度）保持 A=1、B=0 不变即可。
      */
     data class Result(
         val depth: FloatArray,
@@ -39,7 +56,10 @@ interface DepthProvider {
         val confidence: FloatArray?,
         val timestampNs: Long,
         val metric: Boolean,
-        val backend: String
+        val backend: String,
+        val normA: Float = 1f,
+        val normB: Float = 0f,
+        val normVersion: Long = 0L
     )
 
     /** 后端名，进诊断报告与 HUD。 */

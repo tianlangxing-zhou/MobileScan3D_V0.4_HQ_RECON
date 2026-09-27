@@ -6,6 +6,8 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <locale>
+#include <iomanip>
 #include <sstream>
 #include <vector>
 
@@ -52,9 +54,10 @@ std::string jnum(double v) {
     if (!std::isfinite(v)) {
         return "0";
     }
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "%.7g", v);
-    return std::string(buf);
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::setprecision(std::numeric_limits<float>::max_digits10) << v;
+    return out.str();
 }
 
 /** 极简 JSON 字符串转义（只处理必要字符，避免非法 JSON）。 */
@@ -94,8 +97,17 @@ bool exportGlb(const Mesh& mesh, const std::string& path,
         }
         return false;
     }
-    if (mesh.positions.size() < st.vertices * 3) {
-        st.note = "positions truncated";
+    const auto finite = [](const std::vector<float>& values) {
+        return std::all_of(values.begin(), values.end(),
+                           [](float v) { return std::isfinite(v); });
+    };
+    if (mesh.positions.size() % 3 != 0 || mesh.indices.size() % 3 != 0 ||
+        (!mesh.normals.empty() && mesh.normals.size() != mesh.positions.size()) ||
+        (!mesh.colors.empty() && mesh.colors.size() != mesh.positions.size()) ||
+        !finite(mesh.positions) || !finite(mesh.normals) || !finite(mesh.colors) ||
+        std::any_of(mesh.indices.begin(), mesh.indices.end(),
+                    [&](uint32_t i) { return i >= st.vertices; })) {
+        st.note = "invalid mesh attributes or indices";
         if (stats) {
             *stats = st;
         }
@@ -144,7 +156,7 @@ bool exportGlb(const Mesh& mesh, const std::string& path,
     bin.reserve(bin.size() + st.triangles * 3 * sizeof(uint32_t));
     for (size_t i = 0; i < st.triangles * 3; ++i) {
         const uint32_t idx = mesh.indices[i];
-        putU32(bin, (idx < st.vertices) ? idx : 0u);
+        putU32(bin, idx);
     }
 
     // POSITION 的 min/max 是 glTF 规范强制要求的
@@ -164,6 +176,7 @@ bool exportGlb(const Mesh& mesh, const std::string& path,
 
     // ---------------------------------------------------------------- JSON
     std::ostringstream j;
+    j.imbue(std::locale::classic());
     j << "{";
     j << "\"asset\":{\"version\":\"2.0\",\"generator\":\"MobileScan3D\"},";
     j << "\"scene\":0,";
@@ -175,7 +188,7 @@ bool exportGlb(const Mesh& mesh, const std::string& path,
         j << ",\"NORMAL\":1";
     }
     if (hasColor) {
-        j << ",\"COLOR_0\":2";
+        j << ",\"COLOR_0\":" << (hasNormal ? 2 : 1);
     }
     j << "}";
     j << ",\"indices\":" << (hasNormal ? (hasColor ? 3 : 2) : (hasColor ? 2 : 1));
@@ -240,6 +253,11 @@ bool exportGlb(const Mesh& mesh, const std::string& path,
     st.jsonBytes = jsonPadded;
     st.binBytes = binPadded;
     st.fileBytes = total;
+    if (total > std::numeric_limits<uint32_t>::max()) {
+        st.note = "GLB exceeds 32-bit length limit";
+        if (stats) *stats = st;
+        return false;
+    }
 
     std::vector<uint8_t> out;
     out.reserve(total);
@@ -270,6 +288,7 @@ bool exportGlb(const Mesh& mesh, const std::string& path,
         return false;
     }
     f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+    f.flush();
     if (!f.good()) {
         st.note = "write failed";
         if (stats) {

@@ -71,7 +71,9 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
     ModelScore s;
     std::vector<float> rel;
     rel.reserve(d.size());
-    for (size_t i = 0; i < d.size(); ++i) {
+    for (size_t i = 0; i < std::min(d.size(), z.size()); ++i) {
+        if (!std::isfinite(d[i]) || !std::isfinite(z[i]) ||
+            z[i] <= 0.05f || z[i] > 50.f) continue;
         float zp;
         if (inverse) {
             const float inv = a * d[i] + b;

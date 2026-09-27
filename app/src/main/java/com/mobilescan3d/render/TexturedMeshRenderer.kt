@@ -76,6 +76,35 @@ class TexturedMeshRenderer {
     private var uFar = -1
     private var uAtlas = -1
     private var uAlpha = -1
+    /** V0.13.4 P1：model-to-world（列主序 4x4）。 */
+    private var uModel = -1
+
+    /**
+     * V0.13.4 P1：model-to-world 变换。**默认单位矩阵 = 原位恢复**（模型顶点
+     * 本就在保存时的世界坐标里，靠持久地图回到原物理位置）；自由摆放时把模型
+     * 搬到当前世界坐标下的新锚点，不修改也不需要旧环境地图。
+     */
+    @Volatile
+    private var modelMatrix = floatArrayOf(
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f
+    )
+
+    /** 设置 model-to-world 变换（列主序 4x4，16 元素）。传 null 恢复单位矩阵。 */
+    fun setModelMatrix(m: FloatArray?) {
+        modelMatrix = if (m != null && m.size >= 16) {
+            m.copyOf()
+        } else {
+            floatArrayOf(
+                1f, 0f, 0f, 0f,
+                0f, 1f, 0f, 0f,
+                0f, 0f, 1f, 0f,
+                0f, 0f, 0f, 1f
+            )
+        }
+    }
 
     @Volatile
     private var pendingVertices: FloatArray? = null
@@ -122,6 +151,7 @@ class TexturedMeshRenderer {
         uFar = GLES20.glGetUniformLocation(program, "uFar")
         uAtlas = GLES20.glGetUniformLocation(program, "uAtlas")
         uAlpha = GLES20.glGetUniformLocation(program, "uAlpha")
+        uModel = GLES20.glGetUniformLocation(program, "uModel")
 
         val ids = IntArray(1)
         GLES20.glGenBuffers(1, ids, 0)
@@ -251,6 +281,7 @@ class TexturedMeshRenderer {
         GLES20.glUniform1f(uNear, near)
         GLES20.glUniform1f(uFar, far)
         GLES20.glUniform1f(uAlpha, alpha.coerceIn(0f, 1f))
+        GLES20.glUniformMatrix4fv(uModel, 1, false, modelMatrix, 0)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(
@@ -613,9 +644,13 @@ class TexturedMeshRenderer {
 
             varying vec2 vUv;
 
+            // V0.13.4 P1：model-to-world（自由摆放用；原位恢复时为单位矩阵）
+            uniform mat4 uModel;
+
             void main() {
+                vec3 pw = (uModel * vec4(aPosition, 1.0)).xyz;
                 vec3 dw =
-                    aPosition - uCameraT;
+                    pw - uCameraT;
 
                 vec3 pc = vec3(
                     dot(dw, uCameraRight),

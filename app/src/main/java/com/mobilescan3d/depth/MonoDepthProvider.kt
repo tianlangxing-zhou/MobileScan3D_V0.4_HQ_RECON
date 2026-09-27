@@ -33,6 +33,23 @@ class MonoDepthProvider(
     private var globalMin = Float.MAX_VALUE
     private var globalMax = -Float.MAX_VALUE
 
+    // ---- V0.13.4：归一化映射元数据（d = normA * q + normB）----
+    /**
+     * 当前映射的斜率/截距。由 [globalMin] / [globalMax] 推出：
+     *   `d = FAR - norm*(FAR-NEAR)`，`norm = (q - lo)/(hi - lo)`
+     *   => `A = -(FAR-NEAR)/(hi-lo)`，`B = FAR + (FAR-NEAR)*lo/(hi-lo)`
+     * 注意 A 恒为负：网络输出越大（越远）d 越小，这是这套映射的定义。
+     */
+    @Volatile private var normA = 0f
+    @Volatile private var normB = 0f
+    /** 映射每次变化 +1；0 表示「还没有有效映射」。 */
+    @Volatile private var normVersion = 0L
+    /** 上一帧实际使用的 lo/hi，用来判断这一帧的映射有没有变。 */
+    private var appliedLo = 0f
+    private var appliedHi = 0f
+    /** 冻结标志：true 时 min/max 不再扩张（epoch 锁定后使用）。 */
+    @Volatile private var normalizedFrozen = false
+
     private var buffer: FloatArray = FloatArray(0)
     private var bufferW = 0
     private var bufferH = 0
@@ -73,15 +90,38 @@ class MonoDepthProvider(
                 if (z > mx) mx = z
             }
         }
-        if (mn < globalMin) globalMin = mn
-        if (mx > globalMax) globalMax = mx
+        // 冻结后不再扩张范围：epoch 锁定期间 d 的语义必须恒定。
+        if (!normalizedFrozen) {
+            if (mn < globalMin) globalMin = mn
+            if (mx > globalMax) globalMax = mx
+        }
         val lo = globalMin
         val hi = globalMax
-        val range = (hi - lo).coerceAtLeast(1e-4f)
+        // V0.13.4：范围退化保护。首帧或画面极平坦时 hi-lo 接近 0，此时
+        // 归一化会把整帧压成常数 NEAR 或 FAR（A 趋于无穷），后面一旦范围
+        // 扩张就会触发一次幅度极大的重参数化。这里直接沿用上一次映射。
+        val rawSpan = hi - lo
+        if (rawSpan < MIN_RAW_SPAN && appliedHi > appliedLo) {
+            // 维持既有映射，不更新版本号
+        } else {
+            val range = rawSpan.coerceAtLeast(MIN_RAW_SPAN)
+            normA = -(FAR - NEAR) / range
+            normB = FAR + (FAR - NEAR) * lo / range
+            if (lo != appliedLo || hi != appliedHi) {
+                appliedLo = lo
+                appliedHi = hi
+                ++normVersion
+            }
+        }
+        val a = normA
+        val b = normB
         for (oy in 0 until inputSize) {
             for (ox in 0 until inputSize) {
-                val norm = ((output[0][oy][ox][0] - lo) / range).coerceIn(0f, 1f)
-                depthSmall[oy * inputSize + ox] = FAR - norm * (FAR - NEAR)
+                // 与上报的元数据严格一致：d = a*q + b（q 为网络原始输出）。
+                // 因为 globalMin/Max 单调覆盖所有历史输出，q 恒在 [lo,hi] 内，
+                // 结果自然落在 [NEAR, FAR]；这里仍钳一次只为防浮点边界。
+                depthSmall[oy * inputSize + ox] =
+                    (a * output[0][oy][ox][0] + b).coerceIn(NEAR, FAR)
             }
         }
 
@@ -106,7 +146,10 @@ class MonoDepthProvider(
             confidence = null,
             timestampNs = timestampNs,
             metric = false,
-            backend = backendName
+            backend = backendName,
+            normA = normA,
+            normB = normB,
+            normVersion = normVersion
         )
         return true
     }
@@ -116,8 +159,35 @@ class MonoDepthProvider(
     override fun reset() {
         globalMin = Float.MAX_VALUE
         globalMax = -Float.MAX_VALUE
+        normA = 0f
+        normB = 0f
+        appliedLo = 0f
+        appliedHi = 0f
+        normalizedFrozen = false
+        // 版本号必须推进：新会话的范围与上一会话无关，native 侧要把自己的
+        // 归一化基线一并清掉，不能拿上一会话的 A/B 去重参数化。
+        ++normVersion
         latestResult = null
     }
+
+    /**
+     * V0.13.4：冻结当前归一化映射（之后不再随 min/max 扩张）。
+     *
+     * 重参数化已经能保证「映射变了标定也跟着变」，但每次变化都会让
+     * epoch 的漂移监控多一次扰动。epoch 冻结标定之后，最稳妥的做法是
+     * 连输入映射一起冻住 —— 这样整个 epoch 内 d 的语义完全恒定。
+     */
+    fun freezeNormalization() {
+        normalizedFrozen = true
+    }
+
+    /** 解除冻结（新会话/重新标定时用）。 */
+    fun unfreezeNormalization() {
+        normalizedFrozen = false
+    }
+
+    /** 当前映射是否已冻结。诊断用。 */
+    val normalizationFrozen: Boolean get() = normalizedFrozen
 
     override fun close() {
         try {
@@ -139,5 +209,10 @@ class MonoDepthProvider(
         private const val TAG = "MonoDepthProvider"
         private const val NEAR = 0.4f
         private const val FAR = 6f
+        /**
+         * V0.13.4：原始输出跨度下限。低于此值认为这一帧的 min/max 退化
+         * （平坦画面 / 首帧），不据此改写映射，避免一次极端重参数化。
+         */
+        private const val MIN_RAW_SPAN = 1e-3f
     }
 }

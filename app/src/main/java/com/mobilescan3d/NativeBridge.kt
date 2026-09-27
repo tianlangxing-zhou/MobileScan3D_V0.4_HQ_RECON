@@ -402,6 +402,30 @@ object NativeBridge {
      */
     external fun nativeSetDepthCalibrationEnabled(enabled: Boolean)
 
+    /**
+     * V0.13.4：上报当前深度帧所用的归一化映射 `d = aNorm * q + bNorm`。
+     *
+     * 只要 `version` 与上次不同，就必须在**喂这一帧之前**调用 —— native
+     * 会按 `a_new = a_old*A_old/A_new`、`b_new = b_old + a_old*B_old -
+     * a_new*B_new` 重参数化已收敛的标定与冻结中的 epoch 参数，让「同一个
+     * 网络输出」始终对应「同一个米制深度」。
+     *
+     * 不这么做的话，会话级 min/max 一扩张，d 的语义就变了，而冻结的标定
+     * 还按旧语义解释 —— 几何随扫描推进整体膨胀/收缩（尺度漂移）。
+     */
+    external fun nativeSetDepthNormMapping(aNorm: Float, bNorm: Float, version: Long)
+
+    /**
+     * V0.13.4 深度数值域诊断（5 槽）：
+     * 0=当前 A 斜率，1=当前 B 截距，2=版本号，3=重参数化次数，
+     * 4=「epoch 已冻结但数值域还在变」的次数。
+     * 返回写入的槽数（< 5 表示 native 未实现，调用方必须降级）。
+     */
+    external fun nativeGetDepthNormStats(out: FloatArray): Int
+
+    /** [nativeGetDepthNormStats] 的槽数。 */
+    const val DEPTH_NORM_STATS_SLOTS = 5
+
     /** 读深度标定状态（[DEPTH_CALIBRATION_SLOTS] 槽）。返回写入的槽数。 */
     external fun nativeGetDepthCalibration(out: FloatArray): Int
 
