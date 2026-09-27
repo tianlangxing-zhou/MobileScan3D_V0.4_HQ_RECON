@@ -198,6 +198,27 @@ private var lastRelocPollMs = 0L
     private var arLayerButton: android.widget.Button? = null
     /** AR 绘制模式，见 PointCloudRenderer.DRAW_* */
     @Volatile private var arDrawMode = PointCloudRenderer.DRAW_LIVE
+
+    // ---- V0.13.3 模型查看器 ----
+    /** 查看模式是否激活（激活时 glView 接管触摸手势） */
+    @Volatile private var modelViewerActive = false
+    /** 查看器按钮（进入/退出共用，文字随状态切换） */
+    private var modelViewerButton: android.widget.Button? = null
+    /** 进入查看模式前的 AR 图层，退出时恢复 */
+    private var modelViewerPrevMode = PointCloudRenderer.DRAW_LIVE
+    /** 手势状态：按下的位置/时刻，及当前手势是「旋转」还是「长按平移」 */
+    private var viewerLastX = 0f
+    private var viewerLastY = 0f
+    private var viewerDownX = 0f
+    private var viewerDownY = 0f
+    private var viewerPanMode = false
+    private var viewerMoved = false
+    /** 长按判定：按下后 300ms 内没动过就切到「平移」手势 */
+    private val viewerLongPressMs = 300L
+    private val viewerHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var viewerLongPressRunnable: Runnable? = null
+    /** 旋转灵敏度：弧度/像素。一屏宽拖过去 ≈ 转 300°，接近「转一圈」的直觉。 */
+    private val viewerRotRadPerPx = 0.005f
     /** V0.12: 实时网格快照是否正在后台重建（防止同一时刻排队两次）。 */
     @Volatile private var liveMeshBuildBusy = false
     /** V0.12: 上一次提交网格快照的时刻（SystemClock.elapsedRealtime）。 */
@@ -500,6 +521,16 @@ private var lastRelocPollMs = 0L
             isClickable = false
             isFocusable = false
         }
+        // V0.13.3 模型查看器手势。glView 平时不吃触摸（isClickable=false，
+        // 事件穿透到 TextureView 走点选目标/对焦）；进入查看模式时置
+        // clickable，手势在这里处理：
+        //   - 按下后立刻拖动 -> 旋转（yaw/pitch）
+        //   - 按住不动 300ms 后再拖 -> 平移（物体跟手）
+        glView.setOnTouchListener { _, event ->
+            if (!modelViewerActive) return@setOnTouchListener false
+            handleModelViewerTouch(event)
+            true
+        }
         root.addView(glView, android.widget.FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
@@ -615,10 +646,19 @@ private var lastRelocPollMs = 0L
             setBackgroundColor(android.graphics.Color.argb(120, 255, 255, 255))
             setOnClickListener { showExportDrawer() }
         }
+        modelViewerButton = android.widget.Button(this).apply {
+            text = "查看模型"
+            setTextColor(android.graphics.Color.WHITE)
+            setBackgroundColor(android.graphics.Color.argb(200, 88, 86, 214))
+            setPadding(20, 12, 20, 12)
+            setOnClickListener { toggleModelViewer() }
+        }
         bottom.addView(exportButton, android.widget.LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = 8 })
+        bottom.addView(modelViewerButton, android.widget.LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = 8 })
         bottom.addView(primaryButton, android.widget.LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 3f))
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
         root.addView(bottom, android.widget.FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -2328,6 +2368,10 @@ private var lastRelocPollMs = 0L
 
     private fun startScan() {
         scanning = true
+        // V0.13.3：开新扫描必须退出模型查看器 —— 查看器的不透明背景会
+        // 盖住相机预览，用户会以為相机坏了；且新扫描会清网格，查看器
+        // 立刻变成空转。
+        if (modelViewerActive) exitModelViewer()
         // V0.5：新一轮扫描 —— 在 native 会话就绪前不喂帧，并进入世代。
         scanNativeReady = false
         arMeshViewing = false
@@ -2375,10 +2419,14 @@ private var lastRelocPollMs = 0L
             // 「VINS world 的可见表面」选的；真实的米制对齐由 native 侧的
             // 鲁棒标定（MAD + Huber IRLS + EMA）负责。
             //
-            // 截断距离在 native 侧固定 0.10（见 tsdf_engine.cpp），
-            // 即场景约 5 个体素、目标约 12 个体素 —— 对噪声更宽容。
-            NativeBridge.nativeSetVoxelSizes(0.020f, 0.008f)
-            NativeBridge.nativeSetVoxelBudget(8192, 4096)
+            // V0.13.3 精度提升：原 0.020/0.008 在 20cm 级手办上只能提出
+            // ~3k 三角形（Marching Tetrahedra 面数 ≈ 表面积/体素²），
+            // 表面呈明显的块状。降到 0.012/0.004（目标面数 ×4），
+            // 同时块预算翻倍（每块 8³×8B=4KB，scene 64MB + target 32MB，
+            // PLK110 可承受）。截断距离 = voxel×4（tsdf_engine 固定系数），
+            // 目标侧 16mm —— 立体深度噪声典型 5~15mm，尚在容忍带内。
+            NativeBridge.nativeSetVoxelSizes(0.012f, 0.004f)
+            NativeBridge.nativeSetVoxelBudget(16384, 8192)
             NativeBridge.nativeSetDepthCalibrationEnabled(true)
             if (objectLockEnabled) {
                 NativeBridge.nativeSetObjectLockEnabled(true)
@@ -2586,6 +2634,161 @@ private var lastRelocPollMs = 0L
         NativeBridge.MESH_QUALITY_PREVIEW -> "预览"
         NativeBridge.MESH_QUALITY_HQ -> "HQ"
         else -> "常规"
+    }
+
+    // ==================================================================
+    // V0.13.3 模型查看器
+    // ==================================================================
+
+    /** 「查看模型」按钮入口：切换进出查看模式。 */
+    private fun toggleModelViewer() {
+        if (modelViewerActive) {
+            exitModelViewer()
+            return
+        }
+        val mesh = if (::exportManager.isInitialized) exportManager.lastMesh else null
+        if (mesh != null && mesh.triangleCount > 0) {
+            enterModelViewerWith(mesh)
+            return
+        }
+        // 没有现成网格：先按预览质量构建一份，成功后再进入。
+        if (!::exportManager.isInitialized) {
+            toast("还没有可查看的模型，请先扫描")
+            return
+        }
+        toast("正在生成模型，请稍候…")
+        try {
+            exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_NORMAL) { built ->
+                runOnUiThread {
+                    if (built != null && built.triangleCount > 0) {
+                        enterModelViewerWith(built)
+                    } else {
+                        toast("暂无可查看的模型（体素场不足以提取表面），请先扫描")
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            toast("模型构建异常：${t.javaClass.simpleName}")
+        }
+    }
+
+    /** 用一份网格数据进入查看模式：算包围球 -> 自动构图 -> 切图层。 */
+    private fun enterModelViewerWith(mesh: com.mobilescan3d.export.ExportManager.MeshData) {
+        renderer.setMesh(mesh.vertices, mesh.indices)
+        // 包围球：顶点交错布局 x,y,z 每 9 个 float 一组。几十万顶点的
+        // 线性扫描在 UI 线程 ~10ms 量级，一次性成本可接受。
+        var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var minZ = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
+        val v = mesh.vertices
+        var i = 0
+        val n = v.size - 8
+        while (i < n) {
+            val x = v[i]; val y = v[i + 1]; val z = v[i + 2]
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+            if (z < minZ) minZ = z
+            if (z > maxZ) maxZ = z
+            i += 9
+        }
+        val cx = (minX + maxX) * 0.5f
+        val cy = (minY + maxY) * 0.5f
+        val cz = (minZ + maxZ) * 0.5f
+        val radius = 0.5f * kotlin.math.sqrt(
+            (maxX - minX) * (maxX - minX) +
+                (maxY - minY) * (maxY - minY) +
+                (maxZ - minZ) * (maxZ - minZ)
+        )
+        modelViewerPrevMode = arDrawMode
+        renderer.setViewerFrame(cx, cy, cz, radius)
+        renderer.drawMode = PointCloudRenderer.DRAW_MODEL_VIEWER
+        modelViewerActive = true
+        glView.isClickable = true
+        modelViewerButton?.text = "退出查看"
+        glView.requestRender()
+        toast("拖动=旋转 · 按住不动再拖=移动 · 「退出查看」返回相机")
+    }
+
+    /** 退出查看模式：恢复 AR 图层与触摸穿透。 */
+    private fun exitModelViewer() {
+        cancelViewerLongPress()
+        viewerPanMode = false
+        viewerMoved = false
+        modelViewerActive = false
+        glView.isClickable = false
+        renderer.drawMode = arDrawMode
+        modelViewerButton?.text = "查看模型"
+        glView.requestRender()
+    }
+
+    private fun cancelViewerLongPress() {
+        viewerLongPressRunnable?.let { viewerHandler.removeCallbacks(it) }
+        viewerLongPressRunnable = null
+    }
+
+    /**
+     * 查看模式触摸手势：
+     *  - 按下即拖 -> 旋转
+     *  - 按住 300ms 未动 -> 震动一下进入平移，之后拖动 = 物体跟手平移
+     */
+    private fun handleModelViewerTouch(event: android.view.MotionEvent) {
+        when (event.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                viewerDownX = event.x
+                viewerDownY = event.y
+                viewerLastX = event.x
+                viewerLastY = event.y
+                viewerPanMode = false
+                viewerMoved = false
+                val r = Runnable {
+                    viewerLongPressRunnable = null
+                    if (!viewerMoved) {
+                        viewerPanMode = true
+                        // 触觉反馈：告诉用户手势已从「旋转」切到「平移」
+                        try {
+                            val hh = getSystemService(android.content.Context.VIBRATOR_SERVICE)
+                                    as? android.os.Vibrator
+                            @Suppress("DEPRECATION")
+                            hh?.vibrate(20L)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                }
+                viewerLongPressRunnable = r
+                viewerHandler.postDelayed(r, viewerLongPressMs)
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                val dx = event.x - viewerLastX
+                val dy = event.y - viewerLastY
+                viewerLastX = event.x
+                viewerLastY = event.y
+                if (!viewerMoved) {
+                    val tx = event.x - viewerDownX
+                    val ty = event.y - viewerDownY
+                    if (tx * tx + ty * ty > 20f * 20f) {
+                        viewerMoved = true
+                        // 300ms 内就开始拖 = 旋转手势，长按判定作废
+                        if (!viewerPanMode) cancelViewerLongPress()
+                    } else if (!viewerPanMode) {
+                        // 还没确定手势类型也没挪出 slop，先不动作
+                        return
+                    }
+                }
+                if (viewerPanMode) {
+                    renderer.panViewer(dx, dy)
+                } else {
+                    renderer.rotateViewer(dx * viewerRotRadPerPx, dy * viewerRotRadPerPx)
+                }
+                glView.requestRender()
+            }
+            android.view.MotionEvent.ACTION_UP,
+            android.view.MotionEvent.ACTION_CANCEL -> {
+                cancelViewerLongPress()
+                viewerPanMode = false
+                viewerMoved = false
+            }
+        }
     }
 
     /**

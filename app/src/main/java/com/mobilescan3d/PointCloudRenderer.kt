@@ -128,6 +128,104 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         get() =
             texturedMeshRenderer.lastError
 
+    // ------------------------------------------------------------------ V0.13.3 模型查看器状态
+
+    /** 轨道相机：eye = target + dist * dir(yaw, pitch)，dir 绕世界 Y 轴。 */
+    @Volatile private var viewerYaw = 0.9f
+    @Volatile private var viewerPitch = 0.35f
+    @Volatile private var viewerDist = 1.0f
+    @Volatile private var viewerTargetX = 0f
+    @Volatile private var viewerTargetY = 0f
+    @Volatile private var viewerTargetZ = 0f
+    /** 模型包围球半径，setViewerFrame 时记录，用于最小 dist 保护。 */
+    @Volatile private var viewerRadius = 0.2f
+
+    /**
+     * 设置查看相框：模型包围球中心与半径。进入查看模式时调用一次，
+     * 自动把轨道距离放到「整球正好入画」的位置。
+     */
+    fun setViewerFrame(cx: Float, cy: Float, cz: Float, radius: Float) {
+        viewerTargetX = cx
+        viewerTargetY = cy
+        viewerTargetZ = cz
+        viewerRadius = radius.coerceAtLeast(0.02f)
+        // 竖直半 FOV = atan(0.5 / 1.2) ≈ 22.6°，dist = r / sin(22.6°) ≈ 2.6r；
+        // 留 8% 边距，并保证不小于 0.3m（MeshRenderer 着色器有 5cm 近裁剪）。
+        viewerDist = (viewerRadius * 2.8f).coerceAtLeast(0.3f)
+    }
+
+    /** 单指旋转：yaw/pitch 增量（弧度）。yaw 增大 = 模型向右转。 */
+    fun rotateViewer(dYaw: Float, dPitch: Float) {
+        viewerYaw += dYaw
+        viewerPitch = (viewerPitch + dPitch).coerceIn(-VIEWER_MAX_PITCH, VIEWER_MAX_PITCH)
+    }
+
+    /**
+     * 单指平移：屏幕像素位移 -> 轨道 target 在相机平面内移动。
+     * 物体跟手：手指向右滑，target 沿相机 right 反方向移动
+     * （相机看向 target，target 左移 = 画面里的物体右移）。
+     */
+    fun panViewer(dxPx: Float, dyPx: Float) {
+        if (dxPx == 0f && dyPx == 0f) return
+        val pose = FloatArray(12)
+        computeViewerPose(pose)
+        // pose[0..2]=right, [3..5]=down（行主序 R 的列）
+        val rx = pose[0]; val ry = pose[3]; val rz = pose[6]
+        val dx = pose[1]; val dy = pose[4]; val dz = pose[7]
+        // 屏幕高度方向可见的世界尺寸 = dist / focal；除以像素数得每像素世界量
+        val wpp = viewerDist / VIEWER_FOCAL_NORM / viewportH.coerceAtLeast(1)
+        viewerTargetX -= (rx * dxPx + dx * dyPx) * wpp
+        viewerTargetY -= (ry * dxPx + dy * dyPx) * wpp
+        viewerTargetZ -= (rz * dxPx + dz * dyPx) * wpp
+    }
+
+    /** 重置视角回到自动构图。 */
+    fun resetViewerView() {
+        viewerYaw = 0.9f
+        viewerPitch = 0.35f
+        setViewerFrame(viewerTargetX, viewerTargetY, viewerTargetZ, viewerRadius)
+    }
+
+    /**
+     * 由 yaw/pitch/dist/target 计算合成位姿。布局与 nativeGetRenderPoseAt
+     * 一致：[R(9) 行主序, t(3)]，R 的三列分别是相机 right/down/forward
+     * 在世界系下的方向，t 是相机中心。
+     *
+     * 基向量推导（物理自检：站在 z=-5 面向 +z，右手边是 +x ——
+     * right = up×fw 给出 (1,0,0)，投影后 +x 点落在屏幕右侧，不镜像）：
+     *   dir    = (cosP·sinY, sinP, cosP·cosY)   target→eye 方向
+     *   eye    = target + dist·dir
+     *   fw     = -dir                            eye→target（光轴）
+     *   right  = worldUp × fw
+     *   down   = right × fw
+     */
+    private fun computeViewerPose(out: FloatArray) {
+        val cp = kotlin.math.cos(viewerPitch)
+        val sp = kotlin.math.sin(viewerPitch)
+        val cy = kotlin.math.cos(viewerYaw)
+        val sy = kotlin.math.sin(viewerYaw)
+        // fw：eye 指向 target 的单位向量（相机光轴）
+        val fx = -cp * sy; val fy = -sp; val fz = -cp * cy
+        // right = (0,1,0) × fw = (fw.z, 0, -fw.x)
+        var rx = fz; var ry = 0f; var rz = -fx
+        var rl = kotlin.math.sqrt(rx * rx + ry * ry + rz * rz)
+        if (rl < 1e-5f) { rx = 1f; ry = 0f; rz = 0f; rl = 1f }
+        rx /= rl; ry /= rl; rz /= rl
+        // down = right × fw
+        val ddx = ry * fz - rz * fy
+        val ddy = rz * fx - rx * fz
+        val ddz = rx * fy - ry * fx
+        // eye = target - fw·dist = target + dir·dist
+        val eyeX = viewerTargetX - fx * viewerDist
+        val eyeY = viewerTargetY - fy * viewerDist
+        val eyeZ = viewerTargetZ - fz * viewerDist
+        // 行主序 R，列 = (right, down, forward)
+        out[0] = rx; out[1] = ddx; out[2] = fx
+        out[3] = ry; out[4] = ddy; out[5] = fy
+        out[6] = rz; out[7] = ddz; out[8] = fz
+        out[9] = eyeX; out[10] = eyeY; out[11] = eyeZ
+    }
+
     fun setTexturedMesh(
         vertices8: FloatArray?,
         indices: IntArray?,
@@ -276,6 +374,55 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        // ---- V0.13.3 模型查看器：合成轨道相机，完全绕开 AR 坐标链 ----
+        if (drawMode == DRAW_MODEL_VIEWER) {
+            // 不透明深色背景盖住相机预览（glView setZOrderOnTop，
+            // alpha=1 的 clear 就是一整块实色底）。
+            GLES20.glClearColor(0.07f, 0.08f, 0.10f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+            GLES20.glClearColor(0f, 0f, 0f, 0f)  // 下一帧 AR 模式要恢复透明
+
+            drawnAccumulated = 0
+            drawnDebug = 0
+            drawnMeshTriangles = 0
+            val pose = FloatArray(12)
+            computeViewerPose(pose)
+            // 归一化针孔：fy=1.2（竖直），fx 按视口宽高比缩放，
+            // 保证世界系的圆投在屏幕上仍是圆（竖屏不拉伸）。
+            val fx = VIEWER_FOCAL_NORM * viewportH / viewportW.coerceAtLeast(1)
+            val near = 0.02f
+            val far = viewerDist * 10f + 10f
+            // 查看模式必须不透明 + 真实顶点色；退出后恢复 AR 模式的设置。
+            val savedAlpha = meshRenderer.alpha
+            val savedTint = meshRenderer.useTint
+            val savedTexAlpha = texturedMeshRenderer.alpha
+            meshRenderer.alpha = 1f
+            meshRenderer.useTint = false
+            texturedMeshRenderer.alpha = 1f
+            var drawn = 0
+            try {
+                if (texturedMeshRenderer.hasAsset) {
+                    drawn = texturedMeshRenderer.draw(
+                        pose, fx, VIEWER_FOCAL_NORM, 0.5f, 0.5f, 1, 1,
+                        IDENTITY_CAMERA_TO_VIEW, near, far
+                    )
+                }
+                if (drawn <= 0) {
+                    drawn = meshRenderer.draw(
+                        pose, fx, VIEWER_FOCAL_NORM, 0.5f, 0.5f, 1, 1,
+                        IDENTITY_CAMERA_TO_VIEW, near, far
+                    )
+                }
+            } catch (_: Throwable) {
+                drawn = 0
+            }
+            drawnMeshTriangles = drawn
+            meshRenderer.alpha = savedAlpha
+            meshRenderer.useTint = savedTint
+            texturedMeshRenderer.alpha = savedTexAlpha
+            return
+        }
+
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         drawnAccumulated = 0
         drawnDebug = 0
@@ -536,6 +683,26 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
          * 分开看任一图层都无法判断「没长」是几何没收敛还是数据没进来。
          */
         const val DRAW_LIVE = 4
+
+        /**
+         * V0.13.3 模型查看器。
+         *
+         * 一个**合成轨道相机**：yaw/pitch/dist/target 由触摸手势驱动，
+         * 完全不查 VINS pose、不依赖 cameraToView —— 进这个模式看的
+         * 是「网格本身长什么样」，AR 对齐好不好在这里反而是噪声。
+         * 相机内参用归一化针孔（fx=fy=1.2、cx=cy=0.5、imageW/H=1），
+         * cameraToView 恒等 —— 直接把 [0,1] 的 camera UV 映到屏幕。
+         */
+        const val DRAW_MODEL_VIEWER = 5
+
+        /** 查看器合成相机的归一化焦距（竖直方向）。越大模型看起来越「平」。 */
+        private const val VIEWER_FOCAL_NORM = 1.2f
+
+        /** 查看器轨道 pitch 限幅，避免世界 up 基向量退化。 */
+        private const val VIEWER_MAX_PITCH = 1.4f
+
+        /** 查看器模式的恒等 cameraToView：cameraUV 直通 viewUV。 */
+        private val IDENTITY_CAMERA_TO_VIEW = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f)
 
         /** LIVE 层配色：累计点青色 / 当前帧新点亮绿色。 */
         private val LIVE_ACCUM_COLOR = floatArrayOf(0.10f, 0.95f, 1.00f)
