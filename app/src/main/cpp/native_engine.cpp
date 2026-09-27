@@ -410,7 +410,15 @@ struct RenderPoseSample {
 static std::deque<RenderPoseSample> renderPoseHistory;
 static constexpr size_t kRenderPoseHistoryMax = 120;
 // 查询允许的最大 pose 年龄；超过就说明这段历史里没有对应时刻的位姿
-static constexpr int64_t kRenderPoseMaxAgeNs = 80'000'000LL; // 80ms
+// V0.13.11：80ms -> 300ms。
+// 旧值 80ms 是首版占位（见 nativeGetRenderPoseAt 注释「< 80ms 就返回…以后
+// 若发现快速运动下仍有偏差再升级」）。真机数据（diag_live_20260927_2155）显示
+// AR 预览管线延迟使 Preview 的 SENSOR_TIMESTAMP 系统性落后 VINS 历史位姿
+// >80ms（nativeOnCameraFrame 均值 44.9ms、峰值 1.1s），导致 strict 查询 100%
+// 失败、AR 渲染回退到「冻结的最新 pose」——模型坐标错乱、不跟随物体。放宽到
+// 300ms 后，最近邻查找仍能取到「距当前 ≤300ms」的时序位姿，世界系 mesh 即可随
+// 手机近期运动正确锚定。300ms 在世界锚定下仅对应手持扫描的轻微滞后，远优于冻结。
+static constexpr int64_t kRenderPoseMaxAgeNs = 300'000'000LL; // 300ms
 
 // ------------------------------------------------- 当前帧 target depth 调试层
 /**
@@ -1424,6 +1432,17 @@ static void nativeOnCameraFrameImpl(
                                  static_cast<uint64_t>(frameTs));
             tracker->track(gTrackerGray.data(), tw, th, tw,
                            static_cast<uint64_t>(frameTs));
+
+            // V0.13.11 取证：量化 Nano(TFLite) 推理耗时占 camera 帧的比例。
+            // 与 Kotlin 侧 FrameProbe(测 nativeOnCameraFrame 总耗时) 对照，
+            // 即可判断相机线程掉帧是否由 Nano 同步推理尖峰导致，避免盲改。
+            if (tracker->nanoUpdateCalls() > 0 &&
+                tracker->nanoUpdateCalls() % 30 == 0) {
+                __android_log_print(ANDROID_LOG_INFO, "NanoProbe",
+                                    "nanoUpdate %.1f ms calls=%d",
+                                    tracker->nanoLastMs(),
+                                    static_cast<int>(tracker->nanoUpdateCalls()));
+            }
 
             // 每 5 帧喂一张由 YUV420 直接生成的真实彩色缩略图给 NanoTrack。
             // 原实现把灰度复制成三通道（COLOR_GRAY2BGR），NanoTrack 的外观
@@ -3701,6 +3720,9 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAt(JNIEnv* env, jobject,
  * 「burst 开始前最后一个位姿」对 burst 内任何一帧都是可接受的近似。
  * 容差由调用方传入（关键帧路径用 500ms）；AR 渲染仍走 strict 80ms 版。
  */
+// V0.13.14 ArAxesProbe 节流时间戳（按位姿样本 ts，1s 一条）。
+static int64_t sAxesProbeLastLogNs = 0;
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject,
                                                             jlong timestampNs,
@@ -3713,6 +3735,9 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject
         ? static_cast<int64_t>(maxAgeNs)
         : kRenderPoseMaxAgeNs;
     float pose[12];
+    // V0.13.14 ArAxesProbe：锁外可见的样本信息捕获。
+    int64_t probeSampleTs = 0;
+    int64_t probeDeltaMs = 0;
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
         if (renderPoseHistory.empty()) {
@@ -3747,6 +3772,29 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject
         pose[9] = best->t[0];
         pose[10] = best->t[1];
         pose[11] = best->t[2];
+        probeSampleTs = static_cast<int64_t>(best->ts);
+        probeDeltaMs = bestDelta / 1'000'000LL;
+    }
+    // V0.13.14 取证：AR 模型「上下相反」轴探针（ArAxesProbe）。
+    // VINS 世界系初始化对齐后 +Z 指向重力方向（estimator.cpp g2R：g=(0,0,9.8)）。
+    // 用户竖直持机时，图像 down ≈ 物理 down ≈ 世界 +Z，正确位姿应满足
+    // col1(down)·Z > 0 且 col2(fwd)·Z ≈ 0。三种故障各有唯一签名：
+    //   A) raw col1·Z < 0                   => VINS 相机帧 y 轴朝上，几何整体垂直镜像
+    //                                          （点云同镜像，仅纹理模型可见）
+    //   B) raw col1·Z > 0 但 post col1·Z<0  => transformPose 引入 ~180° 横滚
+    //                                          （持久地图帧与当前扫描帧错位）
+    //   C) 两者皆正确                        => 翻转在投影/纹理链
+    //                                          （配合 PointCloudRenderer 一次性
+    //                                          打出的 cameraToView 仿射定位）
+    // 1s 节流（按位姿样本时间戳），每秒至多 1 条。
+    const bool axesProbeDue =
+        (probeSampleTs - sAxesProbeLastLogNs) > 1'000'000'000LL;
+    float rawDownFwd[6] = {
+        pose[1], pose[4], pose[7],   // raw col1 (down) 世界分量
+        pose[2], pose[5], pose[8]    // raw col2 (forward) 世界分量
+    };
+    if (axesProbeDue) {
+        sAxesProbeLastLogNs = probeSampleTs;
     }
     float savedR[9];
     float savedT[3];
@@ -3758,6 +3806,15 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject
     pose[9] = savedT[0];
     pose[10] = savedT[1];
     pose[11] = savedT[2];
+    if (axesProbeDue) {
+        LOGI("ArAxesProbe raw down=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) "
+             "post down=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) deltaMs=%.0f",
+             rawDownFwd[0], rawDownFwd[1], rawDownFwd[2],
+             rawDownFwd[3], rawDownFwd[4], rawDownFwd[5],
+             pose[1], pose[4], pose[7],
+             pose[2], pose[5], pose[8],
+             static_cast<double>(probeDeltaMs));
+    }
     env->SetFloatArrayRegion(out, 0, 12, pose);
     return JNI_TRUE;
 }

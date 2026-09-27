@@ -83,6 +83,8 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
      * 由 MainActivity.updateCameraToViewTransform() 算出。
      */
     @Volatile private var cameraToView = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f)
+    // V0.13.14 取证：cameraToView 仿射只打一次日志。
+    @Volatile private var cameraToViewProbeLogged = false
     @Volatile private var haveCameraToView = false
 
     /** Preview 的时间戳（SurfaceTexture.getTimestamp），用来查那一时刻的 VINS pose */
@@ -90,6 +92,11 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     /** 上一次绘制有没有成功按 Preview 时间戳取到 pose（false 表示走的是回退） */
     @Volatile var poseFromTimestamp = false
         private set
+
+    // ---- AR 模型跟随量化埋点（V0.13.11 取证）：统计 pose 来源比例 ----
+    private var arPoseStatsTotal = 0
+    private var arPoseStatsFromTs = 0
+    private var arPoseStatsLatest = 0
 
     /** 绘制模式：见 DRAW_* 常量 */
     @Volatile var drawMode = DRAW_TARGET_DEBUG
@@ -316,6 +323,18 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
      */
     fun setCameraToView(m: FloatArray) {
         if (m.size < 6) return
+        // V0.13.14 取证：一次性打出 preview 仿射（ArAxesProbe case C 定位用）。
+        // 正确的 camera->view 仿射不应含垂直翻转（y 缩放为负）；
+        // 若 m[4]（y 系数）为负，说明投影链自带上下翻转。
+        if (!cameraToViewProbeLogged) {
+            cameraToViewProbeLogged = true
+            android.util.Log.i(
+                "ArAxesProbe",
+                "cameraToView=[" + m.joinToString(", ") {
+                    String.format("%.4f", it)
+                } + "]"
+            )
+        }
         cameraToView = floatArrayOf(m[0], m[1], m[2], m[3], m[4], m[5])
         haveCameraToView = true
     }
@@ -446,19 +465,40 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
             return
         }
 
-        // ---- 位姿：优先按 Preview 的时间戳查历史 ----
-        // 屏幕上这一帧画面有它自己的 SENSOR_TIMESTAMP；拿「此刻最新」的 pose
-        // 去画它，手机一转动点云就会漂。只有查不到时才回退。
+        // ---- 位姿：优先按 Preview 时间戳查历史（放宽到 500ms 容差）----
+        // 屏幕画面有它自己的 SENSOR_TIMESTAMP；拿「此刻最新」的 pose 去画它，
+        // 手机一转点云就漂。nativeGetRenderPoseAt(strict 300ms) 实测 fromTs≈0%：
+        // 历史库是按 YUV(ImageReader) 流时间戳建的，而查询用的是 Preview
+        // (SurfaceTexture) 流的时间戳，两流时间戳基准不一致、差 >300ms，
+        // strict 永远查不到 → 长期回退冻结 pose → 模型不跟随。
+        // 关键帧路径 nativeGetRenderPoseAtTol(500ms) 已验证可用（同基准 Image
+        // 时间戳），这里对齐到同一宽松窗口；最近邻只在时间最接近的位姿里取，
+        // 不会拿错时刻的 pose。burst 空洞(>500ms) 仍回退，行为与现一致。
         val ts = previewTimestampNs
         var ok = false
         if (ts > 0L) {
             ok = try {
-                NativeBridge.nativeGetRenderPoseAt(ts, poseBuf)
+                NativeBridge.nativeGetRenderPoseAtTol(ts, 500_000_000L, poseBuf)
             } catch (t: Throwable) {
                 false
             }
         }
         poseFromTimestamp = ok
+        // AR 模型跟随量化：统计按 Preview 时间戳取 pose 的成功率。
+        // 若长期 false，说明累计模型/网格用「此刻最新 pose」渲染，手机
+        // 一转动模型就会漂 —— 这正是「AR 模型不跟随物体固定」的根因之一。
+        arPoseStatsTotal++
+        if (ok) arPoseStatsFromTs++ else arPoseStatsLatest++
+        if (arPoseStatsTotal % 90 == 0) {
+            val pct = 100f * arPoseStatsFromTs / arPoseStatsTotal
+            android.util.Log.i(
+                "ArPoseProbe",
+                String.format(
+                    "fromTs=%.1f%% latest=%.1f%% total=%d",
+                    pct, 100f - pct, arPoseStatsTotal
+                )
+            )
+        }
         if (!ok) {
             ok = try {
                 NativeBridge.nativeGetRenderPose(poseBuf)
