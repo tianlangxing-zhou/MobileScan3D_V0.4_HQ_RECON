@@ -57,7 +57,7 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 136
-        versionName = "0.13.6-review"
+        versionName = "0.13.7-blur-fix"
         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
         ndk { abiFilters += listOf("arm64-v8a") }

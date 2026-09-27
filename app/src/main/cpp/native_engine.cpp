@@ -373,8 +373,12 @@ struct FrameSnap {
 };
 
 static std::deque<FrameSnap> snaps;
-static const int SNAP_W = 160;
-static const int SNAP_H = 120;
+// V0.13.7：原本 160x120 的快照是「逐顶点颜色 GLB」的唯一色彩来源，
+// 分辨率太低 -> 顶点颜色糊成一团，模型看上去「和被扫描物体差别很大、模糊不清楚」。
+// 提到 320x240 后顶点颜色采样密度翻 4 倍，纹理烘焙失败退回 vertex color 时也清晰可辨。
+// 60 帧历史上限下内存约 13.8MB（60 * 320*240*3），可接受。
+static const int SNAP_W = 320;
+static const int SNAP_H = 240;
 static int gVinsW = 640;
 static int gVinsH = 480;
 

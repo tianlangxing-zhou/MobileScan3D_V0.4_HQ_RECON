@@ -2157,8 +2157,24 @@ class HqCaptureController(
             }
             tooBlurry -> {
                 if (out.exists()) out.delete()
-                stats.lastCaptureRejectReason =
-                    "all frames blurry(sharpest=${"%.1f".format(sharpestScore)}<$MIN_SHARPEST_SCORE)"
+                // V0.13.7：整组全糊也不能直接丢弃——短扫描里 burst 一糊到底就会永远
+                // 0 关键帧，导出退回 vertex color 后就是一团糊。降级留最清晰单帧作纹理
+                // 候选（位姿取它自己那一帧），至少让模型带一张真实纹理而不是纯顶点色。
+                val picked = if (sharpestIndex in paths.indices) sharpestIndex else 0
+                if (saveFallbackSingle(ctx, paths[picked])) {
+                    registerTextureKeyframe(
+                        ctx,
+                        File(captureDir(ctx.sessionId), "single_${ctx.token}.jpg"),
+                        picked,
+                        sharpestScore
+                    )
+                    stats.fusionFallbackSingle++
+                    stats.lastCaptureRejectReason =
+                        "all frames blurry(sharpest=${"%.1f".format(sharpestScore)}<$MIN_SHARPEST_SCORE) -> 已降级交付最清晰单帧"
+                } else {
+                    stats.lastCaptureRejectReason =
+                        "all frames blurry(sharpest=${"%.1f".format(sharpestScore)}<$MIN_SHARPEST_SCORE) -> 最清晰单帧留取失败"
+                }
                 retake = true
             }
             alignReject.isNotEmpty() -> {

@@ -3364,7 +3364,7 @@ private var lastRelocPollMs = 0L
                 -1
             }
             return if (kf == 0) " · vertex color（未采集到关键帧：扫描时请缓慢移动手机让追踪初始化）"
-            else " · vertex color"
+            else " · vertex color（已登记 $kf 个关键帧但纹理烘焙未生效）"
         }
         val t = try {
             exportManager.textureStats()

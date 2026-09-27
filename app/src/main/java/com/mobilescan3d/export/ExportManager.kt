@@ -297,6 +297,17 @@ class ExportManager(context: Context) {
                             false
                         }
                 }
+                // V0.13.7：纹理未生效时把「已登记关键帧数」打进日志，
+                // 下一次真机扫描的 logcat 就能直接看出是「没采到关键帧」还是「烘焙失败」。
+                if (ok && !textured) {
+                    val ts = textureStats()
+                    val rk = if (ts.size > NativeBridge.TEXTURE_STATS_INDEX_REGISTERED_KEYFRAMES)
+                        ts[NativeBridge.TEXTURE_STATS_INDEX_REGISTERED_KEYFRAMES] else -1
+                    Log.w(TAG, "buildAndExportGlb: vertex-color fallback — " +
+                        "registeredKeyframes=$rk (texture bake skipped/failed). " +
+                        "registeredKeyframes=0 说明扫描时未采到关键帧（VINS 未初始化或 burst 全失败）；" +
+                        ">0 说明关键帧已登记但烘焙未产出可用视角。")
+                }
                 ok = ok && staging.isFile && staging.length() > 0L && staging.renameTo(file)
                 if (ok && textured) {
                     val baked = NativeBridge.nativeGetTexturedArAssetStats()
