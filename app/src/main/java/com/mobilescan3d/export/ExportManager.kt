@@ -326,6 +326,37 @@ class ExportManager(context: Context) {
                     textured -> "HQ 纹理模型已导出：${file.absolutePath}"
                     else -> "网格已导出（vertex color；纹理烘焙未生效）：${file.absolutePath}"
                 }
+                // V0.13.9：烘焙诊断持久化。logcat 主缓冲区被相机 HAL 噪音冲刷极快，
+                // bakeDiag 行常在取证前丢失；改为落盘到 GLB 同目录，adb pull 随时可取。
+                if (ok) {
+                    try {
+                        val ts = textureStats()
+                        val cs = meshCleanupStats()
+                        val diag = org.json.JSONObject().apply {
+                            put("sessionId", sessionId)
+                            put("ts", System.currentTimeMillis())
+                            put("textured", textured)
+                            put("vertices", verts)
+                            put("triangles", tris)
+                            put("fileBytes", file.length())
+                            put("message", msg)
+                            put("registeredKeyframes", if (ts.size > 0) ts[0] else -1)
+                            put("loadedKeyframes", if (ts.size > 1) ts[1] else -1)
+                            put("usedKeyframes", if (ts.size > 2) ts[2] else -1)
+                            put("atlasW", if (ts.size > 3) ts[3] else -1)
+                            put("atlasH", if (ts.size > 4) ts[4] else -1)
+                            put("texturedTriangles", if (ts.size > 5) ts[5] else -1)
+                            put("fallbackTriangles", if (ts.size > 6) ts[6] else -1)
+                            put("coveragePercent", if (ts.size > 7) ts[7] / 10f else -1f)
+                            put("usedXatlas", if (ts.size > 8) ts[8] == 1 else false)
+                            put("meshCleanupStats", org.json.JSONArray(cs.toList()))
+                        }
+                        val diagFile = File(file.parent, file.nameWithoutExtension + ".bakeDiag.json")
+                        diagFile.writeText(diag.toString(2))
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "write bakeDiag.json failed", t)
+                    }
+                }
             } catch (t: Throwable) {
                 Log.e(TAG, "buildAndExportGlb failed", t)
                 ok = false
