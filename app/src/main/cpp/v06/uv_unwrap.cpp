@@ -10,6 +10,9 @@
 // V0.13.8：xatlas 失败退 fallback 时必须留下原因。实测（190525 会话）出现
 // uv=fallback，但旧代码在 AddMesh 失败 / atlas 维度异常 / 顶点校验失败三条
 // 路径上都静默直落 fallback，无法区分是网格质量还是库内问题。
+// V0.13.10：根因是 xatlas 会丢弃退化三角形、留下 atlasIndex=-1 的孤儿顶点；
+// 旧代码遍历整个 vertexArray 遇任一孤儿即整批 fallback。改为按 indexArray
+// （仅含被打包的 charted 面）构建输出，逐面跳过孤儿，保留 xatlas 紧凑 UV。
 #define UW_LOGW(...) \
     __android_log_print(ANDROID_LOG_WARN, "MobileScan3D", __VA_ARGS__)
 
@@ -103,67 +106,90 @@ bool UvUnwrapper::unwrap(
                 atlas->height > 0) {
                 const xatlas::Mesh& xm = atlas->meshes[0];
 
-                out.vertices.resize(xm.vertexCount);
-                out.indices.resize(xm.indexCount);
+                if (xm.indexCount == 0 || (xm.indexCount % 3u) != 0) {
+                    UW_LOGW("uv_unwrap: xatlas produced no valid index "
+                            "buffer indexCount=%u", xm.indexCount);
+                } else {
+                    const float invW =
+                        1.0f / static_cast<float>(atlas->width);
+                    const float invH =
+                        1.0f / static_cast<float>(atlas->height);
 
-                const float invW =
-                    1.0f / static_cast<float>(atlas->width);
-                const float invH =
-                    1.0f / static_cast<float>(atlas->height);
+                    out.vertices.clear();
+                    out.indices.clear();
+                    out.vertices.reserve(xm.indexCount);
+                    out.indices.reserve(xm.indexCount);
 
-                bool valid = true;
-                for (std::uint32_t i = 0;
-                     i < xm.vertexCount;
-                     ++i) {
-                    const auto& xv = xm.vertexArray[i];
-                    if (xv.xref >= mesh.vertices.size() ||
-                        xv.atlasIndex < 0) {
-                        UW_LOGW("uv_unwrap: vertex invalid i=%u "
-                                "xref=%u(verts=%zu) atlasIndex=%d",
-                                i, xv.xref, mesh.vertices.size(),
-                                xv.atlasIndex);
-                        valid = false;
-                        break;
+                    std::uint32_t dropped = 0;
+                    const std::uint32_t triCount = xm.indexCount / 3u;
+                    for (std::uint32_t t = 0; t < triCount; ++t) {
+                        // indexArray holds only charted faces. Orphan vertices
+                        // (atlasIndex == -1, from degenerate faces xatlas drops)
+                        // are skipped per-triangle instead of failing the whole
+                        // unwrap — previously a single orphan forced the entire
+                        // mesh into the low-res triangle-soup fallback.
+                        bool triOk = true;
+                        for (int k = 0; k < 3; ++k) {
+                            const std::uint32_t vi =
+                                xm.indexArray[t * 3u +
+                                    static_cast<std::uint32_t>(k)];
+                            if (vi >= xm.vertexCount) { triOk = false; break; }
+                            const auto& xv = xm.vertexArray[vi];
+                            if (xv.atlasIndex < 0 ||
+                                xv.xref >= mesh.vertices.size()) {
+                                triOk = false; break;
+                            }
+                        }
+                        if (!triOk) { ++dropped; continue; }
+
+                        for (int k = 0; k < 3; ++k) {
+                            const std::uint32_t vi =
+                                xm.indexArray[t * 3u +
+                                    static_cast<std::uint32_t>(k)];
+                            const auto& xv = xm.vertexArray[vi];
+                            UvVertex uvv;
+                            uvv.base = mesh.vertices[xv.xref];
+
+                            // xatlas UVs are in atlas texel coordinates. We
+                            // bake the image using the same coordinates, so no
+                            // hidden Y flip is needed. glTF 2.0 defines (0,0)
+                            // as image upper-left.
+                            uvv.u = std::clamp(
+                                xv.uv[0] * invW, 0.0f, 1.0f);
+                            uvv.v = std::clamp(
+                                xv.uv[1] * invH, 0.0f, 1.0f);
+                            out.vertices.push_back(uvv);
+                            out.indices.push_back(
+                                static_cast<std::uint32_t>(
+                                    out.indices.size()));
+                        }
                     }
 
-                    UvVertex uvv;
-                    uvv.base = mesh.vertices[xv.xref];
-
-                    // xatlas UVs are in atlas texel coordinates. We bake the
-                    // image using the same coordinates, so no hidden Y flip
-                    // is needed. glTF 2.0 defines (0,0) as image upper-left.
-                    uvv.u = std::clamp(
-                        xv.uv[0] * invW,
-                        0.0f,
-                        1.0f);
-                    uvv.v = std::clamp(
-                        xv.uv[1] * invH,
-                        0.0f,
-                        1.0f);
-                    out.vertices[i] = uvv;
-                }
-
-                if (valid) {
-                    for (std::uint32_t i = 0;
-                         i < xm.indexCount;
-                         ++i) {
-                        out.indices[i] = xm.indexArray[i];
+                    if (dropped > 0) {
+                        UW_LOGW("uv_unwrap: xatlas dropped %u degenerate/"
+                                "orphan tris of %u (kept %zu)",
+                                dropped, triCount, out.vertices.size() / 3u);
                     }
 
-                    out.atlasWidth =
-                        static_cast<int>(atlas->width);
-                    out.atlasHeight =
-                        static_cast<int>(atlas->height);
+                    if (out.empty()) {
+                        UW_LOGW("uv_unwrap: xatlas kept 0 tris, "
+                                "falling back to triangle atlas");
+                    } else {
+                        out.atlasWidth =
+                            static_cast<int>(atlas->width);
+                        out.atlasHeight =
+                            static_cast<int>(atlas->height);
 
-                    localStats.usedXatlas = true;
-                    localStats.atlasWidth = out.atlasWidth;
-                    localStats.atlasHeight = out.atlasHeight;
-                    localStats.outputVertices = out.vertices.size();
-                    localStats.chartCount = atlas->chartCount;
+                        localStats.usedXatlas = true;
+                        localStats.atlasWidth = out.atlasWidth;
+                        localStats.atlasHeight = out.atlasHeight;
+                        localStats.outputVertices = out.vertices.size();
+                        localStats.chartCount = atlas->chartCount;
 
-                    xatlas::Destroy(atlas);
-                    if (stats) *stats = localStats;
-                    return !out.empty();
+                        if (stats) *stats = localStats;
+                        xatlas::Destroy(atlas);
+                        return true;
+                    }
                 }
             }
         }
