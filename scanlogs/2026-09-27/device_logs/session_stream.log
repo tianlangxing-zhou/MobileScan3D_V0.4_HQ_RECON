@@ -1,0 +1,5 @@
+--------- beginning of main
+09-27 19:18:40.840 I/DepthProvider(30753): probe: 本机没有 DEPTH_OUTPUT 相机（走单目模型）
+09-27 19:18:40.939 I/MobileScan3D(30753): V0.4 native create Vulkan=1
+09-27 19:18:46.665 I/DepthProvider(30753): probe: 本机没有 DEPTH_OUTPUT 相机（走单目模型）
+09-27 19:18:46.740 I/MobileScan3D(30753): V0.4 native create Vulkan=1

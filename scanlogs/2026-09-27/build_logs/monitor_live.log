@@ -1,0 +1,2403 @@
+[10:08:17] monitor start, interval=120s, out=E:\MobileScan3D\devtest\monitor
+
+========================================================================
+[10:08:19] R01  采集开始
+  pid=14071
+  threads=39 fd=0
+  PSS=323MB java=23MB native=115MB
+  cpu=0.3%
+  screen=E:\MobileScan3D\devtest\monitor\screen_R01_100820.png (2773248 bytes)
+  HUD | FPS 30.0 · 空闲
+  HUD | 地图 0 · 绘制 0 · 非米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +937 行  级别分布={'E': 920, 'W': 10, 'I': 4, 'D': 3}  可疑=6
+     ! 09-27 10:08:22.789  3480  5212 I ActivityManager: Process com.nearme.gamecenter (pid 16120) has died: svc SVC 
+     ! 09-27 10:08:23.324 17389 17389 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:08:23.332 17389 17389 I AndroidRuntime: Using default boot image
+     ! 09-27 10:08:23.332 17389 17389 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:08:23.535 17389 17389 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:08:24.616 17389 17389 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R01.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R01.logcat
+
+========================================================================
+[10:10:19] R02  采集开始
+  pid=14071
+  threads=41 fd=0
+  PSS=518MB java=91MB native=226MB
+  cpu=172.0%
+  +3611帧 卡顿0 (30.1 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R02_101020.png (3090839 bytes)
+  HUD | FPS 29.0 · 扫描中
+  HUD | 地图 134 · 绘制 135 · 米制
+  HUD | 物体锁定
+  HUD | 停止实验扫描
+  logcat +18594 行  级别分布={'E': 18267, 'I': 37, 'W': 287, 'D': 3}  可疑=13
+     ! 09-27 10:08:29.878  3480  8621 I ActivityManager: Process com.tencent.mm:appbrand1 (pid 14657) has died: cch+5 CEM 
+     ! 09-27 10:08:57.285  3480  5212 I ActivityManager: Process com.heytap.market (pid 15813) has died: cch+5 CEM 
+     ! 09-27 10:09:59.292  3480  8621 I ActivityManager: Process com.android.keychain (pid 15793) has died: cch+5 CEM 
+     ! 09-27 10:09:59.324  3480  5212 I ActivityManager: Process com.android.vending (pid 13401) has died: cch+55 CEM 
+     ! 09-27 10:09:59.329  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 14454) has died: cch+5 CEM 
+     ! 09-27 10:10:12.495 16251 16625 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R02.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R02.logcat
+
+========================================================================
+[10:12:19] R03  采集开始
+  pid=14071
+  threads=43 fd=0
+  PSS=344MB java=56MB native=160MB
+  cpu=130.0%
+  +2295帧 卡顿4 (19.0 fps, janky 0.2%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R03_101220.png (20039 bytes)
+  logcat +12101 行  级别分布={'E': 11827, 'I': 20, 'W': 251, 'D': 3}  可疑=7
+     ! 09-27 10:11:35.000  3480  6585 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 10:12:23.454 22104 22104 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:12:23.465 22104 22104 I AndroidRuntime: Using default boot image
+     ! 09-27 10:12:23.465 22104 22104 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:12:23.620 22104 22104 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:12:24.660 22104 22104 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R03.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R03.logcat
+
+========================================================================
+[10:14:19] R04  采集开始
+  pid=14071
+  threads=44 fd=0
+  PSS=277MB java=19MB native=145MB
+  cpu=0.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R04_101420.png (20039 bytes)
+  logcat +1646 行  级别分布={'E': 1569, 'W': 35, 'I': 39, 'D': 3}  可疑=13
+     ! 09-27 10:13:10.543  3480  8621 I ActivityManager: Process com.oplus.metis:net (pid 22167) has died: fg  SVC 
+     ! 09-27 10:14:16.709  3480  5212 I ActivityManager: Process com.android.providers.downloads (pid 12347) has died: cch+65 CEM 
+     ! 09-27 10:14:16.712  3480  8621 I ActivityManager: Process com.coloros.ocs.opencapabilityservice:ocs (pid 12460) has died: cch+75 CEM 
+     ! 09-27 10:14:16.715  3480  5212 I ActivityManager: Process com.google.android.configupdater (pid 12375) has died: cch+65 CEM 
+     ! 09-27 10:14:18.801  3480  8621 I ActivityManager: Process com.android.vending:background (pid 13568) has died: svcb SVC 
+     ! 09-27 10:14:18.803  3480  5212 I ActivityManager: Process com.android.vending:quick_launch (pid 14218) has died: svcb SVC 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R04.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R04.logcat
+
+========================================================================
+[10:16:19] R05  采集开始
+  pid=14071
+  threads=44 fd=0
+  PSS=265MB java=19MB native=108MB
+  cpu=0.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R05_101620.png (20039 bytes)
+  logcat +243 行  级别分布={'E': 223, 'W': 13, 'D': 3, 'I': 4}  可疑=6
+     ! 09-27 10:16:22.208 23094 23094 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:16:22.227 23094 23094 I AndroidRuntime: Using default boot image
+     ! 09-27 10:16:22.228 23094 23094 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:16:22.482 23094 23094 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:16:23.599 23094 23094 D AndroidRuntime: Shutting down VM
+     ! 09-27 10:16:23.611  3480  8621 I ActivityManager: Process com.oplus.dmp:main (pid 22875) has died: cch+5 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R05.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R05.logcat
+
+========================================================================
+[10:18:19] R06  采集开始
+  !! pid 变化 14071 -> 14072（Activity/进程重建）
+  pid=14072
+  threads=41 fd=0
+  PSS=335MB java=36MB native=75MB
+  cpu=2.9%
+  +-3881帧 卡顿-3 (-32.4 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R06_101820.png (3173170 bytes)
+  logcat +14714 行  级别分布={'E': 14176, 'I': 38, 'W': 497, 'D': 3}  可疑=13
+     ! 09-27 10:16:34.960  3480  5212 I ActivityManager: Process com.oplus.sau (pid 15991) has died: svc SVC 
+     ! 09-27 10:17:04.380  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:67 ShareLibraryUnit() ShareLibraryUnit dlopen with error: dlopen failed: li
+     ! 09-27 10:17:04.380  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:344 ProcessDeferredEvent() LoadShareLibrary /odm/lib64/libarcsoft_triple_zo
+     ! 09-27 10:17:04.761  3480  5994 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 10:17:05.036  3480  8621 I ActivityManager: Process com.android.photopicker (pid 13852) has died: cch+85 CEM 
+     ! 09-27 10:17:06.565 23618 24132 E fatal_log: android.database.sqlite.SQLiteException: no such table: download (code 1 SQLITE_ERROR): , while compiling:
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R06.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R06.logcat
+
+========================================================================
+[10:20:19] R07  采集开始
+  pid=14072
+  threads=42 fd=0
+  PSS=505MB java=75MB native=221MB
+  cpu=214.0%
+  +3604帧 卡顿4 (30.1 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R07_102020.png (3156021 bytes)
+  logcat +21033 行  级别分布={'E': 20520, 'I': 38, 'W': 472, 'D': 3}  可疑=11
+     ! 09-27 10:18:27.432  3480  8621 I ActivityManager: Process com.android.keychain (pid 23529) has died: cch+55 CEM 
+     ! 09-27 10:18:27.458  3480  5212 I ActivityManager: Process com.android.vending (pid 22457) has died: cch+85 CEM 
+     ! 09-27 10:19:06.362 23720 23863 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+     ! 09-27 10:19:06.375  3480  8621 I ActivityManager: Process com.qualcomm.qti.workloadclassifier (pid 23720) has died: cch+5 CEM 
+     ! 09-27 10:19:16.921  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 23639) has died: cch+15 CEM 
+     ! 09-27 10:19:32.614  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 22834) has died: cch+5 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R07.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R07.logcat
+
+========================================================================
+[10:22:19] R08  采集开始
+  pid=14072
+  threads=44 fd=0
+  PSS=379MB java=68MB native=181MB
+  cpu=221.0%
+  +2739帧 卡顿3 (22.8 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R08_102220.png (20039 bytes)
+  logcat +11779 行  级别分布={'E': 11417, 'I': 35, 'W': 324, 'D': 3}  可疑=7
+     ! 09-27 10:22:06.229  3480  5212 I ActivityManager: Process com.oplus.sau (pid 23569) has died: fg  SVC 
+     ! 09-27 10:22:11.737  3480  8621 I ActivityManager: Process com.oplus.romupdate (pid 15764) has died: fg  SVC 
+     ! 09-27 10:22:21.071 31615 31615 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:22:21.078 31615 31615 I AndroidRuntime: Using default boot image
+     ! 09-27 10:22:21.078 31615 31615 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:22:21.228 31615 31615 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R08.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R08.logcat
+
+========================================================================
+[10:24:19] R09  采集开始
+  pid=14072
+  threads=45 fd=0
+  PSS=301MB java=24MB native=149MB
+  cpu=33.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R09_102420.png (20039 bytes)
+  logcat +354 行  级别分布={'E': 325, 'I': 12, 'W': 14, 'D': 3}  可疑=10
+     ! 09-27 10:22:51.197  3480  5212 I ActivityManager: Process com.heytap.market (pid 22238) has died: cch+25 CEM 
+     ! 09-27 10:22:51.666  3480  8621 I ActivityManager: Process com.oplus.metis:text_intent (pid 30563) has died: svc SVC 
+     ! 09-27 10:23:11.748  3480  5212 I ActivityManager: Process com.oplus.aiunit:worker35 (pid 30660) has died: cch+99 CEM 
+     ! 09-27 10:23:11.752  3480  8621 I ActivityManager: Process com.oplus.aiunit:worker65 (pid 30653) has died: cch+99 CEM 
+     ! 09-27 10:24:23.167  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 31680) has died: cch+5 CEM 
+     ! 09-27 10:24:23.327 31904 31904 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R09.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R09.logcat
+
+========================================================================
+[10:26:19] R10  采集开始
+  pid=14072
+  threads=46 fd=0
+  PSS=292MB java=24MB native=139MB
+  cpu=33.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R10_102620.png (20039 bytes)
+  logcat +157 行  级别分布={'E': 139, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 10:26:22.730 31993 31993 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:26:22.761 31993 31993 I AndroidRuntime: Using default boot image
+     ! 09-27 10:26:22.761 31993 31993 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:26:23.369 31993 31993 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:26:24.490 31993 31993 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R10.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R10.logcat
+
+========================================================================
+[10:28:19] R11  采集开始
+  !! pid 变化 14072 -> 17204（Activity/进程重建）
+  pid=17204
+  threads=39 fd=0
+  PSS=325MB java=41MB native=95MB
+  cpu=10.0%
+  +-8134帧 卡顿-8 (-67.9 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R11_102820.png (3223832 bytes)
+  HUD | FPS 30.0 · 空闲
+  HUD | 地图 0 · 绘制 0 · 非米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +12811 行  级别分布={'E': 12226, 'W': 504, 'I': 78, 'D': 3}  可疑=21
+     ! 09-27 10:27:10.315  3480  8621 I ActivityManager: Process com.oplus.metis:net (pid 32045) has died: fg  SVC 
+     ! 09-27 10:27:27.747  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:67 ShareLibraryUnit() ShareLibraryUnit dlopen with error: dlopen failed: li
+     ! 09-27 10:27:27.747  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:344 ProcessDeferredEvent() LoadShareLibrary /odm/lib64/libarcsoft_triple_zo
+     ! 09-27 10:27:28.130  3480  8736 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 10:27:28.523  3480  5212 I ActivityManager: Process com.oplus.safecenter (pid 15920) has died: cch+99 CEM 
+     ! 09-27 10:27:28.539  3480  8621 I ActivityManager: Process com.coloros.phonemanager (pid 15382) has died: cch+99 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R11.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R11.logcat
+
+========================================================================
+[10:30:19] R12  采集开始
+  pid=17204
+  threads=44 fd=0
+  PSS=465MB java=55MB native=206MB
+  cpu=145.0%
+  +3596帧 卡顿1 (30.0 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R12_103020.png (2466204 bytes)
+  HUD | FPS 30.0 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +17614 行  级别分布={'E': 17301, 'I': 23, 'W': 287, 'D': 3}  可疑=13
+     ! 09-27 10:28:49.328  3480  5212 I ActivityManager: Process com.heytap.market (pid 428) has died: cch+5 CEM 
+     ! 09-27 10:28:52.608  3480  3922 I ActivityManager: updateOomAdj start time is before than pendingPid added, don't delete it
+     ! 09-27 10:30:00.164  6887  6927 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 10:30:00.174  6887  6930 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 10:30:00.391  6887  6943 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 10:30:04.739   733  1193 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R12.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R12.logcat
+
+========================================================================
+[10:32:19] R13  采集开始
+  pid=17204
+  threads=45 fd=0
+  PSS=474MB java=60MB native=210MB
+  cpu=129.0%
+  +3674帧 卡顿0 (30.6 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R13_103220.png (3104991 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +12079 行  级别分布={'E': 12061, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 10:32:23.860 10293 10293 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:32:23.867 10293 10293 I AndroidRuntime: Using default boot image
+     ! 09-27 10:32:23.867 10293 10293 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:32:23.999 10293 10293 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:32:25.026 10293 10293 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R13.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R13.logcat
+
+========================================================================
+[10:34:19] R14  采集开始
+  pid=17204
+  threads=45 fd=0
+  PSS=446MB java=26MB native=215MB
+  cpu=123.0%
+  +3671帧 卡顿0 (30.6 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R14_103420.png (3132802 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +9163 行  级别分布={'E': 9115, 'I': 24, 'W': 21, 'D': 3}  可疑=10
+     ! 09-27 10:32:46.432  3480  8621 I ActivityManager: Process com.oplus.romupdate (pid 31734) has died: fg  SVC 
+     ! 09-27 10:32:57.058  3480  5212 I ActivityManager: Process com.coloros.filemanager (pid 2971) has died: cch+5 CEM 
+     ! 09-27 10:32:57.075  3480  8621 I ActivityManager: Process com.android.vending (pid 1896) has died: cch+45 CEM 
+     ! 09-27 10:33:04.408  3480  5212 I ActivityManager: Process com.oplus.sau (pid 492) has died: svcb SVC 
+     ! 09-27 10:33:54.337  3480  8621 I ActivityManager: Process com.oplus.pantanal.ums:utrace_core (pid 10459) has died: prev LAST
+     ! 09-27 10:34:23.618 10604 10604 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R14.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R14.logcat
+
+========================================================================
+[10:36:19] R15  采集开始
+  pid=17204
+  threads=43 fd=0
+  PSS=378MB java=29MB native=219MB
+  cpu=101.0%
+  +2708帧 卡顿0 (22.5 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R15_103620.png (20039 bytes)
+  logcat +6381 行  级别分布={'E': 6341, 'W': 35, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 10:36:22.604 11179 11179 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:36:22.626 11179 11179 I AndroidRuntime: Using default boot image
+     ! 09-27 10:36:22.626 11179 11179 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:36:23.036 11179 11179 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:36:24.159 11179 11179 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R15.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R15.logcat
+
+========================================================================
+[10:38:19] R16  采集开始
+  pid=17204
+  threads=44 fd=0
+  PSS=298MB java=19MB native=150MB
+  cpu=101.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R16_103820.png (20039 bytes)
+  logcat +402 行  级别分布={'I': 16, 'E': 364, 'W': 19, 'D': 3}  可疑=7
+     ! 09-27 10:36:25.662  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 10724) has died: cch+15 CEM 
+     ! 09-27 10:37:25.791  3480  8621 I ActivityManager: Process com.oplus.statistics.rom:cc (pid 11232) has died: fg  BFGS
+     ! 09-27 10:38:21.410 11574 11574 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:38:21.417 11574 11574 I AndroidRuntime: Using default boot image
+     ! 09-27 10:38:21.417 11574 11574 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:38:21.561 11574 11574 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R16.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R16.logcat
+
+========================================================================
+[10:40:19] R17  采集开始
+  pid=17204
+  threads=45 fd=0
+  PSS=285MB java=14MB native=20MB
+  cpu=0.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R17_104020.png (20039 bytes)
+  logcat +168 行  级别分布={'E': 148, 'W': 13, 'I': 4, 'D': 3}  可疑=6
+     ! 09-27 10:40:20.305  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:worker (pid 6887) has died: cch+25 CEM 
+     ! 09-27 10:40:22.094 11703 11703 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:40:22.125 11703 11703 I AndroidRuntime: Using default boot image
+     ! 09-27 10:40:22.125 11703 11703 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:40:22.743 11703 11703 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:40:23.924 11703 11703 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R17.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R17.logcat
+
+========================================================================
+[10:42:19] R18  采集开始
+  pid=17204
+  threads=46 fd=0
+  PSS=291MB java=13MB native=2MB
+  cpu=0.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R18_104220.png (20039 bytes)
+  logcat +224 行  级别分布={'E': 199, 'W': 17, 'I': 5, 'D': 3}  可疑=5
+     ! 09-27 10:42:21.882 11955 11955 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:42:21.906 11955 11955 I AndroidRuntime: Using default boot image
+     ! 09-27 10:42:21.906 11955 11955 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:42:22.247 11955 11955 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:42:23.281 11955 11955 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R18.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R18.logcat
+
+========================================================================
+[10:44:19] R19  采集开始
+  pid=17204
+  threads=49 fd=0
+  PSS=240MB java=13MB native=28MB
+  cpu=9.1%
+  +498帧 卡顿3 (4.2 fps, janky 0.6%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R19_104420.png (572582 bytes)
+  logcat +10742 行  级别分布={'E': 8478, 'W': 2209, 'I': 52, 'D': 3}  可疑=27
+     ! 09-27 10:42:27.289  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:67 ShareLibraryUnit() ShareLibraryUnit dlopen with error: dlopen failed: li
+     ! 09-27 10:42:27.289  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:344 ProcessDeferredEvent() LoadShareLibrary /odm/lib64/libarcsoft_triple_zo
+     ! 09-27 10:42:27.688  3480  5423 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 10:42:27.963  3480  8621 I ActivityManager: Process com.oplus.safecenter (pid 459) has died: cch+99 CEM 
+     ! 09-27 10:42:27.971  3480  5212 I ActivityManager: Process com.coloros.phonemanager:scan (pid 806) has died: cch+99 CEM 
+     ! 09-27 10:42:27.974  3480  8621 I ActivityManager: Process com.ted.number (pid 12231) has died: cch+99 SVC 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R19.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R19.logcat
+
+========================================================================
+[10:46:19] R20  采集开始
+  pid=17204
+  threads=49 fd=0
+  PSS=228MB java=12MB native=16MB
+  cpu=9.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R20_104620.png (571499 bytes)
+  logcat +1267 行  级别分布={'E': 1244, 'W': 15, 'I': 5, 'D': 3}  可疑=5
+     ! 09-27 10:46:21.080 16407 16407 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:46:21.087 16407 16407 I AndroidRuntime: Using default boot image
+     ! 09-27 10:46:21.087 16407 16407 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:46:21.206 16407 16407 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:46:22.242 16407 16407 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R20.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R20.logcat
+
+========================================================================
+[10:48:19] R21  采集开始
+  pid=17204
+  threads=49 fd=0
+  PSS=233MB java=17MB native=16MB
+  cpu=9.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R21_104820.png (571478 bytes)
+  logcat +948 行  级别分布={'E': 927, 'W': 13, 'I': 5, 'D': 3}  可疑=5
+     ! 09-27 10:48:20.997 16821 16821 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:48:21.003 16821 16821 I AndroidRuntime: Using default boot image
+     ! 09-27 10:48:21.003 16821 16821 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 10:48:21.123 16821 16821 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 10:48:22.153 16821 16821 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R21.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R21.logcat
+
+========================================================================
+[10:50:19] R22  采集开始
+  pid=17204
+  threads=48 fd=0
+  PSS=219MB java=17MB native=15MB
+  cpu=0.4%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R22_105021.png (20039 bytes)
+  logcat +655 行  级别分布={'E': 635, 'W': 13, 'I': 4, 'D': 3}  可疑=8
+     ! 09-27 10:48:24.385  5577  6414 E AMC     : [P-msc_qqlive] execute failed in triggers[0]:[touchidle:false][viewdanmaku:null, validviewspeed:null, fulls
+     ! 09-27 10:48:24.385  5577  6414 E AMC     : [P-msc_mango] execute failed in triggers[0]:[touchidle:false][fgapplist7:false, viewdanmaku:null, validview
+     ! 09-27 10:50:20.798  3480  8621 I ActivityManager: Process com.oplus.ota (pid 11371) has died: svc SVC 
+     ! 09-27 10:50:22.076 17209 17209 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:50:22.120 17209 17209 I AndroidRuntime: Using default boot image
+     ! 09-27 10:50:22.120 17209 17209 I AndroidRuntime: Leaving lock profiling enabled
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R22.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R22.logcat
+
+========================================================================
+[10:52:19] R23  采集开始
+  pid=17204
+  threads=48 fd=0
+  PSS=218MB java=17MB native=14MB
+  cpu=0.4%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R23_105221.png (20039 bytes)
+  HUD | FPS -- · 空闲
+  HUD | 点云 0 点 · 非米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +3381 行  级别分布={'E': 3080, 'W': 238, 'I': 60, 'D': 3}  可疑=19
+     ! 09-27 10:51:55.065  3480  5212 I ActivityManager: Process com.tencent.mm:appbrand1 (pid 14761) has died: cch CACC
+     ! 09-27 10:51:55.107  3480  8621 I ActivityManager: Process com.tencent.mm:appbrand0 (pid 14760) has died: vis SVC 
+     ! 09-27 10:52:21.568  3480  8621 I ActivityManager: Process com.tencent.mm:xweb_privileged_process_0 (pid 15339) has died: fg  SVC 
+     ! 09-27 10:52:21.782 17380 17380 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:52:21.786 17380 17380 I AndroidRuntime: Using default boot image
+     ! 09-27 10:52:21.786 17380 17380 I AndroidRuntime: Leaving lock profiling enabled
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R23.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R23.logcat
+
+========================================================================
+[10:54:19] R24  采集开始
+  !! pid 变化 17204 -> 24296（Activity/进程重建）
+  pid=24296
+  threads=40 fd=0
+  PSS=328MB java=36MB native=109MB
+  cpu=137.0%
+  +-12521帧 卡顿-4 (-104.9 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R24_105420.png (3313166 bytes)
+  HUD | FPS 30.0 · 空闲
+  HUD | 地图 0 · 绘制 0 · 非米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +19656 行  级别分布={'E': 19197, 'I': 74, 'W': 378, 'D': 6, 'F': 1}  可疑=20
+     ! 09-27 10:53:10.850  3480  8621 I ActivityManager: Process com.android.keychain (pid 19039) has died: cch+5 CEM 
+     ! 09-27 10:53:11.527 19179 19808 E fatal_log: android.database.sqlite.SQLiteException: no such table: download (code 1 SQLITE_ERROR): , while compiling:
+     ! 09-27 10:53:21.693  3480  5212 I ActivityManager: Process com.nearme.gamecenter (pid 19179) has died: svc SVC 
+     ! 09-27 10:53:34.410 20626 20626 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 10372 <<<<<<
+     ! 09-27 10:53:34.423 20626 20626 I AndroidRuntime: Using default boot image
+     ! 09-27 10:53:34.423 20626 20626 I AndroidRuntime: Leaving lock profiling enabled
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R24.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R24.logcat
+
+========================================================================
+[10:56:19] R25  采集开始
+  pid=24296
+  threads=41 fd=0
+  PSS=434MB java=52MB native=215MB
+  cpu=222.0%
+  +3614帧 卡顿2 (30.1 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R25_105620.png (2994278 bytes)
+  HUD | FPS 29.0 · 扫描中
+  HUD | 地图 26 · 绘制 27 · 米制
+  HUD | 物体锁定
+  HUD | 停止实验扫描
+  logcat +18835 行  级别分布={'E': 18523, 'W': 282, 'I': 27, 'D': 3}  可疑=8
+     ! 09-27 10:55:11.172 19318 19427 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+     ! 09-27 10:55:11.186  3480  8621 I ActivityManager: Process com.qualcomm.qti.workloadclassifier (pid 19318) has died: cch+5 CEM 
+     ! 09-27 10:55:21.086  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 18736) has died: cch+5 CEM 
+     ! 09-27 10:56:22.913 23900 23900 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 10:56:22.920 23900 23900 I AndroidRuntime: Using default boot image
+     ! 09-27 10:56:22.920 23900 23900 I AndroidRuntime: Leaving lock profiling enabled
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R25.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R25.logcat
+
+========================================================================
+[10:58:19] R26  采集开始
+  pid=24296
+  threads=41 fd=0
+  PSS=435MB java=50MB native=217MB
+  cpu=220.0%
+  +3686帧 卡顿2 (30.7 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R26_105820.png (3403467 bytes)
+  HUD | FPS 24.4 · 扫描中
+  HUD | 地图 1563 · 绘制 1564 · 米制
+  HUD | 物体锁定
+  HUD | 停止实验扫描
+  logcat +19548 行  级别分布={'E': 19409, 'I': 56, 'W': 76, 'D': 7}  可疑=19
+     ! 09-27 10:58:11.038  3480  8621 I ActivityManager: Process com.oplus.sau (pid 19129) has died: fg  SVC 
+     ! 09-27 10:58:21.255 20648 20648 D AndroidRuntime: Calling main entry com/xingin/tiny/daemon/e
+     ! 09-27 10:58:22.084  3480  5212 I ActivityManager: Process com.android.settings:background (pid 16827) has died: cch+15 CEM 
+     ! 09-27 10:58:22.118  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 18695) has died: cch+5 CEM 
+     ! 09-27 10:58:22.161  1838  9432 E         : DNS_CACHE: hanle request << lookupdns: hostname:live-room.xiaohongshu.com, servername:^, ai_flags:1024, ai_
+     ! 09-27 10:58:22.161  1838  9432 E         : DNS_CACHE look_up_dns: live-room.xiaohongshu.com, getHitCount: 0
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R26.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R26.logcat
+
+========================================================================
+[11:00:19] R27  采集开始
+  pid=24296
+  threads=44 fd=0
+  PSS=315MB java=50MB native=191MB
+  cpu=173.0%
+  +3158帧 卡顿1 (26.3 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R27_110020.png (20039 bytes)
+  logcat +14832 行  级别分布={'E': 14482, 'I': 30, 'W': 317, 'D': 3}  可疑=5
+     ! 09-27 11:00:21.104 32335 32335 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:00:21.127 32335 32335 I AndroidRuntime: Using default boot image
+     ! 09-27 11:00:21.127 32335 32335 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:00:21.284 32335 32335 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:00:22.347 32335 32335 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R27.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R27.logcat
+
+========================================================================
+[11:02:19] R28  采集开始
+  pid=24296
+  threads=45 fd=0
+  PSS=243MB java=21MB native=148MB
+  cpu=173.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R28_110220.png (20039 bytes)
+  logcat +281 行  级别分布={'E': 254, 'I': 10, 'W': 14, 'D': 3}  可疑=9
+     ! 09-27 11:00:30.290  3480  8621 I ActivityManager: Process com.oplus.dmp:main (pid 28882) has died: cch+15 CEM 
+     ! 09-27 11:00:36.451  3480  5212 I ActivityManager: Process com.oplus.metis:text_intent (pid 30554) has died: svcb SVC 
+     ! 09-27 11:00:56.580  3480  8621 I ActivityManager: Process com.oplus.aiunit:worker65 (pid 30635) has died: cch+75 CEM 
+     ! 09-27 11:00:56.592  3480  5212 I ActivityManager: Process com.oplus.aiunit:worker35 (pid 30642) has died: cch+75 CEM 
+     ! 09-27 11:02:22.484 32447 32447 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:02:22.491 32447 32447 I AndroidRuntime: Using default boot image
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R28.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R28.logcat
+
+========================================================================
+[11:04:19] R29  采集开始
+  pid=24296
+  threads=46 fd=0
+  PSS=243MB java=21MB native=148MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R29_110420.png (20039 bytes)
+  logcat +491 行  级别分布={'E': 391, 'I': 11, 'W': 80, 'D': 9}  可疑=18
+     ! 09-27 11:02:48.684  3480  8621 I ActivityManager: Process com.oplus.romupdate (pid 18792) has died: fg  SVC 
+     ! 09-27 11:03:20.829 28598 28598 D AndroidRuntime: Calling main entry com/xingin/tiny/daemon/e
+     ! 09-27 11:03:21.352 32628 32628 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 10372 <<<<<<
+     ! 09-27 11:03:21.359 32628 32628 I AndroidRuntime: Using default boot image
+     ! 09-27 11:03:21.359 32628 32628 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:03:21.513 32628 32628 D AndroidRuntime: Calling main entry com/xingin/tiny/daemon/e
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R29.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R29.logcat
+
+========================================================================
+[11:06:19] R30  采集开始
+  !! pid 变化 24296 -> 1964（Activity/进程重建）
+  pid=1964
+  threads=42 fd=0
+  PSS=474MB java=64MB native=209MB
+  cpu=3.5%
+  +-9393帧 卡顿-5 (-78.6 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R30_110620.png (2789342 bytes)
+  HUD | FPS 27.1 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +19034 行  级别分布={'E': 18130, 'I': 98, 'W': 803, 'D': 3}  可疑=22
+     ! 09-27 11:04:29.853  3480  8621 I ActivityManager: Process com.android.keychain (pid 428) has died: cch+5 CEM 
+     ! 09-27 11:04:29.933  3480  5212 I ActivityManager: Process com.android.vending:background (pid 18196) has died: svcb SVC 
+     ! 09-27 11:04:29.934  3480  5212 I ActivityManager: Process com.android.vending:quick_launch (pid 18518) has died: svcb SVC 
+     ! 09-27 11:04:29.938  3480  8621 I ActivityManager: Process com.coloros.securityguard (pid 15546) has died: cch+75 CEM 
+     ! 09-27 11:04:29.966  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:67 ShareLibraryUnit() ShareLibraryUnit dlopen with error: dlopen failed: li
+     ! 09-27 11:04:29.966  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:344 ProcessDeferredEvent() LoadShareLibrary /odm/lib64/libarcsoft_triple_zo
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R30.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R30.logcat
+
+========================================================================
+[11:08:19] R31  采集开始
+  pid=1964
+  threads=49 fd=0
+  PSS=529MB java=65MB native=259MB
+  cpu=183.0%
+  +3069帧 卡顿1 (25.6 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R31_110820.png (2646940 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 11990 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +16851 行  级别分布={'E': 16212, 'I': 42, 'W': 591, 'D': 6}  可疑=17
+     ! 09-27 11:06:29.688   552   669 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+     ! 09-27 11:06:29.705  3480  8621 I ActivityManager: Process com.qualcomm.qti.workloadclassifier (pid 552) has died: cch+5 CEM 
+     ! 09-27 11:06:40.951  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 680) has died: cch+5 CEM 
+     ! 09-27 11:08:20.853  1838  9432 E         : DNS_CACHE: hanle request << lookupdns: hostname:live-room.xiaohongshu.com, servername:^, ai_flags:1024, ai_
+     ! 09-27 11:08:20.853  1838  9432 E         : DNS_CACHE look_up_dns: live-room.xiaohongshu.com, getHitCount: 0
+     ! 09-27 11:08:21.298 32662 32662 D AndroidRuntime: Calling main entry com/xingin/tiny/daemon/e
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R31.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R31.logcat
+
+========================================================================
+[11:10:19] R32  采集开始
+  pid=1964
+  threads=50 fd=0
+  PSS=565MB java=109MB native=250MB
+  cpu=389.0%
+  +3685帧 卡顿0 (30.7 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R32_111020.png (2688810 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 11990 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +8931 行  级别分布={'E': 8898, 'W': 18, 'I': 12, 'D': 3}  可疑=7
+     ! 09-27 11:09:29.678  3480  8621 I ActivityManager: Process com.oplus.sau (pid 454) has died: fg  SVC 
+     ! 09-27 11:09:47.858  3480  5212 I ActivityManager: Process com.coloros.filemanager (pid 6964) has died: cch+5 CEM 
+     ! 09-27 11:10:24.136 11734 11734 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:10:24.147 11734 11734 I AndroidRuntime: Using default boot image
+     ! 09-27 11:10:24.148 11734 11734 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:10:24.345 11734 11734 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R32.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R32.logcat
+
+========================================================================
+[11:12:19] R33  采集开始
+  pid=1964
+  threads=50 fd=0
+  PSS=548MB java=94MB native=248MB
+  cpu=407.0%
+  +3672帧 卡顿0 (30.6 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R33_111220.png (2735012 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 11990 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +15245 行  级别分布={'E': 15227, 'W': 11, 'D': 3, 'I': 4}  可疑=6
+     ! 09-27 11:12:25.103 11988 11988 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:12:25.119 11988 11988 I AndroidRuntime: Using default boot image
+     ! 09-27 11:12:25.119 11988 11988 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:12:25.340 11988 11988 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:12:26.466 11988 11988 D AndroidRuntime: Shutting down VM
+     ! 09-27 11:12:26.473  3480  8621 I ActivityManager: Process com.oplus.dmp:main (pid 11798) has died: cch+5 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R33.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R33.logcat
+
+========================================================================
+[11:14:19] R34  采集开始
+  pid=1964
+  threads=49 fd=0
+  PSS=467MB java=90MB native=247MB
+  cpu=-1.0%
+  +1134帧 卡顿0 (9.4 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R34_111420.png (20039 bytes)
+  logcat +4995 行  级别分布={'E': 4952, 'W': 38, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 11:14:21.349 12544 12544 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:14:21.356 12544 12544 I AndroidRuntime: Using default boot image
+     ! 09-27 11:14:21.356 12544 12544 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:14:21.497 12544 12544 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:14:22.540 12544 12544 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R34.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R34.logcat
+
+========================================================================
+[11:16:19] R35  采集开始
+  pid=1964
+  threads=51 fd=0
+  PSS=252MB java=18MB native=110MB
+  cpu=10.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R35_111620.png (20039 bytes)
+  logcat +4724 行  级别分布={'E': 4587, 'W': 76, 'I': 51, 'D': 10}  可疑=55
+     ! 09-27 11:14:35.549  1449  1449 E tombstoned: Traces for pid 1964 written to: trace_00
+     ! 09-27 11:15:37.455  3480  3966 E OomConnection: failed waiting for OOM events: java.lang.RuntimeException: listener failed waiting for OOM event
+     ! 09-27 11:15:41.501  3480  5212 I ActivityManager: Process com.oplus.safecenter (pid 13019) has died: cch+55 CEM 
+     ! 09-27 11:15:41.528  3480  8621 I ActivityManager: Process com.coloros.phonemanager (pid 18969) has died: cch+55 CEM 
+     ! 09-27 11:15:44.280 12703 12812 E dumpstate: libdebuggerd_client: failed to read status response from tombstoned: Try again
+     ! 09-27 11:15:47.352 12703 12812 E dumpstate: libdebuggerd_client: failed to read status response from tombstoned: Try again
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R35.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R35.logcat
+
+========================================================================
+[11:18:19] R36  采集开始
+  pid=1964
+  threads=54 fd=0
+  PSS=404MB java=53MB native=87MB
+  cpu=361.0%
+  +1220帧 卡顿1 (10.2 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R36_111820.png (3224790 bytes)
+  HUD | FPS 30.0 · 空闲
+  HUD | 地图 11990 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +9457 行  级别分布={'E': 9205, 'I': 30, 'W': 219, 'D': 3}  可疑=17
+     ! 09-27 11:16:27.345  3480  5212 I ActivityManager: Process com.oplus.pantanal.ums:uiSetting (pid 19343) has died: cch+45 CEM 
+     ! 09-27 11:16:27.538  2653  5147 E ProcessInfo: pid 14761 invalid OOM score -10000
+     ! 09-27 11:16:27.538  2653  5147 E ProcessInfo: pid 17554 invalid OOM score -10000
+     ! 09-27 11:16:27.538  2653  5147 E ProcessInfo: pid 22273 invalid OOM score -10000
+     ! 09-27 11:16:37.720  1998  1998 E QTI PowerHAL: Failed to get CPU headroom
+     ! 09-27 11:16:52.858 13463 13519 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R36.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R36.logcat
+
+========================================================================
+[11:20:19] R37  采集开始
+  pid=1964
+  threads=54 fd=0
+  PSS=390MB java=29MB native=104MB
+  cpu=370.0%
+  +3688帧 卡顿0 (30.7 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R37_112020.png (3240420 bytes)
+  HUD | FPS -- · 空闲
+  HUD | 点云 0 点 · 非米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +20282 行  级别分布={'E': 19908, 'I': 57, 'W': 314, 'D': 3}  可疑=7
+     ! 09-27 11:20:25.934  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 18746) has died: cch+5 CEM 
+     ! 09-27 11:20:26.496 18896 18896 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:20:26.504 18896 18896 I AndroidRuntime: Using default boot image
+     ! 09-27 11:20:26.504 18896 18896 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:20:26.671 18896 18896 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:20:29.360 18896 18896 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R37.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R37.logcat
+
+========================================================================
+[11:22:19] R38  采集开始
+  !! pid 变化 1964 -> 19959（Activity/进程重建）
+  pid=19959
+  threads=43 fd=0
+  PSS=448MB java=31MB native=215MB
+  cpu=201.0%
+  +-16280帧 卡顿0 (-135.8 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R38_112220.png (3765683 bytes)
+  HUD | FPS 23.4 · 扫描中
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 停止实验扫描
+  logcat +19941 行  级别分布={'E': 19613, 'W': 290, 'I': 35, 'D': 3}  可疑=15
+     ! 09-27 11:20:31.775 20390 20512 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 11:20:33.854  3480  5212 I ActivityManager: Process com.coloros.securityguard:pvm_process (pid 19506) has died: fg  BFGS
+     ! 09-27 11:20:35.957  3480  8621 I ActivityManager: Process com.oplus.statistics.rom:infer1 (pid 20390) has died: fg  BFGS
+     ! 09-27 11:20:39.509  3480  5212 I ActivityManager: Process com.nearme.gamecenter (pid 19356) has died: svc SVC 
+     ! 09-27 11:21:13.459  3480  8621 I ActivityManager: Process com.heytap.market (pid 19110) has died: cch+15 CEM 
+     ! 09-27 11:22:00.555  3480  5212 I ActivityManager: Process com.android.keychain (pid 18995) has died: cch+5 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R38.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R38.logcat
+
+========================================================================
+[11:24:19] R39  采集开始
+  pid=19959
+  threads=45 fd=0
+  PSS=457MB java=39MB native=212MB
+  cpu=236.0%
+  +3692帧 卡顿1 (30.8 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R39_112420.png (3131846 bytes)
+  HUD | FPS 28.1 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +17368 行  级别分布={'E': 17324, 'I': 28, 'W': 13, 'D': 3}  可疑=6
+     ! 09-27 11:22:40.088  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 19555) has died: cch+5 CEM 
+     ! 09-27 11:24:24.026 26001 26001 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:24:24.035 26001 26001 I AndroidRuntime: Using default boot image
+     ! 09-27 11:24:24.035 26001 26001 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:24:24.232 26001 26001 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:24:25.811 26001 26001 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R39.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R39.logcat
+
+========================================================================
+[11:26:19] R40  采集开始
+  pid=19959
+  threads=45 fd=0
+  PSS=510MB java=85MB native=217MB
+  cpu=139.0%
+  +3671帧 卡顿0 (30.6 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R40_112620.png (2734766 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +8932 行  级别分布={'E': 8898, 'W': 17, 'I': 14, 'D': 3}  可疑=8
+     ! 09-27 11:25:28.338  3480  8621 I ActivityManager: Process com.oplus.sau (pid 19203) has died: svcb SVC 
+     ! 09-27 11:25:55.405  3480  5212 I ActivityManager: Process com.android.traceur (pid 12715) has died: cch+75 CEM 
+     ! 09-27 11:25:55.415  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 22154) has died: cch+5 CEM 
+     ! 09-27 11:26:24.193 26224 26224 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:26:24.204 26224 26224 I AndroidRuntime: Using default boot image
+     ! 09-27 11:26:24.204 26224 26224 I AndroidRuntime: Leaving lock profiling enabled
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R40.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R40.logcat
+
+========================================================================
+[11:28:19] R41  采集开始
+  pid=19959
+  threads=45 fd=0
+  PSS=499MB java=82MB native=211MB
+  cpu=128.0%
+  +3654帧 卡顿0 (30.4 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R41_112820.png (2668911 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +8867 行  级别分布={'E': 8847, 'W': 13, 'I': 4, 'D': 3}  可疑=6
+     ! 09-27 11:28:20.689  3480  5212 I ActivityManager: Process com.oplus.romupdate (pid 489) has died: fg  SVC 
+     ! 09-27 11:28:24.227 26546 26546 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:28:24.237 26546 26546 I AndroidRuntime: Using default boot image
+     ! 09-27 11:28:24.237 26546 26546 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:28:24.410 26546 26546 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:28:25.450 26546 26546 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R41.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R41.logcat
+
+========================================================================
+[11:30:19] R42  采集开始
+  pid=19959
+  threads=42 fd=0
+  PSS=364MB java=29MB native=203MB
+  cpu=93.0%
+  +1689帧 卡顿0 (14.0 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R42_113020.png (20039 bytes)
+  logcat +4060 行  级别分布={'E': 4016, 'I': 4, 'W': 37, 'D': 3}  可疑=6
+     ! 09-27 11:28:26.382  3480  8621 I ActivityManager: Process com.oplus.dmp:main (pid 26286) has died: cch+5 CEM 
+     ! 09-27 11:30:23.136 26818 26818 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:30:23.166 26818 26818 I AndroidRuntime: Using default boot image
+     ! 09-27 11:30:23.166 26818 26818 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:30:23.783 26818 26818 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:30:24.950 26818 26818 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R42.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R42.logcat
+
+========================================================================
+[11:32:19] R43  采集开始
+  pid=19959
+  threads=43 fd=0
+  PSS=288MB java=18MB native=138MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R43_113220.png (20039 bytes)
+  logcat +313 行  级别分布={'E': 285, 'W': 13, 'I': 12, 'D': 3}  可疑=10
+     ! 09-27 11:31:16.524  3480  5212 I ActivityManager: Process com.oplus.safecenter (pid 19149) has died: cch+75 CEM 
+     ! 09-27 11:31:16.531  3480  5212 I ActivityManager: Process com.oplus.matrix (pid 20125) has died: cch+65 CEM 
+     ! 09-27 11:31:16.539  3480  8621 I ActivityManager: Process com.android.printspooler (pid 15783) has died: cch+75 CEM 
+     ! 09-27 11:31:56.107  3480  5212 I ActivityManager: Process com.coloros.securityguard (pid 19037) has died: cch+35 CEM 
+     ! 09-27 11:31:56.110  3480  8621 I ActivityManager: Process com.oplus.notificationmanager (pid 19083) has died: cch+55 CEM 
+     ! 09-27 11:32:22.732 26951 26951 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R43.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R43.logcat
+
+========================================================================
+[11:34:19] R44  采集开始
+  pid=19959
+  threads=43 fd=0
+  PSS=280MB java=18MB native=137MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R44_113420.png (20039 bytes)
+  logcat +1813 行  级别分布={'E': 1738, 'W': 30, 'I': 42, 'D': 3}  可疑=13
+     ! 09-27 11:33:39.532  3480  5212 I ActivityManager: Process com.android.permissioncontroller (pid 19129) has died: cch+35 CEM 
+     ! 09-27 11:33:39.534  3480  8621 I ActivityManager: Process com.oplus.aiwriter (pid 14661) has died: cch+85 SVC 
+     ! 09-27 11:33:41.662  3480  5212 I ActivityManager: Process com.android.vending:background (pid 18187) has died: svcb SVC 
+     ! 09-27 11:33:41.672  3480  8621 I ActivityManager: Process com.android.vending:quick_launch (pid 18523) has died: svcb SVC 
+     ! 09-27 11:33:43.681  3480  5212 I ActivityManager: Process com.oplus.pantanal.ums:uiSetting (pid 19606) has died: cch+65 CEM 
+     ! 09-27 11:33:43.686  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 26241) has died: cch+5 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R44.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R44.logcat
+
+========================================================================
+[11:36:19] R45  采集开始
+  pid=19959
+  threads=43 fd=0
+  PSS=279MB java=18MB native=136MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R45_113620.png (20039 bytes)
+  logcat +166 行  级别分布={'E': 146, 'W': 13, 'D': 3, 'I': 4}  可疑=6
+     ! 09-27 11:36:22.607 27846 27846 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:36:22.638 27846 27846 I AndroidRuntime: Using default boot image
+     ! 09-27 11:36:22.638 27846 27846 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:36:23.162  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 27677) has died: cch+5 CEM 
+     ! 09-27 11:36:23.260 27846 27846 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:36:24.384 27846 27846 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R45.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R45.logcat
+
+========================================================================
+[11:38:19] R46  采集开始
+  pid=19959
+  threads=44 fd=0
+  PSS=279MB java=18MB native=132MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R46_113820.png (20039 bytes)
+  logcat +268 行  级别分布={'E': 248, 'W': 15, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 11:38:21.057 28098 28098 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:38:21.062 28098 28098 I AndroidRuntime: Using default boot image
+     ! 09-27 11:38:21.062 28098 28098 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:38:21.145 28098 28098 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:38:22.172 28098 28098 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R46.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R46.logcat
+
+========================================================================
+[11:40:19] R47  采集开始
+  pid=19959
+  threads=44 fd=0
+  PSS=283MB java=23MB native=118MB
+  cpu=0.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R47_114020.png (20039 bytes)
+  logcat +168 行  级别分布={'E': 152, 'W': 11, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 11:40:21.850 28274 28274 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:40:21.871 28274 28274 I AndroidRuntime: Using default boot image
+     ! 09-27 11:40:21.872 28274 28274 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:40:22.203 28274 28274 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:40:23.285 28274 28274 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R47.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R47.logcat
+
+========================================================================
+[11:42:19] R48  采集开始
+  pid=19959
+  threads=44 fd=0
+  PSS=280MB java=23MB native=93MB
+  cpu=0.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R48_114220.png (20039 bytes)
+  logcat +273 行  级别分布={'E': 253, 'W': 11, 'I': 6, 'D': 3}  可疑=7
+     ! 09-27 11:42:08.315  3480  8621 I ActivityManager: Process com.coloros.gallery3d (pid 13064) has died: cch+35 CEM 
+     ! 09-27 11:42:08.323  3480  5212 I ActivityManager: Process com.coloros.phonemanager (pid 18964) has died: cch+55 CEM 
+     ! 09-27 11:42:20.994 28503 28503 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:42:21.013 28503 28503 I AndroidRuntime: Using default boot image
+     ! 09-27 11:42:21.013 28503 28503 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:42:21.122 28503 28503 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R48.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R48.logcat
+
+========================================================================
+[11:44:19] R49  采集开始
+  pid=19959
+  threads=44 fd=0
+  PSS=279MB java=23MB native=91MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R49_114420.png (20039 bytes)
+  logcat +202 行  级别分布={'E': 171, 'W': 19, 'I': 9, 'D': 3}  可疑=7
+     ! 09-27 11:43:20.711  3480  8621 I ActivityManager: Process com.oplus.romupdate (pid 27724) has died: fg  SVC 
+     ! 09-27 11:44:06.253  3480  5212 I ActivityManager: Process com.heytap.market (pid 28579) has died: cch+5 CEM 
+     ! 09-27 11:44:21.954 28873 28873 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:44:21.986 28873 28873 I AndroidRuntime: Using default boot image
+     ! 09-27 11:44:21.987 28873 28873 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:44:22.652 28873 28873 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R49.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R49.logcat
+
+========================================================================
+[11:46:19] R50  采集开始
+  pid=19959
+  threads=45 fd=0
+  PSS=279MB java=23MB native=91MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R50_114620.png (20039 bytes)
+  logcat +125 行  级别分布={'E': 109, 'W': 11, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 11:46:22.162 28981 28981 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:46:22.188 28981 28981 I AndroidRuntime: Using default boot image
+     ! 09-27 11:46:22.188 28981 28981 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:46:22.601 28981 28981 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:46:23.688 28981 28981 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R50.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R50.logcat
+
+========================================================================
+[11:48:19] R51  采集开始
+  pid=19959
+  threads=46 fd=0
+  PSS=279MB java=23MB native=91MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R51_114820.png (20039 bytes)
+  logcat +480 行  级别分布={'E': 428, 'W': 31, 'I': 18, 'D': 3}  可疑=9
+     ! 09-27 11:48:20.701  1838  9432 E         : DNS_CACHE: hanle request << lookupdns: hostname:live-room.xiaohongshu.com, servername:^, ai_flags:1024, ai_
+     ! 09-27 11:48:20.701  1838  9432 E         : DNS_CACHE look_up_dns: live-room.xiaohongshu.com, getHitCount: 0
+     ! 09-27 11:48:21.041  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 27634) has died: cch+5 CEM 
+     ! 09-27 11:48:21.046  3480  5212 I ActivityManager: Process com.android.vending (pid 27111) has died: cch+5 CEM 
+     ! 09-27 11:48:21.088 29217 29217 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:48:21.094 29217 29217 I AndroidRuntime: Using default boot image
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R51.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R51.logcat
+
+========================================================================
+[11:50:19] R52  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=227MB java=24MB native=62MB
+  cpu=1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R52_115021.png (20039 bytes)
+  logcat +1501 行  级别分布={'W': 58, 'E': 1420, 'I': 20, 'D': 3}  可疑=12
+     ! 09-27 11:49:00.176 30622 30648 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 11:49:00.184 30622 30649 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 11:49:00.349 30622 30658 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 11:49:01.033  3480  8621 I ActivityManager: Process com.ss.android.ugc.aweme (pid 29160) has died: svc SVC 
+     ! 09-27 11:49:01.047 30662 30662 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+     ! 09-27 11:49:01.115  3480  5212 I ActivityManager: Process com.ss.android.ugc.aweme:sandboxed_process0 (pid 30662) has died: fg  SVC 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R52.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R52.logcat
+
+========================================================================
+[11:52:19] R53  采集开始
+  pid=19959
+  threads=50 fd=0
+  PSS=324MB java=18MB native=72MB
+  cpu=1.0%
+  +707帧 卡顿1 (5.9 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R53_115220.png (3541662 bytes)
+  HUD | FPS 30.0 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +3879 行  级别分布={'E': 3640, 'W': 215, 'I': 21, 'D': 3}  可疑=14
+     ! 09-27 11:51:56.945  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:67 ShareLibraryUnit() ShareLibraryUnit dlopen with error: dlopen failed: li
+     ! 09-27 11:51:56.945  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:344 ProcessDeferredEvent() LoadShareLibrary /odm/lib64/libarcsoft_triple_zo
+     ! 09-27 11:51:57.299  3480  5234 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 11:51:57.523  3480  5212 I ActivityManager: Process com.android.vending:quick_launch (pid 27463) has died: svcb SVC 
+     ! 09-27 11:51:57.526  3480  8621 I ActivityManager: Process com.android.vending:background (pid 27130) has died: svcb SVC 
+     ! 09-27 11:51:57.530  3480  5212 I ActivityManager: Process com.oplus.onetrace (pid 15626) has died: cch+65 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R53.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R53.logcat
+
+========================================================================
+[11:54:19] R54  采集开始
+  pid=19959
+  threads=50 fd=0
+  PSS=327MB java=31MB native=62MB
+  cpu=104.0%
+  +3642帧 卡顿0 (30.4 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R54_115420.png (3011954 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +13083 行  级别分布={'E': 13003, 'I': 28, 'W': 49, 'D': 3}  可疑=10
+     ! 09-27 11:52:30.234  3480  3922 I ActivityManager: updateOomAdj start time is before than pendingPid added, don't delete it
+     ! 09-27 11:52:31.306  3480  4702 E FlexibleWindowManagerService: shouldInterceptImeForZoom isInMiniState
+     ! 09-27 11:52:35.998  3480  8621 I ActivityManager: Process com.coloros.securityguard:pvm_process (pid 32059) has died: fg  BFGS
+     ! 09-27 11:52:44.114  3480  4702 E FlexibleWindowManagerService: shouldInterceptImeForZoom isInMiniState
+     ! 09-27 11:54:23.033   467   467 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:54:23.040   467   467 I AndroidRuntime: Using default boot image
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R54.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R54.logcat
+
+========================================================================
+[11:56:19] R55  采集开始
+  pid=19959
+  threads=50 fd=0
+  PSS=331MB java=33MB native=63MB
+  cpu=103.0%
+  +3659帧 卡顿0 (30.5 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R55_115620.png (3227906 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +8843 行  级别分布={'E': 8827, 'W': 11, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 11:56:23.137   596   596 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:56:23.145   596   596 I AndroidRuntime: Using default boot image
+     ! 09-27 11:56:23.145   596   596 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:56:23.269   596   596 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:56:24.312   596   596 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R55.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R55.logcat
+
+========================================================================
+[11:58:19] R56  采集开始
+  pid=19959
+  threads=49 fd=0
+  PSS=278MB java=57MB native=59MB
+  cpu=103.0%
+  +2564帧 卡顿0 (21.3 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R56_115821.png (20039 bytes)
+  logcat +6242 行  级别分布={'E': 6200, 'W': 35, 'I': 4, 'D': 3}  可疑=6
+     ! 09-27 11:58:20.699  3480  8621 I ActivityManager: Process com.oplus.romupdate (pid 29644) has died: fg  SVC 
+     ! 09-27 11:58:21.865   970   970 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 11:58:21.896   970   970 I AndroidRuntime: Using default boot image
+     ! 09-27 11:58:21.896   970   970 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 11:58:22.528   970   970 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 11:58:23.714   970   970 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R56.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R56.logcat
+
+========================================================================
+[12:00:19] R57  采集开始
+  pid=19959
+  threads=49 fd=0
+  PSS=213MB java=13MB native=39MB
+  cpu=67.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R57_120020.png (20039 bytes)
+  logcat +217 行  级别分布={'E': 198, 'W': 12, 'I': 4, 'D': 3}  可疑=6
+     ! 09-27 12:00:20.271  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:worker (pid 30622) has died: cch+75 CEM 
+     ! 09-27 12:00:22.730  1165  1165 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:00:22.760  1165  1165 I AndroidRuntime: Using default boot image
+     ! 09-27 12:00:22.760  1165  1165 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:00:23.372  1165  1165 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:00:24.512  1165  1165 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R57.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R57.logcat
+
+========================================================================
+[12:02:19] R58  采集开始
+  pid=19959
+  threads=49 fd=0
+  PSS=204MB java=13MB native=30MB
+  cpu=67.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R58_120220.png (20039 bytes)
+  logcat +155 行  级别分布={'E': 137, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:02:21.855  1450  1450 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:02:21.869  1450  1450 I AndroidRuntime: Using default boot image
+     ! 09-27 12:02:21.869  1450  1450 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:02:22.141  1450  1450 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:02:23.185  1450  1450 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R58.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R58.logcat
+
+========================================================================
+[12:04:19] R59  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=207MB java=18MB native=28MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R59_120420.png (2425745 bytes)
+  logcat +1386 行  级别分布={'E': 1308, 'W': 49, 'I': 26, 'D': 3}  可疑=5
+     ! 09-27 12:04:21.412  3499  3499 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:04:21.417  3499  3499 I AndroidRuntime: Using default boot image
+     ! 09-27 12:04:21.417  3499  3499 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:04:21.506  3499  3499 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:04:23.641  3499  3499 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R59.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R59.logcat
+
+========================================================================
+[12:06:19] R60  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=205MB java=19MB native=26MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R60_120621.png (20039 bytes)
+  logcat +325 行  级别分布={'E': 307, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:06:22.128  3876  3876 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:06:22.143  3876  3876 I AndroidRuntime: Using default boot image
+     ! 09-27 12:06:22.143  3876  3876 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:06:22.368  3876  3876 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:06:23.479  3876  3876 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R60.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R60.logcat
+
+========================================================================
+[12:08:19] R61  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=204MB java=18MB native=26MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R61_120820.png (20039 bytes)
+  logcat +293 行  级别分布={'E': 266, 'I': 7, 'W': 17, 'D': 3}  可疑=8
+     ! 09-27 12:07:36.959  3480  8621 I ActivityManager: Process com.oplus.statistics.rom:cc (pid 3945) has died: fg  BFGS
+     ! 09-27 12:08:20.698  1838  9432 E         : DNS_CACHE: hanle request << lookupdns: hostname:live-room.xiaohongshu.com, servername:^, ai_flags:1024, ai_
+     ! 09-27 12:08:20.698  1838  9432 E         : DNS_CACHE look_up_dns: live-room.xiaohongshu.com, getHitCount: 0
+     ! 09-27 12:08:20.774  4508  4508 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:08:20.779  4508  4508 I AndroidRuntime: Using default boot image
+     ! 09-27 12:08:20.779  4508  4508 I AndroidRuntime: Leaving lock profiling enabled
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R61.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R61.logcat
+
+========================================================================
+[12:10:19] R62  采集开始
+  pid=19959
+  threads=49 fd=0
+  PSS=208MB java=17MB native=28MB
+  cpu=2.7%
+  +21帧 卡顿1 (0.2 fps, janky 4.8%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R62_121020.png (780833 bytes)
+  logcat +2926 行  级别分布={'E': 2631, 'W': 258, 'I': 34, 'D': 3}  可疑=14
+     ! 09-27 12:09:37.443  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:67 ShareLibraryUnit() ShareLibraryUnit dlopen with error: dlopen failed: li
+     ! 09-27 12:09:37.443  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:344 ProcessDeferredEvent() LoadShareLibrary /odm/lib64/libarcsoft_triple_zo
+     ! 09-27 12:09:37.833  3480  6490 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 12:09:38.000  3480  5212 I ActivityManager: Process com.coloros.ocs.opencapabilityservice:ocs (pid 30322) has died: cch+75 CEM 
+     ! 09-27 12:09:38.031  3480  8621 I ActivityManager: Process com.oplus.games (pid 29253) has died: cch+85 SVC 
+     ! 09-27 12:09:38.063  3480  5212 I ActivityManager: Process com.android.vending (pid 31947) has died: cch+65 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R62.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R62.logcat
+
+========================================================================
+[12:12:19] R63  采集开始
+  pid=19959
+  threads=49 fd=0
+  PSS=202MB java=15MB native=25MB
+  cpu=0.3%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R63_121220.png (829804 bytes)
+  logcat +810 行  级别分布={'E': 793, 'I': 4, 'W': 10, 'D': 3}  可疑=5
+     ! 09-27 12:12:20.927  8969  8969 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:12:20.935  8969  8969 I AndroidRuntime: Using default boot image
+     ! 09-27 12:12:20.935  8969  8969 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:12:21.063  8969  8969 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:12:31.118  8969  8969 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R63.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R63.logcat
+
+========================================================================
+[12:14:19] R64  采集开始
+  pid=19959
+  threads=49 fd=0
+  PSS=204MB java=16MB native=25MB
+  cpu=0.6%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R64_121420.png (850260 bytes)
+  logcat +754 行  级别分布={'E': 735, 'W': 11, 'I': 5, 'D': 3}  可疑=6
+     ! 09-27 12:13:20.663  3480  5212 I ActivityManager: Process com.oplus.romupdate (pid 2402) has died: fg  SVC 
+     ! 09-27 12:14:21.030 10020 10020 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:14:21.036 10020 10020 I AndroidRuntime: Using default boot image
+     ! 09-27 12:14:21.036 10020 10020 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:14:21.162 10020 10020 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:14:22.235 10020 10020 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R64.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R64.logcat
+
+========================================================================
+[12:16:19] R65  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=203MB java=16MB native=24MB
+  cpu=0.6%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R65_121620.png (874896 bytes)
+  logcat +927 行  级别分布={'E': 908, 'I': 5, 'W': 11, 'D': 3}  可疑=5
+     ! 09-27 12:16:20.938 11171 11171 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:16:20.944 11171 11171 I AndroidRuntime: Using default boot image
+     ! 09-27 12:16:20.944 11171 11171 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:16:21.071 11171 11171 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:16:29.686 11171 11171 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R65.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R65.logcat
+
+========================================================================
+[12:18:19] R66  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=201MB java=16MB native=23MB
+  cpu=0.6%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R66_121820.png (456000 bytes)
+  logcat +4797 行  级别分布={'E': 4637, 'W': 89, 'I': 68, 'D': 3}  可疑=12
+     ! 09-27 12:17:50.932  3480  3922 I ActivityManager: updateOomAdj start time is before than pendingPid added, don't delete it
+     ! 09-27 12:17:53.720  3480  8621 I ActivityManager: Process com.android.vending:background (pid 32132) has died: svcb SVC 
+     ! 09-27 12:17:53.724  3480  5212 I ActivityManager: Process com.coloros.filemanager (pid 31790) has died: cch+25 CEM 
+     ! 09-27 12:18:02.211  2006  3461 E OplusSpatEffect_AIDL: other_roommodel_load music call oplus_algo_spat_roommodel_set ret 0, valid_size 429420
+     ! 09-27 12:18:20.996  3480  8621 I ActivityManager: Process com.oplus.pantanal.ums:analyzer (pid 3438) has died: cch+85 CEM 
+     ! 09-27 12:18:21.001  3480  5212 I ActivityManager: Process com.xtc.watch:remote (pid 6737) has died: cch+55 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R66.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R66.logcat
+
+========================================================================
+[12:20:19] R67  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=197MB java=16MB native=18MB
+  cpu=0.3%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R67_122020.png (3070319 bytes)
+  logcat +2703 行  级别分布={'E': 2567, 'I': 39, 'W': 94, 'D': 3}  可疑=32
+     ! 09-27 12:19:12.285  3480  5212 I ActivityManager: Process com.oplus.ovoicemanager.wakeup (pid 13921) has died: prcp FGS 
+     ! 09-27 12:19:12.334  3480  8621 I ActivityManager: Process com.heytap.speechassist (pid 12509) has died: vis IMPF
+     ! 09-27 12:19:58.741  3480  4791 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 12:19:58.901  3480  3922 I ActivityManager: updateOomAdj start time is before than pendingPid added, don't delete it
+     ! 09-27 12:20:00.880  3480  5212 I ActivityManager: Process com.coloros.securityguard (pid 31953) has died: cch+55 CEM 
+     ! 09-27 12:20:00.883  3480  8621 I ActivityManager: Process com.coloros.codebook (pid 2667) has died: cch+55 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R67.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R67.logcat
+
+========================================================================
+[12:22:19] R68  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=196MB java=16MB native=17MB
+  cpu=0.3%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R68_122220.png (20039 bytes)
+  logcat +2985 行  级别分布={'E': 2922, 'I': 6, 'W': 54, 'D': 3}  可疑=36
+     ! 09-27 12:20:24.481  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 14833) has died: cch+35 CEM 
+     ! 09-27 12:20:35.699 17097 17252 E I [GPU]u4proc: GpuWatchdog [gpu_watchdog_thread.cc:479 StopWatchdogTimeoutTask] background, stop watchdog, timeout: 3
+     ! 09-27 12:20:35.711 17097 17252 E I [GPU]u4proc: GpuWatchdog [gpu_watchdog_thread.cc:386 RestartWatchdogTimeoutTask] foreground, start watchdog, timeou
+     ! 09-27 12:20:39.336 17097 17252 E I [GPU]u4proc: GpuWatchdog [gpu_watchdog_thread.cc:479 StopWatchdogTimeoutTask] background, stop watchdog, timeout: 3
+     ! 09-27 12:20:39.358 17097 17252 E I [GPU]u4proc: GpuWatchdog [gpu_watchdog_thread.cc:386 RestartWatchdogTimeoutTask] foreground, start watchdog, timeou
+     ! 09-27 12:20:42.746 17097 17252 E I [GPU]u4proc: GpuWatchdog [gpu_watchdog_thread.cc:479 StopWatchdogTimeoutTask] background, stop watchdog, timeout: 3
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R68.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R68.logcat
+
+========================================================================
+[12:24:19] R69  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=197MB java=17MB native=17MB
+  cpu=0.7%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R69_122420.png (20039 bytes)
+  logcat +390 行  级别分布={'E': 365, 'I': 8, 'W': 14, 'D': 3}  可疑=8
+     ! 09-27 12:22:54.581  3480  8621 I ActivityManager: Process com.oplus.sau (pid 13195) has died: svc SVC 
+     ! 09-27 12:23:34.201  3480  5212 I ActivityManager: Process com.android.rkpdapp (pid 11597) has died: cch+75 CEM 
+     ! 09-27 12:23:34.269  3480  8621 I ActivityManager: Process com.android.vending (pid 12701) has died: cch+65 CEM 
+     ! 09-27 12:24:22.132 18957 18957 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:24:22.147 18957 18957 I AndroidRuntime: Using default boot image
+     ! 09-27 12:24:22.147 18957 18957 I AndroidRuntime: Leaving lock profiling enabled
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R69.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R69.logcat
+
+========================================================================
+[12:26:19] R70  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=196MB java=16MB native=16MB
+  cpu=0.7%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R70_122621.png (20039 bytes)
+  logcat +169 行  级别分布={'E': 151, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:26:22.153 19076 19076 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:26:22.165 19076 19076 I AndroidRuntime: Using default boot image
+     ! 09-27 12:26:22.165 19076 19076 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:26:22.410 19076 19076 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:26:23.503 19076 19076 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R70.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R70.logcat
+
+========================================================================
+[12:28:19] R71  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=196MB java=16MB native=16MB
+  cpu=0.7%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R71_122821.png (20039 bytes)
+  logcat +384 行  级别分布={'E': 355, 'I': 9, 'W': 17, 'D': 3}  可疑=7
+     ! 09-27 12:26:47.304  3480  5212 I ActivityManager: Process com.oplus.romupdate (pid 13253) has died: fg  SVC 
+     ! 09-27 12:26:57.684  3480  8621 I ActivityManager: Process com.heytap.market (pid 14257) has died: cch+55 CEM 
+     ! 09-27 12:28:21.771 19376 19376 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:28:21.783 19376 19376 I AndroidRuntime: Using default boot image
+     ! 09-27 12:28:21.783 19376 19376 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:28:22.020 19376 19376 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R71.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R71.logcat
+
+========================================================================
+[12:30:19] R72  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=196MB java=16MB native=15MB
+  cpu=1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R72_123021.png (20039 bytes)
+  logcat +250 行  级别分布={'E': 213, 'I': 14, 'W': 20, 'D': 3}  可疑=7
+     ! 09-27 12:28:44.166  3480  5212 I ActivityManager: Process com.android.settings (pid 13567) has died: cch+65 CEM 
+     ! 09-27 12:28:44.180  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 14781) has died: cch+5 CEM 
+     ! 09-27 12:30:22.038 19529 19529 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:30:22.055 19529 19529 I AndroidRuntime: Using default boot image
+     ! 09-27 12:30:22.056 19529 19529 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:30:22.431 19529 19529 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R72.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R72.logcat
+
+========================================================================
+[12:32:19] R73  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=196MB java=16MB native=14MB
+  cpu=1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R73_123221.png (20039 bytes)
+  logcat +160 行  级别分布={'E': 141, 'I': 3, 'W': 13, 'D': 3}  可疑=5
+     ! 09-27 12:32:22.141 19757 19757 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:32:22.160 19757 19757 I AndroidRuntime: Using default boot image
+     ! 09-27 12:32:22.160 19757 19757 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:32:22.414 19757 19757 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:32:23.491 19757 19757 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R73.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R73.logcat
+
+========================================================================
+[12:34:19] R74  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=196MB java=16MB native=14MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R74_123420.png (20039 bytes)
+  logcat +548 行  级别分布={'I': 13, 'E': 519, 'W': 13, 'D': 3}  可疑=11
+     ! 09-27 12:32:24.643  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 19594) has died: cch+5 CEM 
+     ! 09-27 12:33:20.771  1838  9432 E         : DNS_CACHE: hanle request << lookupdns: hostname:live-room.xiaohongshu.com, servername:^, ai_flags:1024, ai_
+     ! 09-27 12:33:20.772  1838  9432 E         : DNS_CACHE look_up_dns: live-room.xiaohongshu.com, getHitCount: 0
+     ! 09-27 12:33:53.488  3480  8621 I ActivityManager: Process com.oplus.blacklistapp (pid 1722) has died: cch+35 CEM 
+     ! 09-27 12:33:53.500  3480  5212 I ActivityManager: Process com.google.android.webview:webview_service (pid 17393) has died: cch+25 CEM 
+     ! 09-27 12:33:53.508  3480  8621 I ActivityManager: Process com.oplus.phonenoareainquire (pid 1807) has died: cch+35 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R74.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R74.logcat
+
+========================================================================
+[12:36:19] R75  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=196MB java=16MB native=14MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R75_123621.png (20039 bytes)
+  logcat +167 行  级别分布={'E': 149, 'I': 4, 'W': 11, 'D': 3}  可疑=6
+     ! 09-27 12:34:45.282  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:cc (pid 19994) has died: fg  BFGS
+     ! 09-27 12:36:22.255 20180 20180 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:36:22.269 20180 20180 I AndroidRuntime: Using default boot image
+     ! 09-27 12:36:22.269 20180 20180 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:36:22.512 20180 20180 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:36:23.606 20180 20180 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R75.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R75.logcat
+
+========================================================================
+[12:38:19] R76  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=15MB native=13MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R76_123820.png (749236 bytes)
+  logcat +1551 行  级别分布={'E': 1465, 'W': 48, 'I': 35, 'D': 3}  可疑=10
+     ! 09-27 12:38:02.735 20741 20766 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 12:38:06.861  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:infer1 (pid 20741) has died: fg  BFGS
+     ! 09-27 12:38:12.856  3480  4493 I ActivityManager: Process com.oplus.romupdate (pid 19652) has died: cch+5 CEM 
+     ! 09-27 12:38:18.001  3480  5212 I ActivityManager: Process com.coloros.securityguard:pvm_process (pid 21045) has died: cch+5 CEM 
+     ! 09-27 12:38:20.880 21319 21319 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:38:20.884 21319 21319 I AndroidRuntime: Using default boot image
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R76.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R76.logcat
+
+========================================================================
+[12:40:19] R77  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=13MB native=13MB
+  cpu=1.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R77_124021.png (20039 bytes)
+  logcat +483 行  级别分布={'E': 440, 'I': 17, 'W': 23, 'D': 3}  可疑=10
+     ! 09-27 12:39:00.157 21623 21649 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 12:39:00.166 21623 21650 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 12:39:00.326 21623 21659 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 12:39:23.521  3480  8621 I ActivityManager: Process com.oplus.ovoicemanager.wakeup (pid 21711) has died: prcp FGS 
+     ! 09-27 12:39:23.575  3480  5212 I ActivityManager: Process com.heytap.speechassist (pid 15023) has died: vis IMPF
+     ! 09-27 12:40:23.015 21876 21876 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R77.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R77.logcat
+
+========================================================================
+[12:42:19] R78  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=13MB native=13MB
+  cpu=1.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R78_124221.png (20039 bytes)
+  logcat +182 行  级别分布={'E': 164, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:42:22.496 21983 21983 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:42:22.557 21983 21983 I AndroidRuntime: Using default boot image
+     ! 09-27 12:42:22.557 21983 21983 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:42:22.801 21983 21983 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:42:23.889 21983 21983 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R78.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R78.logcat
+
+========================================================================
+[12:44:19] R79  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=13MB native=13MB
+  cpu=1.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R79_124420.png (20039 bytes)
+  logcat +286 行  级别分布={'E': 264, 'W': 17, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:44:20.945 22218 22218 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:44:20.951 22218 22218 I AndroidRuntime: Using default boot image
+     ! 09-27 12:44:20.951 22218 22218 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:44:21.035 22218 22218 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:44:22.090 22218 22218 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R79.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R79.logcat
+
+========================================================================
+[12:46:19] R80  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=13MB native=12MB
+  cpu=1.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R80_124621.png (20039 bytes)
+  logcat +141 行  级别分布={'E': 123, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:46:22.015 22312 22312 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:46:22.027 22312 22312 I AndroidRuntime: Using default boot image
+     ! 09-27 12:46:22.028 22312 22312 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:46:22.304 22312 22312 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:46:23.422 22312 22312 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R80.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R80.logcat
+
+========================================================================
+[12:48:19] R81  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=16MB native=12MB
+  cpu=1.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R81_124821.png (20039 bytes)
+  logcat +286 行  级别分布={'E': 266, 'W': 13, 'I': 4, 'D': 3}  可疑=6
+     ! 09-27 12:48:20.696  3480  8621 I ActivityManager: Process com.oplus.romupdate (pid 21166) has died: fg  SVC 
+     ! 09-27 12:48:21.183 22509 22509 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:48:21.187 22509 22509 I AndroidRuntime: Using default boot image
+     ! 09-27 12:48:21.187 22509 22509 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:48:21.283 22509 22509 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:48:22.380 22509 22509 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R81.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R81.logcat
+
+========================================================================
+[12:50:19] R82  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=15MB native=11MB
+  cpu=1.5%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R82_125021.png (20039 bytes)
+  logcat +335 行  级别分布={'E': 315, 'W': 13, 'I': 4, 'D': 3}  可疑=6
+     ! 09-27 12:50:20.254  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:worker (pid 21623) has died: cch+5 CEM 
+     ! 09-27 12:50:22.697 22756 22756 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:50:22.718 22756 22756 I AndroidRuntime: Using default boot image
+     ! 09-27 12:50:22.718 22756 22756 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:50:23.041 22756 22756 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:50:24.140 22756 22756 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R82.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R82.logcat
+
+========================================================================
+[12:52:19] R83  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=15MB native=11MB
+  cpu=1.5%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R83_125221.png (20039 bytes)
+  logcat +185 行  级别分布={'E': 169, 'W': 11, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:52:22.297 22864 22864 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:52:22.306 22864 22864 I AndroidRuntime: Using default boot image
+     ! 09-27 12:52:22.307 22864 22864 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:52:22.422 22864 22864 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:52:23.457 22864 22864 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R83.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R83.logcat
+
+========================================================================
+[12:54:19] R84  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=15MB native=11MB
+  cpu=1.8%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R84_125420.png (20039 bytes)
+  logcat +460 行  级别分布={'E': 444, 'W': 11, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:54:21.755 23121 23121 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:54:21.767 23121 23121 I AndroidRuntime: Using default boot image
+     ! 09-27 12:54:21.767 23121 23121 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:54:22.007 23121 23121 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:54:23.101 23121 23121 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R84.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R84.logcat
+
+========================================================================
+[12:56:19] R85  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=16MB native=11MB
+  cpu=1.8%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R85_125621.png (20039 bytes)
+  logcat +149 行  级别分布={'E': 133, 'W': 11, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 12:56:22.134 23208 23208 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:56:22.155 23208 23208 I AndroidRuntime: Using default boot image
+     ! 09-27 12:56:22.155 23208 23208 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:56:22.403 23208 23208 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 12:56:23.497 23208 23208 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R85.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R85.logcat
+
+========================================================================
+[12:58:19] R86  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=15MB native=11MB
+  cpu=1.8%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R86_125821.png (20039 bytes)
+  logcat +303 行  级别分布={'E': 280, 'W': 15, 'I': 5, 'D': 3}  可疑=7
+     ! 09-27 12:58:20.700  1838  9432 E         : DNS_CACHE: hanle request << lookupdns: hostname:live-room.xiaohongshu.com, servername:^, ai_flags:1024, ai_
+     ! 09-27 12:58:20.700  1838  9432 E         : DNS_CACHE look_up_dns: live-room.xiaohongshu.com, getHitCount: 0
+     ! 09-27 12:58:21.801 23438 23438 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 12:58:21.814 23438 23438 I AndroidRuntime: Using default boot image
+     ! 09-27 12:58:21.814 23438 23438 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 12:58:22.025 23438 23438 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R86.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R86.logcat
+
+========================================================================
+[13:00:19] R87  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=15MB native=11MB
+  cpu=3.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R87_130020.png (20039 bytes)
+  logcat +288 行  级别分布={'E': 271, 'W': 12, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 13:00:22.308 23659 23659 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:00:22.327 23659 23659 I AndroidRuntime: Using default boot image
+     ! 09-27 13:00:22.327 23659 23659 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:00:22.581 23659 23659 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:00:23.663 23659 23659 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R87.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R87.logcat
+
+========================================================================
+[13:02:19] R88  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=15MB native=11MB
+  cpu=3.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R88_130221.png (20039 bytes)
+  logcat +149 行  级别分布={'E': 133, 'W': 11, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 13:02:22.077 23771 23771 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:02:22.089 23771 23771 I AndroidRuntime: Using default boot image
+     ! 09-27 13:02:22.091 23771 23771 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:02:22.282 23771 23771 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:02:23.372 23771 23771 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R88.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R88.logcat
+
+========================================================================
+[13:04:19] R89  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=198MB java=15MB native=11MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R89_130420.png (20039 bytes)
+  logcat +392 行  级别分布={'E': 376, 'W': 11, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 13:04:22.049 24086 24086 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:04:22.061 24086 24086 I AndroidRuntime: Using default boot image
+     ! 09-27 13:04:22.061 24086 24086 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:04:22.288 24086 24086 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:04:23.374 24086 24086 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R89.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R89.logcat
+
+========================================================================
+[13:06:19] R90  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=13MB native=10MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R90_130621.png (20039 bytes)
+  logcat +1089 行  级别分布={'E': 1048, 'I': 15, 'W': 23, 'D': 3}  可疑=9
+     ! 09-27 13:04:38.143  3480  6582 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 13:04:38.888 24446 24472 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:04:43.002  3480  8621 I ActivityManager: Process com.oplus.statistics.rom:infer1 (pid 24446) has died: fg  BFGS
+     ! 09-27 13:05:08.980  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:cc (pid 24342) has died: fg  BFGS
+     ! 09-27 13:06:22.116 24774 24774 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:06:22.131 24774 24774 I AndroidRuntime: Using default boot image
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R90.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R90.logcat
+
+========================================================================
+[13:08:19] R91  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=197MB java=15MB native=9MB
+  cpu=1.3%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R91_130820.png (20039 bytes)
+  logcat +478 行  级别分布={'E': 438, 'I': 21, 'W': 16, 'D': 3}  可疑=14
+     ! 09-27 13:07:06.912  3480  8621 I ActivityManager: Process com.android.vending:quick_launch (pid 13357) has died: svcb SVC 
+     ! 09-27 13:07:06.924  3480  5212 I ActivityManager: Process com.oplus.cosa (pid 28527) has died: cch+95 SVC 
+     ! 09-27 13:07:06.939  3480  8621 I ActivityManager: Process com.android.vending:background (pid 13039) has died: svcb SVC 
+     ! 09-27 13:07:06.972  3480  5212 I ActivityManager: Process com.oplus.mediaturbo (pid 28336) has died: fg  SVC 
+     ! 09-27 13:07:10.134  3480  8621 I ActivityManager: Process com.coloros.securityguard (pid 21006) has died: cch+85 CEM 
+     ! 09-27 13:07:10.138  3480  5212 I ActivityManager: Process com.oplus.phonenoareainquire (pid 20284) has died: cch+75 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R91.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R91.logcat
+
+========================================================================
+[13:10:19] R92  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=197MB java=15MB native=9MB
+  cpu=1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R92_131021.png (20039 bytes)
+  logcat +1982 行  级别分布={'E': 1921, 'W': 31, 'I': 27, 'D': 3}  可疑=9
+     ! 09-27 13:09:04.750  3480  8621 I ActivityManager: Process com.oplus.onetrace (pid 32662) has died: cch+95 CEM 
+     ! 09-27 13:09:04.758  3480  5212 I ActivityManager: Process com.coloros.filemanager (pid 19550) has died: cch+5 CEM 
+     ! 09-27 13:09:42.764  3480  8621 I ActivityManager: Process com.android.contacts.child_process (pid 12647) has died: cch+75 CEM 
+     ! 09-27 13:09:42.783  3480  5212 I ActivityManager: Process com.google.android.gms.unstable (pid 32173) has died: cch+5 CEM 
+     ! 09-27 13:10:21.395 25916 25916 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:10:21.406 25916 25916 I AndroidRuntime: Using default boot image
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R92.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R92.logcat
+
+========================================================================
+[13:12:19] R93  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=197MB java=15MB native=9MB
+  cpu=1.6%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R93_131221.png (20039 bytes)
+  logcat +217 行  级别分布={'W': 25, 'I': 17, 'E': 172, 'D': 3}  可疑=10
+     ! 09-27 13:10:23.849 26175 26230 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:10:23.867 26175 26233 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:10:24.436 26267 26309 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:10:24.469 26267 26312 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:12:22.485 26434 26434 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:12:22.546 26434 26434 I AndroidRuntime: Using default boot image
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R93.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R93.logcat
+
+========================================================================
+[13:14:19] R94  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=197MB java=15MB native=9MB
+  cpu=1.8%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R94_131420.png (20039 bytes)
+  logcat +158 行  级别分布={'E': 138, 'W': 15, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 13:14:20.721 26633 26633 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:14:20.726 26633 26633 I AndroidRuntime: Using default boot image
+     ! 09-27 13:14:20.726 26633 26633 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:14:20.821 26633 26633 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:14:21.868 26633 26633 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R94.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R94.logcat
+
+========================================================================
+[13:16:19] R95  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=197MB java=14MB native=8MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R95_131620.png (20039 bytes)
+  logcat +1826 行  级别分布={'E': 1750, 'I': 33, 'W': 40, 'D': 3}  可疑=11
+     ! 09-27 13:14:48.377 26667 26667 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+     ! 09-27 13:14:48.429  3480  5212 I ActivityManager: Process com.heytap.themestore (pid 26667) has died: cch+5 CEM 
+     ! 09-27 13:14:52.610  3480  5128 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 13:14:54.812  3480  8621 I ActivityManager: Process com.android.rkpdapp (pid 19169) has died: cch+85 CEM 
+     ! 09-27 13:14:54.850  3480  5212 I ActivityManager: Process com.coloros.filemanager (pid 25937) has died: cch+15 CEM 
+     ! 09-27 13:14:54.904  3480  8621 I ActivityManager: Process com.android.vending (pid 25416) has died: cch+55 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R95.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R95.logcat
+
+========================================================================
+[13:18:19] R96  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=13MB native=8MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R96_131821.png (20039 bytes)
+  logcat +391 行  级别分布={'E': 365, 'W': 14, 'I': 9, 'D': 3}  可疑=10
+     ! 09-27 13:18:20.784  1838  9432 E         : DNS_CACHE: hanle request << lookupdns: hostname:live-room.xiaohongshu.com, servername:^, ai_flags:1024, ai_
+     ! 09-27 13:18:20.784  1838  9432 E         : DNS_CACHE look_up_dns: live-room.xiaohongshu.com, getHitCount: 0
+     ! 09-27 13:18:20.808  1838  9432 E         : DNS_CACHE: hanle request << adddns: hostname:live-room.xiaohongshu.com, servername:^, ai_flags:1024, ai_fam
+     ! 09-27 13:18:21.071  3480  5212 I ActivityManager: Process com.android.vending:quick_launch (pid 25799) has died: svcb SVC 
+     ! 09-27 13:18:21.075  3480  8621 I ActivityManager: Process com.android.vending:background (pid 25556) has died: svcb SVC 
+     ! 09-27 13:18:21.321 28649 28649 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R96.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R96.logcat
+
+========================================================================
+[13:20:19] R97  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=191MB java=13MB native=7MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R97_132020.png (652977 bytes)
+  logcat +3061 行  级别分布={'E': 2929, 'I': 54, 'W': 75, 'D': 3}  可疑=20
+     ! 09-27 13:18:24.690  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 28241) has died: cch+5 CEM 
+     ! 09-27 13:18:25.728  3480  8621 I ActivityManager: Process com.oplus.romupdate (pid 26049) has died: fg  SVC 
+     ! 09-27 13:19:53.725  3480  4492 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 13:19:54.326  3480  3922 I ActivityManager: updateOomAdj start time is before than pendingPid added, don't delete it
+     ! 09-27 13:19:54.559 29319 29345 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:19:55.846  3480  5212 I ActivityManager: Process com.google.android.gms.unstable (pid 25591) has died: cch+15 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R97.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R97.logcat
+
+========================================================================
+[13:22:19] R98  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=194MB java=12MB native=5MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R98_132220.png (20039 bytes)
+  logcat +3915 行  级别分布={'E': 3747, 'W': 126, 'I': 39, 'D': 3}  可疑=29
+     ! 09-27 13:20:27.105  3480  3971 I ActivityManager: updateOomAdj start time is before than pendingPid added, don't delete it
+     ! 09-27 13:20:27.532  3480  5212 I ActivityManager: Process com.heytap.htms:cloudctrl_v3 (pid 26175) has died: cch+99 CEM 
+     ! 09-27 13:20:27.568  3480  8621 I ActivityManager: Process com.xtc.watch:push (pid 27098) has died: prcp FGS 
+     ! 09-27 13:20:31.324  5577  6414 E AMC     : [P-msc_qqlive] execute failed in triggers[0]:[fullscreen:true][viewdanmaku:null, validviewspeed:null, com.t
+     ! 09-27 13:20:31.324  5577  6414 E AMC     : [P-msc_mango] execute failed in triggers[0]:[fullscreen:true][fgapplist7:false, viewdanmaku:null, validview
+     ! 09-27 13:20:33.937  5577  6414 E AMC     : [P-msc_qqlive] execute failed in triggers[0]:[fullscreen:false][viewdanmaku:null, validviewspeed:null, full
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R98.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R98.logcat
+
+========================================================================
+[13:24:19] R99  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=194MB java=12MB native=5MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R99_132420.png (20039 bytes)
+  logcat +186 行  级别分布={'I': 4, 'E': 166, 'W': 13, 'D': 3}  可疑=6
+     ! 09-27 13:22:24.841  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 30504) has died: cch+45 CEM 
+     ! 09-27 13:24:22.158 32580 32580 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:24:22.194 32580 32580 I AndroidRuntime: Using default boot image
+     ! 09-27 13:24:22.194 32580 32580 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:24:22.819 32580 32580 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:24:23.926 32580 32580 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R99.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R99.logcat
+
+========================================================================
+[13:26:19] R100  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=186MB java=3MB native=1MB
+  cpu=0.7%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R100_132620.png (485239 bytes)
+  logcat +8101 行  级别分布={'E': 7920, 'I': 63, 'W': 115, 'D': 3}  可疑=22
+     ! 09-27 13:24:41.664  3480  8621 I ActivityManager: Process com.taobao.idlefish:normal_render_proc0 (pid 17058) has died: prev  +4 CACC
+     ! 09-27 13:24:41.669  3480  5212 I ActivityManager: Process com.taobao.idlefish:gpu_process (pid 17097) has died: prev  +4 CACC
+     ! 09-27 13:24:41.731  3480  8621 I ActivityManager: Process com.android.vending (pid 31455) has died: cch+55 CEM 
+     ! 09-27 13:24:41.863  3480  6585 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 13:24:42.699  5577  6414 E AMC     : [P-msc_qqlive] execute failed in triggers[0]:[audioplay:true][viewdanmaku:null, validviewspeed:null, fullsc
+     ! 09-27 13:24:42.699  5577  6414 E AMC     : [P-msc_mango] execute failed in triggers[0]:[audioplaydelay:true][fgapplist7:false, viewdanmaku:null, valid
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R100.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R100.logcat
+
+========================================================================
+[13:28:19] R101  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=11MB native=3MB
+  cpu=0.6%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R101_132821.png (20039 bytes)
+  logcat +4384 行  级别分布={'E': 4344, 'W': 21, 'I': 16, 'D': 3}  可疑=10
+     ! 09-27 13:27:01.384  3480  8621 I ActivityManager: Process com.google.android.gms.unstable (pid 3237) has died: cch+5 CEM 
+     ! 09-27 13:27:33.475  3480  8621 I ActivityManager: Process com.tencent.mm:appbrand0 (pid 3228) has died: vis SVC 
+     ! 09-27 13:27:33.500  3177  3531 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+     ! 09-27 13:27:33.677  3480  5212 I ActivityManager: Process com.tencent.mm:appbrand1 (pid 3177) has died: cch CACC
+     ! 09-27 13:27:34.630  3480  8621 I ActivityManager: Process com.android.rkpdapp (pid 28354) has died: cch+95 CEM 
+     ! 09-27 13:28:21.426  6912  6912 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R101.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R101.logcat
+
+========================================================================
+[13:30:19] R102  采集开始
+  pid=19959
+  threads=48 fd=0
+  PSS=195MB java=12MB native=4MB
+  cpu=0.6%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R102_133020.png (20039 bytes)
+  logcat +1649 行  级别分布={'I': 35, 'E': 1562, 'W': 49, 'D': 3}  可疑=10
+     ! 09-27 13:28:24.077  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 4691) has died: cch+15 CEM 
+     ! 09-27 13:30:20.691  7235  7235 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:30:20.694  7235  7235 I AndroidRuntime: Using default boot image
+     ! 09-27 13:30:20.694  7235  7235 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:30:20.756  7235  7235 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:30:23.936  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 4627) has died: cch+15 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R102.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R102.logcat
+
+========================================================================
+[13:32:19] R103  采集开始
+  pid=19959
+  threads=53 fd=0
+  PSS=350MB java=34MB native=54MB
+  cpu=0.7%
+  +173帧 卡顿2 (1.4 fps, janky 1.2%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R103_133220.png (1011068 bytes)
+  logcat +4300 行  级别分布={'E': 4000, 'W': 265, 'I': 32, 'D': 3}  可疑=22
+     ! 09-27 13:31:00.771  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:67 ShareLibraryUnit() ShareLibraryUnit dlopen with error: dlopen failed: li
+     ! 09-27 13:31:00.771  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:344 ProcessDeferredEvent() LoadShareLibrary /odm/lib64/libarcsoft_triple_zo
+     ! 09-27 13:31:00.791  9377  9439 E ROOM    : Invalidation tracker is initialized twice :/.
+     ! 09-27 13:31:00.927  9377  9439 E SG.PvmContentProviderTAG: [runDbOperation] cipher_insert failed: java.lang.IllegalStateException: The passphrase appe
+     ! 09-27 13:31:01.111  9377  9439 E SG.PvmContentProviderTAG: [runDbQuery] cipher_queryAfterInsert failed: java.lang.IllegalStateException: The passphras
+     ! 09-27 13:31:01.255  9377  9439 E SG.PvmContentProviderTAG: [runDbQuery] cipher_queryById failed: java.lang.IllegalStateException: The passphrase appea
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R103.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R103.logcat
+
+========================================================================
+[13:34:19] R104  采集开始
+  pid=19959
+  threads=53 fd=0
+  PSS=315MB java=23MB native=42MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R104_133420.png (1009164 bytes)
+  logcat +958 行  级别分布={'E': 941, 'I': 6, 'W': 8, 'D': 3}  可疑=6
+     ! 09-27 13:32:30.397  3480  8621 I ActivityManager: Process com.oplus.dmp:main (pid 8661) has died: cch+45 CEM 
+     ! 09-27 13:34:20.639 12424 12424 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:34:20.643 12424 12424 I AndroidRuntime: Using default boot image
+     ! 09-27 13:34:20.643 12424 12424 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:34:20.710 12424 12424 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:34:30.752 12424 12424 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R104.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R104.logcat
+
+========================================================================
+[13:36:19] R105  采集开始
+  pid=19959
+  threads=53 fd=0
+  PSS=302MB java=23MB native=37MB
+  cpu=0.7%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R105_133620.png (1010583 bytes)
+  logcat +989 行  级别分布={'E': 960, 'I': 11, 'W': 15, 'D': 3}  可疑=5
+     ! 09-27 13:36:20.880 13667 13667 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:36:20.887 13667 13667 I AndroidRuntime: Using default boot image
+     ! 09-27 13:36:20.887 13667 13667 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:36:20.964 13667 13667 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:36:23.105 13667 13667 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R105.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R105.logcat
+
+========================================================================
+[13:38:19] R106  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=299MB java=23MB native=36MB
+  cpu=0.7%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R106_133820.png (1010263 bytes)
+  logcat +1503 行  级别分布={'E': 1460, 'I': 14, 'W': 26, 'D': 3}  可疑=12
+     ! 09-27 13:36:25.468  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:cc (pid 13351) has died: fg  BFGS
+     ! 09-27 13:37:00.279 14177 14208 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:37:00.299 14177 14210 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:37:00.603 14177 14221 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:37:39.519  3480  4791 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 13:37:40.400 14592 14623 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R106.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R106.logcat
+
+========================================================================
+[13:40:19] R107  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=290MB java=23MB native=30MB
+  cpu=2.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R107_134020.png (1010818 bytes)
+  logcat +1406 行  级别分布={'E': 1388, 'W': 11, 'I': 4, 'D': 3}  可疑=5
+     ! 09-27 13:40:20.957 16112 16112 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:40:20.978 16112 16112 I AndroidRuntime: Using default boot image
+     ! 09-27 13:40:20.978 16112 16112 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:40:21.074 16112 16112 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:40:24.117 16112 16112 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R107.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R107.logcat
+
+========================================================================
+[13:42:19] R108  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=276MB java=22MB native=16MB
+  cpu=1.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R108_134220.png (1009872 bytes)
+  logcat +1089 行  级别分布={'E': 1030, 'I': 26, 'W': 30, 'D': 3}  可疑=7
+     ! 09-27 13:42:06.208  3480  5212 I ActivityManager: Process com.coloros.securityguard (pid 9322) has died: cch+45 CEM 
+     ! 09-27 13:42:06.219  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 8589) has died: cch+5 CEM 
+     ! 09-27 13:42:21.027 17994 17994 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:42:21.036 17994 17994 I AndroidRuntime: Using default boot image
+     ! 09-27 13:42:21.036 17994 17994 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:42:21.139 17994 17994 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R108.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R108.logcat
+
+========================================================================
+[13:44:19] R109  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=272MB java=23MB native=16MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R109_134420.png (20039 bytes)
+  logcat +900 行  级别分布={'E': 866, 'I': 13, 'W': 18, 'D': 3}  可疑=10
+     ! 09-27 13:43:20.729  3480  5212 I ActivityManager: Process com.oplus.romupdate (pid 8731) has died: fg  SVC 
+     ! 09-27 13:43:35.739  3480  8621 I ActivityManager: Process com.oplus.metis:text_intent (pid 17470) has died: svcb SVC 
+     ! 09-27 13:43:55.831  3480  5212 I ActivityManager: Process com.oplus.aiunit:worker66 (pid 17627) has died: cch+5 CEM 
+     ! 09-27 13:43:55.840  3480  8621 I ActivityManager: Process com.oplus.aiunit:worker65 (pid 17579) has died: cch+5 CEM 
+     ! 09-27 13:43:55.847  3480  5212 I ActivityManager: Process com.oplus.aiunit:worker35 (pid 17565) has died: cch+5 CEM 
+     ! 09-27 13:44:20.922 18706 18706 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R109.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R109.logcat
+
+========================================================================
+[13:46:19] R110  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=272MB java=23MB native=16MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R110_134621.png (20039 bytes)
+  logcat +120 行  级别分布={'I': 4, 'E': 100, 'W': 13, 'D': 3}  可疑=6
+     ! 09-27 13:44:24.079  3480  8621 I ActivityManager: Process com.oplus.dmp:main (pid 18100) has died: cch+25 CEM 
+     ! 09-27 13:46:22.352 18804 18804 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:46:22.375 18804 18804 I AndroidRuntime: Using default boot image
+     ! 09-27 13:46:22.375 18804 18804 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:46:22.771 18804 18804 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:46:23.864 18804 18804 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R110.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R110.logcat
+
+========================================================================
+[13:48:19] R111  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=272MB java=23MB native=16MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R111_134821.png (20039 bytes)
+  logcat +254 行  级别分布={'E': 232, 'W': 15, 'I': 4, 'D': 3}  可疑=6
+     ! 09-27 13:48:20.204  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:worker (pid 14177) has died: cch+65 CEM 
+     ! 09-27 13:48:21.471 19007 19007 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:48:21.475 19007 19007 I AndroidRuntime: Using default boot image
+     ! 09-27 13:48:21.475 19007 19007 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:48:21.561 19007 19007 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:48:22.594 19007 19007 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R111.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R111.logcat
+
+========================================================================
+[13:50:19] R112  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=271MB java=23MB native=15MB
+  cpu=2.2%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R112_135021.png (20039 bytes)
+  logcat +149 行  级别分布={'E': 127, 'W': 17, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 13:50:22.785 19137 19137 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:50:22.809 19137 19137 I AndroidRuntime: Using default boot image
+     ! 09-27 13:50:22.809 19137 19137 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:50:23.139 19137 19137 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:50:24.229 19137 19137 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R112.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R112.logcat
+
+========================================================================
+[13:52:19] R113  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=271MB java=23MB native=15MB
+  cpu=2.1%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R113_135220.png (20039 bytes)
+  logcat +166 行  级别分布={'E': 147, 'W': 14, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 13:52:22.092 19289 19289 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 13:52:22.116 19289 19289 I AndroidRuntime: Using default boot image
+     ! 09-27 13:52:22.117 19289 19289 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 13:52:22.334 19289 19289 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 13:52:23.374 19289 19289 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R113.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R113.logcat
+
+========================================================================
+[13:54:19] R114  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=264MB java=23MB native=7MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R114_135420.png (167884 bytes)
+  logcat +5585 行  级别分布={'E': 5380, 'W': 134, 'I': 68, 'D': 3}  可疑=32
+     ! 09-27 13:53:15.523  3480  6585 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 13:53:16.366 19722 19747 E SQLiteLog: (5) statement aborts at 2: [PRAGMA journal_mode=TRUNCATE] database is locked
+     ! 09-27 13:53:17.421  3480  8621 I ActivityManager: Process com.ted.number (pid 20375) has died: cch+99 SVC 
+     ! 09-27 13:53:17.423  3480  5212 I ActivityManager: Process com.android.rkpdapp (pid 6738) has died: cch+75 CEM 
+     ! 09-27 13:53:17.430  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 18051) has died: cch+15 CEM 
+     ! 09-27 13:53:20.456  3480  5212 I ActivityManager: Process com.oplus.statistics.rom:infer1 (pid 19722) has died: fg  BFGS
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R114.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R114.logcat
+
+========================================================================
+[13:56:19] R115  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=260MB java=20MB native=6MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R115_135620.png (675188 bytes)
+  logcat +6094 行  级别分布={'E': 6023, 'W': 46, 'I': 22, 'D': 3}  可疑=12
+     ! 09-27 13:54:27.032  3480  6490 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 13:54:27.722  3480  8621 I ActivityManager: Process com.oplus.onetrace (pid 13211) has died: cch+75 CEM 
+     ! 09-27 13:54:27.760  3480  5212 I ActivityManager: Process com.xtc.watch:push (pid 10311) has died: prcp FGS 
+     ! 09-27 13:54:30.938  3480  8621 I ActivityManager: Process com.tencent.mm:xweb_privileged_process_0 (pid 19918) has died: fg  SVC 
+     ! 09-27 13:55:29.225  5577  6414 E AMC     : [P-msc_qqlive] execute failed in triggers[0]:[touchidle:true][viewdanmaku:null, validviewspeed:null, fullsc
+     ! 09-27 13:55:29.225  5577  6414 E AMC     : [P-msc_mango] execute failed in triggers[0]:[touchidle:true][fgapplist7:false, viewdanmaku:null, validviews
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R115.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R115.logcat
+
+========================================================================
+[13:58:19] R116  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=261MB java=21MB native=6MB
+  cpu=-1.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R116_135820.png (20039 bytes)
+  logcat +1476 行  级别分布={'E': 1447, 'W': 21, 'I': 5, 'D': 3}  可疑=11
+     ! 09-27 13:56:51.181  5577  6414 E AMC     : [P-msc_qqlive] execute failed in triggers[0]:[touchidle:false][viewdanmaku:null, validviewspeed:null, fulls
+     ! 09-27 13:56:51.181  5577  6414 E AMC     : [P-msc_mango] execute failed in triggers[0]:[touchidle:false][fgapplist7:false, viewdanmaku:null, validview
+     ! 09-27 13:57:04.309  5577  6414 E AMC     : [P-msc_qqlive] execute failed in triggers[0]:[touchidle:true][viewdanmaku:null, validviewspeed:null, fullsc
+     ! 09-27 13:57:04.309  5577  6414 E AMC     : [P-msc_mango] execute failed in triggers[0]:[touchidle:true][fgapplist7:false, viewdanmaku:null, validviews
+     ! 09-27 13:57:45.280  5577  6414 E AMC     : [P-msc_qqlive] execute failed in triggers[0]:[touchidle:false][viewdanmaku:null, validviewspeed:null, fulls
+     ! 09-27 13:57:45.280  5577  6414 E AMC     : [P-msc_mango] execute failed in triggers[0]:[touchidle:false][fgapplist7:false, viewdanmaku:null, validview
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R116.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R116.logcat
+
+========================================================================
+[14:00:19] R117  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=262MB java=23MB native=5MB
+  cpu=4.2%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R117_140021.png (20039 bytes)
+  logcat +634 行  级别分布={'E': 562, 'W': 61, 'I': 8, 'D': 3}  可疑=7
+     ! 09-27 13:59:08.137  3480  5212 I ActivityManager: Process com.tencent.mm:appbrand0 (pid 22282) has died: vis SVC 
+     ! 09-27 13:59:08.200  3480  8621 I ActivityManager: Process com.tencent.mm:appbrand1 (pid 22210) has died: fg  SVC 
+     ! 09-27 14:00:22.199 24494 24494 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:00:22.215 24494 24494 I AndroidRuntime: Using default boot image
+     ! 09-27 14:00:22.215 24494 24494 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:00:22.494 24494 24494 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R117.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R117.logcat
+
+========================================================================
+[14:02:19] R118  采集开始
+  pid=19959
+  threads=52 fd=0
+  PSS=259MB java=20MB native=6MB
+  cpu=4.2%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R118_140221.png (20039 bytes)
+  logcat +220 行  级别分布={'E': 199, 'W': 16, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 14:02:22.058 24628 24628 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:02:22.064 24628 24628 I AndroidRuntime: Using default boot image
+     ! 09-27 14:02:22.064 24628 24628 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:02:22.152 24628 24628 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 14:02:24.043 24628 24628 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R118.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R118.logcat
+
+========================================================================
+[14:04:19] R119  采集开始
+  !! pid 变化 19959 -> 12109（Activity/进程重建）
+  pid=12109
+  threads=43 fd=0
+  PSS=361MB java=75MB native=112MB
+  cpu=0.0%
+  +-26832帧 卡顿-8 (-224.9 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R119_140420.png (57374 bytes)
+  logcat +6250 行  级别分布={'E': 5596, 'W': 542, 'I': 107, 'D': 5}  可疑=25
+     ! 09-27 14:03:20.673  3480  5212 I ActivityManager: Process com.oplus.romupdate (pid 22070) has died: fg  SVC 
+     ! 09-27 14:03:29.552  3480  5212 I ActivityManager: Process com.android.keychain (pid 25183) has died: cch+5 CEM 
+     ! 09-27 14:03:29.562  3480  8621 I ActivityManager: Process com.coloros.filemanager (pid 21955) has died: cch+35 CEM 
+     ! 09-27 14:03:29.594  3480  5212 I ActivityManager: Process com.android.vending (pid 19991) has died: cch+65 CEM 
+     ! 09-27 14:03:30.408 25460 25953 E fatal_log: android.database.sqlite.SQLiteException: no such table: download (code 1 SQLITE_ERROR): , while compiling:
+     ! 09-27 14:03:36.070  3480  8621 I ActivityManager: Process com.coloros.securityguard:pvm_process (pid 26210) has died: fg  BFGS
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R119.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R119.logcat
+
+========================================================================
+[14:06:19] R120  采集开始
+  pid=12109
+  threads=52 fd=0
+  PSS=601MB java=42MB native=221MB
+  cpu=83.0%
+  +2970帧 卡顿2 (24.7 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R120_140620.png (3341536 bytes)
+  HUD | FPS 30.0 · 扫描中
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 停止实验扫描
+  logcat +17295 行  级别分布={'E': 16581, 'W': 687, 'I': 24, 'D': 3}  可疑=12
+     ! 09-27 14:04:40.606  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:67 ShareLibraryUnit() ShareLibraryUnit dlopen with error: dlopen failed: li
+     ! 09-27 14:04:40.606  2025 18990 E OUTILS  : [ERROR   ] sharelibraryutil.cpp:344 ProcessDeferredEvent() LoadShareLibrary /odm/lib64/libarcsoft_triple_zo
+     ! 09-27 14:04:40.981  3480  3623 E BiometricScheduler: Current operation is null,no need to start watchdog
+     ! 09-27 14:05:29.985 25505 25605 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
+     ! 09-27 14:05:30.010  3480  8621 I ActivityManager: Process com.qualcomm.qti.workloadclassifier (pid 25505) has died: svcb SVC 
+     ! 09-27 14:05:50.802  3480  5212 I ActivityManager: Process com.oplus.dmp:main (pid 25618) has died: cch+15 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R120.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R120.logcat
+
+========================================================================
+[14:08:19] R121  采集开始
+  pid=12109
+  threads=52 fd=0
+  PSS=585MB java=60MB native=213MB
+  cpu=184.0%
+  +3653帧 卡顿0 (30.4 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R121_140820.png (4043877 bytes)
+  HUD | FPS 30.0 · 扫描中
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 停止实验扫描
+  logcat +18877 行  级别分布={'E': 18543, 'I': 45, 'W': 286, 'D': 3}  可疑=8
+     ! 09-27 14:08:21.028  3480  8621 I ActivityManager: Process com.android.rkpdapp (pid 24133) has died: cch+75 CEM 
+     ! 09-27 14:08:21.054  3480  5212 I ActivityManager: Process com.coloros.filemanager (pid 27867) has died: cch+5 CEM 
+     ! 09-27 14:08:21.060  3480  8621 I ActivityManager: Process com.android.vending (pid 27285) has died: cch+25 CEM 
+     ! 09-27 14:08:23.498 30364 30364 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:08:23.511 30364 30364 I AndroidRuntime: Using default boot image
+     ! 09-27 14:08:23.511 30364 30364 I AndroidRuntime: Leaving lock profiling enabled
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R121.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R121.logcat
+
+========================================================================
+[14:10:19] R122  采集开始
+  pid=12109
+  threads=54 fd=0
+  PSS=597MB java=87MB native=206MB
+  cpu=162.0%
+  +3730帧 卡顿2 (31.1 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R122_141020.png (2845798 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +16912 行  级别分布={'E': 16871, 'I': 23, 'W': 15, 'D': 3}  可疑=6
+     ! 09-27 14:08:30.074  3480  5212 I ActivityManager: Process com.oplus.sau (pid 25414) has died: svcb SVC 
+     ! 09-27 14:10:23.031 30811 30811 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:10:23.040 30811 30811 I AndroidRuntime: Using default boot image
+     ! 09-27 14:10:23.040 30811 30811 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:10:23.220 30811 30811 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 14:10:24.275 30811 30811 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R122.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R122.logcat
+
+========================================================================
+[14:12:19] R123  采集开始
+  pid=12109
+  threads=54 fd=0
+  PSS=574MB java=59MB native=212MB
+  cpu=125.0%
+  +3679帧 卡顿1 (30.7 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R123_141220.png (2835493 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +8934 行  级别分布={'E': 8902, 'I': 12, 'W': 17, 'D': 3}  可疑=7
+     ! 09-27 14:10:25.770  3480  8621 I ActivityManager: Process com.oplus.dmp:main (pid 30435) has died: cch+5 CEM 
+     ! 09-27 14:12:21.119  3480  5212 I ActivityManager: Process com.coloros.filemanager (pid 30392) has died: cch+5 CEM 
+     ! 09-27 14:12:22.721 30913 30913 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:12:22.728 30913 30913 I AndroidRuntime: Using default boot image
+     ! 09-27 14:12:22.728 30913 30913 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:12:22.869 30913 30913 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R123.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R123.logcat
+
+========================================================================
+[14:14:19] R124  采集开始
+  pid=12109
+  threads=54 fd=0
+  PSS=564MB java=56MB native=191MB
+  cpu=129.0%
+  +3687帧 卡顿0 (30.7 fps, janky 0.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R124_141420.png (2832611 bytes)
+  HUD | FPS 29.8 · 空闲
+  HUD | 地图 0 · 绘制 0 · 米制
+  HUD | 物体锁定
+  HUD | 实验扫描（非测量）
+  logcat +9119 行  级别分布={'E': 9082, 'I': 19, 'W': 15, 'D': 3}  可疑=12
+     ! 09-27 14:13:20.720  3480  8621 I ActivityManager: Process com.oplus.romupdate (pid 25214) has died: fg  SVC 
+     ! 09-27 14:13:23.467  3480  5212 I ActivityManager: Process com.heytap.htms:cloudctrl_v3 (pid 24825) has died: cch+75 CEM 
+     ! 09-27 14:13:54.383  3480  8621 I ActivityManager: Process com.oplus.safecenter (pid 25331) has died: cch+55 CEM 
+     ! 09-27 14:13:54.393  3480  8621 I ActivityManager: Process com.oplus.matrix (pid 25922) has died: cch+45 CEM 
+     ! 09-27 14:13:54.401  3480  5212 I ActivityManager: Process com.android.permissioncontroller (pid 25305) has died: cch+45 CEM 
+     ! 09-27 14:14:02.381  3480  8621 I ActivityManager: Process com.oplus.pantanal.ums:uiSetting (pid 25645) has died: cch+55 CEM 
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R124.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R124.logcat
+
+========================================================================
+[14:16:19] R125  采集开始
+  pid=12109
+  threads=51 fd=0
+  PSS=530MB java=100MB native=164MB
+  cpu=135.0%
+  +1328帧 卡顿1 (11.0 fps, janky 0.1%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R125_141620.png (20039 bytes)
+  logcat +3324 行  级别分布={'E': 3257, 'W': 51, 'I': 13, 'D': 3}  可疑=6
+     ! 09-27 14:16:14.479  3480  8621 I ActivityManager: Process com.oplus.metis:text_intent (pid 31449) has died: svc SVC 
+     ! 09-27 14:16:23.156 31901 31901 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:16:23.186 31901 31901 I AndroidRuntime: Using default boot image
+     ! 09-27 14:16:23.186 31901 31901 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:16:23.797 31901 31901 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 14:16:24.941 31901 31901 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R125.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R125.logcat
+
+========================================================================
+[14:18:19] R126  采集开始
+  pid=12109
+  threads=53 fd=0
+  PSS=394MB java=24MB native=120MB
+  cpu=135.0%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R126_141821.png (20039 bytes)
+  logcat +257 行  级别分布={'E': 235, 'I': 6, 'W': 13, 'D': 3}  可疑=7
+     ! 09-27 14:16:34.603  3480  5212 I ActivityManager: Process com.oplus.aiunit:worker65 (pid 31548) has died: cch+65 CEM 
+     ! 09-27 14:16:34.613  3480  8621 I ActivityManager: Process com.oplus.aiunit:worker35 (pid 31542) has died: cch+65 CEM 
+     ! 09-27 14:18:21.683 32089 32089 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:18:21.694 32089 32089 I AndroidRuntime: Using default boot image
+     ! 09-27 14:18:21.694 32089 32089 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:18:21.911 32089 32089 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R126.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R126.logcat
+
+========================================================================
+[14:20:19] R127  采集开始
+  pid=12109
+  threads=54 fd=0
+  PSS=392MB java=24MB native=118MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R127_142021.png (20039 bytes)
+  logcat +167 行  级别分布={'E': 149, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 14:20:23.352 32204 32204 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:20:23.382 32204 32204 I AndroidRuntime: Using default boot image
+     ! 09-27 14:20:23.382 32204 32204 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:20:24.018 32204 32204 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 14:20:25.129 32204 32204 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R127.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R127.logcat
+
+========================================================================
+[14:22:19] R128  采集开始
+  pid=12109
+  threads=55 fd=0
+  PSS=392MB java=24MB native=118MB
+  cpu=0.9%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R128_142221.png (20039 bytes)
+  logcat +169 行  级别分布={'E': 151, 'W': 13, 'D': 3, 'I': 2}  可疑=5
+     ! 09-27 14:22:22.238 32336 32336 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:22:22.249 32336 32336 I AndroidRuntime: Using default boot image
+     ! 09-27 14:22:22.249 32336 32336 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:22:22.410 32336 32336 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 14:22:23.455 32336 32336 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R128.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R128.logcat
+
+========================================================================
+[14:24:19] R129  采集开始
+  pid=12109
+  threads=56 fd=0
+  PSS=404MB java=33MB native=113MB
+  cpu=0.7%
+  +0帧 卡顿0 (0.0 fps, janky -1.0%)
+  screen=E:\MobileScan3D\devtest\monitor\screen_R129_142421.png (20039 bytes)
+  logcat +442 行  级别分布={'E': 409, 'W': 25, 'I': 5, 'D': 3}  可疑=5
+     ! 09-27 14:24:22.125   514   514 D AndroidRuntime: >>>>>> START com.android.internal.os.RuntimeInit uid 2000 <<<<<<
+     ! 09-27 14:24:22.142   514   514 I AndroidRuntime: Using default boot image
+     ! 09-27 14:24:22.142   514   514 I AndroidRuntime: Leaving lock profiling enabled
+     ! 09-27 14:24:22.468   514   514 D AndroidRuntime: Calling main entry com.android.commands.uiautomator.Launcher
+     ! 09-27 14:24:23.569   514   514 D AndroidRuntime: Shutting down VM
+  可疑明细: E:\MobileScan3D\devtest\monitor\suspect_R129.txt
+  slice: E:\MobileScan3D\devtest\monitor\slice_R129.logcat

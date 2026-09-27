@@ -1,0 +1,14 @@
+--------- beginning of system
+09-27 18:56:18.754 I/Quality ( 3114): MonitorInfo:com.mobilescan3d,onDeviceError,CameraDeviceImpl.java_2286,200
+09-27 18:56:19.038 D/VRI[MainActivity]( 3114): relayoutWindow result, sizeChanged:false, surfaceControlChanged:true, transformHintChanged:false, mSurfaceSize:Point(1272, 2772), mLastSurfaceSize:Point(1272, 2772), mWidth:1272, mHeight:2772, requestedWidth:1272, requestedHeight:2772, transformHint:0, installOrientation:0, displayRotation:0, isSurfaceValid:false, attr.flag:-2122251008, tmpFrames:ClientWindowFrames{frame=[0,0][1272,2772] display=[0,0][1272,2772] parentFrame=[0,0][0,0]}, relayoutResult:2, relayoutAsync:false, mSyncSeqId:0
+09-27 19:03:18.600 D/ActivityThread( 3114): ComponentInfo{com.mobilescan3d/com.mobilescan3d.MainActivity} checkFinished=false 2
+09-27 19:03:18.601 D/ResourcesManagerExtImpl( 3114): applyConfigurationToAppResourcesLocked app.getDisplayId() return callback.displayId:0
+09-27 19:03:18.649 D/VRI[MainActivity]( 3114): relayoutWindow result, sizeChanged:false, surfaceControlChanged:true, transformHintChanged:false, mSurfaceSize:Point(1272, 2772), mLastSurfaceSize:Point(1272, 2772), mWidth:1272, mHeight:2772, requestedWidth:1272, requestedHeight:2772, transformHint:0, installOrientation:0, displayRotation:0, isSurfaceValid:true, attr.flag:-2122251008, tmpFrames:ClientWindowFrames{frame=[0,0][1272,2772] display=[0,0][1272,2772] parentFrame=[0,0][0,0]}, relayoutResult:3, relayoutAsync:false, mSyncSeqId:0
+09-27 19:03:18.650 W/VRI[MainActivity]( 3114): updateBlastSurfaceIfNeeded, surfaceSize:Point(1272, 2772), lastSurfaceSize:Point(1272, 2772), format:-3, blastBufferQueue:null
+09-27 19:03:18.702 W/VRI[MainActivity]( 3114): handleResized abandoned!
+09-27 19:03:18.779 W/VRI[MainActivity]( 3114): handleResized abandoned!
+09-27 19:03:18.794 W/VRI[MainActivity]( 3114): handleResized abandoned!
+09-27 19:03:18.911 W/VRI[MainActivity]( 3114): handleResized abandoned!
+09-27 19:03:19.587 I/Quality ( 3114): GCInfo: com.mobilescan3d,50-1.781s-1.598s-1.934ms-46MB-51MB-24MB-0B-34199.014s-0,0,0,50-1.781s-1.598s-1.934ms-46MB-51MB-24MB-0B
+09-27 19:03:20.768 W/VRI[MainActivity]( 3114): handleResized abandoned!
+09-27 19:03:28.385 W/VRI[MainActivity]( 3114): handleResized abandoned!
