@@ -257,11 +257,6 @@ private var lastRelocPollMs = 0L
     @Volatile private var lastLiveMeshRefreshMs = 0L
     /** 已经因为「epoch 未激活」清过一次网格，避免逐帧重复清。 */
     private var liveMeshBlockedNotice = false
-    /**
-     * V0.13.4：上一次上报给 native 的深度归一化映射版本号。
-     * 与 [MonoDepthProvider] 的 `normVersion` 对应；变化时才需要重参数化。
-     */
-    @Volatile private var lastDepthNormVersion = 0L
 
     // ---- V0.13.4 P1：自由摆放 AR ----
     /**
@@ -2436,19 +2431,6 @@ private var lastRelocPollMs = 0L
                     if (res != null && res.depth.isNotEmpty()) {
                         // 世代不一致说明这帧属于上一轮会话，必须丢弃。
                         if (generation == depthGeneration) {
-                            // V0.13.4 尺度漂移修复：深度数值域（归一化映射）
-                            // 变了就必须**先**让 native 重参数化标定，再喂
-                            // 这一帧。顺序反了的话，这一帧会带着新数值域的
-                            // d 被旧标定解释，几何当场跳一次。
-                            if (res.normVersion != lastDepthNormVersion) {
-                                lastDepthNormVersion = res.normVersion
-                                try {
-                                    NativeBridge.nativeSetDepthNormMapping(
-                                        res.normA, res.normB, res.normVersion
-                                    )
-                                } catch (_: Throwable) {
-                                }
-                            }
                             NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height, 0.5f, t)
                             glView.requestRender()
                         }
@@ -2530,22 +2512,14 @@ private var lastRelocPollMs = 0L
         cameraHandler?.post {
             NativeBridge.nativeDestroy()
             NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
-            // 体素边长与块预算。
-            //
-            // **这些数值不是真实米制**：融合用的 Rwc/twc 来自 VINS，而深度是
-            // 会话 min/max 映射出来的相对尺度，实机上是 raw≈5.56m vs
-            // VINS≈0.54m，两者相差约一个常数因子。所以体素边长是按
-            // 「VINS world 的可见表面」选的；真实的米制对齐由 native 侧的
-            // 鲁棒标定（MAD + Huber IRLS + EMA）负责。
-            //
-            // V0.13.3 精度提升：原 0.020/0.008 在 20cm 级手办上只能提出
-            // ~3k 三角形（Marching Tetrahedra 面数 ≈ 表面积/体素²），
-            // 表面呈明显的块状。降到 0.012/0.004（目标面数 ×4），
-            // 同时块预算翻倍（每块 8³×8B=4KB，scene 64MB + target 32MB，
-            // PLK110 可承受）。截断距离 = voxel×4（tsdf_engine 固定系数），
-            // 目标侧 16mm —— 立体深度噪声典型 5~15mm，尚在容忍带内。
-            NativeBridge.nativeSetVoxelSizes(0.012f, 0.004f)
-            NativeBridge.nativeSetVoxelBudget(16384, 8192)
+            // 体素边长与块预算：评审 P1-2 改为按档位切换。物体扫描默认
+            // OBJECT_HQ（目标 4mm / 场景 8mm），比 V0.13.3 的 0.012/0.004
+            // 更细（场景 ×1.5 分辨率，面数约 ×2.25）；块预算保持一致
+            // （scene 64MB + target 32MB，PLK110 可承受）。
+            // 截断距离 = voxel×4（tsdf_engine 固定系数），目标侧 16mm，
+            // 立体深度噪声典型 5~15mm，尚在容忍带内。
+            // 注意：nativeCreate 已 reset TSDF，这里在复位后设置档位才有效。
+            NativeBridge.nativeSetVoxelProfile(0)
             NativeBridge.nativeSetDepthCalibrationEnabled(true)
             if (objectLockEnabled) {
                 NativeBridge.nativeSetObjectLockEnabled(true)
@@ -3252,16 +3226,16 @@ private var lastRelocPollMs = 0L
             0
         }
         if (n < NativeBridge.DEPTH_NORM_STATS_SLOTS) return "depthNorm n/a"
-        val frozen = if (::depthProvider.isInitialized &&
+        val rep = if (::depthProvider.isInitialized &&
             depthProvider is com.mobilescan3d.depth.MonoDepthProvider
         ) {
-            (depthProvider as com.mobilescan3d.depth.MonoDepthProvider).normalizationFrozen
+            "RELATIVE_DEPTH"
         } else {
-            false
+            "n/a"
         }
-        return "depthNorm v=${buf[2].toLong()} A=${"%.3f".format(buf[0])} " +
+        return "depthNorm rep=$rep A=${"%.3f".format(buf[0])} " +
             "B=${"%.3f".format(buf[1])} reparam=${buf[3].toInt()} " +
-            "chgWhileEpoch=${buf[4].toInt()} frozen=$frozen"
+            "chgWhileEpoch=${buf[4].toInt()}"
     }
 
     /** V0.13.4：UI 线程版 epoch 激活查询（用独立缓冲，避开相机线程争用）。 */
@@ -3743,16 +3717,8 @@ private var lastRelocPollMs = 0L
         // 重参数化能保证「数值域变了标定也跟着变」，但每次变化都会给 epoch
         // 的漂移监控带来一次扰动。epoch 一旦锁定，(a,b) 就是定死的，此时
         // 让输入映射也定死，整个 epoch 内 d 的语义完全恒定 —— 这才是
-        // 「尺度不漂」的强保证。
-        // 只读一个 volatile 标志 + 一次 native 状态查询，1Hz 下开销可忽略。
-        if (scanning && ::depthProvider.isInitialized &&
-            depthProvider is com.mobilescan3d.depth.MonoDepthProvider
-        ) {
-            val mono = depthProvider as com.mobilescan3d.depth.MonoDepthProvider
-            if (!mono.normalizationFrozen && fusionEpochActiveUi()) {
-                mono.freezeNormalization()
-            }
-        }
+        // 「尺度不漂」的强保证：评审 P0-1 之后深度表示固定为 RELATIVE_DEPTH，
+        // 不再需要运行期冻结/重参数化；native 侧标定在 epoch 内收敛即可。
         val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
             .format(java.util.Date())
         val bat = try {

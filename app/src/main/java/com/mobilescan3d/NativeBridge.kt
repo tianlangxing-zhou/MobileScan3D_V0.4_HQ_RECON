@@ -403,20 +403,16 @@ object NativeBridge {
     external fun nativeSetDepthCalibrationEnabled(enabled: Boolean)
 
     /**
-     * V0.13.4：上报当前深度帧所用的归一化映射 `d = aNorm * q + bNorm`。
-     *
-     * 只要 `version` 与上次不同，就必须在**喂这一帧之前**调用 —— native
-     * 会按 `a_new = a_old*A_old/A_new`、`b_new = b_old + a_old*B_old -
-     * a_new*B_new` 重参数化已收敛的标定与冻结中的 epoch 参数，让「同一个
-     * 网络输出」始终对应「同一个米制深度」。
-     *
-     * 不这么做的话，会话级 min/max 一扩张，d 的语义就变了，而冻结的标定
-     * 还按旧语义解释 —— 几何随扫描推进整体膨胀/收缩（尺度漂移）。
+     * 评审 P1-2：按扫描档位切换 TSDF 体素分辨率与块预算。
+     * 0=OBJECT_HQ（4mm 目标 / 8mm 场景，小物体细节），
+     * 1=OBJECT_FAST（8mm / 12mm，实时更顺），
+     * 2=ROOM（8mm 目标 / 20mm 场景，大空间覆盖）。
+     * 必须在 startScan 之后、喂帧之前调用（改变体素尺寸会清场）。
      */
-    external fun nativeSetDepthNormMapping(aNorm: Float, bNorm: Float, version: Long)
+    external fun nativeSetVoxelProfile(profile: Int)
 
     /**
-     * V0.13.4 深度数值域诊断（5 槽）：
+     * 深度数值域诊断（5 槽）：
      * 0=当前 A 斜率，1=当前 B 截距，2=版本号，3=重参数化次数，
      * 4=「epoch 已冻结但数值域还在变」的次数。
      * 返回写入的槽数（< 5 表示 native 未实现，调用方必须降级）。

@@ -587,11 +587,20 @@ static void downscaleYuvToBgr(const uint8_t* y, const uint8_t* u, const uint8_t*
     }
 }
 
-static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence) {    if (!depth || w < 4 || h < 4 || s.rgb.empty()) {
+static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence) {
+    if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
         return;
     }
+    // 评审 P0-2：深度现在以 256² 到达（不再上采样到相机分辨率），内参必须按
+    // 深度/相机分辨率比降采样，否则几何会被拉伸到相机分辨率量级。
+    const float rx = (float)w / (float)s.w;
+    const float ry = (float)h / (float)s.h;
+    const float dFx = gFx * rx;
+    const float dFy = gFy * ry;
+    const float dCx = gCx * rx;
+    const float dCy = gCy * ry;
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
-                        gFx, gFy, gCx, gCy, s.R, s.t, confidence);
+                        dFx, dFy, dCx, dCy, s.R, s.t, confidence);
 
     for (int yy = 0; yy < s.h; yy++) {
         int y = std::min(h - 1, yy * h / s.h);
@@ -601,8 +610,8 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
             if (!(z > 0.08f && z < 8.f)) {
                 continue;
             }
-            float Xc = (x - gCx) * z / gFx;
-            float Yc = (y - gCy) * z / gFy;
+            float Xc = (x - dCx) * z / dFx;
+            float Yc = (y - dCy) * z / dFy;
             float Xw, Yw, Zw;
             rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
             size_t o = ((size_t)yy * s.w + xx) * 3;
@@ -967,8 +976,15 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
         }
     }
 
+    // 评审 P0-2：深度以 256² 到达，内参按深度/相机比降采样。
+    const float rtx = (float)w / (float)s.w;
+    const float rty = (float)h / (float)s.h;
+    const float dFx = gFx * rtx;
+    const float dFy = gFy * rty;
+    const float dCx = gCx * rtx;
+    const float dCy = gCy * rty;
     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
-                              gFx, gFy, gCx, gCy, s.R, s.t, confidence);
+                              dFx, dFy, dCx, dCy, s.R, s.t, confidence);
 
     for (int yy = 0; yy < s.h; yy++) {
         const int y = std::min(h - 1, yy * h / s.h);
@@ -982,8 +998,8 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
             if (!(z > 0.08f && z < 8.f)) {
                 continue;
             }
-            const float Xc = (x - gCx) * z / gFx;
-            const float Yc = (y - gCy) * z / gFy;
+            const float Xc = (x - dCx) * z / dFx;
+            const float Yc = (y - dCy) * z / dFy;
             float Xw, Yw, Zw;
             rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
             const size_t o = (static_cast<size_t>(yy) * s.w + xx) * 3;
@@ -3843,6 +3859,47 @@ Java_com_mobilescan3d_NativeBridge_nativeSetVoxelBudget(JNIEnv*, jobject,
     if (targetBlocks > 0) {
         targetTsdf.setMaxBlocks((size_t)targetBlocks);
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetVoxelProfile(JNIEnv*, jobject,
+                                                         jint profile) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    // 评审 P1-2：按扫描档位切换 TSDF 体素分辨率 + 块预算。
+    // 字段在 nativeCreate 里被重置为默认（场景 20mm / 目标 8mm），
+    // 因此本函数必须在 startScan 之后、喂帧之前调用。
+    //   0 = OBJECT_HQ : 目标 4mm / 场景 8mm，小物体细节
+    //   1 = OBJECT_FAST: 目标 8mm / 场景 12mm，实时更顺
+    //   2 = ROOM      : 目标 8mm / 场景 20mm，大空间覆盖
+    // 高分辨率档位给更多块预算，避免「半边模型」截断。
+    float targetVox = 0.008f, sceneVox = 0.020f;
+    size_t targetBlocks = 8192, sceneBlocks = 8192;
+    switch (profile) {
+        case 0:  // OBJECT_HQ
+            targetVox = 0.004f;
+            sceneVox  = 0.008f;
+            targetBlocks = 8192;
+            sceneBlocks  = 16384;
+            break;
+        case 1:  // OBJECT_FAST
+            targetVox = 0.008f;
+            sceneVox  = 0.012f;
+            targetBlocks = 8192;
+            sceneBlocks  = 12288;
+            break;
+        case 2:  // ROOM
+            targetVox = 0.008f;
+            sceneVox  = 0.020f;
+            targetBlocks = 8192;
+            sceneBlocks  = 8192;
+            break;
+        default:
+            return;  // 未知档位：保持 nativeCreate 设好的默认
+    }
+    targetTsdf.setVoxelSize(targetVox);
+    targetTsdf.setMaxBlocks(targetBlocks);
+    tsdf.setVoxelSize(sceneVox);
+    tsdf.setMaxBlocks(sceneBlocks);
 }
 
 extern "C" JNIEXPORT void JNICALL

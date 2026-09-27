@@ -3,6 +3,25 @@ package com.mobilescan3d.depth
 import android.media.Image
 
 /**
+ * 深度表示的固定语义（评审 P0-1）。
+ *
+ * 关键：**一旦模型确定，表示就固定，运行时不要再猜 linear 还是 inverse**。
+ * - [RELATIVE_DEPTH]：模型输出 raw `q` 与“真实远近”单调递增（大模型越大=越近
+ *   或越大=越远，由标定 affine 吸收符号），native 侧用 VINS 稀疏三角化 + stereo
+ *   anchors 拟合 `metric = scale*q + shift` 得到米制。
+ * - [INVERSE_DEPTH]：模型输出 raw `q` 是视差/逆深度，native 用 `metric =
+ *   scale/q + shift`。
+ *
+ * 选择哪种由 `depth_model.tflite` 的真实输出定义**固定一次**；不要像旧实现那样
+ * 用会话级 min/max 把 q 重映射到 [0.4,6]——那会让同一 q 在不同扫描阶段对应不同
+ * 米制，正是尺度漂移的根因。
+ */
+enum class DepthRepresentation {
+    RELATIVE_DEPTH,
+    INVERSE_DEPTH
+}
+
+/**
  * 深度来源的统一接口。
  *
  * 为什么要把深度抽象出来（评审 P0-1）：
@@ -32,22 +51,11 @@ interface DepthProvider {
      *                            稀疏三角化深度做鲁棒标定后再用）。
      * @param timestampNs 对应的相机帧时间戳（不是推理完成时刻！）。
      *
-     * @param normA / normB / normVersion
-     *        V0.13.4 尺度漂移修复：**这一帧深度所用归一化映射的元数据**。
-     *
-     *        非米制 provider 输出的 d 是网络原始值 q 的仿射：
-     *            `d = normA * q + normB`
-     *        而 `normA/normB` 由会话级 min/max 决定，**会随扫描推进变化**
-     *        （看到更近/更远的表面时范围扩张）。native 侧的标定拟合的是
-     *        `z = a*d + b`，一旦 d 的含义悄悄变了而 (a,b) 还冻结着，几何
-     *        就会整体膨胀或收缩 —— 这就是「同一物体扫到后面越来越大」的
-     *        根因。
-     *
-     *        所以每一帧都必须把它所用的映射带出去，`normVersion` 每次映射
-     *        变化 +1；调用方发现版本号变了，要在**喂这一帧之前**用
-     *        `nativeSetDepthNormMapping` 让 native 显式重参数化标定，
-     *        而不是让标定继续用旧映射去解释新数值。
-     *        米制 provider（硬件深度）保持 A=1、B=0 不变即可。
+     * @param representation 深度固定表示语义（RELATIVE_DEPTH / INVERSE_DEPTH）。
+     *                    **固定一次**，运行时绝不根据单帧内容重新猜测 linear
+     *                    还是 inverse。native 侧用 VINS 稀疏三角化 +
+     *                    stereo anchors 拟合 `metric = scale*q + shift`
+     *                    （逆深度则是 `scale/q + shift`）得到米制。
      */
     data class Result(
         val depth: FloatArray,
@@ -57,9 +65,7 @@ interface DepthProvider {
         val timestampNs: Long,
         val metric: Boolean,
         val backend: String,
-        val normA: Float = 1f,
-        val normB: Float = 0f,
-        val normVersion: Long = 0L
+        val representation: DepthRepresentation = DepthRepresentation.RELATIVE_DEPTH
     )
 
     /** 后端名，进诊断报告与 HUD。 */
