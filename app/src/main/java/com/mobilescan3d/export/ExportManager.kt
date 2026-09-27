@@ -84,6 +84,9 @@ class ExportManager(context: Context) {
     var lastMesh: MeshData? = null
         private set
 
+    private val meshGeneration = java.util.concurrent.atomic.AtomicLong(0)
+    private val meshCacheLock = Any()
+
     val dir: File get() = outputDir
 
     // ------------------------------------------------------------------ PLY
@@ -154,9 +157,7 @@ class ExportManager(context: Context) {
         return try {
             val q = quality.coerceIn(0, 2)
             val ok = NativeBridge.nativeBuildMesh(q)
-            if (ok) {
-                lastMesh = pullMesh()
-            }
+            lastMesh = if (ok) pullMesh() else null
             // 必须显式返回；只写 `if (ok) {...}` 会让 try 块的值推断成 Any，
             // 与函数声明的 Boolean 冲突（Kotlin 不把 if-without-else 当表达式）。
             ok
@@ -225,6 +226,10 @@ class ExportManager(context: Context) {
     }
 
     fun resetMesh() {
+        synchronized(meshCacheLock) {
+            meshGeneration.incrementAndGet()
+            lastMesh = null
+        }
         try {
             NativeBridge.nativeResetMesh()
         } catch (t: Throwable) {
@@ -337,19 +342,29 @@ class ExportManager(context: Context) {
      */
     fun buildMeshAsync(quality: Int, onDone: (MeshData?) -> Unit) {
         val q = quality.coerceIn(0, 2)
+        val generation = meshGeneration.get()
         io.execute {
+            if (generation != meshGeneration.get()) return@execute
             val mesh = try {
                 if (NativeBridge.nativeBuildMesh(q)) pullMesh() else null
             } catch (t: Throwable) {
                 Log.e(TAG, "buildMeshAsync failed", t)
                 null
             }
-            lastMesh = mesh
-            main.post { onDone(mesh) }
+            synchronized(meshCacheLock) {
+                if (generation == meshGeneration.get()) lastMesh = mesh
+            }
+            main.post {
+                if (generation == meshGeneration.get()) onDone(mesh)
+            }
         }
     }
 
     fun shutdown() {
+        synchronized(meshCacheLock) {
+            meshGeneration.incrementAndGet()
+            lastMesh = null
+        }
         try {
             io.shutdownNow()
         } catch (_: Throwable) {

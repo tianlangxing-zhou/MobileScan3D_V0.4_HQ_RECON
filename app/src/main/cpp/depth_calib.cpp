@@ -77,7 +77,8 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
         float zp;
         if (inverse) {
             const float inv = a * d[i] + b;
-            if (!(inv > 1e-6f)) {
+            if (!(inv > 1e-6f) || !std::isfinite(inv)) {
+                rel.push_back(1e6f);
                 continue;
             }
             zp = 1.f / inv;
@@ -85,6 +86,7 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
             zp = a * d[i] + b;
         }
         if (!(zp > 1e-4f) || !std::isfinite(zp)) {
+            rel.push_back(1e6f);
             continue;
         }
         const float r = std::fabs(zp - z[i]) / std::max(1e-4f, z[i]);
@@ -98,7 +100,7 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
     s.medianRelResidual = med;
     const float thr = std::max(0.05f, 3.f * med);
     for (float r : rel) {
-        if (r <= thr) {
+        if (r < 1e6f && r <= thr) {
             ++s.inliers;
         }
     }
@@ -114,7 +116,7 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
 DepthCalibration fitDepthRobust(const std::vector<float>& d,
                                 const std::vector<float>& z,
                                 bool inverseDepth,
-                                int maxIterations) {
+                                int maxIterations, bool forceInverse) {
     DepthCalibration out;
     const size_t n = std::min(d.size(), z.size());
     if (n < 6) {
@@ -204,11 +206,11 @@ DepthCalibration fitDepthRobust(const std::vector<float>& d,
     };
 
     float aLin = 0.f, bLin = 0.f;
-    const bool okLin = fitLinear(false, &aLin, &bLin);
+    const bool okLin = !forceInverse && fitLinear(false, &aLin, &bLin);
 
     float aInv = 0.f, bInv = 0.f;
     bool okInv = false;
-    if (inverseDepth) {
+    if (inverseDepth || forceInverse) {
         okInv = fitLinear(true, &aInv, &bInv);
     }
 
@@ -264,7 +266,8 @@ void DepthCalibrator::reset() {
 }
 
 bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<float>& z) {
-    if (d.size() < static_cast<size_t>(cfg_.minSamples)) {
+    if (std::min(d.size(), z.size()) < static_cast<size_t>(std::max(6, cfg_.minSamples)) ||
+        cfg_.maxSamples < 6) {
         lastReject_ = "too few paired samples";
         ++rejectedFrames_;
         return false;
@@ -285,8 +288,8 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
     }
 
     const DepthCalibration fresh =
-        fitDepthRobust(dd, zz, cfg_.allowInverseDepth);
-    if (!fresh.valid) {
+        fitDepthRobust(dd, zz, cfg_.allowInverseDepth, 10, cfg_.forceInverseDepth);
+    if (!fresh.valid || fresh.samples < std::max(6, cfg_.minSamples)) {
         lastReject_ = "fit degenerate";
         ++rejectedFrames_;
         return false;
@@ -316,7 +319,8 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
             const float ratio = (std::fabs(calib_.scale) > 1e-9f)
                                     ? std::fabs(fresh.scale / calib_.scale)
                                     : 1.f;
-            if (ratio > cfg_.maxJumpRatio || ratio < 1.f / cfg_.maxJumpRatio) {
+            if (fresh.scale * calib_.scale <= 0.f ||
+                ratio > cfg_.maxJumpRatio || ratio < 1.f / cfg_.maxJumpRatio) {
                 lastReject_ = "scale jump rejected";
                 ++rejectedFrames_;
                 return false;

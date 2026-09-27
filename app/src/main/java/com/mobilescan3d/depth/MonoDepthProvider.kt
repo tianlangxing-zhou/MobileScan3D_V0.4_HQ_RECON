@@ -11,10 +11,10 @@ import java.nio.channels.FileChannel
  * 单目深度：assets/depth_model.tflite（256x256 输入）。
  *
  * **评审 P0-1 行为（2026-09-27 改）**：不再做会话级 min/max 动态映射，也不
- * 上采样到相机分辨率。模型原始输出 `q` 以固定表示 [RELATIVE_DEPTH] 原样交
+ * 上采样到相机分辨率。模型原始输出 `q` 以固定表示 [INVERSE_DEPTH] 原样交
  * native，**同一个 q 永远对应同一个米制深度** —— 这是根除尺度漂移的关键。
  * 真正的米制关系由 native 侧用 VINS 稀疏三角化 + stereo anchors 拟合
- * `metric = scale*q + shift`（MAD + Huber IRLS + EMA）建立。
+ * `1/metric = scale*q + shift`（MAD + Huber IRLS + EMA）建立。
  *
  * 注意：下游「目标 mask / presence gate」依赖的是**相对深度的相对排序与分布**，
  * 而相对排序在去掉 min/max 映射后反而更稳定（之前会话级 min/max 扩张会让
@@ -33,7 +33,7 @@ class MonoDepthProvider(
     private val depthSmall = FloatArray(inputSize * inputSize)
 
     // 评审 P0-1：不再做会话级 min/max 动态映射，也不上采样到相机分辨率。
-    // 模型原始输出 q 以固定表示（RELATIVE_DEPTH）原样交 native，由 native 侧
+    // 模型原始输出 q 以固定表示（INVERSE_DEPTH）原样交 native，由 native 侧
     // 用 VINS 稀疏三角化 + stereo anchors 拟合 scale/shift 得到米制。
     // 这样同一 q 永远对应同一个米制深度，彻底消除尺度漂移。
 
@@ -63,7 +63,7 @@ class MonoDepthProvider(
         pre.fill(y, u, v, width, height, rowStride, uRowStride, uPixelStride)
         itp.run(pre.tensor, output)
 
-        // 评审 P0-1 + P0-2：直接取原始模型输出 q，固定 RELATIVE_DEPTH 语义，
+        // 评审 P0-1 + P0-2：直接取原始模型输出 q，固定 INVERSE_DEPTH 语义，
         // 不做会话级 min/max、不做 [0.4,6] 映射、不上采样到相机分辨率。
         // 分辨率保持 inputSize×inputSize (256×256)，native 侧按深度/相机比
         // 降采样内参 K 完成融合，几何信息基本无损。
@@ -82,7 +82,7 @@ class MonoDepthProvider(
             timestampNs = timestampNs,
             metric = false,
             backend = backendName,
-            representation = DepthRepresentation.RELATIVE_DEPTH
+            representation = DepthRepresentation.INVERSE_DEPTH
         )
         return true
     }
@@ -101,11 +101,12 @@ class MonoDepthProvider(
     }
 
     private fun loadModel(assets: AssetManager): ByteBuffer {
-        val fd = assets.openFd(modelAsset)
-        FileInputStream(fd.fileDescriptor).use { stream ->
-            return stream.channel.map(
-                FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength
-            )
+        assets.openFd(modelAsset).use { fd ->
+            FileInputStream(fd.fileDescriptor).use { stream ->
+                return stream.channel.map(
+                    FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength
+                )
+            }
         }
     }
 

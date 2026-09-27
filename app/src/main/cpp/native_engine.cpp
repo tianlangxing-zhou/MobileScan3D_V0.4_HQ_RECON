@@ -26,6 +26,7 @@
 #include "object_tracker.h"
 #include "target_mask_engine.h"
 #include "depth_calib.h"
+#include "depth_geometry.h"
 #include "stereo_anchor_bridge.h"
 #include "mesh/mesh_engine.h"
 #include "export/gltf_exporter.h"
@@ -125,7 +126,6 @@ static float lastFusionDepthMean = 0.f;
 static uint64_t lastFusionDepthValid = 0;
 static uint64_t lastFusionDepthConversionFallback = 0;
 static constexpr int kMaxCalibSamples = 256;
-static float gCalibSampleBuf[kMaxCalibSamples * 3];
 
 // ------------------------------------------- V0.12 Fusion Calibration Epoch
 // V0.11 的实测结论：标定器本身没问题，问题是它**每帧都在动**（EMA）。
@@ -593,19 +593,15 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     }
     // 评审 P0-2：深度现在以 256² 到达（不再上采样到相机分辨率），内参必须按
     // 深度/相机分辨率比降采样，否则几何会被拉伸到相机分辨率量级。
-    const float rx = (float)w / (float)s.w;
-    const float ry = (float)h / (float)s.h;
-    const float dFx = gFx * rx;
-    const float dFy = gFy * ry;
-    const float dCx = gCx * rx;
-    const float dCy = gCy * ry;
+    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+    const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
                         dFx, dFy, dCx, dCy, s.R, s.t, confidence);
 
-    for (int yy = 0; yy < s.h; yy++) {
-        int y = std::min(h - 1, yy * h / s.h);
-        for (int xx = 0; xx < s.w; xx++) {
-            int x = std::min(w - 1, xx * w / s.w);
+    for (int y = 0; y < h; ++y) {
+        const int yy = std::min(s.h - 1, y * s.h / h);
+        for (int x = 0; x < w; ++x) {
+            const int xx = std::min(s.w - 1, x * s.w / w);
             float z = depth[(size_t)y * w + x];
             if (!(z > 0.08f && z < 8.f)) {
                 continue;
@@ -977,20 +973,16 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
     }
 
     // 评审 P0-2：深度以 256² 到达，内参按深度/相机比降采样。
-    const float rtx = (float)w / (float)s.w;
-    const float rty = (float)h / (float)s.h;
-    const float dFx = gFx * rtx;
-    const float dFy = gFy * rty;
-    const float dCx = gCx * rtx;
-    const float dCy = gCy * rty;
+    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+    const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
                               dFx, dFy, dCx, dCy, s.R, s.t, confidence);
 
-    for (int yy = 0; yy < s.h; yy++) {
-        const int y = std::min(h - 1, yy * h / s.h);
+    for (int y = 0; y < h; ++y) {
+        const int yy = std::min(s.h - 1, y * s.h / h);
         const uint8_t* mRow = mask.ptr<uint8_t>(y);
-        for (int xx = 0; xx < s.w; xx++) {
-            const int x = std::min(w - 1, xx * w / s.w);
+        for (int x = 0; x < w; ++x) {
+            const int xx = std::min(s.w - 1, x * s.w / w);
             if (!mRow[x]) {
                 continue;
             }
@@ -1054,7 +1046,7 @@ static PresenceDecision evaluatePresence(const TargetTrackInfo& ti,
         : (ti.confidence >= kPresenceConfidenceFallback);
     d.motionOk = (ti.inlierRatio >= kPresenceMinInlierRatio) ||
                  (ti.trackedPoints >= kPresenceMinPoints);
-    d.maskOk = ms.valid && ms.area >= kPresenceMinMaskArea;
+    d.maskOk = ms.valid && !ms.overExpanded && ms.area >= kPresenceMinMaskArea;
     if (d.maskOk) {
         const float bw = (ti.x1 - ti.x0) * static_cast<float>(depthW);
         const float bh = (ti.y1 - ti.y0) * static_cast<float>(depthH);
@@ -1733,6 +1725,7 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
     const bool useMask = !mask.empty() && mask.cols == w && mask.rows == h &&
                          mask.type() == CV_8U;
 
+    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
     int step = 1;
     while ((roiW / step) * (roiH / step) > kTargetDebugMaxPoints) {
         step++;
@@ -1751,8 +1744,8 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
             if (targetDebugPointCount >= kTargetDebugMaxPoints) {
                 continue;
             }
-            const float Xc = (x - gCx) * z / gFx;
-            const float Yc = (y - gCy) * z / gFy;
+            const float Xc = (x - dk.cx) * z / dk.fx;
+            const float Yc = (y - dk.cy) * z / dk.fy;
             float* p = targetDebugPoints.data() +
                        static_cast<size_t>(targetDebugPointCount) * 6;
             // **相机坐标**：Renderer 侧用 uPointSpace=0 时 pc = aPosition。
@@ -1773,8 +1766,9 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
 /** nativeOnDepthMap 的实现体；JNI 包装负责兜住所有 C++ 异常。 */
 static void nativeOnDepthMapImpl(
         JNIEnv* e, jfloatArray depth, jint w, jint h,
-        jfloat confidence, jlong t) {
-    if (!depth || w <= 0 || h <= 0) {
+        jfloat confidence, jlong t, jint representation) {
+    if (!depth || w <= 0 || h <= 0 || w > 4096 || h > 4096 ||
+        !std::isfinite(confidence) || confidence <= 0.f || representation < 0 || representation > 1) {
         return;
     }
     jsize n = e->GetArrayLength(depth);
@@ -1784,6 +1778,11 @@ static void nativeOnDepthMapImpl(
     std::vector<float> d((size_t)w * h);
     e->GetFloatArrayRegion(depth, 0, w * h, d.data());
 
+    // Fetch timestamp-aligned sparse observations before taking gStateMutex.
+    // Every calibrator read/write below is protected against reset/UI diagnostics.
+    float frameSamples[kMaxCalibSamples * 3];
+    const int ns = vinsFeatureSamples(frameSamples, kMaxCalibSamples, static_cast<uint64_t>(t));
+    std::lock_guard<std::mutex> lk(gStateMutex);
     // V0.9: raw model depth retained briefly for exact-timestamp stereo pairing.
     mobilescan3d::stereo_anchor::onDepthFrame(
         static_cast<uint64_t>(t),
@@ -1791,52 +1790,12 @@ static void nativeOnDepthMapImpl(
         w,
         h);
 
-    {
-        std::shared_ptr<ObjectTracker> tracker;
-        {
-            std::lock_guard<std::mutex> lk(gStateMutex);
-            tracker = objectTracker;
-        }
-        if (tracker && tracker->isTracking()) {
-            tracker->updateFromDepth(d.data(), w, h, (uint64_t)t);
-        }
-    }
-
-    // ---- 目标专属深度尺度：目标 ROI 内的 VINS 三角化特征中位数 ----
-    //
-    // 为什么放在**进入 gStateMutex 之前**：vinsFeatureDepthMedianInRoi() 内部持
-    // g_vinsMutex。若把它嵌进本函数主段的临界区，就会形成
-    // gStateMutex -> g_vinsMutex 的嵌套锁序，而 nativeOnCameraFrame 是
-    // 「先拿 gStateMutex 做统计、VINS 计算放到锁外」——两者锁序不一致，
-    // 迟早会互相等。这里刻意让它独立成段。
-    {
-        std::shared_ptr<ObjectTracker> probe;
-        {
-            std::lock_guard<std::mutex> lk(gStateMutex);
-            probe = objectTracker;
-        }
-        if (probe && probe->isTracking()) {
-            const TargetTrackInfo t0 = probe->info();
-            if (t0.depthRoiArea >= kPresenceMinMaskArea) {
-                int vinsSamples = 0;
-                const float vinsRoiMedian =
-                    vinsFeatureDepthMedianInRoi(t0.x0, t0.y0, t0.x1, t0.y1, &vinsSamples);
-                const float rawMedian = t0.medianDepth;
-                if (vinsSamples >= 8 && rawMedian > 0.05f && vinsRoiMedian > 0.05f) {
-                    const float s = vinsRoiMedian / rawMedian;
-                    if (std::isfinite(s) && s > kTargetScaleMin && s < kTargetScaleMax) {
-                        std::lock_guard<std::mutex> lk(gStateMutex);
-                        targetDepthScaleEma = (targetDepthScaleSamples == 0)
-                            ? s
-                            : (0.9f * targetDepthScaleEma + 0.1f * s);
-                        targetDepthScaleSamples++;
-                        lastTargetVinsMedian = vinsRoiMedian;
-                        lastTargetRawMedian = rawMedian;
-                        lastTargetVinsFeatureCount = vinsSamples;
-                    }
-                }
-            }
-        }
+    auto config = depthCalibrator.config();
+    config.allowInverseDepth = representation == 1;
+    config.forceInverseDepth = representation == 1;
+    depthCalibrator.setConfig(config);
+    if (objectTracker && objectTracker->isTracking()) {
+        objectTracker->updateFromDepth(d.data(), w, h, static_cast<uint64_t>(t));
     }
 
     // ---- V0.9 深度标定：VINS 稀疏深度 + stereo metric anchors ----
@@ -1846,11 +1805,6 @@ static void nativeOnDepthMapImpl(
     // diagnostics-only. Once stable, clean stereo samples enter the existing
     // MAD + Huber IRLS + EMA calibrator at 2-3x sample weight.
     if (depthCalibrationEnabled) {
-        const int ns =
-            vinsFeatureSamples(
-                gCalibSampleBuf,
-                kMaxCalibSamples);
-
         std::vector<float> dPairs;
         std::vector<float> zPairs;
         dPairs.reserve(
@@ -1860,11 +1814,11 @@ static void nativeOnDepthMapImpl(
 
         for (int i = 0; i < ns; ++i) {
             const float nu =
-                gCalibSampleBuf[i * 3 + 0];
+                frameSamples[i * 3 + 0];
             const float nv =
-                gCalibSampleBuf[i * 3 + 1];
+                frameSamples[i * 3 + 1];
             const float vz =
-                gCalibSampleBuf[i * 3 + 2];
+                frameSamples[i * 3 + 2];
 
             if (!(nu >= 0.f && nu <= 1.f &&
                   nv >= 0.f && nv <= 1.f)) {
@@ -2001,8 +1955,9 @@ static void nativeOnDepthMapImpl(
         lastCalibInverse =
             c.inverseDepthModel;
     }
-    // 融合用的深度图：标定可用时逐像素映射到 VINS 尺度，否则原样透传
-    // （tracker / mask 仍看未标定的 d，保持第八轮已验收的行为不变）。
+    // Calibrated depth is also the input to the metric-threshold target mask.
+    // Before calibration, retain appearance tracking but do not classify presence
+    // from uncalibrated model values.
     const bool calibratedNow = depthCalibrationEnabled && depthCalibrator.usable();
     std::vector<float> zCal;
     const float* depthForFusion = d.data();
@@ -2044,7 +1999,6 @@ static void nativeOnDepthMapImpl(
         fusionDepthMinFrame = 0.f;
     }
 
-    std::lock_guard<std::mutex> lk(gStateMutex);
     lastFusionDepthCalibrated = calibratedNow && fusionDepthValidFrame > 0;
     lastFusionDepthMin = fusionDepthMinFrame;
     lastFusionDepthMax = fusionDepthMaxFrame;
@@ -2062,8 +2016,8 @@ static void nativeOnDepthMapImpl(
     {
         const float rawNow = rawDepthSampleMedian(d.data(), w, h);
         const DepthCalibration liveCal = depthCalibrator.calibration();
-        const float zLiveNow =
-            (calibratedNow && rawNow > 0.f) ? liveCal.toMetric(rawNow, 0.f) : 0.f;
+        if (!epochActive && !haveEpochPrevZ && std::isfinite(rawNow)) epochRefRaw = rawNow;
+        const float zLiveNow = calibratedNow ? liveCal.toMetric(epochRefRaw, 0.f) : 0.f;
         const bool liveOk = std::isfinite(zLiveNow) && zLiveNow > 0.f;
 
         if (!depthCalibrationEnabled) {
@@ -2113,7 +2067,6 @@ static void nativeOnDepthMapImpl(
             if (epochStableStreak >= kEpochStableFrames) {
                 epochCalib = liveCal;
                 epochCalib.valid = true;
-                epochRefRaw = rawNow;
                 epochRefZ = zLiveNow;
                 epochActive = true;
                 epochStableStreak = 0;
@@ -2227,7 +2180,7 @@ static void nativeOnDepthMapImpl(
     // ---- 目标分割 Mask + PresenceGate ----
     bool presenceOk = false;
     bool maskOk = false;
-    if (haveTi) {
+    if (haveTi && calibratedNow) {
         const int bx0 = std::max(0, static_cast<int>(ti.x0 * w));
         const int by0 = std::max(0, static_cast<int>(ti.y0 * h));
         const int bx1 = std::min(w - 1, static_cast<int>(ti.x1 * w));
@@ -2235,10 +2188,10 @@ static void nativeOnDepthMapImpl(
         if (bx1 > bx0 && by1 > by0) {
             const cv::Rect searchBox(bx0, by0, bx1 - bx0 + 1, by1 - by0 + 1);
             const cv::Point seed((bx0 + bx1) / 2, (by0 + by1) / 2);
-            targetMaskEngine.build(d.data(), w, h, searchBox, seed,
+            targetMaskEngine.build(depthForFusion, w, h, searchBox, seed,
                                    targetMaskMat, targetMaskStats);
             targetMaskFrames++;
-            maskOk = targetMaskStats.valid &&
+            maskOk = targetMaskStats.valid && !targetMaskStats.overExpanded &&
                      targetMaskStats.area >= kPresenceMinMaskArea;
             // V0.13 Mask temporal gate：Adaptive Mask 管住了「一帧之内的
             // 面积/边界」，这里再管住「两帧之间的跳变」。
@@ -2285,7 +2238,7 @@ static void nativeOnDepthMapImpl(
         buildTargetDebugLayer(
             depthForFusion, w, h, ti, targetMaskMat);
         targetDebugTs = static_cast<uint64_t>(t);
-    } else if (depthCalibrationEnabled && !calibratedNow) {
+    } else {
         targetDebugPointCount = 0;
         targetDebugValidPixels = 0;
     }
@@ -2337,9 +2290,10 @@ static void nativeOnDepthMapImpl(
                 }
                 trel[i] = acc;
             }
+            const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
             lastTemporalRatio = temporalConsistencyRatio(
                 lastFusedDepth.data(), depthForFusion, w, h,
-                gFx, gFy, gCx, gCy, Rrel, trel);
+                dk.fx, dk.fy, dk.cx, dk.cy, Rrel, trel);
             temporalChecks++;
             if (lastTemporalRatio < 0.35f) {
                 temporalRejects++;
@@ -2477,7 +2431,7 @@ static void nativeOnDepthMapImpl(
 extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
         JNIEnv* e, jobject, jfloatArray depth, jint w, jint h,
-        jfloat confidence, jlong t) {
+        jfloat confidence, jlong t, jint representation) {
     // JNI 边界是所有 native 异常的最后一道防线。
     //
     // C++ 异常一旦越过 JNI 回到 ART，Kotlin 侧任何 try/catch 都抓不到
@@ -2490,7 +2444,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     // 就是从这条深度线程路径逃出去的。修复了根因之后，这里仍然保留兜底：
     // 30Hz 的深度回调里任何一个 OpenCV/STL 异常都不该带走整个 APP。
     try {
-        nativeOnDepthMapImpl(e, depth, w, h, confidence, t);
+        nativeOnDepthMapImpl(e, depth, w, h, confidence, t, representation);
     } catch (const cv::Exception& ex) {
         __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Depth",
                             "nativeOnDepthMap OpenCV exception: %s", ex.what());

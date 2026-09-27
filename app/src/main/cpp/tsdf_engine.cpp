@@ -166,9 +166,9 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
     if (!depth || w < 4 || h < 4 || !R || !t) {
         return;
     }
-    if (atCapacity()) {
-        return;
-    }
+    if (!std::isfinite(confidence) || confidence <= 0.f ||
+        !std::isfinite(fx) || !std::isfinite(fy) || fx <= 0.f || fy <= 0.f ||
+        !std::isfinite(cx) || !std::isfinite(cy)) return;
 
     const int step = pixelStep_ < 1 ? 1 : pixelStep_;
     const float mu = (trunc_ > 1e-4f) ? trunc_ : (voxel_ * kTsdfTruncVoxels);
@@ -237,12 +237,17 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
 
                 TsdfVoxel* v = voxelFor(vx, vy, vz, true);
                 if (!v) {
-                    // 块配额用尽：整帧停止融合，避免一边分配失败一边空转。
-                    return;
+                    // A full budget only prevents new blocks; existing surfaces keep refining.
+                    continue;
                 }
 
-                // 带符号：zi < z -> 正（外侧）; zi > z -> 负（内侧）。
-                float sdf = (z - zi) * invMu;
+                // Evaluate at the voxel's stored lattice position, not at an arbitrary
+                // ray sample inside it. Mesh extraction uses this same lattice.
+                const float wx = vx * voxel_ - t[0];
+                const float wy = vy * voxel_ - t[1];
+                const float wz = vz * voxel_ - t[2];
+                const float voxelZ = R[2] * wx + R[5] * wy + R[8] * wz;
+                float sdf = (z - voxelZ) * invMu;
                 sdf = sdf < -1.f ? -1.f : (sdf > 1.f ? 1.f : sdf);
 
                 const float wOld = dequantWeight(v->weight);

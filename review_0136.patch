@@ -1,0 +1,1932 @@
+diff --git a/README_REPLACE_ZH.md b/README_REPLACE_ZH.md
+new file mode 100644
+index 0000000..e2e0c66
+--- /dev/null
++++ b/README_REPLACE_ZH.md
+@@ -0,0 +1,14 @@
++# MobileScan3D V0.13.6-review 覆盖包
++
++适用基线：GitHub main `2cafb5382e21eec4795255309c413d14efadae5b`（V0.13.5）。
++
++这是增量覆盖包，不是完整工程，不含 APK。完整修改清单和测试边界见 `docs/review_0136/REVIEW_ZH.md`。
++
++1. 先备份你当前的工程。
++2. 解压 ZIP，把其中的 `app`、`docs`、`tools` **合并复制**到原工程根目录（该目录包含 `settings.gradle.kts`），同名文件选择覆盖。不要删除原目录再复制；未包含的模型、第三方库和原文件需要保留。
++3. 同时复制根目录的 `OVERLAY_MANIFEST.json` 和本说明。`review_0136.patch` 是审查用差异，已覆盖文件后不要重复应用 patch。
++4. 在工程根目录运行 `python tools/review_tests/verify_overlay.py`，确认交付文件的 SHA-256 都匹配。
++5. 保留你原来的 `local.properties`、签名、模型和 Ceres/OpenCV/SDK/NDK 路径配置。在 Android Studio 中 Clean/Rebuild，或在 Windows 运行 `gradlew.bat clean :app:assembleDebug`。
++6. 请先做一次短扫描和停扫导出验证，再进行重要采集。若当前工程已经超出上述基线或有自己的改动，请先对比 `review_0136.patch`，避免直接覆盖你的修改。
++
++已执行的宿主回归与语法检查通过；**完整 Android 构建和真机效果尚未验证**。包内没有把这些未验证项目记为通过。
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 082b7e1..aacd9c0 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -22,21 +22,19 @@ val opencvSdkDir = requiredLocalPath("opencv.sdkDir")
+ 
+ fun gitOutput(vararg args: String): String {
+     return try {
+-        ProcessBuilder("git", *args)
++        val process = ProcessBuilder("git", *args)
+             .directory(rootProject.projectDir)
+             .redirectErrorStream(true)
+             .start()
+-            .inputStream
+-            .bufferedReader()
+-            .readText()
+-            .trim()
++        val output = process.inputStream.bufferedReader().use { it.readText().trim() }
++        if (process.waitFor() == 0) output else "unknown"
+     } catch (_: Exception) {
+         "unknown"
+     }
+ }
+ 
+ val gitSha = gitOutput("rev-parse", "--short=8", "HEAD")
+-val gitDirty = gitOutput("status", "--porcelain").isNotBlank()
++val gitDirty = gitOutput("status", "--porcelain").let { it != "unknown" && it.isNotBlank() }
+ val gitBuildId = if (gitDirty) "$gitSha-dirty" else gitSha
+ val buildTimestamp = System.currentTimeMillis()
+ 
+@@ -58,8 +56,8 @@ android {
+         applicationId = "com.mobilescan3d"
+         minSdk = 26
+         targetSdk = 36
+-        versionCode = 130
+-        versionName = "0.13.0-target-identity-sticky-fusion"
++        versionCode = 136
++        versionName = "0.13.6-review"
+         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
+         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
+         ndk { abiFilters += listOf("arm64-v8a") }
+diff --git a/app/src/main/cpp/depth_calib.cpp b/app/src/main/cpp/depth_calib.cpp
+index 5ef969b..fef178b 100644
+--- a/app/src/main/cpp/depth_calib.cpp
++++ b/app/src/main/cpp/depth_calib.cpp
+@@ -77,7 +77,8 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
+         float zp;
+         if (inverse) {
+             const float inv = a * d[i] + b;
+-            if (!(inv > 1e-6f)) {
++            if (!(inv > 1e-6f) || !std::isfinite(inv)) {
++                rel.push_back(1e6f);
+                 continue;
+             }
+             zp = 1.f / inv;
+@@ -85,6 +86,7 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
+             zp = a * d[i] + b;
+         }
+         if (!(zp > 1e-4f) || !std::isfinite(zp)) {
++            rel.push_back(1e6f);
+             continue;
+         }
+         const float r = std::fabs(zp - z[i]) / std::max(1e-4f, z[i]);
+@@ -98,7 +100,7 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
+     s.medianRelResidual = med;
+     const float thr = std::max(0.05f, 3.f * med);
+     for (float r : rel) {
+-        if (r <= thr) {
++        if (r < 1e6f && r <= thr) {
+             ++s.inliers;
+         }
+     }
+@@ -114,7 +116,7 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
+ DepthCalibration fitDepthRobust(const std::vector<float>& d,
+                                 const std::vector<float>& z,
+                                 bool inverseDepth,
+-                                int maxIterations) {
++                                int maxIterations, bool forceInverse) {
+     DepthCalibration out;
+     const size_t n = std::min(d.size(), z.size());
+     if (n < 6) {
+@@ -204,11 +206,11 @@ DepthCalibration fitDepthRobust(const std::vector<float>& d,
+     };
+ 
+     float aLin = 0.f, bLin = 0.f;
+-    const bool okLin = fitLinear(false, &aLin, &bLin);
++    const bool okLin = !forceInverse && fitLinear(false, &aLin, &bLin);
+ 
+     float aInv = 0.f, bInv = 0.f;
+     bool okInv = false;
+-    if (inverseDepth) {
++    if (inverseDepth || forceInverse) {
+         okInv = fitLinear(true, &aInv, &bInv);
+     }
+ 
+@@ -264,7 +266,8 @@ void DepthCalibrator::reset() {
+ }
+ 
+ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<float>& z) {
+-    if (d.size() < static_cast<size_t>(cfg_.minSamples)) {
++    if (std::min(d.size(), z.size()) < static_cast<size_t>(std::max(6, cfg_.minSamples)) ||
++        cfg_.maxSamples < 6) {
+         lastReject_ = "too few paired samples";
+         ++rejectedFrames_;
+         return false;
+@@ -285,8 +288,8 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
+     }
+ 
+     const DepthCalibration fresh =
+-        fitDepthRobust(dd, zz, cfg_.allowInverseDepth);
+-    if (!fresh.valid) {
++        fitDepthRobust(dd, zz, cfg_.allowInverseDepth, 10, cfg_.forceInverseDepth);
++    if (!fresh.valid || fresh.samples < std::max(6, cfg_.minSamples)) {
+         lastReject_ = "fit degenerate";
+         ++rejectedFrames_;
+         return false;
+@@ -316,7 +319,8 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
+             const float ratio = (std::fabs(calib_.scale) > 1e-9f)
+                                     ? std::fabs(fresh.scale / calib_.scale)
+                                     : 1.f;
+-            if (ratio > cfg_.maxJumpRatio || ratio < 1.f / cfg_.maxJumpRatio) {
++            if (fresh.scale * calib_.scale <= 0.f ||
++                ratio > cfg_.maxJumpRatio || ratio < 1.f / cfg_.maxJumpRatio) {
+                 lastReject_ = "scale jump rejected";
+                 ++rejectedFrames_;
+                 return false;
+diff --git a/app/src/main/cpp/depth_calib.h b/app/src/main/cpp/depth_calib.h
+index 191b48a..001170e 100644
+--- a/app/src/main/cpp/depth_calib.h
++++ b/app/src/main/cpp/depth_calib.h
+@@ -128,7 +128,8 @@ struct DepthCalibration {
+ DepthCalibration fitDepthRobust(const std::vector<float>& d,
+                                 const std::vector<float>& z,
+                                 bool inverseDepth = true,
+-                                int maxIterations = 10);
++                                int maxIterations = 10,
++                                bool forceInverse = false);
+ 
+ /** 中位数（会复制输入排序）。空输入返回 0。 */
+ float medianOf(std::vector<float> v);
+@@ -149,6 +150,7 @@ public:
+         float minConfidence = 0.25f;         // 低于此置信度视为无效
+         float maxJumpRatio = 3.0f;           // 新旧 scale 比超过此值视为野值
+         bool allowInverseDepth = true;
++        bool forceInverseDepth = false;
+     };
+ 
+     void reset();
+diff --git a/app/src/main/cpp/depth_geometry.h b/app/src/main/cpp/depth_geometry.h
+new file mode 100644
+index 0000000..7228f17
+--- /dev/null
++++ b/app/src/main/cpp/depth_geometry.h
+@@ -0,0 +1,11 @@
++#pragma once
++struct DepthIntrinsics {
++    float fx, fy, cx, cy;
++};
++// Matches DepthPreprocessor's full-frame resize (no crop or rotation).
++inline DepthIntrinsics depthIntrinsics(float fx, float fy, float cx, float cy,
++                                      int cameraW, int cameraH, int depthW, int depthH) {
++    const float sx = static_cast<float>(depthW) / cameraW;
++    const float sy = static_cast<float>(depthH) / cameraH;
++    return {fx * sx, fy * sy, cx * sx, cy * sy};
++}
+diff --git a/app/src/main/cpp/mesh/mesh_engine.cpp b/app/src/main/cpp/mesh/mesh_engine.cpp
+index 1e53726..9ff0848 100644
+--- a/app/src/main/cpp/mesh/mesh_engine.cpp
++++ b/app/src/main/cpp/mesh/mesh_engine.cpp
+@@ -47,9 +47,9 @@ const int kTetEdge[6][2] = {
+ };
+ 
+ struct EdgeKey {
+-    int32_t x, y, z, axis;
++    int32_t x, y, z, direction; // Bit mask: X=1, Y=2, Z=4, including diagonals.
+     bool operator==(const EdgeKey& o) const {
+-        return x == o.x && y == o.y && z == o.z && axis == o.axis;
++        return x == o.x && y == o.y && z == o.z && direction == o.direction;
+     }
+ };
+ 
+@@ -58,7 +58,7 @@ struct EdgeKeyHash {
+         uint64_t a = (uint64_t)(uint32_t)k.x * 73856093ull;
+         uint64_t b = (uint64_t)(uint32_t)k.y * 19349663ull;
+         uint64_t c = (uint64_t)(uint32_t)k.z * 83492791ull;
+-        uint64_t d = (uint64_t)(uint32_t)k.axis * 2654435761ull;
++        uint64_t d = (uint64_t)(uint32_t)k.direction * 2654435761ull;
+         return (size_t)(a ^ b ^ c ^ d);
+     }
+ };
+@@ -176,19 +176,18 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
+                              float fa, float fb) -> uint32_t {
+         // 棱键：取字典序较小的端点 + 轴向
+         int lo[3];
+-        int axis = -1;
++        int direction = 0;
+         const int a3[3] = {ax, ay, az};
+         const int b3[3] = {bx, by, bz};
+         for (int i = 0; i < 3; ++i) {
+             lo[i] = std::min(a3[i], b3[i]);
+             if (a3[i] != b3[i]) {
+-                axis = i;
++                direction |= (1 << i);
+             }
+         }
+-        if (axis < 0) {
+-            axis = 0;
+-        }
+-        const EdgeKey key{lo[0], lo[1], lo[2], axis};
++        // The six tetrahedra use monotone cube diagonals. Encode ALL changed
++        // axes so body/face diagonals never collide with an axis-aligned edge.
++        const EdgeKey key{lo[0], lo[1], lo[2], direction};
+         auto it = vertOfEdge.find(key);
+         if (it != vertOfEdge.end()) {
+             return it->second;
+@@ -234,6 +233,7 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
+             for (int ly = 0; ly < kTsdfBlockSize; ++ly) {
+                 for (int lx = 0; lx < kTsdfBlockSize; ++lx) {
+                     float f[8];
++                    bool observed[8] = {};
+                     int validCount = 0;
+                     float fmin = 1e9f;
+ 
+@@ -258,6 +258,7 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
+                             f[c] = 1.f;
+                         } else {
+                             f[c] = vv.tsdf / kTsdfValueScale;
++                            observed[c] = true;
+                             ++validCount;
+                         }
+                         if (f[c] < fmin) {
+@@ -282,6 +283,10 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
+ 
+                     for (int ti = 0; ti < 6; ++ti) {
+                         const int* tet = kTets[ti];
++                        // Unknown voxels are not measured free space. Crossing from
++                        // a negative sample into unknown space fabricates a back shell.
++                        if (!observed[tet[0]] || !observed[tet[1]] ||
++                            !observed[tet[2]] || !observed[tet[3]]) continue;
+                         float tf[4];
+                         int insideMask = 0;
+                         int inIdx[4];
+@@ -425,13 +430,9 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
+     for (size_t i = 0; i < vertEdge.size(); ++i) {
+         const EdgeKey& e = vertEdge[i];
+         int vx = e.x, vy = e.y, vz = e.z;
+-        if (e.axis == 0) {
+-            vx += 1;
+-        } else if (e.axis == 1) {
+-            vy += 1;
+-        } else {
+-            vz += 1;
+-        }
++        vx += (e.direction & 1) ? 1 : 0;
++        vy += (e.direction & 2) ? 1 : 0;
++        vz += (e.direction & 4) ? 1 : 0;
+         const float gx = tsdf.valueAt(vx + 1, vy, vz) - tsdf.valueAt(vx - 1, vy, vz);
+         const float gy = tsdf.valueAt(vx, vy + 1, vz) - tsdf.valueAt(vx, vy - 1, vz);
+         const float gz = tsdf.valueAt(vx, vy, vz + 1) - tsdf.valueAt(vx, vy, vz - 1);
+@@ -453,13 +454,9 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
+         const EdgeKey& e = vertEdge[i];
+         int ax = e.x, ay = e.y, az = e.z;
+         int bx = ax, by = ay, bz = az;
+-        if (e.axis == 0) {
+-            bx += 1;
+-        } else if (e.axis == 1) {
+-            by += 1;
+-        } else {
+-            bz += 1;
+-        }
++        bx += (e.direction & 1) ? 1 : 0;
++        by += (e.direction & 2) ? 1 : 0;
++        bz += (e.direction & 4) ? 1 : 0;
+ 
+         const uint16_t c0 = tsdf.color565At(ax, ay, az);
+         const uint16_t c1 = tsdf.color565At(bx, by, bz);
+diff --git a/app/src/main/cpp/native_engine.cpp b/app/src/main/cpp/native_engine.cpp
+index 51b3c38..28fe037 100644
+--- a/app/src/main/cpp/native_engine.cpp
++++ b/app/src/main/cpp/native_engine.cpp
+@@ -26,6 +26,7 @@
+ #include "object_tracker.h"
+ #include "target_mask_engine.h"
+ #include "depth_calib.h"
++#include "depth_geometry.h"
+ #include "stereo_anchor_bridge.h"
+ #include "mesh/mesh_engine.h"
+ #include "export/gltf_exporter.h"
+@@ -125,7 +126,6 @@ static float lastFusionDepthMean = 0.f;
+ static uint64_t lastFusionDepthValid = 0;
+ static uint64_t lastFusionDepthConversionFallback = 0;
+ static constexpr int kMaxCalibSamples = 256;
+-static float gCalibSampleBuf[kMaxCalibSamples * 3];
+ 
+ // ------------------------------------------- V0.12 Fusion Calibration Epoch
+ // V0.11 的实测结论：标定器本身没问题，问题是它**每帧都在动**（EMA）。
+@@ -593,19 +593,15 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
+     }
+     // 评审 P0-2：深度现在以 256² 到达（不再上采样到相机分辨率），内参必须按
+     // 深度/相机分辨率比降采样，否则几何会被拉伸到相机分辨率量级。
+-    const float rx = (float)w / (float)s.w;
+-    const float ry = (float)h / (float)s.h;
+-    const float dFx = gFx * rx;
+-    const float dFy = gFy * ry;
+-    const float dCx = gCx * rx;
+-    const float dCy = gCy * ry;
++    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
++    const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
+     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
+                         dFx, dFy, dCx, dCy, s.R, s.t, confidence);
+ 
+-    for (int yy = 0; yy < s.h; yy++) {
+-        int y = std::min(h - 1, yy * h / s.h);
+-        for (int xx = 0; xx < s.w; xx++) {
+-            int x = std::min(w - 1, xx * w / s.w);
++    for (int y = 0; y < h; ++y) {
++        const int yy = std::min(s.h - 1, y * s.h / h);
++        for (int x = 0; x < w; ++x) {
++            const int xx = std::min(s.w - 1, x * s.w / w);
+             float z = depth[(size_t)y * w + x];
+             if (!(z > 0.08f && z < 8.f)) {
+                 continue;
+@@ -977,20 +973,16 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
+     }
+ 
+     // 评审 P0-2：深度以 256² 到达，内参按深度/相机比降采样。
+-    const float rtx = (float)w / (float)s.w;
+-    const float rty = (float)h / (float)s.h;
+-    const float dFx = gFx * rtx;
+-    const float dFy = gFy * rty;
+-    const float dCx = gCx * rtx;
+-    const float dCy = gCy * rty;
++    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
++    const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
+     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
+                               dFx, dFy, dCx, dCy, s.R, s.t, confidence);
+ 
+-    for (int yy = 0; yy < s.h; yy++) {
+-        const int y = std::min(h - 1, yy * h / s.h);
++    for (int y = 0; y < h; ++y) {
++        const int yy = std::min(s.h - 1, y * s.h / h);
+         const uint8_t* mRow = mask.ptr<uint8_t>(y);
+-        for (int xx = 0; xx < s.w; xx++) {
+-            const int x = std::min(w - 1, xx * w / s.w);
++        for (int x = 0; x < w; ++x) {
++            const int xx = std::min(s.w - 1, x * s.w / w);
+             if (!mRow[x]) {
+                 continue;
+             }
+@@ -1054,7 +1046,7 @@ static PresenceDecision evaluatePresence(const TargetTrackInfo& ti,
+         : (ti.confidence >= kPresenceConfidenceFallback);
+     d.motionOk = (ti.inlierRatio >= kPresenceMinInlierRatio) ||
+                  (ti.trackedPoints >= kPresenceMinPoints);
+-    d.maskOk = ms.valid && ms.area >= kPresenceMinMaskArea;
++    d.maskOk = ms.valid && !ms.overExpanded && ms.area >= kPresenceMinMaskArea;
+     if (d.maskOk) {
+         const float bw = (ti.x1 - ti.x0) * static_cast<float>(depthW);
+         const float bh = (ti.y1 - ti.y0) * static_cast<float>(depthH);
+@@ -1733,6 +1725,7 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
+     const bool useMask = !mask.empty() && mask.cols == w && mask.rows == h &&
+                          mask.type() == CV_8U;
+ 
++    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+     int step = 1;
+     while ((roiW / step) * (roiH / step) > kTargetDebugMaxPoints) {
+         step++;
+@@ -1751,8 +1744,8 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
+             if (targetDebugPointCount >= kTargetDebugMaxPoints) {
+                 continue;
+             }
+-            const float Xc = (x - gCx) * z / gFx;
+-            const float Yc = (y - gCy) * z / gFy;
++            const float Xc = (x - dk.cx) * z / dk.fx;
++            const float Yc = (y - dk.cy) * z / dk.fy;
+             float* p = targetDebugPoints.data() +
+                        static_cast<size_t>(targetDebugPointCount) * 6;
+             // **相机坐标**：Renderer 侧用 uPointSpace=0 时 pc = aPosition。
+@@ -1773,8 +1766,9 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
+ /** nativeOnDepthMap 的实现体；JNI 包装负责兜住所有 C++ 异常。 */
+ static void nativeOnDepthMapImpl(
+         JNIEnv* e, jfloatArray depth, jint w, jint h,
+-        jfloat confidence, jlong t) {
+-    if (!depth || w <= 0 || h <= 0) {
++        jfloat confidence, jlong t, jint representation) {
++    if (!depth || w <= 0 || h <= 0 || w > 4096 || h > 4096 ||
++        !std::isfinite(confidence) || confidence <= 0.f || representation < 0 || representation > 1) {
+         return;
+     }
+     jsize n = e->GetArrayLength(depth);
+@@ -1784,6 +1778,11 @@ static void nativeOnDepthMapImpl(
+     std::vector<float> d((size_t)w * h);
+     e->GetFloatArrayRegion(depth, 0, w * h, d.data());
+ 
++    // Fetch timestamp-aligned sparse observations before taking gStateMutex.
++    // Every calibrator read/write below is protected against reset/UI diagnostics.
++    float frameSamples[kMaxCalibSamples * 3];
++    const int ns = vinsFeatureSamples(frameSamples, kMaxCalibSamples, static_cast<uint64_t>(t));
++    std::lock_guard<std::mutex> lk(gStateMutex);
+     // V0.9: raw model depth retained briefly for exact-timestamp stereo pairing.
+     mobilescan3d::stereo_anchor::onDepthFrame(
+         static_cast<uint64_t>(t),
+@@ -1791,52 +1790,12 @@ static void nativeOnDepthMapImpl(
+         w,
+         h);
+ 
+-    {
+-        std::shared_ptr<ObjectTracker> tracker;
+-        {
+-            std::lock_guard<std::mutex> lk(gStateMutex);
+-            tracker = objectTracker;
+-        }
+-        if (tracker && tracker->isTracking()) {
+-            tracker->updateFromDepth(d.data(), w, h, (uint64_t)t);
+-        }
+-    }
+-
+-    // ---- 目标专属深度尺度：目标 ROI 内的 VINS 三角化特征中位数 ----
+-    //
+-    // 为什么放在**进入 gStateMutex 之前**：vinsFeatureDepthMedianInRoi() 内部持
+-    // g_vinsMutex。若把它嵌进本函数主段的临界区，就会形成
+-    // gStateMutex -> g_vinsMutex 的嵌套锁序，而 nativeOnCameraFrame 是
+-    // 「先拿 gStateMutex 做统计、VINS 计算放到锁外」——两者锁序不一致，
+-    // 迟早会互相等。这里刻意让它独立成段。
+-    {
+-        std::shared_ptr<ObjectTracker> probe;
+-        {
+-            std::lock_guard<std::mutex> lk(gStateMutex);
+-            probe = objectTracker;
+-        }
+-        if (probe && probe->isTracking()) {
+-            const TargetTrackInfo t0 = probe->info();
+-            if (t0.depthRoiArea >= kPresenceMinMaskArea) {
+-                int vinsSamples = 0;
+-                const float vinsRoiMedian =
+-                    vinsFeatureDepthMedianInRoi(t0.x0, t0.y0, t0.x1, t0.y1, &vinsSamples);
+-                const float rawMedian = t0.medianDepth;
+-                if (vinsSamples >= 8 && rawMedian > 0.05f && vinsRoiMedian > 0.05f) {
+-                    const float s = vinsRoiMedian / rawMedian;
+-                    if (std::isfinite(s) && s > kTargetScaleMin && s < kTargetScaleMax) {
+-                        std::lock_guard<std::mutex> lk(gStateMutex);
+-                        targetDepthScaleEma = (targetDepthScaleSamples == 0)
+-                            ? s
+-                            : (0.9f * targetDepthScaleEma + 0.1f * s);
+-                        targetDepthScaleSamples++;
+-                        lastTargetVinsMedian = vinsRoiMedian;
+-                        lastTargetRawMedian = rawMedian;
+-                        lastTargetVinsFeatureCount = vinsSamples;
+-                    }
+-                }
+-            }
+-        }
++    auto config = depthCalibrator.config();
++    config.allowInverseDepth = representation == 1;
++    config.forceInverseDepth = representation == 1;
++    depthCalibrator.setConfig(config);
++    if (objectTracker && objectTracker->isTracking()) {
++        objectTracker->updateFromDepth(d.data(), w, h, static_cast<uint64_t>(t));
+     }
+ 
+     // ---- V0.9 深度标定：VINS 稀疏深度 + stereo metric anchors ----
+@@ -1846,11 +1805,6 @@ static void nativeOnDepthMapImpl(
+     // diagnostics-only. Once stable, clean stereo samples enter the existing
+     // MAD + Huber IRLS + EMA calibrator at 2-3x sample weight.
+     if (depthCalibrationEnabled) {
+-        const int ns =
+-            vinsFeatureSamples(
+-                gCalibSampleBuf,
+-                kMaxCalibSamples);
+-
+         std::vector<float> dPairs;
+         std::vector<float> zPairs;
+         dPairs.reserve(
+@@ -1860,11 +1814,11 @@ static void nativeOnDepthMapImpl(
+ 
+         for (int i = 0; i < ns; ++i) {
+             const float nu =
+-                gCalibSampleBuf[i * 3 + 0];
++                frameSamples[i * 3 + 0];
+             const float nv =
+-                gCalibSampleBuf[i * 3 + 1];
++                frameSamples[i * 3 + 1];
+             const float vz =
+-                gCalibSampleBuf[i * 3 + 2];
++                frameSamples[i * 3 + 2];
+ 
+             if (!(nu >= 0.f && nu <= 1.f &&
+                   nv >= 0.f && nv <= 1.f)) {
+@@ -2001,8 +1955,9 @@ static void nativeOnDepthMapImpl(
+         lastCalibInverse =
+             c.inverseDepthModel;
+     }
+-    // 融合用的深度图：标定可用时逐像素映射到 VINS 尺度，否则原样透传
+-    // （tracker / mask 仍看未标定的 d，保持第八轮已验收的行为不变）。
++    // Calibrated depth is also the input to the metric-threshold target mask.
++    // Before calibration, retain appearance tracking but do not classify presence
++    // from uncalibrated model values.
+     const bool calibratedNow = depthCalibrationEnabled && depthCalibrator.usable();
+     std::vector<float> zCal;
+     const float* depthForFusion = d.data();
+@@ -2044,7 +1999,6 @@ static void nativeOnDepthMapImpl(
+         fusionDepthMinFrame = 0.f;
+     }
+ 
+-    std::lock_guard<std::mutex> lk(gStateMutex);
+     lastFusionDepthCalibrated = calibratedNow && fusionDepthValidFrame > 0;
+     lastFusionDepthMin = fusionDepthMinFrame;
+     lastFusionDepthMax = fusionDepthMaxFrame;
+@@ -2062,8 +2016,8 @@ static void nativeOnDepthMapImpl(
+     {
+         const float rawNow = rawDepthSampleMedian(d.data(), w, h);
+         const DepthCalibration liveCal = depthCalibrator.calibration();
+-        const float zLiveNow =
+-            (calibratedNow && rawNow > 0.f) ? liveCal.toMetric(rawNow, 0.f) : 0.f;
++        if (!epochActive && !haveEpochPrevZ && std::isfinite(rawNow)) epochRefRaw = rawNow;
++        const float zLiveNow = calibratedNow ? liveCal.toMetric(epochRefRaw, 0.f) : 0.f;
+         const bool liveOk = std::isfinite(zLiveNow) && zLiveNow > 0.f;
+ 
+         if (!depthCalibrationEnabled) {
+@@ -2113,7 +2067,6 @@ static void nativeOnDepthMapImpl(
+             if (epochStableStreak >= kEpochStableFrames) {
+                 epochCalib = liveCal;
+                 epochCalib.valid = true;
+-                epochRefRaw = rawNow;
+                 epochRefZ = zLiveNow;
+                 epochActive = true;
+                 epochStableStreak = 0;
+@@ -2227,7 +2180,7 @@ static void nativeOnDepthMapImpl(
+     // ---- 目标分割 Mask + PresenceGate ----
+     bool presenceOk = false;
+     bool maskOk = false;
+-    if (haveTi) {
++    if (haveTi && calibratedNow) {
+         const int bx0 = std::max(0, static_cast<int>(ti.x0 * w));
+         const int by0 = std::max(0, static_cast<int>(ti.y0 * h));
+         const int bx1 = std::min(w - 1, static_cast<int>(ti.x1 * w));
+@@ -2235,10 +2188,10 @@ static void nativeOnDepthMapImpl(
+         if (bx1 > bx0 && by1 > by0) {
+             const cv::Rect searchBox(bx0, by0, bx1 - bx0 + 1, by1 - by0 + 1);
+             const cv::Point seed((bx0 + bx1) / 2, (by0 + by1) / 2);
+-            targetMaskEngine.build(d.data(), w, h, searchBox, seed,
++            targetMaskEngine.build(depthForFusion, w, h, searchBox, seed,
+                                    targetMaskMat, targetMaskStats);
+             targetMaskFrames++;
+-            maskOk = targetMaskStats.valid &&
++            maskOk = targetMaskStats.valid && !targetMaskStats.overExpanded &&
+                      targetMaskStats.area >= kPresenceMinMaskArea;
+             // V0.13 Mask temporal gate：Adaptive Mask 管住了「一帧之内的
+             // 面积/边界」，这里再管住「两帧之间的跳变」。
+@@ -2285,7 +2238,7 @@ static void nativeOnDepthMapImpl(
+         buildTargetDebugLayer(
+             depthForFusion, w, h, ti, targetMaskMat);
+         targetDebugTs = static_cast<uint64_t>(t);
+-    } else if (depthCalibrationEnabled && !calibratedNow) {
++    } else {
+         targetDebugPointCount = 0;
+         targetDebugValidPixels = 0;
+     }
+@@ -2337,9 +2290,10 @@ static void nativeOnDepthMapImpl(
+                 }
+                 trel[i] = acc;
+             }
++            const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+             lastTemporalRatio = temporalConsistencyRatio(
+                 lastFusedDepth.data(), depthForFusion, w, h,
+-                gFx, gFy, gCx, gCy, Rrel, trel);
++                dk.fx, dk.fy, dk.cx, dk.cy, Rrel, trel);
+             temporalChecks++;
+             if (lastTemporalRatio < 0.35f) {
+                 temporalRejects++;
+@@ -2477,7 +2431,7 @@ static void nativeOnDepthMapImpl(
+ extern "C" JNIEXPORT void JNICALL
+ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
+         JNIEnv* e, jobject, jfloatArray depth, jint w, jint h,
+-        jfloat confidence, jlong t) {
++        jfloat confidence, jlong t, jint representation) {
+     // JNI 边界是所有 native 异常的最后一道防线。
+     //
+     // C++ 异常一旦越过 JNI 回到 ART，Kotlin 侧任何 try/catch 都抓不到
+@@ -2490,7 +2444,7 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
+     // 就是从这条深度线程路径逃出去的。修复了根因之后，这里仍然保留兜底：
+     // 30Hz 的深度回调里任何一个 OpenCV/STL 异常都不该带走整个 APP。
+     try {
+-        nativeOnDepthMapImpl(e, depth, w, h, confidence, t);
++        nativeOnDepthMapImpl(e, depth, w, h, confidence, t, representation);
+     } catch (const cv::Exception& ex) {
+         __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Depth",
+                             "nativeOnDepthMap OpenCV exception: %s", ex.what());
+diff --git a/app/src/main/cpp/surfel_engine.cpp b/app/src/main/cpp/surfel_engine.cpp
+index d9f6aea..5b4c85e 100644
+--- a/app/src/main/cpp/surfel_engine.cpp
++++ b/app/src/main/cpp/surfel_engine.cpp
+@@ -19,10 +19,14 @@ void SurfelEngine::ingestPoint(
+         uint8_t g,
+         uint8_t b,
+         float confidence) {
+-    if (!std::isfinite(z) || z < 0.05f || z > 8.f || confidence < 0.05f) {
++    // These are WORLD coordinates. Camera depth has already been gated by callers.
++    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
++        std::fabs(x) > 100000.f || std::fabs(y) > 100000.f || std::fabs(z) > 100000.f ||
++        !std::isfinite(confidence) || confidence < 0.05f) {
+         return;
+     }
+ 
++    confidence = std::min(confidence, 1.f);
+     const float cell = 0.01f;
+     Key k{
+         (int)std::floor(x / cell),
+diff --git a/app/src/main/cpp/target_mask_engine.cpp b/app/src/main/cpp/target_mask_engine.cpp
+index 7befcd8..ac6c052 100644
+--- a/app/src/main/cpp/target_mask_engine.cpp
++++ b/app/src/main/cpp/target_mask_engine.cpp
+@@ -157,7 +157,8 @@ bool TargetMaskEngine::build(const float* depth, int width, int height,
+ 
+     for (int step = 0; step < kToleranceSteps; ++step) {
+         const float tolerance = std::clamp(seedDepth * kToleranceRatios[step],
+-                                           kToleranceMin, kToleranceMax);
++                                           kToleranceMin * kToleranceRatios[step] / kToleranceRatios[0],
++                                           kToleranceMax);
+ 
+         // ---- 深度带通得到 candidate（只在 searchBox 内） ----
+         if (candidate_.rows != height || candidate_.cols != width ||
+@@ -259,6 +260,7 @@ bool TargetMaskEngine::build(const float* depth, int width, int height,
+         maskRoi.setTo(0);
+         maskRoi.setTo(255, labels_ == chosen);
+         cv::morphologyEx(maskRoi, maskRoi, cv::MORPH_CLOSE, kernel_);
++        cv::bitwise_and(maskRoi, candRoi, maskRoi); // Do not refill invalid depth/background.
+         area = cv::countNonZero(maskRoi);
+         if (area < kMinMaskArea) {
+             if (step == 0) {
+diff --git a/app/src/main/cpp/target_mask_engine.h b/app/src/main/cpp/target_mask_engine.h
+index ba4278f..75b7802 100644
+--- a/app/src/main/cpp/target_mask_engine.h
++++ b/app/src/main/cpp/target_mask_engine.h
+@@ -24,10 +24,8 @@
+  * 一次深度带通得到 candidate，然后只保留 **seed 所在的那个连通域**，最后做一次
+  * 小 close 把细缝补上。
+  *
+- * 关键性质：**它只利用同一帧内部的相对深度连续性，不依赖 Depth 的绝对米制准确度。**
+- * 这一点非常重要 —— 实机上目标 raw depth 中位数约 5.56m，而 VINS 三角化只有
+- * 约 0.54m，两者差了十几倍（全局尺度问题至今没有解决）。任何「按绝对深度门限
+- * 切目标」的方案都会被这个尺度差直接打死；而「跟 seed 深度差不多的像素」不受影响。
++ * 输入必须为标定后的深度，与容差下限/上限使用同一单位。
++ * 未标定的模型输出不得进入此接口；native 调用方在标定完成前仅保留外观跟踪。
+  */
+ struct TargetMaskStats {
+     /** mask 是否可用（连通域面积达到下限） */
+diff --git a/app/src/main/cpp/tsdf_engine.cpp b/app/src/main/cpp/tsdf_engine.cpp
+index 29c75ec..ca77d79 100644
+--- a/app/src/main/cpp/tsdf_engine.cpp
++++ b/app/src/main/cpp/tsdf_engine.cpp
+@@ -166,9 +166,9 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
+     if (!depth || w < 4 || h < 4 || !R || !t) {
+         return;
+     }
+-    if (atCapacity()) {
+-        return;
+-    }
++    if (!std::isfinite(confidence) || confidence <= 0.f ||
++        !std::isfinite(fx) || !std::isfinite(fy) || fx <= 0.f || fy <= 0.f ||
++        !std::isfinite(cx) || !std::isfinite(cy)) return;
+ 
+     const int step = pixelStep_ < 1 ? 1 : pixelStep_;
+     const float mu = (trunc_ > 1e-4f) ? trunc_ : (voxel_ * kTsdfTruncVoxels);
+@@ -237,12 +237,17 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
+ 
+                 TsdfVoxel* v = voxelFor(vx, vy, vz, true);
+                 if (!v) {
+-                    // 块配额用尽：整帧停止融合，避免一边分配失败一边空转。
+-                    return;
++                    // A full budget only prevents new blocks; existing surfaces keep refining.
++                    continue;
+                 }
+ 
+-                // 带符号：zi < z -> 正（外侧）; zi > z -> 负（内侧）。
+-                float sdf = (z - zi) * invMu;
++                // Evaluate at the voxel's stored lattice position, not at an arbitrary
++                // ray sample inside it. Mesh extraction uses this same lattice.
++                const float wx = vx * voxel_ - t[0];
++                const float wy = vy * voxel_ - t[1];
++                const float wz = vz * voxel_ - t[2];
++                const float voxelZ = R[2] * wx + R[5] * wy + R[8] * wz;
++                float sdf = (z - voxelZ) * invMu;
+                 sdf = sdf < -1.f ? -1.f : (sdf > 1.f ? 1.f : sdf);
+ 
+                 const float wOld = dequantWeight(v->weight);
+diff --git a/app/src/main/cpp/tsdf_engine.h b/app/src/main/cpp/tsdf_engine.h
+index 72248ba..320dcc4 100644
+--- a/app/src/main/cpp/tsdf_engine.h
++++ b/app/src/main/cpp/tsdf_engine.h
+@@ -168,7 +168,7 @@ private:
+     float trunc_ = 0.080f;     // 4 * voxel_
+     float minDepth_ = 0.08f;
+     float maxDepth_ = 8.0f;
+-    int pixelStep_ = 4;        // 与旧实现一致：depth 本身就是 256x256 上采样的，密集采样无收益
++    int pixelStep_ = 1;        // Native 256x256 depth: preserve every measured pixel.
+     size_t maxBlocks_ = 8192;  // V0.11: 8-byte voxel -> ~32MB 上限
+     uint64_t liveVoxels_ = 0;
+     uint64_t liveColoredVoxels_ = 0;
+diff --git a/app/src/main/cpp/v06/texture_baker.cpp b/app/src/main/cpp/v06/texture_baker.cpp
+index 782f4f8..04e3cb2 100644
+--- a/app/src/main/cpp/v06/texture_baker.cpp
++++ b/app/src/main/cpp/v06/texture_baker.cpp
+@@ -290,9 +290,10 @@ void rasterizeDepth(
+                     continue;
+                 }
+ 
+-                // Coarse visibility only; linear camera-Z interpolation is
+-                // sufficient at this resolution.
+-                const float z = w0*z0 + w1*z1 + w2*z2;
++                // Screen barycentrics interpolate reciprocal camera depth.
++                const float invZ = w0 / z0 + w1 / z1 + w2 / z2;
++                if (!(invZ > 0.f) || !std::isfinite(invZ)) continue;
++                const float z = 1.f / invZ;
+                 if (z < row[x]) row[x] = z;
+             }
+         }
+diff --git a/app/src/main/cpp/vins/vins_bridge.cpp b/app/src/main/cpp/vins/vins_bridge.cpp
+index 4e25510..8f2495f 100644
+--- a/app/src/main/cpp/vins/vins_bridge.cpp
++++ b/app/src/main/cpp/vins/vins_bridge.cpp
+@@ -570,7 +570,7 @@ float vinsFeatureDepthMedian() {
+ //
+ // 调用方必须已持有 g_vinsMutex。
+ static bool vinsAnchorDepthPair(const FeaturePerId& f, Eigen::Vector2d* outUv,
+-                                double* outDepth) {
++                                double* outDepth, int requestedFrame = -1) {
+     if (f.solve_flag != 1 || f.feature_per_frame.empty()) {
+         return false;
+     }
+@@ -580,13 +580,15 @@ static bool vinsAnchorDepthPair(const FeaturePerId& f, Eigen::Vector2d* outUv,
+     }
+ 
+     const int anchorFrame = f.start_frame;
+-    const int obsFrame = anchorFrame + (int)f.feature_per_frame.size() - 1;
++    const int lastFrame = anchorFrame + (int)f.feature_per_frame.size() - 1;
++    const int obsFrame = requestedFrame >= 0 ? requestedFrame : lastFrame;
++    if (obsFrame < anchorFrame || obsFrame > lastFrame) return false;
+     if (anchorFrame < 0 || anchorFrame > WINDOW_SIZE ||
+         obsFrame < 0 || obsFrame > WINDOW_SIZE) {
+         return false;
+     }
+ 
+-    const Eigen::Vector2d& uv = f.feature_per_frame.back().uv;
++    const Eigen::Vector2d& uv = f.feature_per_frame[obsFrame - anchorFrame].uv;
+     if (!std::isfinite(uv.x()) || !std::isfinite(uv.y())) {
+         return false;
+     }
+@@ -680,7 +682,7 @@ float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
+     return static_cast<float>(depths[n / 2]);
+ }
+ 
+-int vinsFeatureSamples(float* out, int maxSamples) {
++int vinsFeatureSamples(float* out, int maxSamples, uint64_t timestampNs) {
+     if (out == nullptr || maxSamples <= 0) {
+         return 0;
+     }
+@@ -694,6 +696,16 @@ int vinsFeatureSamples(float* out, int maxSamples) {
+         return 0;
+     }
+ 
++    int observationFrame = -1;
++    if (timestampNs != 0) {
++        const double requested = static_cast<double>(timestampNs) * 1e-9;
++        double best = 0.035;
++        for (int i = 0; i <= WINDOW_SIZE; ++i) {
++            const double dt = std::fabs(g_estimator.Headers[i].stamp.toSec() - requested);
++            if (dt < best) { best = dt; observationFrame = i; }
++        }
++        if (observationFrame < 0) return 0;
++    }
+     const float invW = 1.0f / static_cast<float>(g_vinsImageW);
+     const float invH = 1.0f / static_cast<float>(g_vinsImageH);
+ 
+@@ -709,7 +721,7 @@ int vinsFeatureSamples(float* out, int maxSamples) {
+         // 否则 vinsFeatureSamples() 交给深度标定器的 (uv, z) 对是错配的。
+         Eigen::Vector2d uv;
+         double d = 0.0;
+-        if (!vinsAnchorDepthPair(it_per_id, &uv, &d)) {
++        if (!vinsAnchorDepthPair(it_per_id, &uv, &d, observationFrame)) {
+             continue;
+         }
+         const float nu = static_cast<float>(uv.x()) * invW;
+diff --git a/app/src/main/cpp/vins/vins_bridge.h b/app/src/main/cpp/vins/vins_bridge.h
+index a5c7658..b9c9793 100644
+--- a/app/src/main/cpp/vins/vins_bridge.h
++++ b/app/src/main/cpp/vins/vins_bridge.h
+@@ -92,7 +92,7 @@ float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
+ // @param out         至少 maxSamples*3 个 float
+ // @param maxSamples  最多取多少样本
+ // @return 实际写入的样本数
+-int vinsFeatureSamples(float* out, int maxSamples);
++int vinsFeatureSamples(float* out, int maxSamples, uint64_t timestampNs = 0);
+ 
+ struct VinsWorldFeature {
+     float u = 0.0f;
+diff --git a/app/src/main/java/com/mobilescan3d/MainActivity.kt b/app/src/main/java/com/mobilescan3d/MainActivity.kt
+index 1ba7876..5fdd546 100644
+--- a/app/src/main/java/com/mobilescan3d/MainActivity.kt
++++ b/app/src/main/java/com/mobilescan3d/MainActivity.kt
+@@ -292,6 +292,7 @@ private var lastRelocPollMs = 0L
+      * 叠在这一轮的空场景上」，比什么都不显示更难排查。
+      */
+     @Volatile private var scanSessionToken = 0L
++    private val depthSessionLock = Any()
+     /**
+      * V0.12: 扫描期网格快照周期。
+      *
+@@ -2430,9 +2431,14 @@ private var lastRelocPollMs = 0L
+                     val res = if (produced) provider.latest() else null
+                     if (res != null && res.depth.isNotEmpty()) {
+                         // 世代不一致说明这帧属于上一轮会话，必须丢弃。
+-                        if (generation == depthGeneration) {
+-                            NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height, 0.5f, t)
+-                            glView.requestRender()
++                        synchronized(depthSessionLock) {
++                            if (generation == depthGeneration && scanning && scanNativeReady && !isDestroyed) {
++                                NativeBridge.nativeOnDepthMap(
++                                    res.depth, res.width, res.height, 0.5f,
++                                    res.timestampNs, res.representation.nativeCode
++                                )
++                                glView.requestRender()
++                            }
+                         }
+                     }
+                 }
+@@ -2509,7 +2515,10 @@ private var lastRelocPollMs = 0L
+         }
+         applyCaptureSettings()
+         // 与相机帧处理线程串行化，避免 reset 期间相机线程正在遍历这些容器（native 崩溃）
++        val startToken = scanSessionToken
+         cameraHandler?.post {
++            synchronized(depthSessionLock) {
++            if (isDestroyed || !scanning || startToken != scanSessionToken) return@post
+             NativeBridge.nativeDestroy()
+             NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
+             // 体素边长与块预算：评审 P1-2 改为按档位切换。物体扫描默认
+@@ -2536,6 +2545,7 @@ private var lastRelocPollMs = 0L
+             } catch (_: Throwable) {
+             }
+             scanNativeReady = true
++            }
+         }
+         // V0.12: 扫描期默认进 LIVE 图层 —— 半透明网格 + 累计 surfel(hits>=1)
+         // + 当前帧 target depth 点，三者同时显示，用户立刻能看到模型「长出来」。
+@@ -2592,7 +2602,7 @@ private var lastRelocPollMs = 0L
+             NativeBridge.nativeSetPersistentMapCaptureEnabled(false)
+         } catch (_: Throwable) {
+         }
+-        depthGeneration++
++        synchronized(depthSessionLock) { depthGeneration++ }
+         arMeshViewing = true
+         aeLock = false
+         awbLock = false
+@@ -2623,8 +2633,9 @@ private var lastRelocPollMs = 0L
+     private fun exportModel() {
+         if (!::exportManager.isInitialized) return
+         val exportSession = sessionId
++        val token = scanSessionToken
+         exportManager.exportPlyAsync(exportSession) { r ->
+-            if (isDestroyed) return@exportPlyAsync
++            if (isDestroyed || token != scanSessionToken) return@exportPlyAsync
+             if (r.ok) {
+                 lastPlyFilename = r.file.name
+                 lastPlySessionId = exportSession
+@@ -2702,8 +2713,10 @@ private var lastRelocPollMs = 0L
+     private fun buildMeshForPreview() {
+         if (!::exportManager.isInitialized || modelOperationBusy) return
+         toast("正在生成网格（预览质量）…")
++        val token = scanSessionToken
+         try {
+             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
++                if (isDestroyed || token != scanSessionToken) return@buildMeshAsync
+                 if (mesh == null || mesh.triangleCount <= 0) {
+                     renderer.clearMesh()
+                     lastMeshSummary = "失败：体素场不足以提取表面"
+@@ -2752,7 +2765,7 @@ private var lastRelocPollMs = 0L
+             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_NORMAL) { built ->
+                 runOnUiThread {
+                     when {
+-                        token != scanSessionToken -> toast("已开始新的扫描，取消查看")
++                        isDestroyed || token != scanSessionToken -> toast("已开始新的扫描，取消查看")
+                         built != null && built.triangleCount > 0 -> enterModelViewerWith(built)
+                         else -> toast("暂无可查看的模型（体素场不足以提取表面），请先扫描")
+                     }
+@@ -3229,7 +3242,7 @@ private var lastRelocPollMs = 0L
+         val rep = if (::depthProvider.isInitialized &&
+             depthProvider is com.mobilescan3d.depth.MonoDepthProvider
+         ) {
+-            "RELATIVE_DEPTH"
++            "INVERSE_DEPTH"
+         } else {
+             "n/a"
+         }
+@@ -3284,8 +3297,10 @@ private var lastRelocPollMs = 0L
+ 
+         lastLiveMeshRefreshMs = now
+         liveMeshBuildBusy = true
++        val token = scanSessionToken
+         try {
+             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
++                if (isDestroyed || token != scanSessionToken) return@buildMeshAsync
+                 try {
+                     if (scanning && arDrawMode == PointCloudRenderer.DRAW_LIVE) {
+                         if (mesh != null && mesh.triangleCount > 0) {
+@@ -3674,6 +3689,21 @@ private var lastRelocPollMs = 0L
+                 "初始化中：请手持手机缓慢平移，建立定位后开始拼接"
+             }
+         }
++        if (scanning && vinsOk) {
++            val epoch = FloatArray(NativeBridge.FUSION_EPOCH_STATS_SLOTS)
++            val count = runCatching { NativeBridge.nativeGetFusionEpochStats(epoch) }.getOrDefault(0)
++            val notice = when {
++                !::depthProvider.isInitialized || !depthProvider.available ->
++                    "深度模型不可用，请检查模型文件后重新开始"
++                count < epoch.size || epoch[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] < 0.5f ->
++                    "正在标定深度：请缓慢平移，让目标和周围纹理保持清晰"
++                epoch[NativeBridge.FUSION_EPOCH_INDEX_SUSPENDED] > 0.5f ->
++                    "已保留扫描结果；深度暂不稳定，请放慢移动并回到已扫区域"
++                else -> ""
++            }
++            warningBanner.text = notice
++            warningBanner.visibility = if (notice.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
++        }
+         val target = try {
+             NativeBridge.nativeGetPointCount().toFloat()
+         } catch (t: Throwable) {
+@@ -4100,18 +4130,21 @@ private var lastRelocPollMs = 0L
+ 
+     override fun onDestroy() {
+         started.set(false)
++        scanning = false
++        scanNativeReady = false
++        scanSessionToken++
++        synchronized(depthSessionLock) { depthGeneration++ }
++        closeCamera()
+         // 权限被拒路径下 startSystem 未执行，sensorManager 可能未初始化，直接访问会崩溃
+         if (::sensorManager.isInitialized) {
+             sensorManager.unregisterListener(this)
+         }
+-        NativeBridge.nativeDestroy()
++        synchronized(depthSessionLock) { NativeBridge.nativeDestroy() }
+         sessionCreated = false
+         // 权限被拒路径下 startSystem 未执行，lateinit 字段还没初始化。
+         if (::depthProvider.isInitialized) {
+-            try {
+-                depthProvider.close()
+-            } catch (_: Throwable) {
+-            }
++            val provider = depthProvider
++            depthHandler?.post { runCatching { provider.close() } }
+         }
+         if (::exportManager.isInitialized) {
+             exportManager.shutdown()
+diff --git a/app/src/main/java/com/mobilescan3d/NativeBridge.kt b/app/src/main/java/com/mobilescan3d/NativeBridge.kt
+index 4bd04fd..63f6d96 100644
+--- a/app/src/main/java/com/mobilescan3d/NativeBridge.kt
++++ b/app/src/main/java/com/mobilescan3d/NativeBridge.kt
+@@ -268,7 +268,7 @@ object NativeBridge {
+     external fun nativeDestroy()
+     external fun nativeOnImu(t:Long,ax:Float,ay:Float,az:Float,gx:Float,gy:Float,gz:Float)
+     external fun nativeOnCameraFrame(y:ByteArray,u:ByteArray,v:ByteArray,w:Int,h:Int,rowStride:Int,uRowStride:Int,uPixelStride:Int,frameTimestampNs:Long,vinsTimestampNs:Long)
+-    external fun nativeOnDepthMap(depth:FloatArray,w:Int,h:Int,confidence:Float,timestamp:Long)
++    external fun nativeOnDepthMap(depth:FloatArray,w:Int,h:Int,confidence:Float,timestamp:Long,representation:Int)
+     external fun nativeExportPly(path:String):Boolean
+     external fun nativeSetMode(m:Int)
+     external fun nativeGetStats():String
+diff --git a/app/src/main/java/com/mobilescan3d/depth/Depth16Decoder.kt b/app/src/main/java/com/mobilescan3d/depth/Depth16Decoder.kt
+new file mode 100644
+index 0000000..895d109
+--- /dev/null
++++ b/app/src/main/java/com/mobilescan3d/depth/Depth16Decoder.kt
+@@ -0,0 +1,35 @@
++package com.mobilescan3d.depth
++
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++/** Android DEPTH16: low 13 bits are millimetres, high 3 bits encode confidence. */
++object Depth16Decoder {
++    data class Decoded(val depth: FloatArray, val confidence: FloatArray)
++
++    fun decode(source: ByteBuffer, width: Int, height: Int, rowStride: Int, pixelStride: Int): Decoded? {
++        if (width <= 0 || height <= 0 || width > 4096 || height > 4096 || pixelStride < 2) return null
++        val rowBytes = (width - 1L) * pixelStride + 2
++        if (rowStride < rowBytes) return null
++        val required = (height - 1L) * rowStride + rowBytes
++        if (required > source.remaining()) return null
++        val bytes = source.duplicate().order(ByteOrder.nativeOrder())
++        val base = bytes.position()
++        val depth = FloatArray(width * height)
++        val confidence = FloatArray(width * height)
++        for (y in 0 until height) {
++            for (x in 0 until width) {
++                val raw = bytes.getShort(base + y * rowStride + x * pixelStride).toInt() and 0xffff
++                val mm = raw and 0x1fff
++                val code = raw ushr 13
++                val c = if (code == 0) 1f else (code - 1) / 7f
++                val i = y * width + x
++                if (mm > 0 && c > 0f) {
++                    depth[i] = mm / 1000f
++                    confidence[i] = c
++                }
++            }
++        }
++        return Decoded(depth, confidence)
++    }
++}
+diff --git a/app/src/main/java/com/mobilescan3d/depth/DepthProvider.kt b/app/src/main/java/com/mobilescan3d/depth/DepthProvider.kt
+index 0b91149..54b53a4 100644
+--- a/app/src/main/java/com/mobilescan3d/depth/DepthProvider.kt
++++ b/app/src/main/java/com/mobilescan3d/depth/DepthProvider.kt
+@@ -2,23 +2,10 @@ package com.mobilescan3d.depth
+ 
+ import android.media.Image
+ 
+-/**
+- * 深度表示的固定语义（评审 P0-1）。
+- *
+- * 关键：**一旦模型确定，表示就固定，运行时不要再猜 linear 还是 inverse**。
+- * - [RELATIVE_DEPTH]：模型输出 raw `q` 与“真实远近”单调递增（大模型越大=越近
+- *   或越大=越远，由标定 affine 吸收符号），native 侧用 VINS 稀疏三角化 + stereo
+- *   anchors 拟合 `metric = scale*q + shift` 得到米制。
+- * - [INVERSE_DEPTH]：模型输出 raw `q` 是视差/逆深度，native 用 `metric =
+- *   scale/q + shift`。
+- *
+- * 选择哪种由 `depth_model.tflite` 的真实输出定义**固定一次**；不要像旧实现那样
+- * 用会话级 min/max 把 q 重映射到 [0.4,6]——那会让同一 q 在不同扫描阶段对应不同
+- * 米制，正是尺度漂移的根因。
+- */
+-enum class DepthRepresentation {
+-    RELATIVE_DEPTH,
+-    INVERSE_DEPTH
++/** Fixed output semantics. Native fits z=a*q+b or 1/z=a*q+b, respectively. */
++enum class DepthRepresentation(val nativeCode: Int) {
++    RELATIVE_DEPTH(0),
++    INVERSE_DEPTH(1)
+ }
+ 
+ /**
+@@ -55,7 +42,7 @@ interface DepthProvider {
+      *                    **固定一次**，运行时绝不根据单帧内容重新猜测 linear
+      *                    还是 inverse。native 侧用 VINS 稀疏三角化 +
+      *                    stereo anchors 拟合 `metric = scale*q + shift`
+-     *                    （逆深度则是 `scale/q + shift`）得到米制。
++     *                    （逆深度则是 `1 / (scale*q + shift)`）得到米制。
+      */
+     data class Result(
+         val depth: FloatArray,
+diff --git a/app/src/main/java/com/mobilescan3d/depth/HardwareDepthProvider.kt b/app/src/main/java/com/mobilescan3d/depth/HardwareDepthProvider.kt
+index f8aea3c..bc90ab0 100644
+--- a/app/src/main/java/com/mobilescan3d/depth/HardwareDepthProvider.kt
++++ b/app/src/main/java/com/mobilescan3d/depth/HardwareDepthProvider.kt
+@@ -32,15 +32,9 @@ import android.view.Surface
+  * 代价是与 RGB 不同步 —— 而不同步这一件事，native 侧的深度标定
+  * （MAD + Huber IRLS + EMA）与时序一致性检查本来就要处理，不是新增问题。
+  *
+- * ## DEPTH16 的数值约定
+- *
+- * 16 位无符号。按 Android 的通用约定按
+- *     `meters = value / 65535 * depthRangeMm / 1000`
+- * 换算。当 `depthRangeMm = 65535`（绝大多数设备，即「1 单位 = 1mm」）时
+- * 公式退化成 `value / 1000f`，就是常见的毫米直读。
+- * 保留 `depthRangeMm` 参数是为了覆盖少数量程自定义的设备 ——
+- * **这一项需要实机核对**，取错了会让深度整体差一个常数因子，
+- * 而那恰好是 native 侧鲁棒标定能兜住的误差。
++ * ## DEPTH16
++ * 低 13 位为毫米深度，高 3 位为置信度编码，见 Android ImageFormat.DEPTH16。
++ * 每次发布独立数组，避免相机回调改写读者正在使用的深度。
+  *
+  * 线程约定：与 [DepthProvider] 接口一致，所有方法都由同一个专用线程调用。
+  * 内部的 ImageReader 回调跑在自己起的 HandlerThread 上，只做「解码 + 存 latest」。
+@@ -49,13 +43,12 @@ class HardwareDepthProvider(
+     context: Context,
+     private val cameraId: String,
+     private val depthWidth: Int = 320,
+-    private val depthHeight: Int = 240,
+-    /** DEPTH16 满量程对应的毫米数；65535 即「1 单位 = 1mm」。 */
+-    private val depthRangeMm: Float = 65535f
++    private val depthHeight: Int = 240
+ ) : DepthProvider {
+ 
+     private val appContext = context.applicationContext
+ 
++    private val lifecycle = java.util.concurrent.atomic.AtomicLong(0)
+     private var camera: CameraDevice? = null
+     private var session: CameraCaptureSession? = null
+     private var reader: ImageReader? = null
+@@ -68,11 +61,6 @@ class HardwareDepthProvider(
+     @Volatile
+     private var latestResult: DepthProvider.Result? = null
+ 
+-    /** 复用缓冲，避免每帧 new（深度帧率不高，但没必要制造 GC 压力）。 */
+-    private var buffer = FloatArray(0)
+-    private var bufferW = 0
+-    private var bufferH = 0
+-
+     @Volatile
+     private var frameCount = 0L
+ 
+@@ -92,6 +80,8 @@ class HardwareDepthProvider(
+      */
+     fun start(): Boolean {
+         if (running) return true
++        close()
++        val generation = lifecycle.incrementAndGet()
+         val manager = appContext.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+         if (manager == null) {
+             lastError = "CameraManager 不可用"
+@@ -131,6 +121,7 @@ class HardwareDepthProvider(
+ 
+             manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                 override fun onOpened(device: CameraDevice) {
++                    if (!running || generation != lifecycle.get()) { device.close(); return }
+                     camera = device
+                     try {
+                         val surface = ir.surface as Surface
+@@ -141,6 +132,7 @@ class HardwareDepthProvider(
+                             listOf(surface),
+                             object : CameraCaptureSession.StateCallback() {
+                                 override fun onConfigured(s: CameraCaptureSession) {
++                                    if (!running || generation != lifecycle.get()) { s.close(); return }
+                                     session = s
+                                     try {
+                                         s.setRepeatingRequest(req.build(), null, h)
+@@ -152,6 +144,8 @@ class HardwareDepthProvider(
+                                 }
+ 
+                                 override fun onConfigureFailed(s: CameraCaptureSession) {
++                                    s.close()
++                                    if (generation != lifecycle.get()) return
+                                     running = false
+                                     lastError = "深度会话配置失败"
+                                     Log.e(TAG, lastError)
+@@ -168,6 +162,7 @@ class HardwareDepthProvider(
+ 
+                 override fun onDisconnected(device: CameraDevice) {
+                     device.close()
++                    if (generation != lifecycle.get()) return
+                     camera = null
+                     running = false
+                     lastError = "深度相机断开"
+@@ -175,6 +170,7 @@ class HardwareDepthProvider(
+ 
+                 override fun onError(device: CameraDevice, error: Int) {
+                     device.close()
++                    if (generation != lifecycle.get()) return
+                     camera = null
+                     running = false
+                     lastError = "深度相机错误码 $error"
+@@ -196,7 +192,7 @@ class HardwareDepthProvider(
+             null
+         } ?: return
+         try {
+-            submitDepthImage(image, image.timestamp)
++            if (running && r === reader) submitDepthImage(image, image.timestamp)
+         } catch (t: Throwable) {
+             lastError = "解码 DEPTH16 失败: ${t.message}"
+         } finally {
+@@ -217,88 +213,31 @@ class HardwareDepthProvider(
+     /**
+      * 把一帧 DEPTH16 解码成米制深度。
+      *
+-     * `timestampNs` 用**调用方给的相机帧时间戳**，而不是 `image.timestamp`：
+-     * 深度相机与 RGB 相机是两个独立的 sensor clock，直接拿深度的时间戳去
+-     * native 侧查 VINS pose 是查不到的（native 按 SENSOR_TIMESTAMP 索引）。
++     * 保留传感器时间戳。接入 RGB 融合前必须完成时钟、内参与外参对齐；
++     * 不得把异步深度帧伪装成当前 RGB 帧。默认工厂仍使用单目模型。
+      */
++    @Synchronized
+     override fun submitDepthImage(image: Image, timestampNs: Long): Boolean {
++        if (!running) return false
+         if (image.format != ImageFormat.DEPTH16) return false
+         val w = image.width
+         val h = image.height
+         if (w <= 0 || h <= 0) return false
+ 
+-        val plane = image.planes[0]
+-        val rowStrideBytes = plane.rowStride
+-        if (rowStrideBytes < w * 2) return false
+-        val rowStrideShorts = rowStrideBytes / 2
+-        val shorts = plane.buffer.order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
+-
+-        if (bufferW != w || bufferH != h) {
+-            buffer = FloatArray(w * h)
+-            bufferW = w
+-            bufferH = h
+-        }
+-        val rangeMm = if (depthRangeMm > 1f) depthRangeMm else 65535f
+-        val unitToMeters = rangeMm / 65535f / 1000f
+-
+-        // DEPTH16 的第二个 plane（如果有）是 8 位置信度图。
+-        // 只有标定为 DEPTH_CALIBRATION 的设备才有，取不到就置 null。
+-        var conf: FloatArray? = null
+-        try {
+-            if (image.planes.size > 1) {
+-                val cp = image.planes[1]
+-                val cb = cp.buffer
+-                if (cb.remaining() >= w * h) {
+-                    val arr = FloatArray(w * h)
+-                    val base = cb.position()
+-                    val cRowStride = cp.rowStride
+-                    val cPixelStride = if (cp.pixelStride > 0) cp.pixelStride else 1
+-                    var oy = 0
+-                    while (oy < h) {
+-                        val ro = base + oy * cRowStride
+-                        var ox = 0
+-                        while (ox < w) {
+-                            val idx = ro + ox * cPixelStride
+-                            if (idx >= base + cb.limit()) break
+-                            arr[oy * w + ox] = (cb.get(idx).toInt() and 0xFF) / 255f
+-                            ++ox
+-                        }
+-                        ++oy
+-                    }
+-                    conf = arr
+-                }
+-            }
+-        } catch (t: Throwable) {
+-            conf = null
+-        }
+-
+-        var valid = 0
+-        var y = 0
+-        while (y < h) {
+-            val ro = y * rowStrideShorts
+-            val base = y * w
+-            var x = 0
+-            while (x < w) {
+-                val raw = shorts.get(ro + x).toInt() and 0xFFFF
+-                if (raw == 0) {
+-                    // 0 表示该像素无有效深度（Android 约定）
+-                    buffer[base + x] = 0f
+-                } else {
+-                    buffer[base + x] = raw * unitToMeters
+-                    ++valid
+-                }
+-                ++x
+-            }
+-            ++y
++        val plane = image.planes.firstOrNull() ?: return false
++        val decoded = Depth16Decoder.decode(plane.buffer, w, h, plane.rowStride, plane.pixelStride)
++            ?: return false
++        if (decoded.depth.none { it > 0f }) {
++            latestResult = null
++            return false
+         }
+-        if (valid <= 0) return false
+ 
+         ++frameCount
+         latestResult = DepthProvider.Result(
+-            depth = buffer,
++            depth = decoded.depth,
+             width = w,
+             height = h,
+-            confidence = conf,
++            confidence = decoded.confidence,
+             timestampNs = timestampNs,
+             metric = true,
+             backend = backendName
+@@ -308,12 +247,15 @@ class HardwareDepthProvider(
+ 
+     override fun latest(): DepthProvider.Result? = latestResult
+ 
++    @Synchronized
+     override fun reset() {
+         latestResult = null
+         frameCount = 0L
+     }
+ 
++    @Synchronized
+     override fun close() {
++        lifecycle.incrementAndGet()
+         running = false
+         latestResult = null
+         try {
+diff --git a/app/src/main/java/com/mobilescan3d/depth/MonoDepthProvider.kt b/app/src/main/java/com/mobilescan3d/depth/MonoDepthProvider.kt
+index 78e98ac..785934b 100644
+--- a/app/src/main/java/com/mobilescan3d/depth/MonoDepthProvider.kt
++++ b/app/src/main/java/com/mobilescan3d/depth/MonoDepthProvider.kt
+@@ -11,10 +11,10 @@ import java.nio.channels.FileChannel
+  * 单目深度：assets/depth_model.tflite（256x256 输入）。
+  *
+  * **评审 P0-1 行为（2026-09-27 改）**：不再做会话级 min/max 动态映射，也不
+- * 上采样到相机分辨率。模型原始输出 `q` 以固定表示 [RELATIVE_DEPTH] 原样交
++ * 上采样到相机分辨率。模型原始输出 `q` 以固定表示 [INVERSE_DEPTH] 原样交
+  * native，**同一个 q 永远对应同一个米制深度** —— 这是根除尺度漂移的关键。
+  * 真正的米制关系由 native 侧用 VINS 稀疏三角化 + stereo anchors 拟合
+- * `metric = scale*q + shift`（MAD + Huber IRLS + EMA）建立。
++ * `1/metric = scale*q + shift`（MAD + Huber IRLS + EMA）建立。
+  *
+  * 注意：下游「目标 mask / presence gate」依赖的是**相对深度的相对排序与分布**，
+  * 而相对排序在去掉 min/max 映射后反而更稳定（之前会话级 min/max 扩张会让
+@@ -33,7 +33,7 @@ class MonoDepthProvider(
+     private val depthSmall = FloatArray(inputSize * inputSize)
+ 
+     // 评审 P0-1：不再做会话级 min/max 动态映射，也不上采样到相机分辨率。
+-    // 模型原始输出 q 以固定表示（RELATIVE_DEPTH）原样交 native，由 native 侧
++    // 模型原始输出 q 以固定表示（INVERSE_DEPTH）原样交 native，由 native 侧
+     // 用 VINS 稀疏三角化 + stereo anchors 拟合 scale/shift 得到米制。
+     // 这样同一 q 永远对应同一个米制深度，彻底消除尺度漂移。
+ 
+@@ -63,7 +63,7 @@ class MonoDepthProvider(
+         pre.fill(y, u, v, width, height, rowStride, uRowStride, uPixelStride)
+         itp.run(pre.tensor, output)
+ 
+-        // 评审 P0-1 + P0-2：直接取原始模型输出 q，固定 RELATIVE_DEPTH 语义，
++        // 评审 P0-1 + P0-2：直接取原始模型输出 q，固定 INVERSE_DEPTH 语义，
+         // 不做会话级 min/max、不做 [0.4,6] 映射、不上采样到相机分辨率。
+         // 分辨率保持 inputSize×inputSize (256×256)，native 侧按深度/相机比
+         // 降采样内参 K 完成融合，几何信息基本无损。
+@@ -82,7 +82,7 @@ class MonoDepthProvider(
+             timestampNs = timestampNs,
+             metric = false,
+             backend = backendName,
+-            representation = DepthRepresentation.RELATIVE_DEPTH
++            representation = DepthRepresentation.INVERSE_DEPTH
+         )
+         return true
+     }
+@@ -101,11 +101,12 @@ class MonoDepthProvider(
+     }
+ 
+     private fun loadModel(assets: AssetManager): ByteBuffer {
+-        val fd = assets.openFd(modelAsset)
+-        FileInputStream(fd.fileDescriptor).use { stream ->
+-            return stream.channel.map(
+-                FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength
+-            )
++        assets.openFd(modelAsset).use { fd ->
++            FileInputStream(fd.fileDescriptor).use { stream ->
++                return stream.channel.map(
++                    FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength
++                )
++            }
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/mobilescan3d/export/ExportManager.kt b/app/src/main/java/com/mobilescan3d/export/ExportManager.kt
+index 45efb1f..48f8ec0 100644
+--- a/app/src/main/java/com/mobilescan3d/export/ExportManager.kt
++++ b/app/src/main/java/com/mobilescan3d/export/ExportManager.kt
+@@ -84,6 +84,9 @@ class ExportManager(context: Context) {
+     var lastMesh: MeshData? = null
+         private set
+ 
++    private val meshGeneration = java.util.concurrent.atomic.AtomicLong(0)
++    private val meshCacheLock = Any()
++
+     val dir: File get() = outputDir
+ 
+     // ------------------------------------------------------------------ PLY
+@@ -154,9 +157,7 @@ class ExportManager(context: Context) {
+         return try {
+             val q = quality.coerceIn(0, 2)
+             val ok = NativeBridge.nativeBuildMesh(q)
+-            if (ok) {
+-                lastMesh = pullMesh()
+-            }
++            lastMesh = if (ok) pullMesh() else null
+             // 必须显式返回；只写 `if (ok) {...}` 会让 try 块的值推断成 Any，
+             // 与函数声明的 Boolean 冲突（Kotlin 不把 if-without-else 当表达式）。
+             ok
+@@ -225,6 +226,10 @@ class ExportManager(context: Context) {
+     }
+ 
+     fun resetMesh() {
++        synchronized(meshCacheLock) {
++            meshGeneration.incrementAndGet()
++            lastMesh = null
++        }
+         try {
+             NativeBridge.nativeResetMesh()
+         } catch (t: Throwable) {
+@@ -337,19 +342,29 @@ class ExportManager(context: Context) {
+      */
+     fun buildMeshAsync(quality: Int, onDone: (MeshData?) -> Unit) {
+         val q = quality.coerceIn(0, 2)
++        val generation = meshGeneration.get()
+         io.execute {
++            if (generation != meshGeneration.get()) return@execute
+             val mesh = try {
+                 if (NativeBridge.nativeBuildMesh(q)) pullMesh() else null
+             } catch (t: Throwable) {
+                 Log.e(TAG, "buildMeshAsync failed", t)
+                 null
+             }
+-            lastMesh = mesh
+-            main.post { onDone(mesh) }
++            synchronized(meshCacheLock) {
++                if (generation == meshGeneration.get()) lastMesh = mesh
++            }
++            main.post {
++                if (generation == meshGeneration.get()) onDone(mesh)
++            }
+         }
+     }
+ 
+     fun shutdown() {
++        synchronized(meshCacheLock) {
++            meshGeneration.incrementAndGet()
++            lastMesh = null
++        }
+         try {
+             io.shutdownNow()
+         } catch (_: Throwable) {
+diff --git a/app/src/main/java/com/mobilescan3d/render/MeshRenderer.kt b/app/src/main/java/com/mobilescan3d/render/MeshRenderer.kt
+index b648bd6..c181edf 100644
+--- a/app/src/main/java/com/mobilescan3d/render/MeshRenderer.kt
++++ b/app/src/main/java/com/mobilescan3d/render/MeshRenderer.kt
+@@ -141,10 +141,9 @@ class MeshRenderer {
+     var tintB = 1.00f
+ 
+     // ---- 待上传数据。setMesh() 可能从任意线程调用，真正的上传推迟到 GL 线程 ----
+-    @Volatile private var pendingVertices: FloatArray? = null
+-    @Volatile private var pendingIndices: IntArray? = null
+-    @Volatile private var pendingVersion = 0L
+-    private var uploadedVersion = -1L
++    private data class PendingMesh(val vertices: FloatArray?, val indices: IntArray?)
++    @Volatile private var pendingMesh = PendingMesh(null, null)
++    private var uploadedMesh: PendingMesh? = null
+ 
+     /** 最近一次上传失败的原因（HUD / 报告用）。 */
+     @Volatile
+@@ -155,7 +154,13 @@ class MeshRenderer {
+ 
+     /** 必须在 GL 线程调用（`onSurfaceCreated`）。 */
+     fun init(): Boolean {
+-        if (glReady) return true
++        // onSurfaceCreated means a new GL context: old integer handles are invalid.
++        glReady = false
++        vbo = 0
++        ibo = 0
++        uploadedMesh = null
++        uploadedVertexCount = 0
++        uploadedTriangleCount = 0
+         program = link(VERT, FRAG)
+         if (program == 0) {
+             lastError = "网格着色器编译失败"
+@@ -209,7 +214,7 @@ class MeshRenderer {
+         ibo = 0
+         program = 0
+         glReady = false
+-        uploadedVersion = -1L
++        uploadedMesh = null
+         uploadedVertexCount = 0
+         uploadedTriangleCount = 0
+     }
+@@ -223,18 +228,14 @@ class MeshRenderer {
+      * @param indices  三角形索引，长度必须是 3 的倍数
+      */
+     fun setMesh(vertices: FloatArray?, indices: IntArray?) {
+-        pendingVertices = vertices
+-        pendingIndices = indices
+-        pendingVersion++
++        pendingMesh = PendingMesh(vertices, indices)
+     }
+ 
+     fun clearMesh() {
+-        pendingVertices = null
+-        pendingIndices = null
+-        pendingVersion++
++        pendingMesh = PendingMesh(null, null)
+     }
+ 
+-    val hasPendingMesh: Boolean get() = pendingVertices != null && pendingIndices != null
++    val hasPendingMesh: Boolean get() = pendingMesh.let { it.vertices != null && it.indices != null }
+     val hasGpuMesh: Boolean get() = uploadedVertexCount > 0 && uploadedTriangleCount > 0
+ 
+     // ------------------------------------------------------------------ 绘制
+@@ -266,7 +267,7 @@ class MeshRenderer {
+         // 法线只吃线性部分：本工程的摆放变换是「绕Y旋转 + 均匀缩放 + 平移」，
+         // 均匀缩放下方向向量只需重新归一化（着色器里本来就归一化了），
+         // 所以直接乘 mat3(uModel) 是正确的，不必再求逆转置。
+-        GLES20.glUniformMatrix4fv(uModelNormal, 1, false, modelNormal3(), 0)
++        GLES20.glUniformMatrix3fv(uModelNormal, 1, false, modelNormal3(), 0)
+ 
+         // Pc = Rwc^T (Pw - twc)。pose 是行主序 R，所以 Rwc 的三列是
+         // (R[0],R[3],R[6]) / (R[1],R[4],R[7]) / (R[2],R[5],R[8])。
+@@ -334,18 +335,21 @@ class MeshRenderer {
+     }
+ 
+     private fun uploadIfNeeded() {
+-        if (pendingVersion == uploadedVersion) return
+-        val verts = pendingVertices
+-        val idx = pendingIndices
++        val snapshot = pendingMesh
++        if (snapshot === uploadedMesh) return
++        val verts = snapshot.vertices
++        val idx = snapshot.indices
+         if (verts == null || idx == null) {
+-            uploadedVersion = pendingVersion
++            uploadedMesh = snapshot
+             uploadedVertexCount = 0
+             uploadedTriangleCount = 0
+             return
+         }
+-        if (verts.size < MESH_VERTEX_FLOATS * 3 || idx.size < 3) {
++        if (verts.size < MESH_VERTEX_FLOATS * 3 || verts.size % MESH_VERTEX_FLOATS != 0 ||
++            idx.size < 3 || idx.size % 3 != 0 ||
++            idx.any { it < 0 || it >= verts.size / MESH_VERTEX_FLOATS }) {
+             lastError = "网格数据过小"
+-            uploadedVersion = pendingVersion
++            uploadedMesh = snapshot
+             uploadedVertexCount = 0
+             uploadedTriangleCount = 0
+             return
+@@ -356,7 +360,7 @@ class MeshRenderer {
+             // 顶点数溢出 65535 的网格 —— 那会画出完全错乱的三角形。
+             lastError = "设备不支持 32 位索引，网格 $vcount 顶点超出 65535，请用「预览」质量"
+             Log.w(TAG, lastError)
+-            uploadedVersion = pendingVersion
++            uploadedMesh = snapshot
+             uploadedVertexCount = 0
+             uploadedTriangleCount = 0
+             return
+@@ -400,7 +404,7 @@ class MeshRenderer {
+         GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
+         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+ 
+-        uploadedVersion = pendingVersion
++        uploadedMesh = snapshot
+         uploadedVertexCount = vcount
+         uploadedTriangleCount = triCount
+         lastError = ""
+diff --git a/app/src/main/java/com/mobilescan3d/render/TexturedMeshRenderer.kt b/app/src/main/java/com/mobilescan3d/render/TexturedMeshRenderer.kt
+index 91330c3..88cee0a 100644
+--- a/app/src/main/java/com/mobilescan3d/render/TexturedMeshRenderer.kt
++++ b/app/src/main/java/com/mobilescan3d/render/TexturedMeshRenderer.kt
+@@ -49,7 +49,7 @@ class TexturedMeshRenderer {
+         private set
+ 
+     val hasAsset: Boolean
+-        get() = uploadedTriangleCount > 0 || pendingVertices != null
++        get() = uploadedTriangleCount > 0 || pendingAsset.vertices != null
+ 
+     private var program = 0
+     private var vbo = 0
+@@ -106,20 +106,21 @@ class TexturedMeshRenderer {
+         }
+     }
+ 
+-    @Volatile
+-    private var pendingVertices: FloatArray? = null
+-
+-    @Volatile
+-    private var pendingIndices: IntArray? = null
+-
+-    @Volatile
+-    private var pendingAtlasJpeg: ByteArray? = null
+-
+-    @Volatile
+-    private var clearPending = false
++    private data class PendingAsset(
++        val vertices: FloatArray?, val indices: IntArray?, val jpeg: ByteArray?
++    )
++    @Volatile private var pendingAsset = PendingAsset(null, null, null)
++    private var uploadedAsset: PendingAsset? = null
+ 
+     fun init() {
+-        releaseGpu()
++        // Do not delete stale names in a new context: they may already name
++        // another renderer's newly-created resources. Retain CPU data for reupload.
++        program = 0
++        vbo = 0
++        textureId = 0
++        uploadedAsset = null
++        uploadedVertexCount = 0
++        uploadedTriangleCount = 0
+ 
+         program = link(VERT, FRAG)
+         if (program == 0) {
+@@ -184,17 +185,11 @@ class TexturedMeshRenderer {
+ 
+         // Ownership is transferred from TexturedArAssetLoader; these arrays
+         // are not mutated afterwards. Avoid a second 5–30 MB Java heap copy.
+-        pendingVertices = vertices8
+-        pendingIndices = indices
+-        pendingAtlasJpeg = atlasJpeg
+-        clearPending = false
++        pendingAsset = PendingAsset(vertices8, indices, atlasJpeg)
+     }
+ 
+     fun clearAsset() {
+-        pendingVertices = null
+-        pendingIndices = null
+-        pendingAtlasJpeg = null
+-        clearPending = true
++        pendingAsset = PendingAsset(null, null, null)
+     }
+ 
+     fun draw(
+@@ -358,21 +353,20 @@ class TexturedMeshRenderer {
+     }
+ 
+     private fun applyPending() {
+-        if (clearPending) {
+-            clearPending = false
++        if (program == 0 || vbo == 0) return
++        val snapshot = pendingAsset
++        if (snapshot === uploadedAsset) return
++        uploadedAsset = snapshot
++        val vertices = snapshot.vertices
++        val indices = snapshot.indices
++        val jpeg = snapshot.jpeg
++        if (vertices == null || indices == null || jpeg == null) {
+             releaseTexture()
+             uploadedTriangleCount = 0
+             uploadedVertexCount = 0
++            return
+         }
+ 
+-        val vertices = pendingVertices ?: return
+-        val indices = pendingIndices ?: return
+-        val jpeg = pendingAtlasJpeg ?: return
+-
+-        pendingVertices = null
+-        pendingIndices = null
+-        pendingAtlasJpeg = null
+-
+         try {
+             val sourceVertexCount =
+                 vertices.size / SOURCE_FLOATS
+diff --git a/docs/review_0136/REVIEW_ZH.md b/docs/review_0136/REVIEW_ZH.md
+new file mode 100644
+index 0000000..63ee722
+--- /dev/null
++++ b/docs/review_0136/REVIEW_ZH.md
+@@ -0,0 +1,89 @@
++# V0.13.6 审查修复说明
++
++基线仓库：https://github.com/tianlangxing-zhou/MobileScan3D_V0.4_HQ_RECON
++
++基线：`2cafb5382e21eec4795255309c413d14efadae5b`（V0.13.5）。审查日期：2026-09-27。交付前重新查询 main，仍为此提交。修改仅在交付包中，未推送 GitHub。
++
++本轮重点核对 V0.13.4、V0.13.5 的变更，并沿相机→深度→标定→分割→TSDF→网格→显示→导出路径追查。下面列出已实际修改的内容；这不是“所有环境绝对无缺陷”的保证。
++
++## 已修复的问题
++
++| # | 问题与影响 | 修复 |
++|---|---|---|
++| 1 | 深度融合用 160×90 RGB 缓存尺寸缩放原相机内参，造成几何拉伸 | 从原始相机输入尺寸计算深度内参，全场景和目标融合统一使用 |
++| 2 | 当前目标调试点仍使用原相机分辨率内参 | 同步缩放到深度栅格，修复画面叠加错位 |
++| 3 | 时序一致性重投影仍使用未缩放的内参 | 与深度融合使用同一套深度内参 |
++| 4 | 256×256 深度仍按步长 4 积分，有效采样约为 64×64 | 默认每深度像素采样；保留现有可配置步长接口 |
++| 5 | Surfel 只沿 160×90 RGB 缓存取点，丢掉部分深度细节 | 遍历深度栅格，独立查 RGB 缓存颜色 |
++| 6 | 体素块配额满后整帧返回，已有表面也停止细化 | 只跳过无法分配的新块，继续更新已有块，配额不增长 |
++| 7 | TSDF 值在射线落点计算，却在体素格点提取，造成表面位置偏移 | 按实际存储格点在相机系的 Z 计算有符号距离 |
++| 8 | 四面体对角边与轴向边缓存键冲突，错误合并顶点 | 用完整方向位掩码区分 7 种边，同步修正颜色与法线取样端点 |
++| 9 | 未观测体素被当成正 TSDF，生成额外背壳 | 仅对四个顶点均已观测的四面体提面，未知空间不再伪造为表面外部 |
++| 10 | Surfel 把世界 Z 当相机深度，删除负 Z 或较大世界 Z 的合法点 | 相机距离由调用方判断，Surfel 校验有限世界坐标与置信度 |
++| 11 | 深度表示枚举没有送进 JNI，标定仍在两种模型间逐帧切换 | Kotlin/JNI/C++ 传递固定表示，支持固定线性或固定逆深度拟合 |
++| 12 | 当前 MiDaS 模型被声明为线性深度，文档逆深度公式也不一致 | 根据当前模型输出层与 MiDaS 约定设为 INVERSE_DEPTH，统一为 z=1/(a·q+b) |
++| 13 | 稀疏标定使用最新观测，可能与异步深度帧错配 | 在 VINS 窗口按深度传感器时间戳找观测；35ms 内无匹配则不凑配对 |
++| 14 | 标定状态在主状态锁外更新，可与会话复位、诊断读取竞争 | 先独立获取 VINS 样本，再在 gStateMutex 下访问标定与融合状态 |
++| 15 | 标定只检查 raw 数组长度，少量有效样本也可能越过门槛 | 同时检查配对长度、过滤后有效样本数、最大采样配置 |
++| 16 | 物理无效的拟合预测被直接跳过，评分可能过于乐观 | 无效预测计入惩罚，不再伪装成好内点；拒绝平滑跨越斜率正负翻转 |
++| 17 | Epoch 预热比较了每帧不同的场景深度中位数，移动容易影响稳定判断 | 预热阶段使用固定 raw 参考点比较映射 |
++| 18 | 原始模型 q 直接进入按距离设阈值的目标分割 | 分割改用标定深度；预热期间保留外观跟踪，不用未标定 mask 判目标丢失 |
++| 19 | mask 多档收紧受固定下限限制；闭运算可补回背景；过扩张结果未阻止融合 | 下限随档位收紧，结果与候选深度带相交，过扩张结果不进入 presence/fusion |
++| 20 | mask 失效后目标调试点可能继续显示上一帧 | 未满足显示条件时清空旧调试点 |
++| 21 | 纹理遮挡深度在屏幕空间线性插值 Z，倾斜面遮挡判断错误 | 改为插值 1/Z 后取倒数 |
++| 22 | mat3 法线矩阵使用 glUniformMatrix4fv 上传 | 改为 glUniformMatrix3fv |
++| 23 | 网格顶点、索引、atlas 分别发布，GL 线程可能混读不同版本；完成旧上传可能吞掉新版本 | 两种 Renderer 使用一次性发布的数据快照，上传只确认所取快照 |
++| 24 | GL 上下文重建后旧句柄仍被使用，纹理 CPU 数据也已丢失 | 重建句柄并保留待重新上传的模型快照；不删除新上下文中可能已复用的旧数值句柄 |
++| 25 | 预览、LIVE 网格、PLY 回调和 ExportManager 缓存可能回写新会话 | 加会话令牌与缓存世代校验，旧任务不得发布结果 |
++| 26 | 新会话 nativeCreate 与已经完成推理的深度提交可能竞争；TFLite 在 UI 线程关闭 | 用短临界区串行 native 深度提交/会话重置，销毁使旧任务失效，provider 在深度线程关闭 |
++| 27 | DEPTH16 将高 3 位置信度当成距离，并假设另有置信度 plane | 独立解码低 13 位毫米距离和高 3 位置信度，零置信度置无效 |
++| 28 | DEPTH16 缓冲区复用、stride/剩余长度处理不足，旧相机回调可污染新生命周期 | 独立发布帧数组，支持 buffer position 和行/像素 padding，校验边界并拒绝旧回调 |
++| 29 | 模型资产文件描述符未完整关闭；版本标记停留 0.13.0；无 Git 时错误文本可能进入构建标记 | 关闭 AssetFileDescriptor，版本改为 0.13.6-review，Git 失败返回 unknown |
++| 30 | 用户在深度标定或融合暂停时看到空白却没有操作指引 | 增加标定等待、模型不可用和深度不稳定时的中文提示 |
++
++## 自检结果
++
++| 检查 | 结果与范围 |
++|---|---|
++| GLB 回归 | 通过：无/有法线与颜色的 4 种组合、内嵌 JPEG 纹理、索引、JSON/二进制对齐、浮点边界、非法网格拒绝、逗号 locale |
++| 几何回归 | 通过：非正方形原相机到 256² 的投影一致性、固定逆深度拟合、无效样本/错长数组/斜率翻转拒绝 |
++| TSDF/网格回归 | 通过：格点 SDF、满预算仍能更新、无效置信度拒绝、负世界坐标；输入平面 1.007m，提取结果全部顶点误差小于 2mm，内部边具有两个邻接三角面 |
++| 内存/未定义行为检查 | 上述 C++ 回归使用 ASan+UBSan，通过；受执行环境限制关闭 LeakSanitizer，因此没有完成泄漏检测 |
++| DEPTH16 JVM 回归 | 通过：真实 Kotlin 解码器编译运行，检查位域、置信度、非零 buffer 起点、行/像素 padding、截断缓冲区、独立帧数组 |
++| C++ 编译器语法检查 | native_engine.cpp、vins_bridge.cpp、target_mask_engine.cpp、texture_baker.cpp 通过 g++ -fsyntax-only；使用 OpenCV 4.12/Ceres 2.2/Vulkan/JNI 头，Android 日志和生成配置采用宿主声明桩；不等同 Android ABI 链接 |
++| Kotlin 语法检查 | 全部 17 个生产 Kotlin 源文件及 app/build.gradle.kts 通过语法解析；DEPTH16 部分另经 Kotlin 2.0.21 编译执行；其余 Android Kotlin 未完整类型检查 |
++| 差异与覆盖包 | git diff --check、ZIP CRC、文件 SHA-256 及覆盖后校验脚本检查 |
++
++## 验证边界与取舍
++
++- 没有完整 Android SDK/NDK/Ceres/OpenCV 工程配置，没有 APK 构建或设备运行。本次不能承诺“完全无问题”，也没有声称真机精度或帧率已提升到某个数值。
++- 去除伪背壳后，未扫描面可能更明显地保持开放，这是正确表示未知区域；应补拍更多视角，而不是用无观测数据制造封闭外壳。
++- 更密集积分和保留可恢复的 CPU 模型快照会增加运算/内存开销；OBJECT_HQ 的持续帧率、发热与内存峰值需真机确认。现有 OBJECT_FAST/ROOM 原生档位仍可使用。
++- DEPTH16 解码修复不代表独立硬件深度相机已经完成 RGB 内外参、时间同步和外参配准；默认仍使用单目深度，不自动启用未对齐硬件数据。
++- 当前模型输出张量名为 `midas_net_custom/sequential/re_lu_9/Relu`，形状 `[1,256,256,1]`。据此及 MiDaS 官方语义固定为逆深度；若自行更换模型，应同时调整表示定义和预处理。
++- VINS 尺度对齐并非测量认证。新提示不替代实际质量验收。
++
++## 本地复验
++
++在工程根目录：
++
++```bash
++python tools/review_tests/run.py
++python tools/review_tests/run_geometry.py
++kotlinc app/src/main/java/com/mobilescan3d/depth/Depth16Decoder.kt tools/review_tests/Depth16Regression.kt -include-runtime -d depth16-test.jar
++java -jar depth16-test.jar
++python tools/review_tests/verify_overlay.py
++```
++
++前两项需要 g++；GLB 检查还需要 Python Pillow；第三项需要 Kotlin/JDK。覆盖校验不依赖编译工具。
++
++在原 Android 构建环境执行 Clean/Rebuild（或 `gradlew.bat clean :app:assembleDebug`）。Kotlin/JNI 接口本轮一起修改，不能只替换 Kotlin 或仅复用旧 .so。
++
++真机重点：同一物体绕拍、返回原位、快速停扫重开、预览构建中重开、熄屏/后台后恢复、导出 GLB 在查看器检查纹理、满体素预算继续扫已有面。记录帧率、发热、内存和 VINS/标定诊断，确认错误日志后再用于重要采集。
++
++## 规范依据
++
++- MiDaS 官方 PyTorch Hub：相对逆深度输出。https://pytorch.org/hub/intelisl_midas_v2/
++- Android ImageFormat.DEPTH16：13 位距离和 3 位置信度。https://developer.android.com/reference/android/graphics/ImageFormat#DEPTH16
++
++以上规范只支持接口/模型语义判断，不能替代当前设备实测。
+diff --git a/tools/review_tests/Depth16Regression.kt b/tools/review_tests/Depth16Regression.kt
+new file mode 100644
+index 0000000..074bb09
+--- /dev/null
++++ b/tools/review_tests/Depth16Regression.kt
+@@ -0,0 +1,29 @@
++import com.mobilescan3d.depth.Depth16Decoder
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++
++fun main() {
++    val bytes = ByteBuffer.allocate(44).order(ByteOrder.nativeOrder())
++    bytes.position(4)
++    // Two rows of three pixels: padded rows, pixel stride four, nonzero base position.
++    val samples = intArrayOf(1000, (1 shl 13) or 1000, (2 shl 13) or 2000,
++                            (7 shl 13) or 8191, 0, (3 shl 13) or 1500)
++    for (y in 0..1) for (x in 0..2) bytes.putShort(4+y*16+x*4, samples[y*3+x].toShort())
++    bytes.limit(30) // Last row need not include trailing padding.
++    val result = checkNotNull(Depth16Decoder.decode(bytes,3,2,16,4))
++    check(bytes.position()==4)
++    check(result.depth[0]==1f && result.confidence[0]==1f)
++    check(result.depth[1]==0f && result.confidence[1]==0f)
++    check(result.depth[2]==2f && kotlin.math.abs(result.confidence[2]-1f/7)<1e-6)
++    check(kotlin.math.abs(result.depth[3]-8.191f)<1e-6)
++    check(result.depth[4]==0f && result.confidence[4]==0f)
++    check(result.depth[5]==1.5f)
++    val again=checkNotNull(Depth16Decoder.decode(bytes,3,2,16,4))
++    again.depth[0]=9f
++    check(result.depth[0]==1f) // Published frames never alias reusable buffers.
++    bytes.limit(29)
++    check(Depth16Decoder.decode(bytes,3,2,16,4)==null)
++    check(Depth16Decoder.decode(bytes,3,2,1,4)==null)
++    check(Depth16Decoder.decode(bytes,Int.MAX_VALUE,2,16,4)==null)
++    println("PASS DEPTH16 bit fields, confidence, padded stride, buffer offset/bounds, immutable frames")
++}
+diff --git a/tools/review_tests/geometry_regression.cpp b/tools/review_tests/geometry_regression.cpp
+new file mode 100644
+index 0000000..84f4221
+--- /dev/null
++++ b/tools/review_tests/geometry_regression.cpp
+@@ -0,0 +1,106 @@
++#include <algorithm>
++#include "depth_geometry.h"
++#include "depth_calib.h"
++#include "tsdf_engine.h"
++#include "surfel_engine.h"
++#include "mesh/mesh_engine.h"
++#include <cassert>
++#include <cmath>
++#include <iostream>
++#include <limits>
++#include <vector>
++#include <map>
++
++extern "C" const char* __asan_default_options() { return "detect_leaks=0"; }
++
++int main() {
++    const auto k = depthIntrinsics(1000, 1000, 640, 360, 1280, 720, 256, 256);
++    assert(std::abs(k.fx - 200) < 1e-5 && std::abs(k.cy - 128) < 1e-5);
++    // Same camera ray at source and depth resolutions, including nonsquare source.
++    assert(std::abs((192-k.cx)/k.fx - (960.f-640)/1000) < 1e-6);
++    assert(std::abs((192-k.cy)/k.fy - (540.f-360)/1000) < 1e-6);
++
++    std::vector<float> raw, metric;
++    for (int i=0; i<100; ++i) { raw.push_back(.2f+i*.02f); metric.push_back(1.f/(.4f*raw.back()+.1f)); }
++    const auto fit = fitDepthRobust(raw, metric, true, 10, true);
++    assert(fit.valid && fit.inverseDepthModel);
++    assert(std::abs(fit.toMetric(1,0)-2) < .001f);
++    DepthCalibrator c;
++    auto cfg=c.config(); cfg.forceInverseDepth=true; c.setConfig(cfg);
++    assert(c.update(raw,metric));
++    auto invalid=metric;
++    for (int i=0;i<90;++i) invalid[i]=std::numeric_limits<float>::quiet_NaN();
++    assert(!c.update(raw,invalid));
++    assert(!c.update(raw, std::vector<float>(5,1)));
++    cfg.maxSamples=0;c.setConfig(cfg);assert(!c.update(raw,metric));
++    cfg.maxSamples=512;c.setConfig(cfg);
++    auto opposite=metric;
++    for(size_t i=0;i<raw.size();++i) opposite[i]=1.f/(1.5f-.4f*raw[i]);
++    assert(!c.update(raw,opposite)); // Never EMA across a slope sign reversal.
++
++    SurfelEngine surfels;
++    surfels.ingestPoint(-1,-2,-3,255,0,0,1);
++    surfels.ingestPoint(0,0,12,255,0,0,1);
++    assert(surfels.count()==2);
++    surfels.ingestPoint(std::numeric_limits<float>::quiet_NaN(),0,1,0,0,0,1);
++    surfels.ingestPoint(0,0,1,0,0,0,std::numeric_limits<float>::quiet_NaN());
++    assert(surfels.count()==2);
++
++    constexpr int N=64;
++    std::vector<float> plane(N*N,1.007f);
++    const float R[]={1,0,0,0,1,0,0,0,1}, t[]={0,0,0};
++    TsdfEngine tsdf;
++    tsdf.setVoxelSize(.02f);tsdf.setMaxBlocks(64);
++    assert(tsdf.pixelStep()==1);
++    tsdf.integrateDepth(plane.data(),N,N,nullptr,0,0,80,80,32,32,R,t,1);
++    assert(tsdf.surfacePresent());
++    // Every observed lattice position must encode signed projective distance.
++    int checked=0;
++    tsdf.forEachBlock([&](int bx,int by,int bz,const TsdfBlock* block){
++        for(int z=0;z<8;++z) for(int y=0;y<8;++y) for(int x=0;x<8;++x) {
++            const auto& v=block->voxels[(z*8+y)*8+x];
++            if(!v.weight) continue;
++            const float expected=std::clamp((1.007f-(bz*8+z)*.02f)/.08f,-1.f,1.f);
++            assert(std::abs(v.tsdf/kTsdfValueScale-expected)<.0001f); ++checked;
++        }
++    });
++    assert(checked>1000);
++    // Fill the allocation budget by scanning widely separated patches.
++    for(int i=0; i<100 && !tsdf.atCapacity(); ++i){
++        const float moved[]={float(i+1),0,0};
++        tsdf.integrateDepth(plane.data(),N,N,nullptr,0,0,80,80,32,32,R,moved,.25f);
++    }
++    assert(tsdf.atCapacity());
++    auto weights=[&](){uint64_t s=0;tsdf.forEachBlock([&](int,int,int,const TsdfBlock* b){for(auto& v:b->voxels)s+=v.weight;});return s;};
++    auto before=weights();
++    tsdf.integrateDepth(plane.data(),N,N,nullptr,0,0,80,80,32,32,R,t,1);
++    assert(tsdf.blocks()==64 && weights()>before);
++    before=weights();
++    tsdf.integrateDepth(plane.data(),N,N,nullptr,0,0,80,80,32,32,R,t,std::numeric_limits<float>::quiet_NaN());
++    assert(weights()==before);
++
++    // End-to-end planar reconstruction: extraction must retain the actual surface depth.
++    TsdfEngine dense;dense.setVoxelSize(.02f);
++    for(int i=0;i<3;++i) dense.integrateDepth(plane.data(),N,N,nullptr,0,0,80,80,32,32,R,t,1);
++    MeshEngine mesh;MeshOptions options;MeshBuildStats stats;
++    options.enableSmoothing=false;options.enableDecimation=false;options.enableComponentFilter=false;
++    assert(mesh.build(dense,options,stats));assert(mesh.mesh().triangleCount()>100);
++    std::vector<float> depths;
++    for(size_t i=2;i<mesh.mesh().positions.size();i+=3)depths.push_back(mesh.mesh().positions[i]);
++    std::cerr << "plane z median=" << medianOf(depths) << " count=" << depths.size() << "\n";
++    for (float z : depths) assert(std::abs(z-1.007f)<.002f);
++    std::map<std::pair<unsigned,unsigned>,int> edges;
++    const auto& indices=mesh.mesh().indices;
++    for(size_t i=0;i<indices.size();i+=3) for(int e=0;e<3;++e) {
++        auto a=indices[i+e], b=indices[i+(e+1)%3];
++        if(a>b) std::swap(a,b);
++        assert((++edges[{a,b}]<=2)); // No branching surfaces from diagonal-key collisions.
++    }
++    for(const auto& [edge,count]:edges) {
++        const auto& p=mesh.mesh().positions;
++        if(std::abs(p[edge.first*3])<.2f && std::abs(p[edge.first*3+1])<.2f &&
++           std::abs(p[edge.second*3])<.2f && std::abs(p[edge.second*3+1])<.2f)
++            assert(count==2); // Interior edges must have two neighboring faces.
++    }
++    std::cout << "PASS projection, fixed inverse calibration, invalid samples, sign reversal, world coordinates, TSDF budget and plane mesh\n";
++}
+diff --git a/tools/review_tests/run_geometry.py b/tools/review_tests/run_geometry.py
+new file mode 100644
+index 0000000..99c64a5
+--- /dev/null
++++ b/tools/review_tests/run_geometry.py
+@@ -0,0 +1,13 @@
++#!/usr/bin/env python3
++"""Native geometry regression with address/undefined behavior sanitizers."""
++from pathlib import Path
++import os, subprocess, tempfile
++root=Path(__file__).resolve().parents[2]
++cpp=root/'app/src/main/cpp'
++with tempfile.TemporaryDirectory() as work:
++    binary=Path(work)/'geometry'
++    sources=['depth_calib.cpp','tsdf_engine.cpp','surfel_engine.cpp','mesh/mesh_engine.cpp']
++    subprocess.run(['g++','-std=c++20','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',
++                    '-I',str(cpp),str(Path(__file__).with_name('geometry_regression.cpp')),
++                    *[str(cpp/s) for s in sources],'-o',str(binary)],check=True)
++    subprocess.run([str(binary)],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True)
+diff --git a/tools/review_tests/verify_overlay.py b/tools/review_tests/verify_overlay.py
+new file mode 100644
+index 0000000..bdf246b
+--- /dev/null
++++ b/tools/review_tests/verify_overlay.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++"""Read-only verification of delivered files after merging the overlay."""
++from pathlib import Path
++import hashlib
++import json
++import sys
++
++root = Path(__file__).resolve().parents[2]
++manifest = root / 'OVERLAY_MANIFEST.json'
++if not manifest.is_file():
++    sys.exit('Missing OVERLAY_MANIFEST.json: copy it from the ZIP to the project root.')
++data = json.loads(manifest.read_text(encoding='utf-8'))
++failed = []
++for item in data['files']:
++    path = root / item['path']
++    if not path.is_file():
++        failed.append('MISSING ' + item['path'])
++    elif hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
++        failed.append('CHANGED ' + item['path'])
++if failed:
++    print('\n'.join(failed))
++    sys.exit(1)
++print(f"PASS {len(data['files'])} delivered files; base {data['base_commit']}")

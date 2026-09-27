@@ -92,7 +92,7 @@ float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
 // @param out         至少 maxSamples*3 个 float
 // @param maxSamples  最多取多少样本
 // @return 实际写入的样本数
-int vinsFeatureSamples(float* out, int maxSamples);
+int vinsFeatureSamples(float* out, int maxSamples, uint64_t timestampNs = 0);
 
 struct VinsWorldFeature {
     float u = 0.0f;

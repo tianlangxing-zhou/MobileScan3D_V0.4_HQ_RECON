@@ -292,6 +292,7 @@ private var lastRelocPollMs = 0L
      * 叠在这一轮的空场景上」，比什么都不显示更难排查。
      */
     @Volatile private var scanSessionToken = 0L
+    private val depthSessionLock = Any()
     /**
      * V0.12: 扫描期网格快照周期。
      *
@@ -2430,9 +2431,14 @@ private var lastRelocPollMs = 0L
                     val res = if (produced) provider.latest() else null
                     if (res != null && res.depth.isNotEmpty()) {
                         // 世代不一致说明这帧属于上一轮会话，必须丢弃。
-                        if (generation == depthGeneration) {
-                            NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height, 0.5f, t)
-                            glView.requestRender()
+                        synchronized(depthSessionLock) {
+                            if (generation == depthGeneration && scanning && scanNativeReady && !isDestroyed) {
+                                NativeBridge.nativeOnDepthMap(
+                                    res.depth, res.width, res.height, 0.5f,
+                                    res.timestampNs, res.representation.nativeCode
+                                )
+                                glView.requestRender()
+                            }
                         }
                     }
                 }
@@ -2509,7 +2515,10 @@ private var lastRelocPollMs = 0L
         }
         applyCaptureSettings()
         // 与相机帧处理线程串行化，避免 reset 期间相机线程正在遍历这些容器（native 崩溃）
+        val startToken = scanSessionToken
         cameraHandler?.post {
+            synchronized(depthSessionLock) {
+            if (isDestroyed || !scanning || startToken != scanSessionToken) return@post
             NativeBridge.nativeDestroy()
             NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
             // 体素边长与块预算：评审 P1-2 改为按档位切换。物体扫描默认
@@ -2536,6 +2545,7 @@ private var lastRelocPollMs = 0L
             } catch (_: Throwable) {
             }
             scanNativeReady = true
+            }
         }
         // V0.12: 扫描期默认进 LIVE 图层 —— 半透明网格 + 累计 surfel(hits>=1)
         // + 当前帧 target depth 点，三者同时显示，用户立刻能看到模型「长出来」。
@@ -2592,7 +2602,7 @@ private var lastRelocPollMs = 0L
             NativeBridge.nativeSetPersistentMapCaptureEnabled(false)
         } catch (_: Throwable) {
         }
-        depthGeneration++
+        synchronized(depthSessionLock) { depthGeneration++ }
         arMeshViewing = true
         aeLock = false
         awbLock = false
@@ -2623,8 +2633,9 @@ private var lastRelocPollMs = 0L
     private fun exportModel() {
         if (!::exportManager.isInitialized) return
         val exportSession = sessionId
+        val token = scanSessionToken
         exportManager.exportPlyAsync(exportSession) { r ->
-            if (isDestroyed) return@exportPlyAsync
+            if (isDestroyed || token != scanSessionToken) return@exportPlyAsync
             if (r.ok) {
                 lastPlyFilename = r.file.name
                 lastPlySessionId = exportSession
@@ -2702,8 +2713,10 @@ private var lastRelocPollMs = 0L
     private fun buildMeshForPreview() {
         if (!::exportManager.isInitialized || modelOperationBusy) return
         toast("正在生成网格（预览质量）…")
+        val token = scanSessionToken
         try {
             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
+                if (isDestroyed || token != scanSessionToken) return@buildMeshAsync
                 if (mesh == null || mesh.triangleCount <= 0) {
                     renderer.clearMesh()
                     lastMeshSummary = "失败：体素场不足以提取表面"
@@ -2752,7 +2765,7 @@ private var lastRelocPollMs = 0L
             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_NORMAL) { built ->
                 runOnUiThread {
                     when {
-                        token != scanSessionToken -> toast("已开始新的扫描，取消查看")
+                        isDestroyed || token != scanSessionToken -> toast("已开始新的扫描，取消查看")
                         built != null && built.triangleCount > 0 -> enterModelViewerWith(built)
                         else -> toast("暂无可查看的模型（体素场不足以提取表面），请先扫描")
                     }
@@ -3229,7 +3242,7 @@ private var lastRelocPollMs = 0L
         val rep = if (::depthProvider.isInitialized &&
             depthProvider is com.mobilescan3d.depth.MonoDepthProvider
         ) {
-            "RELATIVE_DEPTH"
+            "INVERSE_DEPTH"
         } else {
             "n/a"
         }
@@ -3284,8 +3297,10 @@ private var lastRelocPollMs = 0L
 
         lastLiveMeshRefreshMs = now
         liveMeshBuildBusy = true
+        val token = scanSessionToken
         try {
             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
+                if (isDestroyed || token != scanSessionToken) return@buildMeshAsync
                 try {
                     if (scanning && arDrawMode == PointCloudRenderer.DRAW_LIVE) {
                         if (mesh != null && mesh.triangleCount > 0) {
@@ -3673,6 +3688,21 @@ private var lastRelocPollMs = 0L
             } else {
                 "初始化中：请手持手机缓慢平移，建立定位后开始拼接"
             }
+        }
+        if (scanning && vinsOk) {
+            val epoch = FloatArray(NativeBridge.FUSION_EPOCH_STATS_SLOTS)
+            val count = runCatching { NativeBridge.nativeGetFusionEpochStats(epoch) }.getOrDefault(0)
+            val notice = when {
+                !::depthProvider.isInitialized || !depthProvider.available ->
+                    "深度模型不可用，请检查模型文件后重新开始"
+                count < epoch.size || epoch[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] < 0.5f ->
+                    "正在标定深度：请缓慢平移，让目标和周围纹理保持清晰"
+                epoch[NativeBridge.FUSION_EPOCH_INDEX_SUSPENDED] > 0.5f ->
+                    "已保留扫描结果；深度暂不稳定，请放慢移动并回到已扫区域"
+                else -> ""
+            }
+            warningBanner.text = notice
+            warningBanner.visibility = if (notice.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
         }
         val target = try {
             NativeBridge.nativeGetPointCount().toFloat()
@@ -4100,18 +4130,21 @@ private var lastRelocPollMs = 0L
 
     override fun onDestroy() {
         started.set(false)
+        scanning = false
+        scanNativeReady = false
+        scanSessionToken++
+        synchronized(depthSessionLock) { depthGeneration++ }
+        closeCamera()
         // 权限被拒路径下 startSystem 未执行，sensorManager 可能未初始化，直接访问会崩溃
         if (::sensorManager.isInitialized) {
             sensorManager.unregisterListener(this)
         }
-        NativeBridge.nativeDestroy()
+        synchronized(depthSessionLock) { NativeBridge.nativeDestroy() }
         sessionCreated = false
         // 权限被拒路径下 startSystem 未执行，lateinit 字段还没初始化。
         if (::depthProvider.isInitialized) {
-            try {
-                depthProvider.close()
-            } catch (_: Throwable) {
-            }
+            val provider = depthProvider
+            depthHandler?.post { runCatching { provider.close() } }
         }
         if (::exportManager.isInitialized) {
             exportManager.shutdown()

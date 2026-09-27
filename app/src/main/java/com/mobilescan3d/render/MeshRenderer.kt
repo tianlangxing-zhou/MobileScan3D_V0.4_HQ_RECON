@@ -141,10 +141,9 @@ class MeshRenderer {
     var tintB = 1.00f
 
     // ---- 待上传数据。setMesh() 可能从任意线程调用，真正的上传推迟到 GL 线程 ----
-    @Volatile private var pendingVertices: FloatArray? = null
-    @Volatile private var pendingIndices: IntArray? = null
-    @Volatile private var pendingVersion = 0L
-    private var uploadedVersion = -1L
+    private data class PendingMesh(val vertices: FloatArray?, val indices: IntArray?)
+    @Volatile private var pendingMesh = PendingMesh(null, null)
+    private var uploadedMesh: PendingMesh? = null
 
     /** 最近一次上传失败的原因（HUD / 报告用）。 */
     @Volatile
@@ -155,7 +154,13 @@ class MeshRenderer {
 
     /** 必须在 GL 线程调用（`onSurfaceCreated`）。 */
     fun init(): Boolean {
-        if (glReady) return true
+        // onSurfaceCreated means a new GL context: old integer handles are invalid.
+        glReady = false
+        vbo = 0
+        ibo = 0
+        uploadedMesh = null
+        uploadedVertexCount = 0
+        uploadedTriangleCount = 0
         program = link(VERT, FRAG)
         if (program == 0) {
             lastError = "网格着色器编译失败"
@@ -209,7 +214,7 @@ class MeshRenderer {
         ibo = 0
         program = 0
         glReady = false
-        uploadedVersion = -1L
+        uploadedMesh = null
         uploadedVertexCount = 0
         uploadedTriangleCount = 0
     }
@@ -223,18 +228,14 @@ class MeshRenderer {
      * @param indices  三角形索引，长度必须是 3 的倍数
      */
     fun setMesh(vertices: FloatArray?, indices: IntArray?) {
-        pendingVertices = vertices
-        pendingIndices = indices
-        pendingVersion++
+        pendingMesh = PendingMesh(vertices, indices)
     }
 
     fun clearMesh() {
-        pendingVertices = null
-        pendingIndices = null
-        pendingVersion++
+        pendingMesh = PendingMesh(null, null)
     }
 
-    val hasPendingMesh: Boolean get() = pendingVertices != null && pendingIndices != null
+    val hasPendingMesh: Boolean get() = pendingMesh.let { it.vertices != null && it.indices != null }
     val hasGpuMesh: Boolean get() = uploadedVertexCount > 0 && uploadedTriangleCount > 0
 
     // ------------------------------------------------------------------ 绘制
@@ -266,7 +267,7 @@ class MeshRenderer {
         // 法线只吃线性部分：本工程的摆放变换是「绕Y旋转 + 均匀缩放 + 平移」，
         // 均匀缩放下方向向量只需重新归一化（着色器里本来就归一化了），
         // 所以直接乘 mat3(uModel) 是正确的，不必再求逆转置。
-        GLES20.glUniformMatrix4fv(uModelNormal, 1, false, modelNormal3(), 0)
+        GLES20.glUniformMatrix3fv(uModelNormal, 1, false, modelNormal3(), 0)
 
         // Pc = Rwc^T (Pw - twc)。pose 是行主序 R，所以 Rwc 的三列是
         // (R[0],R[3],R[6]) / (R[1],R[4],R[7]) / (R[2],R[5],R[8])。
@@ -334,18 +335,21 @@ class MeshRenderer {
     }
 
     private fun uploadIfNeeded() {
-        if (pendingVersion == uploadedVersion) return
-        val verts = pendingVertices
-        val idx = pendingIndices
+        val snapshot = pendingMesh
+        if (snapshot === uploadedMesh) return
+        val verts = snapshot.vertices
+        val idx = snapshot.indices
         if (verts == null || idx == null) {
-            uploadedVersion = pendingVersion
+            uploadedMesh = snapshot
             uploadedVertexCount = 0
             uploadedTriangleCount = 0
             return
         }
-        if (verts.size < MESH_VERTEX_FLOATS * 3 || idx.size < 3) {
+        if (verts.size < MESH_VERTEX_FLOATS * 3 || verts.size % MESH_VERTEX_FLOATS != 0 ||
+            idx.size < 3 || idx.size % 3 != 0 ||
+            idx.any { it < 0 || it >= verts.size / MESH_VERTEX_FLOATS }) {
             lastError = "网格数据过小"
-            uploadedVersion = pendingVersion
+            uploadedMesh = snapshot
             uploadedVertexCount = 0
             uploadedTriangleCount = 0
             return
@@ -356,7 +360,7 @@ class MeshRenderer {
             // 顶点数溢出 65535 的网格 —— 那会画出完全错乱的三角形。
             lastError = "设备不支持 32 位索引，网格 $vcount 顶点超出 65535，请用「预览」质量"
             Log.w(TAG, lastError)
-            uploadedVersion = pendingVersion
+            uploadedMesh = snapshot
             uploadedVertexCount = 0
             uploadedTriangleCount = 0
             return
@@ -400,7 +404,7 @@ class MeshRenderer {
         GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
 
-        uploadedVersion = pendingVersion
+        uploadedMesh = snapshot
         uploadedVertexCount = vcount
         uploadedTriangleCount = triCount
         lastError = ""

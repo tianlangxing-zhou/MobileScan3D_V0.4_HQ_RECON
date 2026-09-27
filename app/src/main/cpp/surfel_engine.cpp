@@ -19,10 +19,14 @@ void SurfelEngine::ingestPoint(
         uint8_t g,
         uint8_t b,
         float confidence) {
-    if (!std::isfinite(z) || z < 0.05f || z > 8.f || confidence < 0.05f) {
+    // These are WORLD coordinates. Camera depth has already been gated by callers.
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+        std::fabs(x) > 100000.f || std::fabs(y) > 100000.f || std::fabs(z) > 100000.f ||
+        !std::isfinite(confidence) || confidence < 0.05f) {
         return;
     }
 
+    confidence = std::min(confidence, 1.f);
     const float cell = 0.01f;
     Key k{
         (int)std::floor(x / cell),

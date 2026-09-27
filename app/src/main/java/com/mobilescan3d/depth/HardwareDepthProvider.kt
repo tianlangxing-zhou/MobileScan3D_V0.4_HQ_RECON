@@ -32,15 +32,9 @@ import android.view.Surface
  * 代价是与 RGB 不同步 —— 而不同步这一件事，native 侧的深度标定
  * （MAD + Huber IRLS + EMA）与时序一致性检查本来就要处理，不是新增问题。
  *
- * ## DEPTH16 的数值约定
- *
- * 16 位无符号。按 Android 的通用约定按
- *     `meters = value / 65535 * depthRangeMm / 1000`
- * 换算。当 `depthRangeMm = 65535`（绝大多数设备，即「1 单位 = 1mm」）时
- * 公式退化成 `value / 1000f`，就是常见的毫米直读。
- * 保留 `depthRangeMm` 参数是为了覆盖少数量程自定义的设备 ——
- * **这一项需要实机核对**，取错了会让深度整体差一个常数因子，
- * 而那恰好是 native 侧鲁棒标定能兜住的误差。
+ * ## DEPTH16
+ * 低 13 位为毫米深度，高 3 位为置信度编码，见 Android ImageFormat.DEPTH16。
+ * 每次发布独立数组，避免相机回调改写读者正在使用的深度。
  *
  * 线程约定：与 [DepthProvider] 接口一致，所有方法都由同一个专用线程调用。
  * 内部的 ImageReader 回调跑在自己起的 HandlerThread 上，只做「解码 + 存 latest」。
@@ -49,13 +43,12 @@ class HardwareDepthProvider(
     context: Context,
     private val cameraId: String,
     private val depthWidth: Int = 320,
-    private val depthHeight: Int = 240,
-    /** DEPTH16 满量程对应的毫米数；65535 即「1 单位 = 1mm」。 */
-    private val depthRangeMm: Float = 65535f
+    private val depthHeight: Int = 240
 ) : DepthProvider {
 
     private val appContext = context.applicationContext
 
+    private val lifecycle = java.util.concurrent.atomic.AtomicLong(0)
     private var camera: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
@@ -67,11 +60,6 @@ class HardwareDepthProvider(
 
     @Volatile
     private var latestResult: DepthProvider.Result? = null
-
-    /** 复用缓冲，避免每帧 new（深度帧率不高，但没必要制造 GC 压力）。 */
-    private var buffer = FloatArray(0)
-    private var bufferW = 0
-    private var bufferH = 0
 
     @Volatile
     private var frameCount = 0L
@@ -92,6 +80,8 @@ class HardwareDepthProvider(
      */
     fun start(): Boolean {
         if (running) return true
+        close()
+        val generation = lifecycle.incrementAndGet()
         val manager = appContext.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
         if (manager == null) {
             lastError = "CameraManager 不可用"
@@ -131,6 +121,7 @@ class HardwareDepthProvider(
 
             manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
+                    if (!running || generation != lifecycle.get()) { device.close(); return }
                     camera = device
                     try {
                         val surface = ir.surface as Surface
@@ -141,6 +132,7 @@ class HardwareDepthProvider(
                             listOf(surface),
                             object : CameraCaptureSession.StateCallback() {
                                 override fun onConfigured(s: CameraCaptureSession) {
+                                    if (!running || generation != lifecycle.get()) { s.close(); return }
                                     session = s
                                     try {
                                         s.setRepeatingRequest(req.build(), null, h)
@@ -152,6 +144,8 @@ class HardwareDepthProvider(
                                 }
 
                                 override fun onConfigureFailed(s: CameraCaptureSession) {
+                                    s.close()
+                                    if (generation != lifecycle.get()) return
                                     running = false
                                     lastError = "深度会话配置失败"
                                     Log.e(TAG, lastError)
@@ -168,6 +162,7 @@ class HardwareDepthProvider(
 
                 override fun onDisconnected(device: CameraDevice) {
                     device.close()
+                    if (generation != lifecycle.get()) return
                     camera = null
                     running = false
                     lastError = "深度相机断开"
@@ -175,6 +170,7 @@ class HardwareDepthProvider(
 
                 override fun onError(device: CameraDevice, error: Int) {
                     device.close()
+                    if (generation != lifecycle.get()) return
                     camera = null
                     running = false
                     lastError = "深度相机错误码 $error"
@@ -196,7 +192,7 @@ class HardwareDepthProvider(
             null
         } ?: return
         try {
-            submitDepthImage(image, image.timestamp)
+            if (running && r === reader) submitDepthImage(image, image.timestamp)
         } catch (t: Throwable) {
             lastError = "解码 DEPTH16 失败: ${t.message}"
         } finally {
@@ -217,88 +213,31 @@ class HardwareDepthProvider(
     /**
      * 把一帧 DEPTH16 解码成米制深度。
      *
-     * `timestampNs` 用**调用方给的相机帧时间戳**，而不是 `image.timestamp`：
-     * 深度相机与 RGB 相机是两个独立的 sensor clock，直接拿深度的时间戳去
-     * native 侧查 VINS pose 是查不到的（native 按 SENSOR_TIMESTAMP 索引）。
+     * 保留传感器时间戳。接入 RGB 融合前必须完成时钟、内参与外参对齐；
+     * 不得把异步深度帧伪装成当前 RGB 帧。默认工厂仍使用单目模型。
      */
+    @Synchronized
     override fun submitDepthImage(image: Image, timestampNs: Long): Boolean {
+        if (!running) return false
         if (image.format != ImageFormat.DEPTH16) return false
         val w = image.width
         val h = image.height
         if (w <= 0 || h <= 0) return false
 
-        val plane = image.planes[0]
-        val rowStrideBytes = plane.rowStride
-        if (rowStrideBytes < w * 2) return false
-        val rowStrideShorts = rowStrideBytes / 2
-        val shorts = plane.buffer.order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
-
-        if (bufferW != w || bufferH != h) {
-            buffer = FloatArray(w * h)
-            bufferW = w
-            bufferH = h
+        val plane = image.planes.firstOrNull() ?: return false
+        val decoded = Depth16Decoder.decode(plane.buffer, w, h, plane.rowStride, plane.pixelStride)
+            ?: return false
+        if (decoded.depth.none { it > 0f }) {
+            latestResult = null
+            return false
         }
-        val rangeMm = if (depthRangeMm > 1f) depthRangeMm else 65535f
-        val unitToMeters = rangeMm / 65535f / 1000f
-
-        // DEPTH16 的第二个 plane（如果有）是 8 位置信度图。
-        // 只有标定为 DEPTH_CALIBRATION 的设备才有，取不到就置 null。
-        var conf: FloatArray? = null
-        try {
-            if (image.planes.size > 1) {
-                val cp = image.planes[1]
-                val cb = cp.buffer
-                if (cb.remaining() >= w * h) {
-                    val arr = FloatArray(w * h)
-                    val base = cb.position()
-                    val cRowStride = cp.rowStride
-                    val cPixelStride = if (cp.pixelStride > 0) cp.pixelStride else 1
-                    var oy = 0
-                    while (oy < h) {
-                        val ro = base + oy * cRowStride
-                        var ox = 0
-                        while (ox < w) {
-                            val idx = ro + ox * cPixelStride
-                            if (idx >= base + cb.limit()) break
-                            arr[oy * w + ox] = (cb.get(idx).toInt() and 0xFF) / 255f
-                            ++ox
-                        }
-                        ++oy
-                    }
-                    conf = arr
-                }
-            }
-        } catch (t: Throwable) {
-            conf = null
-        }
-
-        var valid = 0
-        var y = 0
-        while (y < h) {
-            val ro = y * rowStrideShorts
-            val base = y * w
-            var x = 0
-            while (x < w) {
-                val raw = shorts.get(ro + x).toInt() and 0xFFFF
-                if (raw == 0) {
-                    // 0 表示该像素无有效深度（Android 约定）
-                    buffer[base + x] = 0f
-                } else {
-                    buffer[base + x] = raw * unitToMeters
-                    ++valid
-                }
-                ++x
-            }
-            ++y
-        }
-        if (valid <= 0) return false
 
         ++frameCount
         latestResult = DepthProvider.Result(
-            depth = buffer,
+            depth = decoded.depth,
             width = w,
             height = h,
-            confidence = conf,
+            confidence = decoded.confidence,
             timestampNs = timestampNs,
             metric = true,
             backend = backendName
@@ -308,12 +247,15 @@ class HardwareDepthProvider(
 
     override fun latest(): DepthProvider.Result? = latestResult
 
+    @Synchronized
     override fun reset() {
         latestResult = null
         frameCount = 0L
     }
 
+    @Synchronized
     override fun close() {
+        lifecycle.incrementAndGet()
         running = false
         latestResult = null
         try {

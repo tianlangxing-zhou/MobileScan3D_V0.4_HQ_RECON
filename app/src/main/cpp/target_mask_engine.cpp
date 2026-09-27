@@ -157,7 +157,8 @@ bool TargetMaskEngine::build(const float* depth, int width, int height,
 
     for (int step = 0; step < kToleranceSteps; ++step) {
         const float tolerance = std::clamp(seedDepth * kToleranceRatios[step],
-                                           kToleranceMin, kToleranceMax);
+                                           kToleranceMin * kToleranceRatios[step] / kToleranceRatios[0],
+                                           kToleranceMax);
 
         // ---- 深度带通得到 candidate（只在 searchBox 内） ----
         if (candidate_.rows != height || candidate_.cols != width ||
@@ -259,6 +260,7 @@ bool TargetMaskEngine::build(const float* depth, int width, int height,
         maskRoi.setTo(0);
         maskRoi.setTo(255, labels_ == chosen);
         cv::morphologyEx(maskRoi, maskRoi, cv::MORPH_CLOSE, kernel_);
+        cv::bitwise_and(maskRoi, candRoi, maskRoi); // Do not refill invalid depth/background.
         area = cv::countNonZero(maskRoi);
         if (area < kMinMaskArea) {
             if (step == 0) {

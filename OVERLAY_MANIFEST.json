@@ -1,0 +1,190 @@
+{
+  "base_commit": "2cafb5382e21eec4795255309c413d14efadae5b",
+  "version": "0.13.6-review",
+  "kind": "incremental overlay",
+  "files": [
+    {
+      "path": "README_REPLACE_ZH.md",
+      "sha256": "12703814939b6a254731a3e7259f75ed79697aa26fbb5d889d974cd53fd8d443",
+      "bytes": 1388
+    },
+    {
+      "path": "app/build.gradle.kts",
+      "sha256": "048c620e9e3c1b2b6f393d0151be8041a457ab01e19f6459e798f9e2c96a2f71",
+      "bytes": 2997,
+      "base_sha256": "62af1114a9cfed865be34dc6932dbb6634dafdc2f478884b14cf57d348348226"
+    },
+    {
+      "path": "app/src/main/cpp/depth_calib.cpp",
+      "sha256": "e35c2fd3b59c72ad723226d34cb5554962e90f2c4769eeadf9d8e5b77fe36c72",
+      "bytes": 13655,
+      "base_sha256": "77b5007df566b92cf30da9c318aad77baeb39a99af00623cbc8f0993d6cd5d1e"
+    },
+    {
+      "path": "app/src/main/cpp/depth_calib.h",
+      "sha256": "153fdea91832a78658964bbc13855fc6c3f741dd2508c07edab13b00bf59da1f",
+      "bytes": 9070,
+      "base_sha256": "be5a5c9a437c5d24dc01bc6c46a3317d7585397fc124506c551fbfd7a6c9ea56"
+    },
+    {
+      "path": "app/src/main/cpp/depth_geometry.h",
+      "sha256": "0428907a1c182258a49c3b9cfd5efb1c409671d40a50360a008aa33fc20d7807",
+      "bytes": 477
+    },
+    {
+      "path": "app/src/main/cpp/mesh/mesh_engine.cpp",
+      "sha256": "75b2319bbce05abaf3af1677d1a096f86ef5e1cbe75bad2b2bcd89d0990a8ea3",
+      "bytes": 40554,
+      "base_sha256": "4b601d76a9503a53c5c7ce52695d30242c1b281e639677e247ea97bb10259172"
+    },
+    {
+      "path": "app/src/main/cpp/native_engine.cpp",
+      "sha256": "1b65899c6223205875ec54295dcef6538d5a39ae6bea1e82f18ec5b72d0e86b4",
+      "bytes": 185270,
+      "base_sha256": "bfe1b39647bf19913cbc300769d75603a1bd87ebb170dd2f23740bee20e280bd"
+    },
+    {
+      "path": "app/src/main/cpp/surfel_engine.cpp",
+      "sha256": "bb19cef6895dd0f717eb0f5c5d7401cee2047e4b339a91d59a4c14912af45720",
+      "bytes": 4866,
+      "base_sha256": "855dd6527c3cb08c4306f0599a14f499b2e794883039f69a27bcbb2bf0d9166d"
+    },
+    {
+      "path": "app/src/main/cpp/target_mask_engine.cpp",
+      "sha256": "5fed53d6df2cfc47dafb19e9ed0bd8438ac482dc8389ac2c41d6eaf4c3fe043e",
+      "bytes": 14914,
+      "base_sha256": "72d617d5674a848104696e22d3deee10b0474c03ad8a1c480e4bc5701fd41c0c"
+    },
+    {
+      "path": "app/src/main/cpp/target_mask_engine.h",
+      "sha256": "425cfdc43e64769f339ec7d19648a007aa8f4f1366d3bec3b510751deb54a6e4",
+      "bytes": 5539,
+      "base_sha256": "2f4d9d0af85173218388a666e2074eb9040ea3a5afa5d084e4be8bf6564f631b"
+    },
+    {
+      "path": "app/src/main/cpp/tsdf_engine.cpp",
+      "sha256": "34a0dcdc31a63f5505c4e5ed0d9361bd784ff055eca97c8e8919c39bc1a38067",
+      "bytes": 13854,
+      "base_sha256": "c939133257921e52304a99019e6a0241506881686e81dfee276baf48342d89cd"
+    },
+    {
+      "path": "app/src/main/cpp/tsdf_engine.h",
+      "sha256": "20c5e8e8147d43da81b8acfffab00e966a7838f34d3afcfb69fc2501776ee72f",
+      "bytes": 7964,
+      "base_sha256": "15becb064e3edb5888fff449baa230feee6dd1ec7f033e3c98a58717b04bb808"
+    },
+    {
+      "path": "app/src/main/cpp/v06/texture_baker.cpp",
+      "sha256": "3537c810e019b4fcd7d3daa7df79a17729b7d4db01755c6160d6bb00c65741f7",
+      "bytes": 26102,
+      "base_sha256": "6e7341fa09ff0d3ad72fe283f265ae8ee15f8432a088594b330b90b4c17133fc"
+    },
+    {
+      "path": "app/src/main/cpp/vins/vins_bridge.cpp",
+      "sha256": "a97e60096b3dc8d0245cc9d6c1dee081d0d0af13affdbc953b48419a944e2dee",
+      "bytes": 27038,
+      "base_sha256": "95e76d5aa1a694ec9bf0ae95cc1a5cd09fc0b2fc65e12e8fb5dfc19b6c007a5d"
+    },
+    {
+      "path": "app/src/main/cpp/vins/vins_bridge.h",
+      "sha256": "485ade9bac694c3cb88fd85a5c4c11c28c2ac1fc00e74991424c44938dc33318",
+      "bytes": 4394,
+      "base_sha256": "c1e14d4cab36702a441cd2ff92a0e4c1a48bb6436c26b9c1361d08649f332d01"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/MainActivity.kt",
+      "sha256": "2949648ace44b21b0c98d76b9903a1ff1bfdfe18f09d6123bcd7aaa60f6cd2b1",
+      "bytes": 199662,
+      "base_sha256": "1abe79dd01fd4b05793a40747d3722bbeeb46e40148edb9cb9022613622827cc"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/NativeBridge.kt",
+      "sha256": "b0f88a1fa76c6decdd65fa8de5bc24f84fc7aac9b7144596c1142f003095d8e1",
+      "bytes": 26208,
+      "base_sha256": "23a42d466ab0ac3df03ce9825ec2754e39457ad90c8d359644a0bac17f78bf70"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/depth/Depth16Decoder.kt",
+      "sha256": "b2c58047e1a158f14e26fe9ece9f1f8ee00bcef497783c11f8f05efd0c42b352",
+      "bytes": 1465
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/depth/DepthProvider.kt",
+      "sha256": "adf1ce06184b3466efdf11a42cea4bc1ba3a1ad9ab4e2c2c93689a25a17b422e",
+      "bytes": 3588,
+      "base_sha256": "b98649035f13fb3f74a7d6e7ac2bc96e2a187013d8504848adf6dd307cb4350b"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/depth/HardwareDepthProvider.kt",
+      "sha256": "d14c9dcef98707d916ef9f6af1f60487d76625818ca78eedfde96cbcfd189907",
+      "bytes": 10703,
+      "base_sha256": "0a6f7332c9e1ebb894ab59f2d4b5926d99925ea4dabc86ea43424aa865f9c8c5"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/depth/MonoDepthProvider.kt",
+      "sha256": "f369df226499680a6369b110f5ce8f51388b6528d89dd0f9e74c23c990725027",
+      "bytes": 4367,
+      "base_sha256": "0da207fe8b1182e943f1707a62a9f92b0cf762a8480436542d6972651968670d"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/export/ExportManager.kt",
+      "sha256": "11a076abefdeb4124f44c998df9fcfa3f68ed0d2726561e6fce3cd094d6eeafa",
+      "bytes": 14937,
+      "base_sha256": "69192b4add1cbc23434005814a95aac1bd9e5b0e08a1d6662484c1f54604718c"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/render/MeshRenderer.kt",
+      "sha256": "7affc0e263c9f74dd1ac0cd7be4f90dd06fdc147074da3c4341150f78580139f",
+      "bytes": 22189,
+      "base_sha256": "d2ea654f9a81829c5213bc7d889af910a63d2c1a55c8f26ded5040439d35122e"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/render/TexturedMeshRenderer.kt",
+      "sha256": "7895037e330ac24c11e23369a371b54a9aeefedf4b69a2424017acfd5728b516",
+      "bytes": 20151,
+      "base_sha256": "5d28eb54f28c020dd1d69e0802efd7465614965899e130c54dba775cb639a0fb"
+    },
+    {
+      "path": "docs/review_0136/REVIEW_ZH.md",
+      "sha256": "30f8144e4796c030b8b84e86ba7f6baf009cd473d3f43af2489fdef7513d1ca9",
+      "bytes": 9322
+    },
+    {
+      "path": "review_0136.patch",
+      "sha256": "1f738d9e946852fe9de6706e9f75a069d6dc271a5f23f6643f66c3ec81119474",
+      "bytes": 94979
+    },
+    {
+      "path": "tools/review_tests/Depth16Regression.kt",
+      "sha256": "61ef877b16594f1467644cd0ea49f86c2fbd71cdc5803088f27e2038c4d02189",
+      "bytes": 1516
+    },
+    {
+      "path": "tools/review_tests/export_regression.cpp",
+      "sha256": "745e07f0bc3291978c5530d12c8777bb2e447ab86510bd989545e5660a24bad3",
+      "bytes": 2918,
+      "base_sha256": "745e07f0bc3291978c5530d12c8777bb2e447ab86510bd989545e5660a24bad3"
+    },
+    {
+      "path": "tools/review_tests/geometry_regression.cpp",
+      "sha256": "34805bf5bdebcd1e52bea30bd8c8fcc2d640a363528e96904106c565f1abf3c3",
+      "bytes": 5181
+    },
+    {
+      "path": "tools/review_tests/run.py",
+      "sha256": "d6ae43805c328efc9c852ca0eacdddf865dcba1fdf4e87c2ebec4d362fafb35b",
+      "bytes": 3547,
+      "base_sha256": "d6ae43805c328efc9c852ca0eacdddf865dcba1fdf4e87c2ebec4d362fafb35b"
+    },
+    {
+      "path": "tools/review_tests/run_geometry.py",
+      "sha256": "fb1dd0dabf5aaf9a93700892528786764faec10a80eef1f4e0bf4a267abfa902",
+      "bytes": 773
+    },
+    {
+      "path": "tools/review_tests/verify_overlay.py",
+      "sha256": "470bcceda02797082c6d438084ce3d08920ce207a6596577478e5b9d06a78b50",
+      "bytes": 824
+    }
+  ]
+}

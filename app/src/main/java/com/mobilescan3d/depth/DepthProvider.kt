@@ -2,23 +2,10 @@ package com.mobilescan3d.depth
 
 import android.media.Image
 
-/**
- * 深度表示的固定语义（评审 P0-1）。
- *
- * 关键：**一旦模型确定，表示就固定，运行时不要再猜 linear 还是 inverse**。
- * - [RELATIVE_DEPTH]：模型输出 raw `q` 与“真实远近”单调递增（大模型越大=越近
- *   或越大=越远，由标定 affine 吸收符号），native 侧用 VINS 稀疏三角化 + stereo
- *   anchors 拟合 `metric = scale*q + shift` 得到米制。
- * - [INVERSE_DEPTH]：模型输出 raw `q` 是视差/逆深度，native 用 `metric =
- *   scale/q + shift`。
- *
- * 选择哪种由 `depth_model.tflite` 的真实输出定义**固定一次**；不要像旧实现那样
- * 用会话级 min/max 把 q 重映射到 [0.4,6]——那会让同一 q 在不同扫描阶段对应不同
- * 米制，正是尺度漂移的根因。
- */
-enum class DepthRepresentation {
-    RELATIVE_DEPTH,
-    INVERSE_DEPTH
+/** Fixed output semantics. Native fits z=a*q+b or 1/z=a*q+b, respectively. */
+enum class DepthRepresentation(val nativeCode: Int) {
+    RELATIVE_DEPTH(0),
+    INVERSE_DEPTH(1)
 }
 
 /**
@@ -55,7 +42,7 @@ interface DepthProvider {
      *                    **固定一次**，运行时绝不根据单帧内容重新猜测 linear
      *                    还是 inverse。native 侧用 VINS 稀疏三角化 +
      *                    stereo anchors 拟合 `metric = scale*q + shift`
-     *                    （逆深度则是 `scale/q + shift`）得到米制。
+     *                    （逆深度则是 `1 / (scale*q + shift)`）得到米制。
      */
     data class Result(
         val depth: FloatArray,

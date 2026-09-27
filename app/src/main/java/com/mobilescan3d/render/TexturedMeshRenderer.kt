@@ -49,7 +49,7 @@ class TexturedMeshRenderer {
         private set
 
     val hasAsset: Boolean
-        get() = uploadedTriangleCount > 0 || pendingVertices != null
+        get() = uploadedTriangleCount > 0 || pendingAsset.vertices != null
 
     private var program = 0
     private var vbo = 0
@@ -106,20 +106,21 @@ class TexturedMeshRenderer {
         }
     }
 
-    @Volatile
-    private var pendingVertices: FloatArray? = null
-
-    @Volatile
-    private var pendingIndices: IntArray? = null
-
-    @Volatile
-    private var pendingAtlasJpeg: ByteArray? = null
-
-    @Volatile
-    private var clearPending = false
+    private data class PendingAsset(
+        val vertices: FloatArray?, val indices: IntArray?, val jpeg: ByteArray?
+    )
+    @Volatile private var pendingAsset = PendingAsset(null, null, null)
+    private var uploadedAsset: PendingAsset? = null
 
     fun init() {
-        releaseGpu()
+        // Do not delete stale names in a new context: they may already name
+        // another renderer's newly-created resources. Retain CPU data for reupload.
+        program = 0
+        vbo = 0
+        textureId = 0
+        uploadedAsset = null
+        uploadedVertexCount = 0
+        uploadedTriangleCount = 0
 
         program = link(VERT, FRAG)
         if (program == 0) {
@@ -184,17 +185,11 @@ class TexturedMeshRenderer {
 
         // Ownership is transferred from TexturedArAssetLoader; these arrays
         // are not mutated afterwards. Avoid a second 5–30 MB Java heap copy.
-        pendingVertices = vertices8
-        pendingIndices = indices
-        pendingAtlasJpeg = atlasJpeg
-        clearPending = false
+        pendingAsset = PendingAsset(vertices8, indices, atlasJpeg)
     }
 
     fun clearAsset() {
-        pendingVertices = null
-        pendingIndices = null
-        pendingAtlasJpeg = null
-        clearPending = true
+        pendingAsset = PendingAsset(null, null, null)
     }
 
     fun draw(
@@ -358,20 +353,19 @@ class TexturedMeshRenderer {
     }
 
     private fun applyPending() {
-        if (clearPending) {
-            clearPending = false
+        if (program == 0 || vbo == 0) return
+        val snapshot = pendingAsset
+        if (snapshot === uploadedAsset) return
+        uploadedAsset = snapshot
+        val vertices = snapshot.vertices
+        val indices = snapshot.indices
+        val jpeg = snapshot.jpeg
+        if (vertices == null || indices == null || jpeg == null) {
             releaseTexture()
             uploadedTriangleCount = 0
             uploadedVertexCount = 0
+            return
         }
-
-        val vertices = pendingVertices ?: return
-        val indices = pendingIndices ?: return
-        val jpeg = pendingAtlasJpeg ?: return
-
-        pendingVertices = null
-        pendingIndices = null
-        pendingAtlasJpeg = null
 
         try {
             val sourceVertexCount =

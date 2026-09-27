@@ -47,9 +47,9 @@ const int kTetEdge[6][2] = {
 };
 
 struct EdgeKey {
-    int32_t x, y, z, axis;
+    int32_t x, y, z, direction; // Bit mask: X=1, Y=2, Z=4, including diagonals.
     bool operator==(const EdgeKey& o) const {
-        return x == o.x && y == o.y && z == o.z && axis == o.axis;
+        return x == o.x && y == o.y && z == o.z && direction == o.direction;
     }
 };
 
@@ -58,7 +58,7 @@ struct EdgeKeyHash {
         uint64_t a = (uint64_t)(uint32_t)k.x * 73856093ull;
         uint64_t b = (uint64_t)(uint32_t)k.y * 19349663ull;
         uint64_t c = (uint64_t)(uint32_t)k.z * 83492791ull;
-        uint64_t d = (uint64_t)(uint32_t)k.axis * 2654435761ull;
+        uint64_t d = (uint64_t)(uint32_t)k.direction * 2654435761ull;
         return (size_t)(a ^ b ^ c ^ d);
     }
 };
@@ -176,19 +176,18 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
                              float fa, float fb) -> uint32_t {
         // 棱键：取字典序较小的端点 + 轴向
         int lo[3];
-        int axis = -1;
+        int direction = 0;
         const int a3[3] = {ax, ay, az};
         const int b3[3] = {bx, by, bz};
         for (int i = 0; i < 3; ++i) {
             lo[i] = std::min(a3[i], b3[i]);
             if (a3[i] != b3[i]) {
-                axis = i;
+                direction |= (1 << i);
             }
         }
-        if (axis < 0) {
-            axis = 0;
-        }
-        const EdgeKey key{lo[0], lo[1], lo[2], axis};
+        // The six tetrahedra use monotone cube diagonals. Encode ALL changed
+        // axes so body/face diagonals never collide with an axis-aligned edge.
+        const EdgeKey key{lo[0], lo[1], lo[2], direction};
         auto it = vertOfEdge.find(key);
         if (it != vertOfEdge.end()) {
             return it->second;
@@ -234,6 +233,7 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
             for (int ly = 0; ly < kTsdfBlockSize; ++ly) {
                 for (int lx = 0; lx < kTsdfBlockSize; ++lx) {
                     float f[8];
+                    bool observed[8] = {};
                     int validCount = 0;
                     float fmin = 1e9f;
 
@@ -258,6 +258,7 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
                             f[c] = 1.f;
                         } else {
                             f[c] = vv.tsdf / kTsdfValueScale;
+                            observed[c] = true;
                             ++validCount;
                         }
                         if (f[c] < fmin) {
@@ -282,6 +283,10 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
 
                     for (int ti = 0; ti < 6; ++ti) {
                         const int* tet = kTets[ti];
+                        // Unknown voxels are not measured free space. Crossing from
+                        // a negative sample into unknown space fabricates a back shell.
+                        if (!observed[tet[0]] || !observed[tet[1]] ||
+                            !observed[tet[2]] || !observed[tet[3]]) continue;
                         float tf[4];
                         int insideMask = 0;
                         int inIdx[4];
@@ -425,13 +430,9 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
     for (size_t i = 0; i < vertEdge.size(); ++i) {
         const EdgeKey& e = vertEdge[i];
         int vx = e.x, vy = e.y, vz = e.z;
-        if (e.axis == 0) {
-            vx += 1;
-        } else if (e.axis == 1) {
-            vy += 1;
-        } else {
-            vz += 1;
-        }
+        vx += (e.direction & 1) ? 1 : 0;
+        vy += (e.direction & 2) ? 1 : 0;
+        vz += (e.direction & 4) ? 1 : 0;
         const float gx = tsdf.valueAt(vx + 1, vy, vz) - tsdf.valueAt(vx - 1, vy, vz);
         const float gy = tsdf.valueAt(vx, vy + 1, vz) - tsdf.valueAt(vx, vy - 1, vz);
         const float gz = tsdf.valueAt(vx, vy, vz + 1) - tsdf.valueAt(vx, vy, vz - 1);
@@ -453,13 +454,9 @@ static void extractMarchingTetrahedra(const TsdfEngine& tsdf, float voxel,
         const EdgeKey& e = vertEdge[i];
         int ax = e.x, ay = e.y, az = e.z;
         int bx = ax, by = ay, bz = az;
-        if (e.axis == 0) {
-            bx += 1;
-        } else if (e.axis == 1) {
-            by += 1;
-        } else {
-            bz += 1;
-        }
+        bx += (e.direction & 1) ? 1 : 0;
+        by += (e.direction & 2) ? 1 : 0;
+        bz += (e.direction & 4) ? 1 : 0;
 
         const uint16_t c0 = tsdf.color565At(ax, ay, az);
         const uint16_t c1 = tsdf.color565At(bx, by, bz);

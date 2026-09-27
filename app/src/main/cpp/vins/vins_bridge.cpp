@@ -570,7 +570,7 @@ float vinsFeatureDepthMedian() {
 //
 // 调用方必须已持有 g_vinsMutex。
 static bool vinsAnchorDepthPair(const FeaturePerId& f, Eigen::Vector2d* outUv,
-                                double* outDepth) {
+                                double* outDepth, int requestedFrame = -1) {
     if (f.solve_flag != 1 || f.feature_per_frame.empty()) {
         return false;
     }
@@ -580,13 +580,15 @@ static bool vinsAnchorDepthPair(const FeaturePerId& f, Eigen::Vector2d* outUv,
     }
 
     const int anchorFrame = f.start_frame;
-    const int obsFrame = anchorFrame + (int)f.feature_per_frame.size() - 1;
+    const int lastFrame = anchorFrame + (int)f.feature_per_frame.size() - 1;
+    const int obsFrame = requestedFrame >= 0 ? requestedFrame : lastFrame;
+    if (obsFrame < anchorFrame || obsFrame > lastFrame) return false;
     if (anchorFrame < 0 || anchorFrame > WINDOW_SIZE ||
         obsFrame < 0 || obsFrame > WINDOW_SIZE) {
         return false;
     }
 
-    const Eigen::Vector2d& uv = f.feature_per_frame.back().uv;
+    const Eigen::Vector2d& uv = f.feature_per_frame[obsFrame - anchorFrame].uv;
     if (!std::isfinite(uv.x()) || !std::isfinite(uv.y())) {
         return false;
     }
@@ -680,7 +682,7 @@ float vinsFeatureDepthMedianInRoi(float nx0, float ny0, float nx1, float ny1,
     return static_cast<float>(depths[n / 2]);
 }
 
-int vinsFeatureSamples(float* out, int maxSamples) {
+int vinsFeatureSamples(float* out, int maxSamples, uint64_t timestampNs) {
     if (out == nullptr || maxSamples <= 0) {
         return 0;
     }
@@ -694,6 +696,16 @@ int vinsFeatureSamples(float* out, int maxSamples) {
         return 0;
     }
 
+    int observationFrame = -1;
+    if (timestampNs != 0) {
+        const double requested = static_cast<double>(timestampNs) * 1e-9;
+        double best = 0.035;
+        for (int i = 0; i <= WINDOW_SIZE; ++i) {
+            const double dt = std::fabs(g_estimator.Headers[i].stamp.toSec() - requested);
+            if (dt < best) { best = dt; observationFrame = i; }
+        }
+        if (observationFrame < 0) return 0;
+    }
     const float invW = 1.0f / static_cast<float>(g_vinsImageW);
     const float invH = 1.0f / static_cast<float>(g_vinsImageH);
 
@@ -709,7 +721,7 @@ int vinsFeatureSamples(float* out, int maxSamples) {
         // 否则 vinsFeatureSamples() 交给深度标定器的 (uv, z) 对是错配的。
         Eigen::Vector2d uv;
         double d = 0.0;
-        if (!vinsAnchorDepthPair(it_per_id, &uv, &d)) {
+        if (!vinsAnchorDepthPair(it_per_id, &uv, &d, observationFrame)) {
             continue;
         }
         const float nu = static_cast<float>(uv.x()) * invW;

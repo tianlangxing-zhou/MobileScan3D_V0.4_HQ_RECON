@@ -290,9 +290,10 @@ void rasterizeDepth(
                     continue;
                 }
 
-                // Coarse visibility only; linear camera-Z interpolation is
-                // sufficient at this resolution.
-                const float z = w0*z0 + w1*z1 + w2*z2;
+                // Screen barycentrics interpolate reciprocal camera depth.
+                const float invZ = w0 / z0 + w1 / z1 + w2 / z2;
+                if (!(invZ > 0.f) || !std::isfinite(invZ)) continue;
+                const float z = 1.f / invZ;
                 if (z < row[x]) row[x] = z;
             }
         }

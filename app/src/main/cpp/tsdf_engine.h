@@ -168,7 +168,7 @@ private:
     float trunc_ = 0.080f;     // 4 * voxel_
     float minDepth_ = 0.08f;
     float maxDepth_ = 8.0f;
-    int pixelStep_ = 4;        // 与旧实现一致：depth 本身就是 256x256 上采样的，密集采样无收益
+    int pixelStep_ = 1;        // Native 256x256 depth: preserve every measured pixel.
     size_t maxBlocks_ = 8192;  // V0.11: 8-byte voxel -> ~32MB 上限
     uint64_t liveVoxels_ = 0;
     uint64_t liveColoredVoxels_ = 0;

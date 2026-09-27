@@ -22,21 +22,19 @@ val opencvSdkDir = requiredLocalPath("opencv.sdkDir")
 
 fun gitOutput(vararg args: String): String {
     return try {
-        ProcessBuilder("git", *args)
+        val process = ProcessBuilder("git", *args)
             .directory(rootProject.projectDir)
             .redirectErrorStream(true)
             .start()
-            .inputStream
-            .bufferedReader()
-            .readText()
-            .trim()
+        val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+        if (process.waitFor() == 0) output else "unknown"
     } catch (_: Exception) {
         "unknown"
     }
 }
 
 val gitSha = gitOutput("rev-parse", "--short=8", "HEAD")
-val gitDirty = gitOutput("status", "--porcelain").isNotBlank()
+val gitDirty = gitOutput("status", "--porcelain").let { it != "unknown" && it.isNotBlank() }
 val gitBuildId = if (gitDirty) "$gitSha-dirty" else gitSha
 val buildTimestamp = System.currentTimeMillis()
 
@@ -58,8 +56,8 @@ android {
         applicationId = "com.mobilescan3d"
         minSdk = 26
         targetSdk = 36
-        versionCode = 130
-        versionName = "0.13.0-target-identity-sticky-fusion"
+        versionCode = 136
+        versionName = "0.13.6-review"
         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
         ndk { abiFilters += listOf("arm64-v8a") }

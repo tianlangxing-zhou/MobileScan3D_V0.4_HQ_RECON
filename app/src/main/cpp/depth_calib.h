@@ -128,7 +128,8 @@ struct DepthCalibration {
 DepthCalibration fitDepthRobust(const std::vector<float>& d,
                                 const std::vector<float>& z,
                                 bool inverseDepth = true,
-                                int maxIterations = 10);
+                                int maxIterations = 10,
+                                bool forceInverse = false);
 
 /** 中位数（会复制输入排序）。空输入返回 0。 */
 float medianOf(std::vector<float> v);
@@ -149,6 +150,7 @@ public:
         float minConfidence = 0.25f;         // 低于此置信度视为无效
         float maxJumpRatio = 3.0f;           // 新旧 scale 比超过此值视为野值
         bool allowInverseDepth = true;
+        bool forceInverseDepth = false;
     };
 
     void reset();
