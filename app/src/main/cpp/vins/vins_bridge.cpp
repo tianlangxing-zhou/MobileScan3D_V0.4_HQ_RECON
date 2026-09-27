@@ -1,6 +1,7 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <deque>
 #include <map>
@@ -456,8 +457,26 @@ bool vinsReady() {
     return g_vinsReady;
 }
 
+// V0.13.1：见 vins_bridge.h 的说明。初始化成功一次就永久置位，
+// 由 vinsReset() 清零 —— 新一轮扫描要重新走一遍初始化。
+static std::atomic<bool> g_vinsEverInit{false};
+
+bool vinsEverInitialized() {
+    return g_vinsEverInit.load(std::memory_order_acquire);
+}
+
+// 新一轮扫描必须重新走一遍初始化：不清零的话，上一场锁过之后
+// 这一场开头会直接显示「定位失锁」，而正确的引导是「请缓慢平移」。
+void vinsResetInitLatch() {
+    g_vinsEverInit.store(false, std::memory_order_release);
+}
+
 bool vinsInitialized() {
-    return g_vinsReady && g_estimator.solver_flag == Estimator::NON_LINEAR;
+    const bool ok = g_vinsReady && g_estimator.solver_flag == Estimator::NON_LINEAR;
+    if (ok) {
+        g_vinsEverInit.store(true, std::memory_order_release);
+    }
+    return ok;
 }
 
 bool vinsGetHealth(VinsHealth* out) {

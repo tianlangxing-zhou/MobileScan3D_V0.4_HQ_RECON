@@ -1177,6 +1177,7 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     vinsQ[3] = 1;
     snaps.clear();
     mobilescan3d::stereo_anchor::reset();
+    vinsResetInitLatch();
     vinsFrames = depthFrames = 0;
     lastVinsMs = 0.0;
 
@@ -1233,9 +1234,9 @@ Java_com_mobilescan3d_NativeBridge_nativeOnImu(JNIEnv*, jobject, jlong t,
     vinsInputImu((double)t * 1e-9, ax, ay, az, gx, gy, gz);
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
-        JNIEnv* e, jobject,
+/** nativeOnCameraFrame 的实现体；JNI 包装负责兜住所有 C++ 异常。 */
+static void nativeOnCameraFrameImpl(
+        JNIEnv* e,
         jbyteArray y, jbyteArray u, jbyteArray v,
         jint w, jint h, jint rs, jint urs, jint ups, jlong frameTs, jlong vinsTs) {
     jsize un = e->GetArrayLength(u);
@@ -1604,6 +1605,32 @@ Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
                 }
             }
         }
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeOnCameraFrame(
+        JNIEnv* e, jobject,
+        jbyteArray y, jbyteArray u, jbyteArray v,
+        jint w, jint h, jint rs, jint urs, jint ups, jlong frameTs, jlong vinsTs) {
+    // 与 nativeOnDepthMap 同样的 JNI 边界防线。
+    //
+    // 原函数里只有 ObjectTracker 那一小段有 try/catch；主体（VINS 前端
+    // goodFeaturesToTrack / findFundamentalMat、重定位 ORB、Ceres 后端、
+    // 色彩空间分支里的 OpenCV 调用）全是裸奔的。这条路径是 **30Hz 相机帧**，
+    // 也是 Ceres 求解真正发生的地方（VINS 在 vinsInputImage 里跑 BA），
+    // 任何一个 cv::Exception 逃出去就是 std::terminate。
+    try {
+        nativeOnCameraFrameImpl(e, y, u, v, w, h, rs, urs, ups, frameTs, vinsTs);
+    } catch (const cv::Exception& ex) {
+        __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Frame",
+                            "nativeOnCameraFrame OpenCV exception: %s", ex.what());
+    } catch (const std::exception& ex) {
+        __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Frame",
+                            "nativeOnCameraFrame exception: %s", ex.what());
+    } catch (...) {
+        __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Frame",
+                            "nativeOnCameraFrame unknown exception");
     }
 }
 
@@ -3226,6 +3253,13 @@ Java_com_mobilescan3d_NativeBridge_nativeGetGaussians(JNIEnv* e, jobject,
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeVinsInitialized(JNIEnv*, jobject) {
     return vinsInitialized() ? JNI_TRUE : JNI_FALSE;
+}
+
+// V0.13.1：UI 靠它区分「还没初始化（该提示用户移动）」与「初始化后跟丢
+// （该提示回到已扫区域）」。两者用同一句「定位失锁」会把用户带偏。
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeVinsEverInitialized(JNIEnv*, jobject) {
+    return vinsEverInitialized() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jstring JNICALL

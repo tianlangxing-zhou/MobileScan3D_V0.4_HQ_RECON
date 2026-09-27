@@ -42,6 +42,21 @@ bool vinsReady();
 
 bool vinsInitialized();
 
+// V0.13.1：VINS 是否**曾经**成功初始化过（solver_flag 进入 NON_LINEAR 就永久置位，
+// 直到下一次 vinsReset()）。
+//
+// 存在的理由：vinsInitialized() 只能表达「此刻是否可用」，而 UI 需要区分两种
+// 完全不同的失败形态：
+//   * 从未初始化 —— 用户刚点开始、还没移动出足够视差，此时的正确引导是
+//     「请手持手机缓慢平移」，报「定位失锁」是错的（根本还没锁过）。
+//   * 初始化后失锁 —— 中途跟丢，正确引导是「回到已扫描区域」。
+// 旧实现把这两种都渲染成「定位失锁：位姿不可用于拼接」，用户刚开扫就被判
+// 失锁，既难懂也会误导他以为设备坏了。
+bool vinsEverInitialized();
+
+// 新一轮扫描开始时清零「曾初始化」闩锁（见 vinsEverInitialized 的说明）。
+void vinsResetInitLatch();
+
 bool vinsGetHealth(VinsHealth* out);
 
 // 当前滑窗内成功三角化的特征深度中位数（VINS 自身尺度）。

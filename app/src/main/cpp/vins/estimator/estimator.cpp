@@ -1,5 +1,7 @@
 #include "estimator.h"
 
+#include <chrono>
+
 Estimator::Estimator(): f_manager{Rs}
 {
     ROS_INFO("init begins");
@@ -829,8 +831,36 @@ void Estimator::optimization()
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     //cout << summary.BriefReport() << endl;
-    ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
-    ROS_DEBUG("solver costs: %f", t_solver.toc());
+
+    // 求解预算诊断。
+    //
+    // 真机实测（OnePlus PLK110）里 Ceres 反复输出
+    // "Terminating: Maximum solver time reached"（4.4e-02 >= 4.0e-02）——
+    // 也就是 BA **几乎每次都被时间预算截断**，属于欠优化。原来这两行是
+    // ROS_DEBUG（逐帧输出，实测 2 分钟 3 万行，把 logcat 配额打爆、
+    // 触发 LOG_FLOWCTRL 丢日志），真出问题时反而看不到。
+    //
+    // 现在只在「未收敛 / 吃掉 90% 以上预算」时打 WARN，并做 5 秒节流：
+    // 正常帧完全静默，欠优化时每秒最多一条，能看见又不刷屏。
+    {
+        const double budgetMs = options.max_solver_time_in_seconds * 1000.0;
+        const double costMs = t_solver.toc();
+        if (summary.termination_type != ceres::CONVERGENCE ||
+            costMs > budgetMs * 0.9) {
+            static double lastWarnSec = -1e9;
+            const double nowSec =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowSec - lastWarnSec > 5.0) {
+                lastWarnSec = nowSec;
+                ROS_WARN("VINS solver did not converge: %s iters=%d %.1fms "
+                         "(budget %.1fms)",
+                         ceres::TerminationTypeToString(summary.termination_type),
+                         static_cast<int>(summary.iterations.size()),
+                         costMs, budgetMs);
+            }
+        }
+    }
 
     double2vector();
 

@@ -2857,7 +2857,22 @@ private var lastRelocPollMs = 0L
      *   2 = 实际使用视角数 / 0 = 已登记视角数 / 3,4 = atlas 宽高 / 7 = 覆盖率×10
      */
     private fun textureNote(textured: Boolean): String {
-        if (!textured) return " · vertex color"
+        if (!textured) {
+            // V0.13 修复：真机实测（OnePlus PLK110）发现 VINS 未初始化成功时
+            // keyframes=0，nativeBakeTexturedGlb 直接 skip，用户拿到的 GLB
+            // 无纹理却毫无提示。这里把「为什么没有纹理」讲清楚，并给出
+            // 下一步动作指引（VINS 需要视差才能初始化——手机必须缓慢移动）。
+            val kf = try {
+                val t = exportManager.textureStats()
+                if (t.size >= NativeBridge.TEXTURE_STATS_SLOTS)
+                    t[NativeBridge.TEXTURE_STATS_INDEX_REGISTERED_KEYFRAMES]
+                else -1
+            } catch (_: Throwable) {
+                -1
+            }
+            return if (kf == 0) " · vertex color（未采集到关键帧：扫描时请缓慢移动手机让追踪初始化）"
+            else " · vertex color"
+        }
         val t = try {
             exportManager.textureStats()
         } catch (_: Throwable) {
@@ -3201,6 +3216,22 @@ private var lastRelocPollMs = 0L
         }
         warningBanner.visibility =
             if (scanning && !vinsOk) android.view.View.VISIBLE else android.view.View.GONE
+        if (scanning && !vinsOk) {
+            // V0.13.1：旧的常量文案「定位失锁：位姿不可用于拼接」在**从未初始化**
+            // 时也会显示 —— 用户刚点开始、还没移动出视差，就被判「失锁」，既不准
+            // 确也让人以为设备坏了。这两种状态的处理动作完全不同：还没初始化要
+            // 平移手机积累视差，初始化后跟丢则要回到已扫描区域。
+            val everInit = try {
+                NativeBridge.nativeVinsEverInitialized()
+            } catch (t: Throwable) {
+                false
+            }
+            warningBanner.text = if (everInit) {
+                "定位失锁：位姿不可用于拼接 · 请回到已扫描区域"
+            } else {
+                "初始化中：请手持手机缓慢平移，建立定位后开始拼接"
+            }
+        }
         val target = try {
             NativeBridge.nativeGetPointCount().toFloat()
         } catch (t: Throwable) {

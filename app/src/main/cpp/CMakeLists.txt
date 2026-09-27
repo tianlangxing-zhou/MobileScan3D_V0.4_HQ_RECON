@@ -175,3 +175,15 @@ if(EXISTS "${MOBILESCAN_XATLAS_DIR}/xatlas.cpp"
 else()
     message(WARNING "MobileScan3D V0.6: xatlas missing; using UV fallback")
 endif()
+
+# Ceres 用 miniglog（没有真正的 glog 可用），它的 VLOG/LOG(INFO) 会直接
+# 写 logcat。真机实测（OnePlus PLK110）：2 分钟里 tag=native 打了 37501 行
+# （detect_structure / schur_eliminator / trust_region 迭代表），占全部
+# APP 日志的 43%，把 LOG_FLOWCTRL 配额打爆。
+#
+# miniglog 的宏在定义了 MAX_LOG_LEVEL 后会变成 LOG_IF(..., n <= MAX_LOG_LEVEL)，
+# 严重级别：FATAL=-3 / ERROR=-2 / WARNING=-1 / INFO=0 / VLOG(n)=n(n>=1)。
+# 取 -1（WARNING）即只保留 WARNING 及以上，INFO 与所有 VLOG 静默。
+# libceres.a 必须用同一个值编译（见构建脚本），这里同步定义以保证
+# 内联进本目标的代码行为一致。
+target_compile_definitions(mobilescan3d PRIVATE MAX_LOG_LEVEL=-1)

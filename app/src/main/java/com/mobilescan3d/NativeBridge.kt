@@ -277,6 +277,14 @@ object NativeBridge {
     external fun nativeGetTargetDepthDebug(out: FloatArray, maxPoints: Int): Int
     external fun nativeSetTargetDebugEnabled(enabled: Boolean)
     external fun nativeVinsInitialized(): Boolean
+    /**
+     * V0.13.1：VINS 是否**曾经**成功初始化过（新一轮 nativeCreate 时清零）。
+     *
+     * 用于区分两种失败形态，二者给用户的引导完全不同：
+     * * false + nativeVinsInitialized()==false —— 还差视差，该提示「缓慢平移手机」
+     * * true  + nativeVinsInitialized()==false —— 中途跟丢，该提示「回到已扫区域」
+     */
+    external fun nativeVinsEverInitialized(): Boolean
     external fun nativeGetHudMetrics(): String
     external fun nativeGetPointCount(): Int
     external fun nativeSelectTarget(u: Float, v: Float): Boolean
