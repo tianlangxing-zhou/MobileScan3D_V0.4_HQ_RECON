@@ -1796,6 +1796,13 @@ private var lastRelocPollMs = 0L
             }
         }
 
+        val appearanceOkDiag = out.getOrElse(NativeBridge.TARGET_STATE_INDEX_APPEARANCE_OK) { 0f } > 0.5f
+        val identityScoreDiag = out.getOrElse(NativeBridge.TARGET_STATE_INDEX_IDENTITY_SCORE) { -1f }
+        if (state == NativeBridge.TARGET_STATE_REACQUIRING || state == NativeBridge.TARGET_STATE_LOST) {
+            android.util.Log.w("TargetWarn", String.format(
+                "DIAG state=%d vf=%.3f present=%b appearanceOk=%b identity=%.2f",
+                state, visibleFraction, presenceValid, appearanceOkDiag, identityScoreDiag))
+        }
         updateTargetWarning(state, visibleFraction, centerX, centerY, presenceValid)
     }
 
@@ -1839,7 +1846,13 @@ private var lastRelocPollMs = 0L
 
         val text = when {
             state == NativeBridge.TARGET_STATE_LOST ->
-                "目标已离开画面" + edgeHint(cx, cy)
+                // 数据实证：物体几何完全在画面(vf≈1.0)、外观匹配、存在性正常时
+                // 仍会被判 LOST（KLT 主链仿射/特征失败），此时说「离开画面」是
+                // 语义错配，会误导用户以为物体出界。仅当 vf 真的低(出界)才报离开。
+                if (visibleFraction >= 0.5f)
+                    "⚠ 跟踪暂时丢失，正在自动找回…" + edgeHint(cx, cy)
+                else
+                    "目标已离开画面" + edgeHint(cx, cy)
 
             state == NativeBridge.TARGET_STATE_REACQUIRING ->
                 "目标暂时丢失，正在自动找回…" + edgeHint(cx, cy)
@@ -1860,6 +1873,16 @@ private var lastRelocPollMs = 0L
                 "⚠ 目标接近边缘，请减速" + edgeHint(cx, cy)
 
             else -> null
+        }
+
+        if (text != null) {
+            android.util.Log.w(
+                "TargetWarn",
+                String.format(
+                    "WARN state=%d vf=%.3f cx=%.2f cy=%.2f present=%b : %s",
+                    state, visibleFraction, cx, cy, presenceValid, text
+                )
+            )
         }
 
         if (text == null) {
@@ -2383,7 +2406,12 @@ private var lastRelocPollMs = 0L
                     }
                 }
                 val vinsTs = ts
+                val t0Frame = System.nanoTime()
                 NativeBridge.nativeOnCameraFrame(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts, vinsTs)
+                val frameDtMs = (System.nanoTime() - t0Frame) / 1_000_000.0
+                if (frameDtMs > 16.0) {
+                    android.util.Log.w("FrameProbe", String.format("nativeOnCameraFrame %.1f ms (trackedPts=%d)", frameDtMs, targetTrackedPoints))
+                }
                 if (scanning && scanNativeReady) {
                     scheduleDepth(y, u, v, image.width, image.height, p[0].rowStride, p[1].rowStride, p[1].pixelStride, ts)
                 }
@@ -3651,6 +3679,10 @@ private var lastRelocPollMs = 0L
             val f = (fpsFrames / dt).toFloat()
             fpsFrames = 0
             fpsLastNs = ts
+            if (f > 0f) android.util.Log.d(
+                "FpsProbe",
+                String.format("fps=%.1f%s", f, if (f < 25f) " LOW" else "")
+            )
             runOnUiThread {
                 fps = f
                 updateHeader()

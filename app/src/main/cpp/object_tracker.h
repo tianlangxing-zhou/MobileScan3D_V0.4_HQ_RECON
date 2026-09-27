@@ -207,6 +207,10 @@ public:
                              const std::string& nanoBackbone,
                              const std::string& nanoHead);
 
+    /** V0.13.11 取证：暴露 Nano 推理耗时与调用次数给 native_engine 量化。 */
+    float nanoLastMs() const { return info_.nanoLastMs; }
+    uint64_t nanoUpdateCalls() const { return info_.nanoUpdateCalls; }
+
 private:
     mutable std::mutex mutex_;
     TargetTrackInfo info_;

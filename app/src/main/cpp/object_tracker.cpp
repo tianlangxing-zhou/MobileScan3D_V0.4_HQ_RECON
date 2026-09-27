@@ -323,6 +323,24 @@ void ObjectTracker::setError(const std::string& msg)
 
 void ObjectTracker::markLost(const std::string& reason)
 {
+    // V0.13.11 取证修复：真机数据（diag_live_20260927_2110）显示物体几何
+    // 100% 在画面(vf=1.0)、外观匹配、存在性有效时仍被大量判 LOST(5537 次)，
+    // 导致 UI 误报「目标已离开画面」并打断融合（建模不连续/精度差）。这类
+    // 误判来自 KLT 主链的仿射/特征临时失败，并非物体真的离开。
+    // 因此：当从 TRACKING 触发、且物体在画面内、语义有效、外观一致时，
+    // 降级为 REACQUIRING 让 Nano/KLT 继续找回并保留跟踪状态，而非彻底 LOST。
+    // 真正的出界由 edgeLostFrames(几何,vf 必低) 与 markPresenceLost(语义) 负责，
+    // 它们不会命中此保护。REACQUIRING 超时(:616)仍正常 LOST。
+    if (info_.state == TargetState::TRACKING &&
+        info_.visibleFraction >= 0.5f &&
+        info_.presenceValid &&
+        appearanceMismatchFrames_ <= 0) {
+        info_.state = TargetState::REACQUIRING;
+        reacquireFrames_ = 0;
+        info_.lastError = "soft-lost (object still in frame): " + reason;
+        info_.lastEvent = "downgraded LOST->REACQUIRING (in-frame)";
+        return;
+    }
     if (info_.state != TargetState::LOST) {
         info_.trackLost++;
     }
@@ -579,6 +597,41 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     // 明显不够好。这里给约 1.5s 的找回窗口。
     if (info_.state == TargetState::REACQUIRING) {
         reacquireFrames_++;
+
+        // V0.13.13 修复：present 有效的软丢失进入 REACQUIRING 后，V0.13.11 的
+        // 续命逻辑让目标永不下 LOST，但 REACQUIRING->TRACKING 的恢复依赖 Nano
+        // 整框重检测（nanoScore>=0.65）。真机数据（diag_live_20260927_2155）
+        // 显示目标仍完整在画面内（vf=1.0/present=true/appearanceOk=true）时
+        // Nano 重检测置信度常低于该阈，恢复永远失败 -> 永久卡死 REACQUIRING ->
+        // 永远进不了 TRACKING -> 点云/AR 模型/GLB 导出全不触发（"没出点云和
+        // AR 模型"的根因）。
+        // 这里加一条「last-good box + 不可变身份锚点」安全找回：目标仍 present
+        // 且身份锚点在 last-good 位置仍匹配（>=kIdentityAcceptMin），就直接
+        // re-lock 回 TRACKING。复用 adoptNanoBox 的几何/身份门，几何安全（回到
+        // 已知目标位置），不依赖 Nano 置信度，破解死锁。
+        if (info_.presenceValid && identityReady_ && !owned.empty() &&
+            (reacquireFrames_ % kReacquireNanoPeriod) == 0) {
+            const int w = owned.cols, h = owned.rows;
+            const float cx = std::clamp(trackCx_, 8.f, std::max(8.f, static_cast<float>(w - 8)));
+            const float cy = std::clamp(trackCy_, 8.f, std::max(8.f, static_cast<float>(h - 8)));
+            const float hw = std::max(8.f, trackHalfW_);
+            const float hh = std::max(8.f, trackHalfH_);
+            cv::Rect lastBox(static_cast<int>(std::floor(cx - hw)),
+                             static_cast<int>(std::floor(cy - hh)),
+                             static_cast<int>(std::ceil(hw * 2.f)),
+                             static_cast<int>(std::ceil(hh * 2.f)));
+            lastBox &= cv::Rect(0, 0, w, h);
+            if (lastBox.width >= 16 && lastBox.height >= 16 &&
+                adoptNanoBox(lastBox, w, h, owned, timestamp)) {
+                info_.state = TargetState::TRACKING;
+                info_.lastEvent = "reacquired via identity-anchored last-good box";
+                info_.trackSuccess++;
+                reacquireFrames_ = 0;
+                info_.timestamp = timestamp;
+                return;
+            }
+        }
+
         // 只有 Nano 模板已经存在时才尝试找回。
         //
         // 刻意不允许这里重新 init：目标刚出界时 info_.x0..y1 是被裁剪过的
@@ -612,10 +665,20 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                 }
             }
         }
-        if (reacquireFrames_ > kReacquireTimeoutFrames) {
-            markLost("target reacquire timeout");
+        // V0.13.11：物体在画面内（语义 presence 仍有效）时不要放弃到 LOST。
+        // 真机数据（diag_live_20260927_2150/2155）显示物体几何/外观/存在性全部
+        // 正常（vf≥0.58、present=true、appearanceOk=true）却被 REACQUIRING 超时判
+        // LOST(占 96%)，连带的硬 LOST 会冻结 VINS 历史引用、让 AR 渲染回退冻结
+        // pose 造成坐标错乱。物体在画面就续命继续找回；真正离开（presence 失效）
+        // 或更久(6×超时≈9s)才放弃，给正常找回留足窗口。
+        const bool objectGone = !info_.presenceValid;
+        if (objectGone) {
+            markLost("target reacquire timeout (object gone)");
+        } else if (reacquireFrames_ > kReacquireTimeoutFrames * 6) {
+            markLost("target reacquire timeout (extended, giving up)");
         } else {
-            info_.lastEvent = "target left frame, reacquiring";
+            reacquireFrames_ = kReacquireTimeoutFrames; // 续命：再给一个超时周期
+            info_.lastEvent = "reacquiring (presence ok, extended)";
         }
         return;
     }

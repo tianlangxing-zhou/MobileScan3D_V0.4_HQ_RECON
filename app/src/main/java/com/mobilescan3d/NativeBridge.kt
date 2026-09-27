@@ -319,7 +319,10 @@ object NativeBridge {
      * 12MP burst 期间预览停摆，位姿历史在 burst 时间戳处有空洞，strict 80ms
      * 永远查不到 —— HQ 纹理关键帧因此被全部静默丢弃。burst 前提是稳定持机，
      * 用「最近的位姿样本」作近似，容差由调用方传入（关键帧路径 500ms）。
-     * AR 渲染路径**不要**用这个，请继续走 strict 版本。
+     * AR 渲染路径原本走 strict 版，但实测 Preview(SurfaceTexture) 流时间戳与
+     * 历史库(YUV ImageReader 流)时间戳基准不一致、差 >300ms，strict 永远查不到
+     * → 长期回退冻结 pose → 模型不跟随。故 AR 现已改用本 tolerant 版 + 500ms
+     * 窗口（最近邻仍只在时间最接近的位姿里取，不会拿错时刻的 pose）。
      */
     external fun nativeGetRenderPoseAtTol(
         timestampNs: Long,
