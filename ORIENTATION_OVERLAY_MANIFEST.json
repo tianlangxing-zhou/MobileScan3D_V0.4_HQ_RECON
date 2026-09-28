@@ -1,0 +1,86 @@
+{
+  "version": "0.13.17-orientation-fix",
+  "base_commit": "abaa641616e6b5398d91426510182805ae0623c7",
+  "files": [
+    {
+      "path": "README_ORIENTATION_FIX_ZH.md",
+      "sha256": "bff5703636b5a5d33d57ba6971b4f2176d6f22da55b3a3be343dce3dc80a8076",
+      "bytes": 3490
+    },
+    {
+      "path": "app/build.gradle.kts",
+      "sha256": "c2585d7e55c868279a1901be6172bc3c17746eaefd40c1c3459c77bff9979858",
+      "bytes": 3426
+    },
+    {
+      "path": "app/src/main/cpp/export/coordinate_conventions.h",
+      "sha256": "abe09a661857014ab954eb6fee8a61e29c285b1763bba4f942165c81ce90aa65",
+      "bytes": 428
+    },
+    {
+      "path": "app/src/main/cpp/export/gltf_exporter.cpp",
+      "sha256": "d58619b19780124577716e092b69ed2dc177d839db639a2531a0cb99c5f7e8cf",
+      "bytes": 10873
+    },
+    {
+      "path": "app/src/main/cpp/native_engine.cpp",
+      "sha256": "baa64c5561018bb3628ca9bd51362b9f7bd5a00a129ccb9c546cb0bea956d60c",
+      "bytes": 191190
+    },
+    {
+      "path": "app/src/main/cpp/v06/textured_glb_exporter.cpp",
+      "sha256": "87c9cf6c311fb4d2593765bac3b8f3923481ea669204e6909f366cbc55dbb332",
+      "bytes": 9528
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/MainActivity.kt",
+      "sha256": "5664399b58881a94e8d3c4a9a1e7c824907e9db02792307a81aefe72421e4624",
+      "bytes": 208023
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt",
+      "sha256": "d7c6e3cc096c665c8251aa63c969aa7cdd8e60b75ff0978b2176a2a2c6d63d1a",
+      "bytes": 36104
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/ScanCoordinates.kt",
+      "sha256": "24a6fde6cd8bbd39ec2cbc1cbe0f769a9b8fb447c41eae6ba7fd15dbfb96cfe8",
+      "bytes": 2686
+    },
+    {
+      "path": "docs/review_01317/REVIEW_ZH.md",
+      "sha256": "de6dd72001d3c48c05b34a5f165106f711469185a9e42ce702eb5a7b7d8f6303",
+      "bytes": 5135
+    },
+    {
+      "path": "orientation_fix.patch",
+      "sha256": "ca9952ece656c34eb480f189dd2bf2eba6afc7d4b808174cbbda131c6763a0b4",
+      "bytes": 36982
+    },
+    {
+      "path": "tools/review_tests/OrientationRegression.kt",
+      "sha256": "35b6e9c2fd0071b5d1d815ebcac7cdff00356af479239286f6a51976f35a900a",
+      "bytes": 4480
+    },
+    {
+      "path": "tools/review_tests/export_regression.cpp",
+      "sha256": "aa9a982da7817492b029b6411fe29c7c2c494188828eaae5d60efe013cbacf71",
+      "bytes": 3818
+    },
+    {
+      "path": "tools/review_tests/run.py",
+      "sha256": "d5d8b2797ce70286f8eba8bce025449909f16e25e22785fb7a9ac99a4cdf24d4",
+      "bytes": 4646
+    },
+    {
+      "path": "tools/review_tests/run_orientation.py",
+      "sha256": "f1e668de57239be8ca23cf8d03e17815b10467cbabb2a7e99050416aa44322c7",
+      "bytes": 841
+    },
+    {
+      "path": "tools/review_tests/verify_orientation_overlay.py",
+      "sha256": "080db6408a2069238c784522025abb924960869e9027bbd3708d7f4f0859dcd0",
+      "bytes": 677
+    }
+  ]
+}

@@ -940,9 +940,9 @@ private var lastRelocPollMs = 0L
                     // requestRender() 本身线程安全，这里是相机线程。
                     if (::glView.isInitialized) glView.requestRender()
                     val f = stMatrixFloats
-                    // 4x4 中作用于 UV 的 2D 仿射部分：
-                    // u' = m0·u + m4·v + m12 ; v' = m1·u + m5·v + m13
-                    val na = floatArrayOf(f[0], f[4], f[12], f[1], f[5], f[13])
+                    // TextureView uses top-left UV; SurfaceTexture expects bottom-left GL UV.
+                    // Both touch selection and AR projection consume this corrected affine.
+                    val na = ScanCoordinates.surfaceTextureToCamera(f)
                     if (!hasStAffine || !na.contentEquals(stAffine)) {
                         val first = !hasStAffine
                         stAffine = na
@@ -2932,34 +2932,9 @@ private var lastRelocPollMs = 0L
         glView.requestRender()
     }
 
-    /**
-     * V0.13.4：把「模型坐标」映射到「当前世界坐标下的锚点」。
-     *
-     *   `P_world = anchor + Ry(yaw) * scale * (P_model - center)`
-     *
-     * 即列主序 4x4：线性部分 = `Ry*scale`，平移 = `anchor - scale*(Ry*center)`。
-     * 先减 center 再变换，模型才会**以它自己的中心**落在锚点上，而不是把
-     * 「扫描时的世界原点」搬过来（那样模型会偏到几米外）。
-     */
-    private fun computePlacementMatrix(): FloatArray {
-        val c = kotlin.math.cos(placeYaw)
-        val s = kotlin.math.sin(placeYaw)
-        val k = placeScale
-        val cx = placeCenter[0]; val cy = placeCenter[1]; val cz = placeCenter[2]
-        // Ry * center
-        val rx = c * cx + s * cz
-        val ry = cy
-        val rz = -s * cx + c * cz
-        return floatArrayOf(
-            k * c, 0f, -k * s, 0f,
-            0f, k, 0f, 0f,
-            k * s, 0f, k * c, 0f,
-            placeAnchor[0] - k * rx,
-            placeAnchor[1] - k * ry,
-            placeAnchor[2] - k * rz,
-            1f
-        )
-    }
+    /** VINS world uses +Z up: yaw must preserve height, with the center at the anchor. */
+    private fun computePlacementMatrix(): FloatArray =
+        ScanCoordinates.placementMatrix(placeYaw, placeScale, placeCenter, placeAnchor)
 
     private fun applyPlacementMatrix() {
         renderer.setModelMatrix(if (placeModeActive) computePlacementMatrix() else null)
@@ -3014,9 +2989,7 @@ private var lastRelocPollMs = 0L
         placeCenter[1] = (minY + maxY) * 0.5f
         placeCenter[2] = (minZ + maxZ) * 0.5f
         // pose: [R(9) 行主序, t(3)]，前向是 R 的第三列 (pose[2],pose[5],pose[8])
-        placeAnchor[0] = pose[9] + pose[2] * 1.2f
-        placeAnchor[1] = pose[10] + pose[5] * 1.2f - 0.20f
-        placeAnchor[2] = pose[11] + pose[8] * 1.2f
+        ScanCoordinates.placementAnchor(pose, 1.2f, 0.20f, placeAnchor)
         placeYaw = 0f
         placeScale = 1f
         placeModeActive = true

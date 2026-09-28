@@ -1,6 +1,7 @@
 #include "export/gltf_exporter.h"
 #include "v06/textured_glb_exporter.h"
 #include "depth_calib.h"
+#include "ar_textured_asset.h"
 #include <cassert>
 #include <fstream>
 #include <iterator>
@@ -19,12 +20,14 @@ int main(int argc, char** argv) {
     const std::string root = argv[1];
     std::locale::global(std::locale(std::locale::classic(), new CommaDecimal));
     Mesh mesh;
-    mesh.positions = {0.123456789f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+    mesh.positions = {0.123456789f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 2.f};
     mesh.indices = {0, 1, 2};
     for (int flags = 0; flags < 4; ++flags) {
         mesh.normals = flags & 1 ? std::vector<float>{0,0,1,0,0,1,0,0,1} : std::vector<float>{};
         mesh.colors = flags & 2 ? std::vector<float>{1,0,0,0,1,0,0,0,1} : std::vector<float>{};
+        const auto positions = mesh.positions;
         assert(exportGlb(mesh, root + "/plain" + std::to_string(flags) + ".glb", "test", nullptr));
+        assert(mesh.positions == positions); // external orientation must not mutate AR geometry
     }
     const std::string bad = root + "/invalid.glb";
     mesh.indices[2] = 3;
@@ -44,6 +47,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 3; ++i) {
         uv.vertices[i].base.px = i == 1 ? 1.f : 0.123456789f;
         uv.vertices[i].base.py = i == 2 ? 1.f : 0.f;
+        uv.vertices[i].base.pz = i == 2 ? 2.f : 0.f;
+        uv.vertices[i].base.nz = 1.f;
         uv.vertices[i].u = i == 1 ? 1.f : 0.f;
         uv.vertices[i].v = i == 2 ? 1.f : 0.f;
     }
@@ -52,6 +57,21 @@ int main(int argc, char** argv) {
     std::ifstream jpegFile(root + "/atlas.jpg", std::ios::binary);
     std::vector<std::uint8_t> jpeg((std::istreambuf_iterator<char>(jpegFile)), {});
     assert(TexturedGlbExporter::write(root + "/textured.glb", uv, jpeg));
+    ArTexturedAsset asset;
+    assert(asset.set(uv, jpeg));
+    assert(asset.save(root + "/asset.bin"));
+    ArTexturedAsset restored;
+    assert(restored.load(root + "/asset.bin"));
+    assert(restored.vertices() == asset.vertices());
+    assert(restored.indices() == uv.indices);
+    assert(restored.jpeg() == jpeg);
+    for (int i = 0; i < 3; ++i) {
+        const auto& v = uv.vertices[i];
+        const float* p = restored.vertices().data() + i * 8;
+        assert(p[0] == v.base.px && p[1] == v.base.py && p[2] == v.base.pz);
+        assert(p[3] == 0 && p[4] == 0 && p[5] == 1);
+        assert(p[6] == v.u && p[7] == v.v);
+    }
     uv.indices[2] = 3;
     assert(!TexturedGlbExporter::write(bad, uv, jpeg));
     uv.indices[2] = 2;

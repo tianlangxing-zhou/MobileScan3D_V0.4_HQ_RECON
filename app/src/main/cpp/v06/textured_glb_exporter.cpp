@@ -1,4 +1,5 @@
 #include "textured_glb_exporter.h"
+#include "../export/coordinate_conventions.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -159,7 +160,8 @@ bool TexturedGlbExporter::write(
         << "\"generator\":\"MobileScan3D V0.6\"},"
         << "\"scene\":0,"
         << "\"scenes\":[{\"nodes\":[0]}],"
-        << "\"nodes\":[{\"mesh\":0,\"name\":\"MobileScan3D_Textured\"}],"
+        << "\"nodes\":[{\"mesh\":0,\"name\":\"MobileScan3D_Textured\",\"matrix\":"
+        << scan_coordinates::kVinsToGltfMatrixJson << "}],"
 
         << "\"meshes\":[{"
         << "\"name\":\"ScanMesh\","

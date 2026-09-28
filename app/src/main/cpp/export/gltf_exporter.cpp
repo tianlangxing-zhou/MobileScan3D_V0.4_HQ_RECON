@@ -1,4 +1,5 @@
 #include "gltf_exporter.h"
+#include "coordinate_conventions.h"
 
 #include <algorithm>
 #include <cmath>
@@ -181,7 +182,8 @@ bool exportGlb(const Mesh& mesh, const std::string& path,
     j << "\"asset\":{\"version\":\"2.0\",\"generator\":\"MobileScan3D\"},";
     j << "\"scene\":0,";
     j << "\"scenes\":[{\"nodes\":[0]}],";
-    j << "\"nodes\":[{\"mesh\":0,\"name\":\"" << jstr(name) << "\"}],";
+    j << "\"nodes\":[{\"mesh\":0,\"name\":\"" << jstr(name)
+      << "\",\"matrix\":" << scan_coordinates::kVinsToGltfMatrixJson << "}],";
     j << "\"meshes\":[{\"name\":\"" << jstr(name) << "\",\"primitives\":[{";
     j << "\"attributes\":{\"POSITION\":0";
     if (hasNormal) {

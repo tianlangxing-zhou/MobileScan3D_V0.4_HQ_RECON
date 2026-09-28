@@ -3829,17 +3829,11 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject
         probeSampleTs = static_cast<int64_t>(best->ts);
         probeDeltaMs = bestDelta / 1'000'000LL;
     }
-    // V0.13.14 取证：AR 模型「上下相反」轴探针（ArAxesProbe）。
-    // VINS 世界系初始化对齐后 +Z 指向重力方向（estimator.cpp g2R：g=(0,0,9.8)）。
-    // 用户竖直持机时，图像 down ≈ 物理 down ≈ 世界 +Z，正确位姿应满足
-    // col1(down)·Z > 0 且 col2(fwd)·Z ≈ 0。三种故障各有唯一签名：
-    //   A) raw col1·Z < 0                   => VINS 相机帧 y 轴朝上，几何整体垂直镜像
-    //                                          （点云同镜像，仅纹理模型可见）
-    //   B) raw col1·Z > 0 但 post col1·Z<0  => transformPose 引入 ~180° 横滚
-    //                                          （持久地图帧与当前扫描帧错位）
-    //   C) 两者皆正确                        => 翻转在投影/纹理链
-    //                                          （配合 PointCloudRenderer 一次性
-    //                                          打出的 cameraToView 仿射定位）
+    // Axis diagnostics only: VINS subtracts g from world-frame accelerometer
+    // specific force, so initialization aligns physical UP with world +Z.
+    // Camera columns refer to raw sensor pixels, not portrait screen axes.
+    // Neither the sign of raw camera-down.z nor a single preview-affine
+    // coefficient diagnoses inversion; sensor orientation must also be applied.
     // 1s 节流（按位姿样本时间戳），每秒至多 1 条。
     const bool axesProbeDue =
         (probeSampleTs - sAxesProbeLastLogNs) > 1'000'000'000LL;

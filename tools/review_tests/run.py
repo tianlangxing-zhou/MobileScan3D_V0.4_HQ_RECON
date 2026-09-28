@@ -40,6 +40,21 @@ def inspect(path):
     view = doc['bufferViews'][pos['bufferView']]
     base = view.get('byteOffset', 0) + pos.get('byteOffset', 0)
     positions = [struct.unpack_from('<fff', binary, base+i*view.get('byteStride', 12)) for i in range(3)]
+    # Use the actual exported scene node, not a second copy of exporter math.
+    matrix = doc['nodes'][0]['matrix']
+    assert len(matrix) == 16
+    vector = lambda p: tuple(sum(matrix[c*4+r]*p[c] for c in range(3)) for r in range(3))
+    point = lambda p: tuple(v+matrix[12+r] for r,v in enumerate(vector(p)))
+    assert vector((0,0,1)) == (0,1,0), 'physical up must become glTF +Y'
+    ex, ey, ez = (vector(p) for p in [(1,0,0),(0,1,0),(0,0,1)])
+    cross = lambda a,b: (a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0])
+    assert cross(ex,ey) == ez, 'no mirrored winding/normals'
+    assert point(positions[2])[1] > point(positions[0])[1], 'top marker must stay above base'
+    if 'NORMAL' in attrs:
+        normal = accessors[attrs['NORMAL']]
+        nv = doc['bufferViews'][normal['bufferView']]
+        nb = nv.get('byteOffset',0) + normal.get('byteOffset',0)
+        assert vector(struct.unpack_from('<fff',binary,nb)) == (0,1,0)
     for k in range(3):
         assert all(math.isfinite(p[k]) for p in positions)
         # Round-trip JSON bounds back to float32: bounds must match actual positions.
@@ -64,6 +79,7 @@ with tempfile.TemporaryDirectory() as work:
                     str(Path(__file__).with_name('export_regression.cpp')),
                     str(CPP / 'export/gltf_exporter.cpp'),
                     str(CPP / 'v06/textured_glb_exporter.cpp'),
+                    str(CPP / 'ar_textured_asset.cpp'),
                     str(CPP / 'depth_calib.cpp'), '-o', str(tmp / 'test')], check=True)
     # This container restricts /proc; LeakSanitizer cannot enumerate threads.
     env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0')
@@ -74,3 +90,4 @@ with tempfile.TemporaryDirectory() as work:
         print('PASS', path.name)
     assert len(list(tmp.glob('*.glb'))) == 5
 print('PASS malformed mesh rejection, comma locale, unequal depth arrays; ASan/UBSan clean (leak detection disabled)')
+print('PASS plain/textured GLB +Y up, preserved handedness, unchanged AR asset save/load')

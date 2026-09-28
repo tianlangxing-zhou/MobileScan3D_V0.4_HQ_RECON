@@ -137,7 +137,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
 
     // ------------------------------------------------------------------ V0.13.3 模型查看器状态
 
-    /** 轨道相机：eye = target + dist * dir(yaw, pitch)，dir 绕世界 Y 轴。 */
+    /** 轨道相机：eye = target + dist * dir(yaw, pitch)，dir 绕世界 Z 轴。 */
     @Volatile private var viewerYaw = 0.9f
     @Volatile private var viewerPitch = 0.35f
     @Volatile private var viewerDist = 1.0f
@@ -176,7 +176,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         if (dxPx == 0f && dyPx == 0f) return
         val pose = FloatArray(12)
         computeViewerPose(pose)
-        // pose[0..2]=right, [3..5]=down（行主序 R 的列）
+        // Row-major R: right=(0,3,6), down=(1,4,7).
         val rx = pose[0]; val ry = pose[3]; val rz = pose[6]
         val dx = pose[1]; val dy = pose[4]; val dz = pose[7]
         // 屏幕高度方向可见的世界尺寸 = dist / focal；除以像素数得每像素世界量
@@ -204,44 +204,12 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         setViewerFrame(viewerTargetX, viewerTargetY, viewerTargetZ, viewerRadius)
     }
 
-    /**
-     * 由 yaw/pitch/dist/target 计算合成位姿。布局与 nativeGetRenderPoseAt
-     * 一致：[R(9) 行主序, t(3)]，R 的三列分别是相机 right/down/forward
-     * 在世界系下的方向，t 是相机中心。
-     *
-     * 基向量推导（物理自检：站在 z=-5 面向 +z，右手边是 +x ——
-     * right = up×fw 给出 (1,0,0)，投影后 +x 点落在屏幕右侧，不镜像）：
-     *   dir    = (cosP·sinY, sinP, cosP·cosY)   target→eye 方向
-     *   eye    = target + dist·dir
-     *   fw     = -dir                            eye→target（光轴）
-     *   right  = worldUp × fw
-     *   down   = right × fw
-     */
+    /** Keep viewer and reconstruction in the same +Z-up world, with a right-handed camera. */
     private fun computeViewerPose(out: FloatArray) {
-        val cp = kotlin.math.cos(viewerPitch)
-        val sp = kotlin.math.sin(viewerPitch)
-        val cy = kotlin.math.cos(viewerYaw)
-        val sy = kotlin.math.sin(viewerYaw)
-        // fw：eye 指向 target 的单位向量（相机光轴）
-        val fx = -cp * sy; val fy = -sp; val fz = -cp * cy
-        // right = (0,1,0) × fw = (fw.z, 0, -fw.x)
-        var rx = fz; var ry = 0f; var rz = -fx
-        var rl = kotlin.math.sqrt(rx * rx + ry * ry + rz * rz)
-        if (rl < 1e-5f) { rx = 1f; ry = 0f; rz = 0f; rl = 1f }
-        rx /= rl; ry /= rl; rz /= rl
-        // down = right × fw
-        val ddx = ry * fz - rz * fy
-        val ddy = rz * fx - rx * fz
-        val ddz = rx * fy - ry * fx
-        // eye = target - fw·dist = target + dir·dist
-        val eyeX = viewerTargetX - fx * viewerDist
-        val eyeY = viewerTargetY - fy * viewerDist
-        val eyeZ = viewerTargetZ - fz * viewerDist
-        // 行主序 R，列 = (right, down, forward)
-        out[0] = rx; out[1] = ddx; out[2] = fx
-        out[3] = ry; out[4] = ddy; out[5] = fy
-        out[6] = rz; out[7] = ddz; out[8] = fz
-        out[9] = eyeX; out[10] = eyeY; out[11] = eyeZ
+        ScanCoordinates.viewerPose(
+            viewerYaw, viewerPitch, viewerDist,
+            viewerTargetX, viewerTargetY, viewerTargetZ, out
+        )
     }
 
     fun setTexturedMesh(
@@ -324,8 +292,8 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     fun setCameraToView(m: FloatArray) {
         if (m.size < 6) return
         // V0.13.14 取证：一次性打出 preview 仿射（ArAxesProbe case C 定位用）。
-        // 正确的 camera->view 仿射不应含垂直翻转（y 缩放为负）；
-        // 若 m[4]（y 系数）为负，说明投影链自带上下翻转。
+        // Individual signs do not diagnose an upside-down image: sensor rotation
+        // and front-camera mirroring can legitimately make coefficients negative.
         if (!cameraToViewProbeLogged) {
             cameraToViewProbeLogged = true
             android.util.Log.i(

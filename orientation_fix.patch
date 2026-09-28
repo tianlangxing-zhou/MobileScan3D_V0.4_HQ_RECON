@@ -1,0 +1,718 @@
+diff --git a/README_ORIENTATION_FIX_ZH.md b/README_ORIENTATION_FIX_ZH.md
+new file mode 100644
+index 0000000..6abe7bb
+--- /dev/null
++++ b/README_ORIENTATION_FIX_ZH.md
+@@ -0,0 +1,52 @@
++# MobileScan3D V0.13.17 模型方向修复覆盖包
++
++适用基线：GitHub 仓库 `tianlangxing-zhou/MobileScan3D_V0.4_HQ_RECON`，提交
++`abaa641616e6b5398d91426510182805ae0623c7`（V0.13.16 vendored OpenCV）。
++安装后版本号：`0.13.17-orientation-fix`，versionCode 145。
++
++## 替换方式
++
++1. 备份当前工程；如果本地在上述基线后另有修改，先对照包内补丁合并。
++2. 解压 ZIP，将其中的 `app/`、`tools/`、`docs/` **合并复制到工程根目录，覆盖同名文件**。
++   同时复制根目录的说明、`ORIENTATION_OVERLAY_MANIFEST.json` 和 `orientation_fix.patch`。
++   不要删除原有目录后再复制：这是覆盖包，不是完整工程。
++3. 必须复制两个新增源码：`ScanCoordinates.kt` 和 `export/coordinate_conventions.h`。
++   不需要修改 CMake 源文件清单。
++4. 在 Android Studio 执行 Sync、Clean Project、Rebuild Project，然后安装新 APK。
++   保留现有 `local.properties`、Ceres、模型文件及仓库内 OpenCV 配置。
++5. 如有 Python，可在工程根目录运行：
++   `python tools/review_tests/verify_orientation_overlay.py`。
++   它检查本覆盖包文件的 SHA-256，不会修改工程。
++
++也可在干净基线上使用 `git apply --check orientation_fix.patch`，再执行
++`git apply orientation_fix.patch`；与直接复制二选一，不能先覆盖后重复打补丁。
++
++## 修复范围
++
++- 预览：补齐 SurfaceTexture 的 GL 原点到 TextureView 屏幕原点转换，点选/拖框与点云、AR 网格共用修正映射。
++- 查看模型：使用 VINS 的世界 +Z 向上，修正相机基向量的镜像问题。
++- 自由摆放：绕世界 Z 轴旋转，向下偏移沿负 Z，防止拖动旋转时模型翻倒。
++- GLB：普通顶点色和 HQ 纹理导出都增加 Z-up → Y-up 根节点旋转；AR 缓存继续使用原世界坐标。
++- 修正“世界 +Z 向下”和“单个仿射系数为负就一定倒置”的误导性诊断注释。
++
++上一轮距离过滤、自动补光及连续扫描修复随当前仓库基线保留。
++
++## 自检结果与限制
++
++- 已通过：144 组预览/点选正反映射、180 组查看/摆放姿态、5 种 GLB 输出、AR 资产保存恢复、近距离 TSDF 回归。
++- 已通过：新增 Kotlin 坐标模块实际编译执行；C++ 导出和近距离测试在 ASan/UBSan 下运行。
++- 尚未验证：完整 Android APK 构建、手机 GPU/相机 HAL 实际显示、真机扫描稳定性。
++  本包是源码修复包，不包含已装机验收的 APK。详见 `docs/review_01317/REVIEW_ZH.md`。
++
++## 建议的一次装机验收
++
++用一个上下明显不同、左右也不对称的物体（顶部贴红色箭头，右侧贴蓝点）：
++
++1. 启动全新扫描，分别点选/拖框物体上部与下部，确认目标框落点一致。
++2. 检查绿色当前帧点、累计点、AR 网格是否与实物同向；缓慢移动手机观察。
++3. 停止扫描，进入“查看模型”：箭头朝上，蓝点没有镜像；旋转查看和长按平移正常。
++4. 使用“摆放”，左右拖动应绕竖直轴旋转，顶部持续朝上；切回“原位”后对齐。
++5. 导出普通 GLB 和 HQ 纹理 GLB，用支持 glTF 节点变换的查看器打开，对比几何和纹理方向。
++
++先测试新扫描。旧 GLB 文件不会自动改写；已有错误目标选择/融合产生的几何也不会因更新自动修复。
++旧扫描包的 AR 缓存仍可读取，但外部旧 GLB 要重新导出才能获得新坐标变换。
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index b1b614e..5de0e89 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -62,8 +62,8 @@ android {
+         applicationId = "com.mobilescan3d"
+         minSdk = 26
+         targetSdk = 36
+-        versionCode = 144
+-        versionName = "0.13.15-near-scan"
++        versionCode = 145
++        versionName = "0.13.17-orientation-fix"
+         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
+         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
+         ndk { abiFilters += listOf("arm64-v8a") }
+diff --git a/app/src/main/cpp/export/coordinate_conventions.h b/app/src/main/cpp/export/coordinate_conventions.h
+new file mode 100644
+index 0000000..7debb32
+--- /dev/null
++++ b/app/src/main/cpp/export/coordinate_conventions.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++namespace scan_coordinates {
++// VINS world is right-handed +Z up; glTF is right-handed +Y up.
++// Column-major Rx(-90 degrees): (x,y,z) -> (x,z,-y), determinant +1.
++// Apply ONLY to the external GLB root node. Keeping mesh-local positions,
++// normals and the AR cache in VINS world preserves saved-map relocalization.
++inline constexpr const char* kVinsToGltfMatrixJson =
++    "[1,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,1]";
++}
+diff --git a/app/src/main/cpp/export/gltf_exporter.cpp b/app/src/main/cpp/export/gltf_exporter.cpp
+index a2f5d9c..1619054 100644
+--- a/app/src/main/cpp/export/gltf_exporter.cpp
++++ b/app/src/main/cpp/export/gltf_exporter.cpp
+@@ -1,4 +1,5 @@
+ #include "gltf_exporter.h"
++#include "coordinate_conventions.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -181,7 +182,8 @@ bool exportGlb(const Mesh& mesh, const std::string& path,
+     j << "\"asset\":{\"version\":\"2.0\",\"generator\":\"MobileScan3D\"},";
+     j << "\"scene\":0,";
+     j << "\"scenes\":[{\"nodes\":[0]}],";
+-    j << "\"nodes\":[{\"mesh\":0,\"name\":\"" << jstr(name) << "\"}],";
++    j << "\"nodes\":[{\"mesh\":0,\"name\":\"" << jstr(name)
++      << "\",\"matrix\":" << scan_coordinates::kVinsToGltfMatrixJson << "}],";
+     j << "\"meshes\":[{\"name\":\"" << jstr(name) << "\",\"primitives\":[{";
+     j << "\"attributes\":{\"POSITION\":0";
+     if (hasNormal) {
+diff --git a/app/src/main/cpp/native_engine.cpp b/app/src/main/cpp/native_engine.cpp
+index 1449a79..e9ad0a6 100644
+--- a/app/src/main/cpp/native_engine.cpp
++++ b/app/src/main/cpp/native_engine.cpp
+@@ -3829,17 +3829,11 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject
+         probeSampleTs = static_cast<int64_t>(best->ts);
+         probeDeltaMs = bestDelta / 1'000'000LL;
+     }
+-    // V0.13.14 取证：AR 模型「上下相反」轴探针（ArAxesProbe）。
+-    // VINS 世界系初始化对齐后 +Z 指向重力方向（estimator.cpp g2R：g=(0,0,9.8)）。
+-    // 用户竖直持机时，图像 down ≈ 物理 down ≈ 世界 +Z，正确位姿应满足
+-    // col1(down)·Z > 0 且 col2(fwd)·Z ≈ 0。三种故障各有唯一签名：
+-    //   A) raw col1·Z < 0                   => VINS 相机帧 y 轴朝上，几何整体垂直镜像
+-    //                                          （点云同镜像，仅纹理模型可见）
+-    //   B) raw col1·Z > 0 但 post col1·Z<0  => transformPose 引入 ~180° 横滚
+-    //                                          （持久地图帧与当前扫描帧错位）
+-    //   C) 两者皆正确                        => 翻转在投影/纹理链
+-    //                                          （配合 PointCloudRenderer 一次性
+-    //                                          打出的 cameraToView 仿射定位）
++    // Axis diagnostics only: VINS subtracts g from world-frame accelerometer
++    // specific force, so initialization aligns physical UP with world +Z.
++    // Camera columns refer to raw sensor pixels, not portrait screen axes.
++    // Neither the sign of raw camera-down.z nor a single preview-affine
++    // coefficient diagnoses inversion; sensor orientation must also be applied.
+     // 1s 节流（按位姿样本时间戳），每秒至多 1 条。
+     const bool axesProbeDue =
+         (probeSampleTs - sAxesProbeLastLogNs) > 1'000'000'000LL;
+diff --git a/app/src/main/cpp/v06/textured_glb_exporter.cpp b/app/src/main/cpp/v06/textured_glb_exporter.cpp
+index 50d3784..f4380f0 100644
+--- a/app/src/main/cpp/v06/textured_glb_exporter.cpp
++++ b/app/src/main/cpp/v06/textured_glb_exporter.cpp
+@@ -1,4 +1,5 @@
+ #include "textured_glb_exporter.h"
++#include "../export/coordinate_conventions.h"
+ 
+ #include <algorithm>
+ #include <cstdint>
+@@ -159,7 +160,8 @@ bool TexturedGlbExporter::write(
+         << "\"generator\":\"MobileScan3D V0.6\"},"
+         << "\"scene\":0,"
+         << "\"scenes\":[{\"nodes\":[0]}],"
+-        << "\"nodes\":[{\"mesh\":0,\"name\":\"MobileScan3D_Textured\"}],"
++        << "\"nodes\":[{\"mesh\":0,\"name\":\"MobileScan3D_Textured\",\"matrix\":"
++        << scan_coordinates::kVinsToGltfMatrixJson << "}],"
+ 
+         << "\"meshes\":[{"
+         << "\"name\":\"ScanMesh\","
+diff --git a/app/src/main/java/com/mobilescan3d/MainActivity.kt b/app/src/main/java/com/mobilescan3d/MainActivity.kt
+index a838a87..e6342cf 100644
+--- a/app/src/main/java/com/mobilescan3d/MainActivity.kt
++++ b/app/src/main/java/com/mobilescan3d/MainActivity.kt
+@@ -940,9 +940,9 @@ private var lastRelocPollMs = 0L
+                     // requestRender() 本身线程安全，这里是相机线程。
+                     if (::glView.isInitialized) glView.requestRender()
+                     val f = stMatrixFloats
+-                    // 4x4 中作用于 UV 的 2D 仿射部分：
+-                    // u' = m0·u + m4·v + m12 ; v' = m1·u + m5·v + m13
+-                    val na = floatArrayOf(f[0], f[4], f[12], f[1], f[5], f[13])
++                    // TextureView uses top-left UV; SurfaceTexture expects bottom-left GL UV.
++                    // Both touch selection and AR projection consume this corrected affine.
++                    val na = ScanCoordinates.surfaceTextureToCamera(f)
+                     if (!hasStAffine || !na.contentEquals(stAffine)) {
+                         val first = !hasStAffine
+                         stAffine = na
+@@ -2932,34 +2932,9 @@ private var lastRelocPollMs = 0L
+         glView.requestRender()
+     }
+ 
+-    /**
+-     * V0.13.4：把「模型坐标」映射到「当前世界坐标下的锚点」。
+-     *
+-     *   `P_world = anchor + Ry(yaw) * scale * (P_model - center)`
+-     *
+-     * 即列主序 4x4：线性部分 = `Ry*scale`，平移 = `anchor - scale*(Ry*center)`。
+-     * 先减 center 再变换，模型才会**以它自己的中心**落在锚点上，而不是把
+-     * 「扫描时的世界原点」搬过来（那样模型会偏到几米外）。
+-     */
+-    private fun computePlacementMatrix(): FloatArray {
+-        val c = kotlin.math.cos(placeYaw)
+-        val s = kotlin.math.sin(placeYaw)
+-        val k = placeScale
+-        val cx = placeCenter[0]; val cy = placeCenter[1]; val cz = placeCenter[2]
+-        // Ry * center
+-        val rx = c * cx + s * cz
+-        val ry = cy
+-        val rz = -s * cx + c * cz
+-        return floatArrayOf(
+-            k * c, 0f, -k * s, 0f,
+-            0f, k, 0f, 0f,
+-            k * s, 0f, k * c, 0f,
+-            placeAnchor[0] - k * rx,
+-            placeAnchor[1] - k * ry,
+-            placeAnchor[2] - k * rz,
+-            1f
+-        )
+-    }
++    /** VINS world uses +Z up: yaw must preserve height, with the center at the anchor. */
++    private fun computePlacementMatrix(): FloatArray =
++        ScanCoordinates.placementMatrix(placeYaw, placeScale, placeCenter, placeAnchor)
+ 
+     private fun applyPlacementMatrix() {
+         renderer.setModelMatrix(if (placeModeActive) computePlacementMatrix() else null)
+@@ -3014,9 +2989,7 @@ private var lastRelocPollMs = 0L
+         placeCenter[1] = (minY + maxY) * 0.5f
+         placeCenter[2] = (minZ + maxZ) * 0.5f
+         // pose: [R(9) 行主序, t(3)]，前向是 R 的第三列 (pose[2],pose[5],pose[8])
+-        placeAnchor[0] = pose[9] + pose[2] * 1.2f
+-        placeAnchor[1] = pose[10] + pose[5] * 1.2f - 0.20f
+-        placeAnchor[2] = pose[11] + pose[8] * 1.2f
++        ScanCoordinates.placementAnchor(pose, 1.2f, 0.20f, placeAnchor)
+         placeYaw = 0f
+         placeScale = 1f
+         placeModeActive = true
+diff --git a/app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt b/app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt
+index 778cba7..d629baf 100644
+--- a/app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt
++++ b/app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt
+@@ -137,7 +137,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
+ 
+     // ------------------------------------------------------------------ V0.13.3 模型查看器状态
+ 
+-    /** 轨道相机：eye = target + dist * dir(yaw, pitch)，dir 绕世界 Y 轴。 */
++    /** 轨道相机：eye = target + dist * dir(yaw, pitch)，dir 绕世界 Z 轴。 */
+     @Volatile private var viewerYaw = 0.9f
+     @Volatile private var viewerPitch = 0.35f
+     @Volatile private var viewerDist = 1.0f
+@@ -176,7 +176,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
+         if (dxPx == 0f && dyPx == 0f) return
+         val pose = FloatArray(12)
+         computeViewerPose(pose)
+-        // pose[0..2]=right, [3..5]=down（行主序 R 的列）
++        // Row-major R: right=(0,3,6), down=(1,4,7).
+         val rx = pose[0]; val ry = pose[3]; val rz = pose[6]
+         val dx = pose[1]; val dy = pose[4]; val dz = pose[7]
+         // 屏幕高度方向可见的世界尺寸 = dist / focal；除以像素数得每像素世界量
+@@ -204,44 +204,12 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
+         setViewerFrame(viewerTargetX, viewerTargetY, viewerTargetZ, viewerRadius)
+     }
+ 
+-    /**
+-     * 由 yaw/pitch/dist/target 计算合成位姿。布局与 nativeGetRenderPoseAt
+-     * 一致：[R(9) 行主序, t(3)]，R 的三列分别是相机 right/down/forward
+-     * 在世界系下的方向，t 是相机中心。
+-     *
+-     * 基向量推导（物理自检：站在 z=-5 面向 +z，右手边是 +x ——
+-     * right = up×fw 给出 (1,0,0)，投影后 +x 点落在屏幕右侧，不镜像）：
+-     *   dir    = (cosP·sinY, sinP, cosP·cosY)   target→eye 方向
+-     *   eye    = target + dist·dir
+-     *   fw     = -dir                            eye→target（光轴）
+-     *   right  = worldUp × fw
+-     *   down   = right × fw
+-     */
++    /** Keep viewer and reconstruction in the same +Z-up world, with a right-handed camera. */
+     private fun computeViewerPose(out: FloatArray) {
+-        val cp = kotlin.math.cos(viewerPitch)
+-        val sp = kotlin.math.sin(viewerPitch)
+-        val cy = kotlin.math.cos(viewerYaw)
+-        val sy = kotlin.math.sin(viewerYaw)
+-        // fw：eye 指向 target 的单位向量（相机光轴）
+-        val fx = -cp * sy; val fy = -sp; val fz = -cp * cy
+-        // right = (0,1,0) × fw = (fw.z, 0, -fw.x)
+-        var rx = fz; var ry = 0f; var rz = -fx
+-        var rl = kotlin.math.sqrt(rx * rx + ry * ry + rz * rz)
+-        if (rl < 1e-5f) { rx = 1f; ry = 0f; rz = 0f; rl = 1f }
+-        rx /= rl; ry /= rl; rz /= rl
+-        // down = right × fw
+-        val ddx = ry * fz - rz * fy
+-        val ddy = rz * fx - rx * fz
+-        val ddz = rx * fy - ry * fx
+-        // eye = target - fw·dist = target + dir·dist
+-        val eyeX = viewerTargetX - fx * viewerDist
+-        val eyeY = viewerTargetY - fy * viewerDist
+-        val eyeZ = viewerTargetZ - fz * viewerDist
+-        // 行主序 R，列 = (right, down, forward)
+-        out[0] = rx; out[1] = ddx; out[2] = fx
+-        out[3] = ry; out[4] = ddy; out[5] = fy
+-        out[6] = rz; out[7] = ddz; out[8] = fz
+-        out[9] = eyeX; out[10] = eyeY; out[11] = eyeZ
++        ScanCoordinates.viewerPose(
++            viewerYaw, viewerPitch, viewerDist,
++            viewerTargetX, viewerTargetY, viewerTargetZ, out
++        )
+     }
+ 
+     fun setTexturedMesh(
+@@ -324,8 +292,8 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
+     fun setCameraToView(m: FloatArray) {
+         if (m.size < 6) return
+         // V0.13.14 取证：一次性打出 preview 仿射（ArAxesProbe case C 定位用）。
+-        // 正确的 camera->view 仿射不应含垂直翻转（y 缩放为负）；
+-        // 若 m[4]（y 系数）为负，说明投影链自带上下翻转。
++        // Individual signs do not diagnose an upside-down image: sensor rotation
++        // and front-camera mirroring can legitimately make coefficients negative.
+         if (!cameraToViewProbeLogged) {
+             cameraToViewProbeLogged = true
+             android.util.Log.i(
+diff --git a/app/src/main/java/com/mobilescan3d/ScanCoordinates.kt b/app/src/main/java/com/mobilescan3d/ScanCoordinates.kt
+new file mode 100644
+index 0000000..6814efd
+--- /dev/null
++++ b/app/src/main/java/com/mobilescan3d/ScanCoordinates.kt
+@@ -0,0 +1,65 @@
++package com.mobilescan3d
++
++import kotlin.math.cos
++import kotlin.math.sin
++
++/** Coordinate boundaries only. Reconstruction and saved AR data stay in VINS +Z-up world. */
++object ScanCoordinates {
++    /**
++     * SurfaceTexture consumes GL UV (bottom-left origin), while TextureView/touch
++     * coordinates have a top-left origin. Compose M_ST * flipY on the INPUT side.
++     * Its output already addresses top-left camera buffer memory: do not flip it again.
++     * Preserve producer rotation, mirroring and crop in M_ST.
++     */
++    fun surfaceTextureToCamera(m: FloatArray): FloatArray {
++        require(m.size >= 16)
++        return floatArrayOf(
++            m[0], -m[4], m[12] + m[4],
++            m[1], -m[5], m[13] + m[5]
++        )
++    }
++
++    /** Row-major Rwc + translation; camera columns are right/down/forward (det R = +1). */
++    fun viewerPose(yaw: Float, pitch: Float, distance: Float,
++                   cx: Float, cy: Float, cz: Float, out: FloatArray) {
++        require(out.size >= 12)
++        val p = pitch.coerceIn(-1.4f, 1.4f)
++        val cp = cos(p); val sp = sin(p)
++        val cyaw = cos(yaw); val syaw = sin(yaw)
++        // Orbit around world +Z. At yaw=0, eye is on -Y looking towards +Y.
++        val fx = -cp * syaw; val fy = cp * cyaw; val fz = -sp
++        // right = normalize(forward x worldUp), down = forward x right.
++        val rx = cyaw; val ry = syaw
++        val dx = -fz * ry; val dy = fz * rx; val dz = fx * ry - fy * rx
++        out[0] = rx; out[1] = dx; out[2] = fx
++        out[3] = ry; out[4] = dy; out[5] = fy
++        out[6] = 0f; out[7] = dz; out[8] = fz
++        out[9] = cx - fx * distance
++        out[10] = cy - fy * distance
++        out[11] = cz - fz * distance
++    }
++
++    /** Column-major model-to-world: anchor + Rz(yaw) * scale * (point - center). */
++    fun placementMatrix(yaw: Float, scale: Float, center: FloatArray,
++                        anchor: FloatArray): FloatArray {
++        require(center.size >= 3 && anchor.size >= 3)
++        val c = cos(yaw); val s = sin(yaw)
++        val rx = c * center[0] - s * center[1]
++        val ry = s * center[0] + c * center[1]
++        return floatArrayOf(
++            scale * c, scale * s, 0f, 0f,
++            -scale * s, scale * c, 0f, 0f,
++            0f, 0f, scale, 0f,
++            anchor[0] - scale * rx,
++            anchor[1] - scale * ry,
++            anchor[2] - scale * center[2], 1f
++        )
++    }
++
++    fun placementAnchor(pose: FloatArray, distance: Float, drop: Float, out: FloatArray) {
++        require(pose.size >= 12 && out.size >= 3)
++        out[0] = pose[9] + pose[2] * distance
++        out[1] = pose[10] + pose[5] * distance
++        out[2] = pose[11] + pose[8] * distance - drop
++    }
++}
+diff --git a/docs/review_01317/REVIEW_ZH.md b/docs/review_01317/REVIEW_ZH.md
+new file mode 100644
+index 0000000..35a359d
+--- /dev/null
++++ b/docs/review_01317/REVIEW_ZH.md
+@@ -0,0 +1,93 @@
++# V0.13.17 方向问题审查与验证
++
++基线：`abaa641616e6b5398d91426510182805ae0623c7`。
++本次读取了最新仓库源码及仓库内历史扫描日志；没有读取上一轮对话中的 ZIP。
++仓库日志不是本次修复后的装机证据。用户所述新测试没有附新的截图/日志，
++因此以下结论区分“源码中已确认的缺陷”与“仍需真机确认的整体效果”。
++
++## 已确认的缺陷
++
++### 1. 预览坐标少一次输入原点转换
++
++`MainActivity.onSurfaceTextureUpdated()` 原样抽取 SurfaceTexture 矩阵的 2D 部分，
++用于 `viewToCameraNorm()`，再求逆给点云/网格渲染器。
++但 View/touch 的归一化坐标从左上开始，SurfaceTexture 矩阵接受的是 GL 左下原点坐标。
++旧算法将输入 `(u,v)` 直接送入 M；修复为 `M * (u,1-v,0,1)`。
++
++对于矩阵元素 f（列主序），修正的 2x3 仿射为：
++
++```
++[ f0, -f4, f12+f4 ]
++[ f1, -f5, f13+f5 ]
++```
++
++转换放在输入端，保留 HAL 旋转、镜像、裁剪；不在 shader 输出端盲目取负。
++该仿射同时供点选、拖框、目标框投影与所有 AR 图层使用。
++无旋转、无裁剪时，标准 ST 的纵向翻转因此被抵消，屏幕顶端正确对应图像顶端。
++
++依据：AOSP `GLConsumer::computeTransformMatrix` 明确在最终矩阵左侧添加 FlipV，
++将 GL 坐标转为 buffer 内存左上原点；TextureView 的布局/触摸仍是左上原点。
++
++- https://developer.android.com/reference/android/graphics/SurfaceTexture#getTransformMatrix(float[])
++- https://android.googlesource.com/platform/frameworks/native/+/refs/heads/main/libs/gui/GLConsumerUtils.cpp
++- 实际核对源码镜像：https://github.com/LineageOS/android_frameworks_native/blob/lineage-23.0/libs/gui/GLConsumerUtils.cpp
++- TextureView 绘制参考：https://github.com/aosp-mirror/platform_frameworks_base/blob/master/libs/hwui/pipeline/skia/LayerDrawable.cpp
++
++### 2. 查看器世界轴和相机手性不一致
++
++本工程 VINS 初始化 `Utility::g2R()` 将 g 对齐 +Z；`processIMU()` 使用
++`R * (acc - bias) - g`，静止的加速度计比力方向代表物理向上，因此世界 +Z 向上。
++相机仍使用原始图像 X 右、Y 下、Z 前。旧注释把 +Z 当成物理向下，这是错误的。
++
++原查看器却绕 Y 轴旋转，并使用 `right = up × forward; down = right × forward`。
++其基向量行列式为 -1，是反射而非合法相机旋转。
++现在绕 +Z 轴构造相机，使用 `right = forward × up; down = forward × right`，
++保持行列式 +1。普通与纹理模型复用这一查看位姿。
++
++### 3. 自由摆放用了 Y-up 约定
++
++原 `Ry` 会改变模型的物理高度方向；锚点沿 -Y 下移实际不是向下。
++修复为 `Rz`、沿 -Z 下移，旋转仍以模型包围球中心为中心。
++
++### 4. 外部 GLB 缺少坐标约定转换
++
++两种导出器直接输出 VINS Z-up 网格，没有 glTF Y-up 转换。
++现在二者共享一个根节点矩阵：`(x,y,z) -> (x,z,-y)`，即绕 X 轴 -90°。
++这是行列式 +1 的旋转，法线随节点正确变换，不改变三角形绕序或 UV。
++
++- glTF 坐标规范：https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#coordinate-system-and-units
++
++导出器只写节点矩阵，不改重建网格内存和 `ArTexturedAsset` 二进制格式。
++应用内 AR 恢复读取原始网格/专用缓存，不从外部 GLB 重新解析顶点，因此不会重复旋转。
++
++## 实际通过的验证
++
++| 检查 | 结果 |
++|---|---|
++| Kotlin `ScanCoordinates` 实际编译运行 | 通过（宿主 Kotlin 2.0.21 / Java 17；工程声明 Kotlin 2.2.20） |
++| 4 个旋转方向 × 镜像开关 × 非对称裁剪开关 × 9 个点 | 144 组正反映射通过 |
++| 完整 360° 轨道、5 个俯仰角 | 180 组正交、行列式 +1、顶部朝上、右侧无镜像检查通过 |
++| 同组摆放与锚点检查 | 中心落在锚点、顶部保持竖直、向下偏移正确 |
++| 4 种顶点属性 GLB + 1 种纹理 GLB | 文件结构、实际节点变换、顶部/法线朝上、右手坐标通过 |
++| 纹理 AR 资产保存/恢复 | 顶点、法线、UV、索引、JPEG 一致，通过 |
++| 原有异常输入/locale/深度数组回归 | 通过 |
++| 原近距离 TSDF 策略回归 | 径向距离、单位缩放、无效输入、冻结证据、近处网格通过 |
++| C++ AddressSanitizer / UndefinedBehaviorSanitizer | 未报告内存/未定义行为错误；容器限制下关闭 LeakSanitizer |
++
++执行命令：
++
++```
++python3 tools/review_tests/run_orientation.py
++python3 tools/review_tests/run.py
++python3 tools/review_tests/run_scan_policy.py
++```
++
++依赖：Python 3、Pillow、g++；方向测试需要 Java 和 kotlinc，可通过 JAVA/KOTLINC 环境变量指定。
++这些测试不等同于 Android APK 构建或 GPU 截图验证。
++
++## 验证边界
++
++本环境未配置 Android SDK/NDK/Ceres 构建链，也没有连接手机。
++不能将 APK 构建、特定机型 HAL 映射、真实物体重建效果记为通过。
++姿态时间差、跟踪质量与本次方向修复属于不同问题；没有用额外模型翻转去掩盖它们。
++请按根目录说明进行一次新的非对称物体扫描验收。
+diff --git a/tools/review_tests/OrientationRegression.kt b/tools/review_tests/OrientationRegression.kt
+new file mode 100644
+index 0000000..482be23
+--- /dev/null
++++ b/tools/review_tests/OrientationRegression.kt
+@@ -0,0 +1,92 @@
++import com.mobilescan3d.ScanCoordinates
++import kotlin.math.abs
++import kotlin.math.PI
++
++private fun close(a: Float, b: Float) {
++    check(abs(a - b) < 2e-5f) { "$a != $b" }
++}
++private fun map(a: FloatArray, u: Float, v: Float) =
++    floatArrayOf(a[0]*u+a[1]*v+a[2], a[3]*u+a[4]*v+a[5])
++private fun inverse(a: FloatArray): FloatArray {
++    val d = a[0]*a[4]-a[1]*a[3]
++    return floatArrayOf(a[4]/d,-a[1]/d,(a[1]*a[5]-a[4]*a[2])/d,
++        -a[3]/d,a[0]/d,(a[3]*a[2]-a[0]*a[5])/d)
++}
++private fun column(p: FloatArray, n: Int) = floatArrayOf(p[n],p[3+n],p[6+n])
++private fun dot(a: FloatArray, b: FloatArray) = a.indices.sumOf { (a[it]*b[it]).toDouble() }.toFloat()
++private fun cross(a: FloatArray, b: FloatArray) = floatArrayOf(
++    a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0])
++private fun project(p: FloatArray, point: FloatArray): FloatArray {
++    val d = FloatArray(3) { point[it]-p[9+it] }
++    val z = dot(d,column(p,2)); check(z > 0)
++    return floatArrayOf(dot(d,column(p,0))/z, dot(d,column(p,1))/z)
++}
++private fun transform(m: FloatArray, p: FloatArray) = FloatArray(3) { r ->
++    m[r]*p[0]+m[4+r]*p[1]+m[8+r]*p[2]+m[12+r]
++}
++
++fun main() {
++    // Independent AOSP GLConsumer fixtures: M = flipY * cropGL * producerTransform.
++    // A display-space clockwise rotation has these inverse top-left image mappings.
++    val expected = arrayOf(
++        floatArrayOf(1f,0f,0f,0f,1f,0f),
++        floatArrayOf(0f,1f,0f,-1f,0f,1f),
++        floatArrayOf(-1f,0f,1f,0f,-1f,1f),
++        floatArrayOf(0f,-1f,1f,1f,0f,0f)
++    )
++    val stFixtures = arrayOf(
++        floatArrayOf(1f,0f,0f,0f,-1f,1f),
++        floatArrayOf(0f,-1f,1f,-1f,0f,1f),
++        floatArrayOf(-1f,0f,1f,0f,1f,0f),
++        floatArrayOf(0f,1f,0f,1f,0f,0f)
++    )
++    var mappingChecks = 0
++    for (rotation in 0..3) for (mirror in listOf(false,true)) for (crop in listOf(false,true)) {
++        val st = stFixtures[rotation].copyOf()
++        if (mirror) { st[0] = -st[0]; st[1] = -st[1]; st[2] = 1f-st[2] }
++        val sx = if(crop) .74f else 1f; val sy = if(crop) .62f else 1f
++        val tx = if(crop) .11f else 0f; val ty = if(crop) .23f else 0f
++        for (i in 0..2) st[i] *= sx
++        for (i in 3..5) st[i] *= sy
++        st[2] += tx; st[5] += ty
++        val m = FloatArray(16)
++        m[0]=st[0];m[4]=st[1];m[12]=st[2];m[1]=st[3];m[5]=st[4];m[13]=st[5]
++        m[10]=1f;m[15]=1f
++        val actual = ScanCoordinates.surfaceTextureToCamera(m)
++        val reverse = inverse(actual)
++        for (u in listOf(.1f,.5f,.9f)) for(v in listOf(.15f,.5f,.85f)) {
++            val want=map(expected[rotation],u,v)
++            if(mirror) want[0]=1f-want[0]
++            want[0]=tx+sx*want[0];want[1]=ty+sy*want[1]
++            val got=map(actual,u,v)
++            close(got[0],want[0]);close(got[1],want[1])
++            val back=map(reverse,got[0],got[1]);close(back[0],u);close(back[1],v)
++            mappingChecks++
++        }
++    }
++    // A physical top marker must remain above the center through the complete orbit.
++    val center=floatArrayOf(.3f,-.8f,1.2f)
++    var poses=0
++    for (degrees in 0 until 360 step 10) for (pitch in listOf(-1.4f,-.35f,0f,.35f,1.4f)) {
++        val yaw=(degrees*PI/180).toFloat()
++        val p=FloatArray(12)
++        ScanCoordinates.viewerPose(yaw,pitch,2f,center[0],center[1],center[2],p)
++        for(i in 0..2) for(j in 0..2) close(dot(column(p,i),column(p,j)),if(i==j) 1f else 0f)
++        close(dot(cross(column(p,0),column(p,1)),column(p,2)),1f)
++        val mid=project(p,center);close(mid[0],0f);close(mid[1],0f)
++        val top=project(p,floatArrayOf(center[0],center[1],center[2]+.1f))
++        check(top[1]<mid[1]) { "physical top is upside down" }
++        val right=FloatArray(3) { center[it]+.1f*column(p,0)[it] }
++        check(project(p,right)[0]>mid[0]) { "horizontal mirror" }
++        val anchor=floatArrayOf(-.4f,1.2f,2.1f)
++        val model=ScanCoordinates.placementMatrix(yaw,1.5f,center,anchor)
++        val moved=transform(model,center)
++        for(i in 0..2) close(moved[i],anchor[i])
++        val movedTop=transform(model,floatArrayOf(center[0],center[1],center[2]+.1f))
++        close(movedTop[0],anchor[0]);close(movedTop[1],anchor[1]);close(movedTop[2],anchor[2]+.15f)
++        val placed=FloatArray(3);ScanCoordinates.placementAnchor(p,1.2f,.2f,placed)
++        for(i in 0..2) close(placed[i],p[9+i]+p[2+i*3]*1.2f-if(i==2) .2f else 0f)
++        poses++
++    }
++    println("PASS $mappingChecks preview/touch mappings; $poses upright right-handed viewer/placement poses")
++}
+diff --git a/tools/review_tests/export_regression.cpp b/tools/review_tests/export_regression.cpp
+index 1519483..0d5fa7f 100644
+--- a/tools/review_tests/export_regression.cpp
++++ b/tools/review_tests/export_regression.cpp
+@@ -1,6 +1,7 @@
+ #include "export/gltf_exporter.h"
+ #include "v06/textured_glb_exporter.h"
+ #include "depth_calib.h"
++#include "ar_textured_asset.h"
+ #include <cassert>
+ #include <fstream>
+ #include <iterator>
+@@ -19,12 +20,14 @@ int main(int argc, char** argv) {
+     const std::string root = argv[1];
+     std::locale::global(std::locale(std::locale::classic(), new CommaDecimal));
+     Mesh mesh;
+-    mesh.positions = {0.123456789f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
++    mesh.positions = {0.123456789f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 2.f};
+     mesh.indices = {0, 1, 2};
+     for (int flags = 0; flags < 4; ++flags) {
+         mesh.normals = flags & 1 ? std::vector<float>{0,0,1,0,0,1,0,0,1} : std::vector<float>{};
+         mesh.colors = flags & 2 ? std::vector<float>{1,0,0,0,1,0,0,0,1} : std::vector<float>{};
++        const auto positions = mesh.positions;
+         assert(exportGlb(mesh, root + "/plain" + std::to_string(flags) + ".glb", "test", nullptr));
++        assert(mesh.positions == positions); // external orientation must not mutate AR geometry
+     }
+     const std::string bad = root + "/invalid.glb";
+     mesh.indices[2] = 3;
+@@ -44,6 +47,8 @@ int main(int argc, char** argv) {
+     for (int i = 0; i < 3; ++i) {
+         uv.vertices[i].base.px = i == 1 ? 1.f : 0.123456789f;
+         uv.vertices[i].base.py = i == 2 ? 1.f : 0.f;
++        uv.vertices[i].base.pz = i == 2 ? 2.f : 0.f;
++        uv.vertices[i].base.nz = 1.f;
+         uv.vertices[i].u = i == 1 ? 1.f : 0.f;
+         uv.vertices[i].v = i == 2 ? 1.f : 0.f;
+     }
+@@ -52,6 +57,21 @@ int main(int argc, char** argv) {
+     std::ifstream jpegFile(root + "/atlas.jpg", std::ios::binary);
+     std::vector<std::uint8_t> jpeg((std::istreambuf_iterator<char>(jpegFile)), {});
+     assert(TexturedGlbExporter::write(root + "/textured.glb", uv, jpeg));
++    ArTexturedAsset asset;
++    assert(asset.set(uv, jpeg));
++    assert(asset.save(root + "/asset.bin"));
++    ArTexturedAsset restored;
++    assert(restored.load(root + "/asset.bin"));
++    assert(restored.vertices() == asset.vertices());
++    assert(restored.indices() == uv.indices);
++    assert(restored.jpeg() == jpeg);
++    for (int i = 0; i < 3; ++i) {
++        const auto& v = uv.vertices[i];
++        const float* p = restored.vertices().data() + i * 8;
++        assert(p[0] == v.base.px && p[1] == v.base.py && p[2] == v.base.pz);
++        assert(p[3] == 0 && p[4] == 0 && p[5] == 1);
++        assert(p[6] == v.u && p[7] == v.v);
++    }
+     uv.indices[2] = 3;
+     assert(!TexturedGlbExporter::write(bad, uv, jpeg));
+     uv.indices[2] = 2;
+diff --git a/tools/review_tests/run.py b/tools/review_tests/run.py
+index 8cba21b..f6bbb2f 100644
+--- a/tools/review_tests/run.py
++++ b/tools/review_tests/run.py
+@@ -40,6 +40,21 @@ def inspect(path):
+     view = doc['bufferViews'][pos['bufferView']]
+     base = view.get('byteOffset', 0) + pos.get('byteOffset', 0)
+     positions = [struct.unpack_from('<fff', binary, base+i*view.get('byteStride', 12)) for i in range(3)]
++    # Use the actual exported scene node, not a second copy of exporter math.
++    matrix = doc['nodes'][0]['matrix']
++    assert len(matrix) == 16
++    vector = lambda p: tuple(sum(matrix[c*4+r]*p[c] for c in range(3)) for r in range(3))
++    point = lambda p: tuple(v+matrix[12+r] for r,v in enumerate(vector(p)))
++    assert vector((0,0,1)) == (0,1,0), 'physical up must become glTF +Y'
++    ex, ey, ez = (vector(p) for p in [(1,0,0),(0,1,0),(0,0,1)])
++    cross = lambda a,b: (a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0])
++    assert cross(ex,ey) == ez, 'no mirrored winding/normals'
++    assert point(positions[2])[1] > point(positions[0])[1], 'top marker must stay above base'
++    if 'NORMAL' in attrs:
++        normal = accessors[attrs['NORMAL']]
++        nv = doc['bufferViews'][normal['bufferView']]
++        nb = nv.get('byteOffset',0) + normal.get('byteOffset',0)
++        assert vector(struct.unpack_from('<fff',binary,nb)) == (0,1,0)
+     for k in range(3):
+         assert all(math.isfinite(p[k]) for p in positions)
+         # Round-trip JSON bounds back to float32: bounds must match actual positions.
+@@ -64,6 +79,7 @@ with tempfile.TemporaryDirectory() as work:
+                     str(Path(__file__).with_name('export_regression.cpp')),
+                     str(CPP / 'export/gltf_exporter.cpp'),
+                     str(CPP / 'v06/textured_glb_exporter.cpp'),
++                    str(CPP / 'ar_textured_asset.cpp'),
+                     str(CPP / 'depth_calib.cpp'), '-o', str(tmp / 'test')], check=True)
+     # This container restricts /proc; LeakSanitizer cannot enumerate threads.
+     env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0')
+@@ -74,3 +90,4 @@ with tempfile.TemporaryDirectory() as work:
+         print('PASS', path.name)
+     assert len(list(tmp.glob('*.glb'))) == 5
+ print('PASS malformed mesh rejection, comma locale, unequal depth arrays; ASan/UBSan clean (leak detection disabled)')
++print('PASS plain/textured GLB +Y up, preserved handedness, unchanged AR asset save/load')
+diff --git a/tools/review_tests/run_orientation.py b/tools/review_tests/run_orientation.py
+new file mode 100644
+index 0000000..8713e5c
+--- /dev/null
++++ b/tools/review_tests/run_orientation.py
+@@ -0,0 +1,19 @@
++#!/usr/bin/env python3
++"""Compile and execute production Kotlin coordinate math. Requires JRE and kotlinc."""
++from pathlib import Path
++import os
++import shutil
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++compiler = os.environ.get('KOTLINC') or shutil.which('kotlinc')
++java = os.environ.get('JAVA') or shutil.which('java')
++if not compiler or not java:
++    raise SystemExit('Set KOTLINC and JAVA, or put kotlinc/java on PATH.')
++with tempfile.TemporaryDirectory() as work:
++    jar = str(Path(work) / 'orientation.jar')
++    subprocess.run([compiler, str(root/'app/src/main/java/com/mobilescan3d/ScanCoordinates.kt'),
++                    str(Path(__file__).with_name('OrientationRegression.kt')),
++                    '-include-runtime', '-d', jar], check=True)
++    subprocess.run([java, '-jar', jar], check=True)
+diff --git a/tools/review_tests/verify_orientation_overlay.py b/tools/review_tests/verify_orientation_overlay.py
+new file mode 100644
+index 0000000..072d734
+--- /dev/null
++++ b/tools/review_tests/verify_orientation_overlay.py
+@@ -0,0 +1,16 @@
++#!/usr/bin/env python3
++"""Read-only verification of the V0.13.17 overlay, in extracted ZIP or project root."""
++import hashlib
++import json
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[2]
++manifest = json.loads((root/'ORIENTATION_OVERLAY_MANIFEST.json').read_text(encoding='utf-8'))
++failed = []
++for item in manifest['files']:
++    path = root / item['path']
++    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
++        failed.append(item['path'])
++if failed:
++    raise SystemExit('FAIL missing or changed:\n' + '\n'.join(failed))
++print(f"PASS {len(manifest['files'])} overlay files; baseline {manifest['base_commit']}")
