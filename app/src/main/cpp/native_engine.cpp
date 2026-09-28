@@ -141,8 +141,9 @@ static constexpr int kMaxCalibSamples = 256;
 static constexpr int kEpochStableFrames = 8;
 static constexpr int kEpochCalibLossFrames = 5;
 static constexpr float kEpochRebuildRatio = 0.08f;
+static constexpr float kEpochDriftSuspendRatio = 0.20f;  // V0.13.19.4：暂停新融合的漂移门限（独立于开启稳定性门槛 8%）
 /** V0.13：连续多少帧漂移超标 -> 暂停新融合（几何保持不动）。 */
-static constexpr int kEpochDriftSuspendFrames = 3;
+static constexpr int kEpochDriftSuspendFrames = 10;
 /** V0.13：漂移连续恢复正常多少帧 -> 解除暂停。 */
 static constexpr int kEpochResumeFrames = 6;
 /** V0.13：极端映射差诊断阈值；不再触发几何清空。 */
@@ -2178,7 +2179,7 @@ static void nativeOnDepthMapImpl(
             if (bothOk) {
                 epochLastDriftRel = std::fabs(zLiveAtRef - zFrozen) / zFrozen;
             }
-            if (bothOk && epochLastDriftRel > kEpochRebuildRatio) {
+            if (bothOk && epochLastDriftRel > kEpochDriftSuspendRatio) {
                 ++epochDriftRejects;
                 ++epochBadStreak;
                 ++epochSuspendStreak;
@@ -3289,6 +3290,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " stableStreak=" << epochStableStreak
       << " rebuildRatio=" << kEpochRebuildRatio
       << " driftSuspendFrames=" << kEpochDriftSuspendFrames
+      << " driftSuspendRatio=" << kEpochDriftSuspendRatio
       << " calibLossFrames=" << kEpochCalibLossFrames
       << " badStreak=" << epochBadStreak
       << " driftRejects=" << epochDriftRejects
