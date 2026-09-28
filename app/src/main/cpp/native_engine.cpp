@@ -1116,7 +1116,16 @@ static PresenceDecision evaluatePresence(const TargetTrackInfo& ti,
         d.centerOffsetRatio = diag > 1.f ? dist / diag : 0.f;
         d.centerOk = d.centerOffsetRatio < kPresenceMaxCenterOffset;
     }
-    d.valid = d.appearanceOk && d.maskOk && (d.motionOk || d.centerOk);
+    // V0.13.19.2 PresenceGate 修正：绕物扫描时目标外观/视角/光照必然变化，
+    // NanoTrack 外观分数会规律性掉到 kPresenceAppearanceScore 以下 —— 这是预期
+    // 现象，不该据此判「目标不在」（否则每帧弹「外观/深度不一致」且目标专属几何
+    // 被饿死）。PresenceGate 的本意是「bbox 在画面 != 物体还在」（防 tracker 锁
+    // 背景纹理），真正的判据应是几何一致性：mask 在 +（运动或中心一致），且只有当
+    // 运动与中心**同时**失配时才需要外观来兜底确认。外观既不能单独判亡，也不该
+    // 一票否决一个几何强一致的跟踪框。
+    const bool geomOk = d.motionOk || d.centerOk;
+    const bool geomStrong = d.motionOk && d.centerOk;
+    d.valid = d.maskOk && geomOk && (geomStrong || d.appearanceOk);
     return d;
 }
 
@@ -2289,6 +2298,15 @@ static void nativeOnDepthMapImpl(
 
         const PresenceDecision pd = evaluatePresence(ti, targetMaskStats, w, h);
         presenceOk = pd.valid;
+        if ((depthFrames % 60) == 0 && !presenceOk) {
+            LOGI("PresenceDiag nano=%d nanoScore=%.3f conf=%.3f inlier=%.3f pts=%d "
+                 "maskV=%d over=%d area=%d centerOff=%.3f "
+                 "appearanceOk=%d motionOk=%d maskOk=%d centerOk=%d",
+                 (int)ti.nanoLoaded, ti.nanoScore, ti.confidence, ti.inlierRatio,
+                 ti.trackedPoints, (int)pd.maskOk, (int)targetMaskStats.overExpanded,
+                 targetMaskStats.area, pd.centerOffsetRatio,
+                 (int)pd.appearanceOk, (int)pd.motionOk, (int)pd.maskOk, (int)pd.centerOk);
+        }
         if (presenceOk) {
             presenceFailStreak = 0;
         } else {
