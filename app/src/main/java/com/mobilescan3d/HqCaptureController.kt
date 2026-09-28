@@ -286,6 +286,8 @@ private class BurstContext(
      */
     val jpegPathByIndex = arrayOfNulls<String>(BURST_FRAME_SLOTS)
     val jpegLock = Any()
+    var completion: BurstCompletion? = null
+    var captureSequenceId = -1
     /** 本组期望的帧数 */
     var expectedFrames = 0
     /** 正常模式只保留一张参考 RAW */
@@ -526,6 +528,27 @@ class HqCaptureController(
 
     val caps: HqCameraCaps
     val stats = HqCaptureStats()
+    @Volatile var torchEnabled = false
+        private set
+    private var lightingSettleUntilMs = 0L
+
+    /** Called on the camera handler, between bursts; wait for fresh 3A convergence. */
+    fun setFillLight(enabled: Boolean) {
+        if (torchEnabled == enabled) return
+        torchEnabled = enabled
+        lightingSettleUntilMs = android.os.SystemClock.elapsedRealtime() + 1200L
+        synchronized(historyLock) { threeAHistory.clear() }
+        stats.threeAReady = false
+        readyStreak = 0
+        readyAeStreak = 0
+        readyAwbStreak = 0
+        readyAfStreak = 0
+        lastConvergedResult = null
+        locked3a = null
+    }
+
+    fun canChangeFillLight(): Boolean = !burstInFlight && !processingInFlight
+
 
     private var jpegReader: ImageReader? = null
     private var rawReader: ImageReader? = null
@@ -683,6 +706,7 @@ class HqCaptureController(
     }
 
     fun detachSurfaces() {
+        endScan() // interrupted camera sessions must not leave burst guards latched
         active = false
         jpegReader?.close(); jpegReader = null
         rawReader?.close(); rawReader = null
@@ -813,6 +837,8 @@ class HqCaptureController(
     // ---------------------------------------------------------------- metadata
 
     fun onCaptureResult(result: TotalCaptureResult) {
+        val captureTag = result.request.tag as? BurstFrameTag
+        if (captureTag != null && captureTag.ctx.sessionId != currentSessionId) return
         stats.aeState = result.get(CaptureResult.CONTROL_AE_STATE)
         stats.awbState = result.get(CaptureResult.CONTROL_AWB_STATE)
         stats.afState = result.get(CaptureResult.CONTROL_AF_STATE)
@@ -1105,6 +1131,8 @@ class HqCaptureController(
         // 打 tag：只有带 BurstFrameTag 的结果才进 HQ 配对表，
         // preview result 会被 onCaptureResult 直接忽略。
         b.setTag(tag)
+        b.set(CaptureRequest.FLASH_MODE,
+            if (torchEnabled) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
         if (frameMode != FRAME_MODE_RAW) {
             jpegReader?.surface?.let { b.addTarget(it) }
         }
@@ -1399,6 +1427,10 @@ class HqCaptureController(
         // 而不是像之前那样只能看到 burstStarted 和一堆模糊的 skip。
         stats.schedulerCandidates++
 
+        if (android.os.SystemClock.elapsedRealtime() < lightingSettleUntilMs) {
+            stats.lastCaptureRejectReason = "补光切换后等待曝光稳定"
+            return
+        }
         if (currentPhase != STATE_READY || !stats.threeAReady) {
             stats.reject3A++
             stats.triggerRejectReason =
@@ -1583,8 +1615,17 @@ class HqCaptureController(
                     BurstFrameTag(ctx, i, FRAME_MODE_JPEG)
                 )
             }
+            ctx.completion = BurstCompletion(count)
             burstInFlight = true
-            session.captureBurst(requests, burstCallback, handler)
+            ctx.captureSequenceId = session.captureBurst(requests, burstCallback, handler)
+            // Some HALs omit terminal callbacks after a capture error. Never leave
+            // the scheduler permanently busy; the existing image timeout handles gaps.
+            handler.postDelayed({
+                if (activeBurst === ctx && burstInFlight) {
+                    stats.lastCaptureRejectReason = "burst callbacks timed out"
+                    finishBurstRound()
+                }
+            }, 5_000L)
         } catch (e: Exception) {
             burstInFlight = false
             stats.burstDropped += count
@@ -1603,12 +1644,10 @@ class HqCaptureController(
             request: CaptureRequest,
             result: TotalCaptureResult
         ) {
+            val tag = request.tag as? BurstFrameTag ?: return
+            if (activeBurst !== tag.ctx || !burstInFlight) return
             onCaptureResult(result)
-            burstCompletedThisRound++
-            stats.burstCompleted = burstCompletedThisRound
-            if (burstCompletedThisRound >= burstExpectedFrames) {
-                finishBurstRound()
-            }
+            recordBurstTerminal(tag, true)
         }
 
         override fun onCaptureFailed(
@@ -1616,12 +1655,25 @@ class HqCaptureController(
             request: CaptureRequest,
             failure: android.hardware.camera2.CaptureFailure
         ) {
-            stats.burstDropped++
-            burstFailedThisRound++
-            if (burstCompletedThisRound + burstFailedThisRound >= burstExpectedFrames) {
-                finishBurstRound()
-            }
+            val tag = request.tag as? BurstFrameTag ?: return
+            if (activeBurst !== tag.ctx || !burstInFlight) return
+            recordBurstTerminal(tag, false)
         }
+
+        override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+            val ctx = activeBurst ?: return
+            if (burstInFlight && ctx.captureSequenceId == sequenceId) finishBurstRound()
+        }
+    }
+
+    private fun recordBurstTerminal(tag: BurstFrameTag, success: Boolean) {
+        val progress = tag.ctx.completion ?: return
+        if (!progress.record(tag.index, success)) return
+        if (!success) stats.burstDropped++
+        burstCompletedThisRound = progress.completed
+        burstFailedThisRound = progress.failed
+        stats.burstCompleted = progress.completed
+        if (progress.done) finishBurstRound()
     }
 
     private fun finishBurstRound() {
@@ -2058,8 +2110,18 @@ class HqCaptureController(
                 false
             }
             handler.post {
-                applyFusionStats(ctx, ok, out, statsOut, frameStatsOut, paths)
-                finishFusion(ctx)
+                try {
+                    if (activeBurst === ctx && ctx.sessionId == currentSessionId) {
+                        applyFusionStats(ctx, ok, out, statsOut, frameStatsOut, paths)
+                    } else {
+                        out.delete() // stale scan: do not register texture into a new model
+                    }
+                } catch (error: Throwable) {
+                    android.util.Log.e("HqCapture", "Unable to publish fused frame", error)
+                    stats.lastCaptureRejectReason = "fusion publish: ${error.message}"
+                } finally {
+                    finishFusion(ctx)
+                }
             }
         }.start()
     }
@@ -2073,9 +2135,11 @@ class HqCaptureController(
         synchronized(ctx.jpegLock) {
             for (i in ctx.jpegPathByIndex.indices) ctx.jpegPathByIndex[i] = null
         }
-        if (activeBurst === ctx) activeBurst = null
-        fusionStarted = false
-        processingInFlight = false
+        if (activeBurst === ctx) {
+            activeBurst = null
+            fusionStarted = false
+            processingInFlight = false
+        }
     }
 
     private fun applyFusionStats(

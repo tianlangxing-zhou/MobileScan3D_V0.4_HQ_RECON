@@ -473,7 +473,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         // strict 永远查不到 → 长期回退冻结 pose → 模型不跟随。
         // 关键帧路径 nativeGetRenderPoseAtTol(500ms) 已验证可用（同基准 Image
         // 时间戳），这里对齐到同一宽松窗口；最近邻只在时间最接近的位姿里取，
-        // 不会拿错时刻的 pose。burst 空洞(>500ms) 仍回退，行为与现一致。
+        // 快速运动下仍可能有可见时差。burst 空洞(>500ms) 仍回退，行为与现一致。
         val ts = previewTimestampNs
         var ok = false
         if (ts > 0L) {

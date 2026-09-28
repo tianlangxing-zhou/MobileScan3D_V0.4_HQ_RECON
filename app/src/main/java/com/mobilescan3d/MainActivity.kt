@@ -126,8 +126,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     /** 深度标定读取缓冲，复用避免每帧分配。 */
     private val calibBuf = FloatArray(NativeBridge.DEPTH_CALIBRATION_SLOTS)
 
-    @Volatile
-    private var depthBusy = false
+    private val depthBusy = AtomicBoolean(false)
+    @Volatile private var depthCompletedMs = 0L
+    @Volatile private var depthErrors = 0L
+    @Volatile private var depthLastError = ""
+    @Volatile private var scanMaxDistanceMeters = 1f
+    @Volatile private var autoFillLight = true
+    @Volatile private var torchRequested = false
+    @Volatile private var torchAvailable = false
+    @Volatile private var torchFailed = false
+    private val autoLightPolicy = AutoLightPolicy()
     // V0.5：会话世代号。停止/重开扫描时自增，用来丢弃「晚到达」的深度推理
     // 结果 —— 否则上一轮会话的深度会喂进已经被 reset 的 TSDF。
     @Volatile private var depthGeneration = 0L
@@ -512,6 +520,10 @@ private var lastRelocPollMs = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val scanPrefs = getSharedPreferences("scan_settings", Context.MODE_PRIVATE)
+        val savedDistance = scanPrefs.getFloat("max_distance_m", 1f)
+        scanMaxDistanceMeters = if (savedDistance.isFinite()) savedDistance.coerceIn(.2f, 5f) else 1f
+        autoFillLight = scanPrefs.getBoolean("auto_fill_light", true)
 
         val root = android.widget.FrameLayout(this)
         val density = resources.displayMetrics.density
@@ -813,6 +825,7 @@ private var lastRelocPollMs = 0L
             Gravity.CENTER_VERTICAL or Gravity.END
         ).apply { rightMargin = 8 })
 
+        settingsButton.bringToFront()
         setContentView(root)
 
         // V0.12: 默认进「实时」图层 —— 半透明网格 + 累计 surfel(hits>=1)
@@ -997,6 +1010,8 @@ private var lastRelocPollMs = 0L
             val id = currentCameraId
             abandonedOpen = false
             val chars = cameraManager.getCameraCharacteristics(id)
+            torchAvailable = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            torchFailed = false
             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
             deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}"
             lensFacing = chars.get(CameraCharacteristics.LENS_FACING) ?: 0
@@ -1519,6 +1534,11 @@ private var lastRelocPollMs = 0L
     }
 
     private fun applyCaptureSettings() {
+        val handler = cameraHandler ?: return
+        if (android.os.Looper.myLooper() != handler.looper) {
+            handler.post { applyCaptureSettings() }
+            return
+        }
         val session = captureSession ?: return
         val camera = cameraDevice ?: return
         val readerSurface = reader?.surface ?: return
@@ -1536,6 +1556,8 @@ private var lastRelocPollMs = 0L
                 // 这里绝不能再跟随控制器写 AE_MODE_OFF / 手动曝光 / 手动焦距——
                 // 那会把 AE_STATE 打成 INACTIVE，让控制器自己的收敛判定永远不成立。
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.FLASH_MODE, if (torchRequested && torchAvailable)
+                    CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
                 if (aeLockAvailable) set(CaptureRequest.CONTROL_AE_LOCK, aeLock)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                 if (awbLockAvailable) set(CaptureRequest.CONTROL_AWB_LOCK, awbLock)
@@ -1591,13 +1613,23 @@ private var lastRelocPollMs = 0L
                         set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
                         set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
                     }
+                    set(CaptureRequest.FLASH_MODE, if (torchRequested && torchAvailable)
+                        CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
                     set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
                 }.build()
                 session.capture(trigger, null, cameraHandler)
             }
             session.setRepeatingRequest(req, captureResultCallback, cameraHandler)
         } catch (e: Exception) {
-            toast("应用相机参数失败：${e.message}")
+            if (torchRequested) {
+                torchRequested = false
+                torchFailed = true
+                if (::hqCapture.isInitialized) hqCapture.setFillLight(false)
+                android.util.Log.w("AutoFillLight", "Torch request rejected; restoring preview", e)
+                applyCaptureSettings() // bounded retry: torchRequested is now false
+            } else {
+                toast("应用相机参数失败：${e.message}")
+            }
         }
     }
 
@@ -2002,6 +2034,8 @@ private var lastRelocPollMs = 0L
      */
     private fun buildFeedbackReport(): String {
         val sb = StringBuilder()
+        sb.appendLine("Scan settings: maxDistanceMeters=$scanMaxDistanceMeters autoFillLight=$autoFillLight torchRequested=$torchRequested torchAvailable=$torchAvailable torchFailed=$torchFailed")
+        sb.appendLine("Depth worker: busy=${depthBusy.get()} errors=$depthErrors lastError=$depthLastError lastCompletedElapsedMs=$depthCompletedMs")
         sb.appendLine("MobileScan3D 配置反馈报告")
         sb.appendLine("时间戳: ${System.currentTimeMillis()}")
         sb.appendLine()
@@ -2370,6 +2404,7 @@ private var lastRelocPollMs = 0L
     }
 
     private fun processImage(image: Image) {
+        if (!resumed) { image.close(); return }
         val ts = image.timestamp
         try {
             val p = image.planes
@@ -2387,6 +2422,7 @@ private var lastRelocPollMs = 0L
                     // 曝光直方图预检：clipping 过高时不要发 still capture
                     if (::hqCapture.isInitialized) {
                         hqCapture.onPreviewLuma(y, image.width, image.height, p[0].rowStride)
+                        updateAutoFillLight()
                     }
                     val meta = synchronized(frameMetaLock) {
                         val ready = frameMeta.remove(ts)
@@ -2417,7 +2453,8 @@ private var lastRelocPollMs = 0L
                 }
                 glView.requestRender()
             }
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
+            android.util.Log.e("ScanFrame", "Camera frame rejected", error)
         } finally {
             image.close()
         }
@@ -2439,42 +2476,66 @@ private var lastRelocPollMs = 0L
      * 深度与位姿差一帧，表现为「边走边扫时模型层层错位」。
      */
     private fun scheduleDepth(y: ByteArray, u: ByteArray, v: ByteArray, w: Int, h: Int, rowStride: Int, uRowStride: Int, uPixelStride: Int, t: Long) {
-        if (depthBusy) return
-        val handler = depthHandler
-        if (handler == null) {
-            // 没有深度线程就不能把 depthBusy 永久置起，否则深度链从此静默死掉。
-            depthBusy = false
-            return
-        }
-        depthBusy = true
-        // V0.5：记下派发时的会话世代；推理是异步的，回来时可能已经停扫/重开。
+        val handler = depthHandler ?: return
+        if (!depthBusy.compareAndSet(false, true)) return
         val generation = depthGeneration
-        handler.post {
-            try {
-                val provider = depthProvider
-                if (provider.available) {
-                    val produced = provider.submitFrame(
-                        y, u, v, w, h, rowStride, uRowStride, uPixelStride, t
-                    )
-                    val res = if (produced) provider.latest() else null
-                    if (res != null && res.depth.isNotEmpty()) {
-                        // 世代不一致说明这帧属于上一轮会话，必须丢弃。
-                        synchronized(depthSessionLock) {
-                            if (generation == depthGeneration && scanning && scanNativeReady && !isDestroyed) {
-                                NativeBridge.nativeOnDepthMap(
-                                    res.depth, res.width, res.height, 0.5f,
-                                    res.timestampNs, res.representation.nativeCode
-                                )
+        try {
+            NativeBridge.nativeRetainDepthFrame(t)
+            val accepted = handler.post {
+                try {
+                    // Queued work may belong to a scan that has already stopped.
+                    if (generation != depthGeneration || !scanning || !scanNativeReady || !resumed) return@post
+                    val provider = depthProvider
+                    if (provider.available && provider.submitFrame(
+                            y, u, v, w, h, rowStride, uRowStride, uPixelStride, t)) {
+                        val res = provider.latest()
+                        if (res != null && res.depth.isNotEmpty()) synchronized(depthSessionLock) {
+                            if (generation == depthGeneration && scanning && scanNativeReady && resumed && !isDestroyed) {
+                                NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height,
+                                    .5f, res.timestampNs, res.representation.nativeCode)
+                                depthCompletedMs = android.os.SystemClock.elapsedRealtime()
+                                depthLastError = ""
                                 glView.requestRender()
                             }
                         }
                     }
+                } catch (error: Throwable) {
+                    depthErrors++
+                    depthLastError = "${error.javaClass.simpleName}: ${error.message}"
+                    android.util.Log.e("ScanDepth", "Depth frame failed; next frame can retry", error)
+                } finally {
+                    depthBusy.set(false)
                 }
-            } catch (_: Throwable) {
-            } finally {
-                depthBusy = false
             }
+            if (!accepted) {
+                depthBusy.set(false)
+                depthErrors++
+                depthLastError = "深度线程拒绝任务"
+            }
+        } catch (error: Throwable) {
+            depthBusy.set(false)
+            depthErrors++
+            depthLastError = "${error.javaClass.simpleName}: ${error.message}"
+            android.util.Log.e("ScanDepth", "Unable to schedule depth frame", error)
         }
+    }
+
+    private fun updateAutoFillLight() {
+        if (!scanning || !resumed || !autoFillLight || !torchAvailable || torchFailed || torchRequested) return
+        if (!::hqCapture.isInitialized || !hqCapture.canChangeFillLight()) return
+        val st = hqCapture.stats
+        if (autoLightPolicy.update(android.os.SystemClock.elapsedRealtime(),
+                st.lumaP50, st.lumaP95, st.iso, st.exposureNs)) {
+            torchRequested = true
+            hqCapture.setFillLight(true)
+            applyCaptureSettings()
+        }
+    }
+
+    private fun resetFillLight() {
+        torchRequested = false
+        autoLightPolicy.reset()
+        if (::hqCapture.isInitialized) hqCapture.setFillLight(false)
     }
 
     private fun extractPlane(plane: Image.Plane): ByteArray {
@@ -2493,7 +2554,15 @@ private var lastRelocPollMs = 0L
             toast("模型正在生成或恢复，请稍候")
             return
         }
+        if (cameraDevice == null || captureSession == null || nativeW <= 0 || nativeH <= 0) {
+            toast("请等待相机预览就绪再开始扫描")
+            return
+        }
         scanning = true
+        depthCompletedMs = android.os.SystemClock.elapsedRealtime()
+        depthErrors = 0
+        depthLastError = ""
+        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
         // V0.13.4 P0-C：会话令牌必须先推进 —— 从这一刻起，所有仍在飞的
         // 后台任务（上一轮的最终导出 / 恢复 / 后台建网格）回跳时都会发现
         // 令牌变了，从而丢弃自己的结果而不是污染这一轮。
@@ -2557,6 +2626,7 @@ private var lastRelocPollMs = 0L
             // 立体深度噪声典型 5~15mm，尚在容忍带内。
             // 注意：nativeCreate 已 reset TSDF，这里在复位后设置档位才有效。
             NativeBridge.nativeSetVoxelProfile(0)
+            NativeBridge.nativeSetScanMaxDistance(scanMaxDistanceMeters)
             NativeBridge.nativeSetDepthCalibrationEnabled(true)
             if (objectLockEnabled) {
                 NativeBridge.nativeSetObjectLockEnabled(true)
@@ -2620,6 +2690,7 @@ private var lastRelocPollMs = 0L
 
     private fun stopScan() {
         scanning = false
+        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
         multiCam?.updateScanState(false, sessionId, false)
         // V0.5：停扫后不再派发深度推理 / TSDF 融合（见 processImage 的
         // nativeFrameActive），但 **VINS 必须继续跑** —— cameraToView 靠它更新，
@@ -3693,7 +3764,15 @@ private var lastRelocPollMs = 0L
 
     private fun updateHeader() {
         val vinsOk = NativeBridge.nativeVinsInitialized()
-        headerStatus.text = "FPS %.1f · %s".format(fps, if (scanning) "扫描中" else "空闲")
+        val lightStatus = when {
+            torchFailed -> "补光不可用"
+            torchRequested -> "补光已开启"
+            !torchAvailable -> "无闪光灯"
+            autoFillLight -> "自动补光"
+            else -> "补光关闭"
+        }
+        headerStatus.text = "FPS %.1f · %s · ≤%.1fm · %s".format(
+            fps, if (scanning) "扫描中" else "空闲", scanMaxDistanceMeters, lightStatus)
         if (objectLockEnabled) {
             // Overlay 的刷新已移到 30Hz 的 updateTargetUiTick()，这里只保留
             // AF 重锁 —— 而且**必须**留在这条 1Hz 路径上。
@@ -3727,6 +3806,9 @@ private var lastRelocPollMs = 0L
             val notice = when {
                 !::depthProvider.isInitialized || !depthProvider.available ->
                     "深度模型不可用，请检查模型文件后重新开始"
+                depthLastError.isNotEmpty() -> "深度帧处理失败，正在重试；详情见反馈报告"
+                android.os.SystemClock.elapsedRealtime() - depthCompletedMs > 4000L ->
+                    "深度处理延迟，等待当前帧完成；请放慢移动"
                 count < epoch.size || epoch[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] < 0.5f ->
                     "正在标定深度：请缓慢平移，让目标和周围纹理保持清晰"
                 epoch[NativeBridge.FUSION_EPOCH_INDEX_SUSPENDED] > 0.5f ->
@@ -3963,15 +4045,59 @@ private var lastRelocPollMs = 0L
         android.widget.PopupMenu(this, settingsButton).apply {
             menu.add("相机参数")
             menu.add("模式选择")
+            menu.add("扫描距离与补光")
             setOnMenuItemClickListener { item ->
                 when (item.title.toString()) {
                     "相机参数" -> showCameraParams()
                     "模式选择" -> showModeDialog()
+                    "扫描距离与补光" -> showScanSettings()
                 }
                 true
             }
             show()
         }
+    }
+
+    private fun showScanSettings() {
+        if (scanning) {
+            toast("请先停止扫描再调整距离或补光；新设置用于下一次扫描")
+            return
+        }
+        val panel = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(36, 20, 36, 12)
+        }
+        val label = TextView(this)
+        val slider = android.widget.SeekBar(this).apply {
+            max = 48
+            progress = ((scanMaxDistanceMeters - .2f) * 10f).toInt().coerceIn(0, 48)
+        }
+        fun updateLabel() { label.text = "最大扫描距离：%.1f 米（估计值）".format(.2f + slider.progress / 10f) }
+        slider.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: android.widget.SeekBar?, value: Int, fromUser: Boolean) = updateLabel()
+            override fun onStartTrackingTouch(bar: android.widget.SeekBar?) {}
+            override fun onStopTrackingTouch(bar: android.widget.SeekBar?) {}
+        })
+        updateLabel()
+        val light = android.widget.CheckBox(this).apply {
+            text = "暗光时自动持续补光"
+            isChecked = autoFillLight
+        }
+        panel.addView(label)
+        panel.addView(slider)
+        panel.addView(light)
+        panel.addView(TextView(this).apply {
+            text = "仅在设定距离内采集点云和模型，默认 1 米。单目距离依赖定位和深度标定，并非测距仪。补光开启后保持至停扫或退到后台，避免反复闪烁；无闪光灯的镜头无法补光。"
+        })
+        android.app.AlertDialog.Builder(this).setTitle("扫描距离与补光").setView(panel)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存") { _, _ ->
+                scanMaxDistanceMeters = .2f + slider.progress / 10f
+                autoFillLight = light.isChecked
+                getSharedPreferences("scan_settings", Context.MODE_PRIVATE).edit()
+                    .putFloat("max_distance_m", scanMaxDistanceMeters)
+                    .putBoolean("auto_fill_light", autoFillLight).apply()
+            }.show()
     }
 
     private fun saveLatestGlb() {
@@ -4124,6 +4250,9 @@ private var lastRelocPollMs = 0L
 
     private fun closeCamera() {
         abandonedOpen = true
+        // Closing the owning CameraDevice extinguishes its torch; serialize policy reset.
+        torchRequested = false
+        cameraHandler?.post { resetFillLight() }
         cameraHandler?.removeCallbacks(resetFocusRunnable)
         captureSession?.close(); captureSession = null
         cameraDevice?.close(); cameraDevice = null
@@ -4146,6 +4275,7 @@ private var lastRelocPollMs = 0L
 
     override fun onPause() {
         resumed = false
+        synchronized(depthSessionLock) { depthGeneration++ }
         closeCamera()
         glView.onPause()
         super.onPause()

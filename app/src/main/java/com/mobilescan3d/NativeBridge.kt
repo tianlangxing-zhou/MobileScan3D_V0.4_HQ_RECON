@@ -1,5 +1,10 @@
 package com.mobilescan3d
 object NativeBridge {
+    /** Set before starting a scan. Changing it does not erase existing geometry. */
+    external fun nativeSetScanMaxDistance(meters: Float)
+    /** Pin the exact source pose/RGB while one depth inference is in flight. */
+    external fun nativeRetainDepthFrame(timestampNs: Long)
+
     init { System.loadLibrary("mobilescan3d") }
 
     /**
@@ -322,7 +327,7 @@ object NativeBridge {
      * AR 渲染路径原本走 strict 版，但实测 Preview(SurfaceTexture) 流时间戳与
      * 历史库(YUV ImageReader 流)时间戳基准不一致、差 >300ms，strict 永远查不到
      * → 长期回退冻结 pose → 模型不跟随。故 AR 现已改用本 tolerant 版 + 500ms
-     * 窗口（最近邻仍只在时间最接近的位姿里取，不会拿错时刻的 pose）。
+     * 窗口；这是最近邻近似，快速移动时仍可能存在时差，不能视为精确同步。
      */
     external fun nativeGetRenderPoseAtTol(
         timestampNs: Long,

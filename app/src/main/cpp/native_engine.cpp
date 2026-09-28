@@ -27,6 +27,7 @@
 #include "target_mask_engine.h"
 #include "depth_calib.h"
 #include "depth_geometry.h"
+#include "scan_policy.h"
 #include "stereo_anchor_bridge.h"
 #include "mesh/mesh_engine.h"
 #include "export/gltf_exporter.h"
@@ -47,6 +48,12 @@
 // （nativeGetGaussians / nativeGetStats）。原代码完全无锁，snaps 的 deque
 // 迭代器失效和 g_ 的 vector 扩容都是未定义行为（崩溃/花屏根因）。
 static std::mutex gStateMutex;
+static float scanMaxDistanceMeters = 1.f;
+static float scanWorldPerMeter = 1.f; // VINS estimate until stereo scale is validated.
+static uint64_t rangeRejectedPixels = 0;
+static uint64_t frozenEvidenceRecoveries = 0;
+static int frozenEvidenceStreak = 0;
+
 static NullAiBackend aiBackend;
 static SurfelEngine g;
 static VioEngine vio;
@@ -373,6 +380,46 @@ struct FrameSnap {
 };
 
 static std::deque<FrameSnap> snaps;
+// One in-flight inference owns its source RGB + pose independently of the ring.
+static FrameSnap retainedDepthSnap;
+static bool haveRetainedDepthSnap = false;
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeRetainDepthFrame(JNIEnv*, jobject, jlong ts) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    haveRetainedDepthSnap = false;
+    if (!snaps.empty() && snaps.back().ts == static_cast<uint64_t>(ts)) {
+        try {
+            retainedDepthSnap = snaps.back();
+            haveRetainedDepthSnap = true;
+        } catch (const std::exception& error) {
+            LOGI("Unable to pin depth snapshot: %s", error.what());
+        }
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetScanMaxDistance(JNIEnv*, jobject, jfloat meters) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    if (std::isfinite(meters)) scanMaxDistanceMeters = std::clamp(meters, .2f, 5.f);
+}
+
+static bool scanRangeAccepts(float z, float x, float y, float fx, float fy, float cx, float cy,
+                             float unitsPerMeter = 0.f) {
+    return scan_policy::inRange(z, (x - cx) / fx, (y - cy) / fy,
+        scanMaxDistanceMeters, unitsPerMeter > 0.f ? unitsPerMeter : scanWorldPerMeter);
+}
+
+static void filterScanRange(std::vector<float>& depth, int w, int h,
+                            float fx, float fy, float cx, float cy) {
+    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+        float& z = depth[static_cast<size_t>(y) * w + x];
+        if (!scanRangeAccepts(z, x, y, fx, fy, cx, cy)) {
+            if (z > 0.f && std::isfinite(z)) ++rangeRejectedPixels;
+            z = 0.f;
+        }
+    }
+}
 // V0.13.7：原本 160x120 的快照是「逐顶点颜色 GLB」的唯一色彩来源，
 // 分辨率太低 -> 顶点颜色糊成一团，模型看上去「和被扫描物体差别很大、模糊不清楚」。
 // 提到 320x240 后顶点颜色采样密度翻 4 倍，纹理烘焙失败退回 vertex color 时也清晰可辨。
@@ -607,6 +654,9 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     // 深度/相机分辨率比降采样，否则几何会被拉伸到相机分辨率量级。
     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
+    std::vector<float> ranged(depth, depth + static_cast<size_t>(w) * h);
+    filterScanRange(ranged, w, h, dFx, dFy, dCx, dCy);
+    depth = ranged.data();
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
                         dFx, dFy, dCx, dCy, s.R, s.t, confidence);
 
@@ -669,6 +719,7 @@ static int buildStereoSparseDepth(
         0.f);
 
     const int step = std::clamp(pixelStep, 1, 4);
+    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, outW, outH);
     int accepted = 0;
 
     for (const auto& a : batch.anchors) {
@@ -677,6 +728,10 @@ static int buildStereoSparseDepth(
             !std::isfinite(a.zWorld)) {
             continue;
         }
+
+        // Stereo already carries physical meters: never compare zWorld directly to meters.
+        if (!scanRangeAccepts(a.zMetric, a.u * (outW - 1), a.v * (outH - 1),
+                              dk.fx, dk.fy, dk.cx, dk.cy, 1.f)) continue;
 
         if (normalizedMask &&
             !normalizedMask->empty() &&
@@ -933,7 +988,8 @@ static constexpr float kTargetScaleMax = 20.f;
 static float currentTargetDepthScale() {
     // 全局深度标定已经把深度对齐到 VINS 尺度时，不再叠加「目标专属尺度」——
     // 两者目标完全相同，叠加就变成双重缩放。
-    if (depthCalibrationEnabled && depthCalibrator.usable()) {
+    if (depthCalibrationEnabled) {
+        // Frozen epoch depth is already calibrated even during live-fit dropout.
         return 1.f;
     }
     if (targetDepthScaleSamples < kTargetScaleMinSamples) {
@@ -987,6 +1043,7 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
     // 评审 P0-2：深度以 256² 到达，内参按深度/相机比降采样。
     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
+    filterScanRange(masked, w, h, dFx, dFy, dCx, dCy);
     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
                               dFx, dFy, dCx, dCy, s.R, s.t, confidence);
 
@@ -1193,6 +1250,11 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
     objectTracker = std::make_shared<ObjectTracker>();
     aiBackend.initialize(w, h);
     frames = 0;
+    rangeRejectedPixels = frozenEvidenceRecoveries = 0;
+    frozenEvidenceStreak = 0;
+    scanWorldPerMeter = 1.f;
+    haveRetainedDepthSnap = false;
+    retainedDepthSnap = FrameSnap{};
     lastKF = 0;
     haveExternalDepth = false;
     vinsPoseOk = false;
@@ -1627,41 +1689,8 @@ static void nativeOnCameraFrameImpl(
         frames++;
     }
 
-    {
-        std::lock_guard<std::mutex> lk(gStateMutex);
-        // V0.12：启用深度标定后**不再**灌合成 Gaussian 兜底深度。
-        //
-        // 这段 fallback 是「没有外部 depth 时用 VIO 特征数编一个假深度场」，
-        // 尺度是随手定的（depthBase ≈ 1.15）。以前它在第一批真 depth 到来之前
-        // 会先往 TSDF 灌若干帧 —— 等到真 depth（带标定）接上时，体素场里
-        // 已经躺着一套完全不同尺度的零交叉面，这就是「覆盖大半屏幕的黑壳」的
-        // 另一个入口。没有真深度时宁可这一帧不建。
-        if (!haveExternalDepth && !depthCalibrationEnabled && (frames % 2 == 0)) {
-            int sx = std::max(1, w / 96);
-            int sy = std::max(1, h / 72);
-            float depthBase = 1.15f + 0.25f * std::min(1.f, vio.features() / 1200.f);
-            for (int yy0 = sy; yy0 < h; yy0 += sy) {
-                for (int x = sx; x < w; x += sx) {
-                    float z = depthBase;
-                    float Xc = (x - gCx) * z / gFx;
-                    float Yc = (yy0 - gCy) * z / gFy;
-                    float Xw, Yw, Zw;
-                    rotatePoint(R, T, Xc, Yc, z, Xw, Yw, Zw);
-                    int yi = yy0 * rs + x;
-                    int ui = (yy0 / 2) * urs + (x / 2) * ups;
-                    int Y = yy[yi];
-                    int U = uu[ui] - 128;
-                    int V = vv[ui] - 128;
-                    int C = Y - 16;
-                    int Rr = std::clamp((298 * C + 409 * V + 128) >> 8, 0, 255);
-                    int Gg = std::clamp((298 * C - 100 * U - 208 * V + 128) >> 8, 0, 255);
-                    int Bb = std::clamp((298 * C + 516 * U + 128) >> 8, 0, 255);
-                    g.ingestPoint(Xw, Yw, Zw, (uint8_t)Rr, (uint8_t)Gg, (uint8_t)Bb,
-                                  ai.q().sharpness * ai.q().exposure);
-                }
-            }
-        }
-    }
+    // No synthetic depth fallback: tracking features are not measured geometry.
+
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1763,6 +1792,7 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
             if (!(z > 0.08f && z < 8.f)) {
                 continue;
             }
+            if (!scanRangeAccepts(z, x, y, dk.fx, dk.fy, dk.cx, dk.cy)) continue;
             targetDebugValidPixels++;
             if (targetDebugPointCount >= kTargetDebugMaxPoints) {
                 continue;
@@ -1821,6 +1851,7 @@ static void nativeOnDepthMapImpl(
         objectTracker->updateFromDepth(d.data(), w, h, static_cast<uint64_t>(t));
     }
 
+    bool frozenEvidenceGood = false;
     // ---- V0.9 深度标定：VINS 稀疏深度 + stereo metric anchors ----
     //
     // VINS is still the pose/world scale. Stereo first passes a robust physical
@@ -1878,6 +1909,8 @@ static void nativeOnDepthMapImpl(
         int stereoUniqueSamples = 0;
         int stereoWeightedCopies = 0;
 
+        // Count distinct VINS observations before weighted stereo duplicates.
+        frozenEvidenceGood = epochActive && scan_policy::validatesFrozen(epochCalib, dPairs, zPairs);
         mobilescan3d::stereo_anchor::CalibrationBatch stereoBatch;
         while (
             mobilescan3d::stereo_anchor::takeCalibrationBatch(
@@ -1981,6 +2014,8 @@ static void nativeOnDepthMapImpl(
     // Calibrated depth is also the input to the metric-threshold target mask.
     // Before calibration, retain appearance tracking but do not classify presence
     // from uncalibrated model values.
+    scanWorldPerMeter = mobilescan3d::stereo_anchor::worldScaleUsable()
+        ? mobilescan3d::stereo_anchor::worldPerMeter() : 1.f;
     const bool calibratedNow = depthCalibrationEnabled && depthCalibrator.usable();
     std::vector<float> zCal;
     const float* depthForFusion = d.data();
@@ -2129,7 +2164,7 @@ static void nativeOnDepthMapImpl(
                 // 附加「持续 kEpochCatastrophicFrames 帧」这个条件，是因为
                 // 在线标定偶尔会在两种模型之间跳一下 —— 那是估计器的形式
                 // 差异，不是现实尺度变了，绝不能拿它去判一个 epoch 作废。
-                if (epochLastDriftRel > kEpochCatastrophicRatio) {
+                if (epochLastDriftRel > kEpochCatastrophicRatio && !frozenEvidenceGood) {
                     ++epochCatastrophicStreak;
                 } else {
                     epochCatastrophicStreak = 0;
@@ -2164,11 +2199,21 @@ static void nativeOnDepthMapImpl(
         }
     }
 
+    // Recover a frozen epoch only after six consecutive independent confirmations.
+    // This closes the 8%-75% drift dead zone without mixing calibration scales.
+    frozenEvidenceStreak = frozenEvidenceGood ? std::min(kEpochResumeFrames, frozenEvidenceStreak + 1) : 0;
+    if (epochActive && epochSuspended && frozenEvidenceStreak >= kEpochResumeFrames) {
+        epochSuspended = false;
+        epochBadStreak = epochSuspendStreak = epochResumeStreak = epochCatastrophicStreak = 0;
+        ++frozenEvidenceRecoveries;
+    }
+
     // epoch 生效时才做「冻结参数」的第二份换算 —— 这一份才是真正进 TSDF 的。
     std::vector<float> zEpoch;
     const float* epochFusionDepth = nullptr;
-    // V0.13：暂停期间不生成 epoch 深度 -> 融合门控自然这一帧不融合。
-    if (epochActive && !epochSuspended) {
+    // Masks use the same frozen mapping even while integration is suspended.
+    // Only epochFusionDepth grants permission to write new geometry.
+    if (epochActive && depthCalibrationEnabled) {
         zEpoch.assign((size_t)w * h, 0.f);
         for (size_t i = 0; i < zEpoch.size(); ++i) {
             const float dv = d[i];
@@ -2180,7 +2225,8 @@ static void nativeOnDepthMapImpl(
                 zEpoch[i] = zz;
             }
         }
-        epochFusionDepth = zEpoch.data();
+        depthForFusion = zEpoch.data();
+        if (!epochSuspended) epochFusionDepth = zEpoch.data();
     }
 
     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
@@ -2203,7 +2249,7 @@ static void nativeOnDepthMapImpl(
     // ---- 目标分割 Mask + PresenceGate ----
     bool presenceOk = false;
     bool maskOk = false;
-    if (haveTi && calibratedNow) {
+    if (haveTi && (calibratedNow || (epochActive && depthCalibrationEnabled))) {
         const int bx0 = std::max(0, static_cast<int>(ti.x0 * w));
         const int by0 = std::max(0, static_cast<int>(ti.y0 * h));
         const int bx1 = std::min(w - 1, static_cast<int>(ti.x1 * w));
@@ -2256,8 +2302,8 @@ static void nativeOnDepthMapImpl(
     // V0.12：标定还没 usable 时**宁可暂时不画**。此时 depthForFusion 还是 raw
     // 量级（实机 ~4~5），画出来就是一个「看起来已经扫出来了」的错误大壳 ——
     // 用户会以为模型长歪了，实际只是标定没到位。空白比错误的大壳诚实。
-    if (haveTi && maskOk &&
-        (!depthCalibrationEnabled || calibratedNow)) {
+    if (haveTi && maskOk && presenceOk && maskTemporalOk &&
+        depthCalibrationEnabled && (calibratedNow || epochActive)) {
         buildTargetDebugLayer(
             depthForFusion, w, h, ti, targetMaskMat);
         targetDebugTs = static_cast<uint64_t>(t);
@@ -2268,6 +2314,10 @@ static void nativeOnDepthMapImpl(
 
     const FrameSnap* match = nullptr;
     int64_t bestSnapDiffNs = kDepthSnapMaxDiffNs;
+    if (haveRetainedDepthSnap && retainedDepthSnap.ts == static_cast<uint64_t>(t)) {
+        match = &retainedDepthSnap;
+        bestSnapDiffNs = 0;
+    }
     for (const auto& snap : snaps) {
         int64_t diff =
             static_cast<int64_t>(snap.ts) -
@@ -2337,7 +2387,7 @@ static void nativeOnDepthMapImpl(
         // 直接融合 `depthForFusion`（未标定的 raw 尺度）。否则「关掉标定」
         // 会静默变成「永远不融合」，那是比标定不准更糟的失败形态。
         const float* fusionDepth =
-            depthCalibrationEnabled ? epochFusionDepth : depthForFusion;
+            depthCalibrationEnabled ? epochFusionDepth : (representation == 0 ? depthForFusion : nullptr);
 
         if (fusionDepth != nullptr) {
             // 全场景地图
@@ -2402,7 +2452,7 @@ static void nativeOnDepthMapImpl(
             const bool targetMaskUsable =
                 haveTi &&
                 presenceOk &&
-                maskOk &&
+                maskOk && maskTemporalOk &&
                 targetDt <= kStereoTargetMaskMaxDiffNs;
 
             if (targetMaskUsable) {
@@ -3021,6 +3071,10 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << "VINS last step: " << lastVinsStep << "\n"
       << "VINS reject count: " << vinsRejectCount << "\n"
       << "VINS reject reason: " << vinsRejectReason << "\n"
+      << "ScanRange: maxMeters=" << scanMaxDistanceMeters
+      << " worldPerMeter=" << scanWorldPerMeter
+      << " rejectedPixels=" << rangeRejectedPixels
+      << " frozenEvidenceRecoveries=" << frozenEvidenceRecoveries << "\n"
       << "VINS lost latch: " << (vinsLostAfterInit ? "true" : "false") << "\n"
       << "VINS recoveries: " << vinsRecoveryCount
       << " rejectStreak: " << vinsRejectStreak << "\n"

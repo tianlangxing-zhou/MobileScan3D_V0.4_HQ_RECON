@@ -1,0 +1,35 @@
+#pragma once
+#include <algorithm>
+#include <cmath>
+#include <vector>
+#include "depth_calib.h"
+
+namespace scan_policy {
+// Euclidean camera-to-surface distance, not optical-axis Z or world origin.
+inline bool inRange(float z, float rayX, float rayY, float maxMeters,
+                    float worldPerMeter = 1.f) {
+    if (!std::isfinite(z) || z <= 0.08f || !std::isfinite(rayX) ||
+        !std::isfinite(rayY) || !std::isfinite(maxMeters) || maxMeters <= 0.f ||
+        !std::isfinite(worldPerMeter) || worldPerMeter <= 0.f) return false;
+    const double distanceSquared = double(z) * z *
+        (1.0 + double(rayX) * rayX + double(rayY) * rayY);
+    const double limit = double(maxMeters) * worldPerMeter;
+    return distanceSquared <= limit * limit;
+}
+
+// Independent current sparse observations can vindicate a frozen mapping even
+// when a newer fit drifted at an old reference value. Never resume on time alone.
+inline bool validatesFrozen(const DepthCalibration& frozen,
+                            const std::vector<float>& raw,
+                            const std::vector<float>& world) {
+    if (!frozen.valid || raw.size() != world.size()) return false;
+    int valid = 0, good = 0;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (!std::isfinite(raw[i]) || !std::isfinite(world[i]) || world[i] <= .08f) continue;
+        ++valid;
+        const float z = frozen.toMetric(raw[i], 0.f);
+        if (z > 0.f && std::fabs(z - world[i]) <= .08f * world[i]) ++good;
+    }
+    return valid >= 20 && good >= 20 && good * 5 >= valid * 4;
+}
+} // namespace scan_policy

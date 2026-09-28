@@ -1,0 +1,1312 @@
+diff --git a/README_REPLACE_ZH.md b/README_REPLACE_ZH.md
+index e2e0c66..451c179 100644
+--- a/README_REPLACE_ZH.md
++++ b/README_REPLACE_ZH.md
+@@ -1,14 +1,29 @@
+-# MobileScan3D V0.13.6-review 覆盖包
++# MobileScan3D V0.13.15 近距离扫描覆盖包
+ 
+-适用基线：GitHub main `2cafb5382e21eec4795255309c413d14efadae5b`（V0.13.5）。
++适用基线：`tianlangxing-zhou/MobileScan3D_V0.4_HQ_RECON`，提交 `98e15aecc835648422b54366f4b28fb1ef8f0ade`。
++版本：`0.13.15-near-scan`，versionCode `144`。这是源码增量覆盖包，不是完整工程，也不含 APK。
+ 
+-这是增量覆盖包，不是完整工程，不含 APK。完整修改清单和测试边界见 `docs/review_0136/REVIEW_ZH.md`。
++## 替换方法
+ 
+-1. 先备份你当前的工程。
+-2. 解压 ZIP，把其中的 `app`、`docs`、`tools` **合并复制**到原工程根目录（该目录包含 `settings.gradle.kts`），同名文件选择覆盖。不要删除原目录再复制；未包含的模型、第三方库和原文件需要保留。
+-3. 同时复制根目录的 `OVERLAY_MANIFEST.json` 和本说明。`review_0136.patch` 是审查用差异，已覆盖文件后不要重复应用 patch。
+-4. 在工程根目录运行 `python tools/review_tests/verify_overlay.py`，确认交付文件的 SHA-256 都匹配。
+-5. 保留你原来的 `local.properties`、签名、模型和 Ceres/OpenCV/SDK/NDK 路径配置。在 Android Studio 中 Clean/Rebuild，或在 Windows 运行 `gradlew.bat clean :app:assembleDebug`。
+-6. 请先做一次短扫描和停扫导出验证，再进行重要采集。若当前工程已经超出上述基线或有自己的改动，请先对比 `review_0136.patch`，避免直接覆盖你的修改。
++1. 备份当前工程。把 ZIP 解压到临时目录。
++2. 将解压后的 `app`、`tools`、`docs` **合并复制到工程根目录**，同名文件覆盖。根目录是含 `settings.gradle.kts` 的目录。不要删除整个原目录再替换。
++3. 同时复制 `README_REPLACE_ZH.md`、`OVERLAY_MANIFEST.json` 和 `review_01315.patch`。patch 仅供审查；覆盖文件后不要再次应用 patch。
++4. 保留原来的 `local.properties`、SDK/NDK/Ceres/OpenCV 配置、签名、模型与第三方库。若你的工程有本地改动或已超出上述基线，先对照 patch 合并。
++5. 在工程根目录运行 `python tools/review_tests/verify_overlay.py`，应全部通过。
++6. Android Studio 执行 Clean/Rebuild；或 Windows 执行 `gradlew.bat clean :app:assembleDebug`。Kotlin 与 JNI 接口同时更新，不能复用旧版 `.so`。
+ 
+-已执行的宿主回归与语法检查通过；**完整 Android 构建和真机效果尚未验证**。包内没有把这些未验证项目记为通过。
++## 新功能入口
++
++右上角齿轮 → **扫描距离与补光**：
++
++- 最大扫描距离：**0.2–5.0 米**，步进 0.1 米，默认 **1.0 米**。这是相机到表面的估计直线距离，不是到世界坐标原点的距离。
++- 暗光自动持续补光：默认开启。暗光持续约 0.9 秒后开灯；开启后保持到停止扫描或退出前台，避免灯自身造成反复开关。HQ 拍摄也保持相同补光，切换后等待约 1.2 秒和 3A 重新稳定。
++- 设置保存后用于下一次扫描；正在扫描时不会改变范围。已保存的旧模型不会被新距离设置裁剪。
++
++范围过滤在写入场景/目标 TSDF、累计点云、当前帧目标深度层与双目深度入口执行，导出 GLB/PLY 使用过滤后的几何。单目米制距离依赖 VINS 和深度标定，界面明确标为估计值；不能当作测距仪的精确边界。没有闪光灯的镜头会显示“无闪光灯”。
++
++## 自检情况
++
++已通过宿主端回归、C++ 语法检查、Kotlin 宿主类型检查及覆盖文件校验。**未完成完整 Android APK 构建和真机验证，不能据此承诺软件完全无问题或任意情况下永不停顿。** 跟踪不可信、目标离屏、尺度确实异常时仍会暂停融合并提示，避免把错误数据写入模型。
++
++完整问题清单、测试范围、真机验收步骤见 `docs/review_01315/REVIEW_ZH.md`。
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 0cc5da9..4f7a075 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -56,8 +56,8 @@ android {
+         applicationId = "com.mobilescan3d"
+         minSdk = 26
+         targetSdk = 36
+-        versionCode = 143
+-        versionName = "0.13.14-axes-probe"
++        versionCode = 144
++        versionName = "0.13.15-near-scan"
+         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
+         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
+         ndk { abiFilters += listOf("arm64-v8a") }
+diff --git a/app/src/main/cpp/native_engine.cpp b/app/src/main/cpp/native_engine.cpp
+index c17dc51..1449a79 100644
+--- a/app/src/main/cpp/native_engine.cpp
++++ b/app/src/main/cpp/native_engine.cpp
+@@ -27,6 +27,7 @@
+ #include "target_mask_engine.h"
+ #include "depth_calib.h"
+ #include "depth_geometry.h"
++#include "scan_policy.h"
+ #include "stereo_anchor_bridge.h"
+ #include "mesh/mesh_engine.h"
+ #include "export/gltf_exporter.h"
+@@ -47,6 +48,12 @@
+ // （nativeGetGaussians / nativeGetStats）。原代码完全无锁，snaps 的 deque
+ // 迭代器失效和 g_ 的 vector 扩容都是未定义行为（崩溃/花屏根因）。
+ static std::mutex gStateMutex;
++static float scanMaxDistanceMeters = 1.f;
++static float scanWorldPerMeter = 1.f; // VINS estimate until stereo scale is validated.
++static uint64_t rangeRejectedPixels = 0;
++static uint64_t frozenEvidenceRecoveries = 0;
++static int frozenEvidenceStreak = 0;
++
+ static NullAiBackend aiBackend;
+ static SurfelEngine g;
+ static VioEngine vio;
+@@ -373,6 +380,46 @@ struct FrameSnap {
+ };
+ 
+ static std::deque<FrameSnap> snaps;
++// One in-flight inference owns its source RGB + pose independently of the ring.
++static FrameSnap retainedDepthSnap;
++static bool haveRetainedDepthSnap = false;
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_mobilescan3d_NativeBridge_nativeRetainDepthFrame(JNIEnv*, jobject, jlong ts) {
++    std::lock_guard<std::mutex> lk(gStateMutex);
++    haveRetainedDepthSnap = false;
++    if (!snaps.empty() && snaps.back().ts == static_cast<uint64_t>(ts)) {
++        try {
++            retainedDepthSnap = snaps.back();
++            haveRetainedDepthSnap = true;
++        } catch (const std::exception& error) {
++            LOGI("Unable to pin depth snapshot: %s", error.what());
++        }
++    }
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_mobilescan3d_NativeBridge_nativeSetScanMaxDistance(JNIEnv*, jobject, jfloat meters) {
++    std::lock_guard<std::mutex> lk(gStateMutex);
++    if (std::isfinite(meters)) scanMaxDistanceMeters = std::clamp(meters, .2f, 5.f);
++}
++
++static bool scanRangeAccepts(float z, float x, float y, float fx, float fy, float cx, float cy,
++                             float unitsPerMeter = 0.f) {
++    return scan_policy::inRange(z, (x - cx) / fx, (y - cy) / fy,
++        scanMaxDistanceMeters, unitsPerMeter > 0.f ? unitsPerMeter : scanWorldPerMeter);
++}
++
++static void filterScanRange(std::vector<float>& depth, int w, int h,
++                            float fx, float fy, float cx, float cy) {
++    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
++        float& z = depth[static_cast<size_t>(y) * w + x];
++        if (!scanRangeAccepts(z, x, y, fx, fy, cx, cy)) {
++            if (z > 0.f && std::isfinite(z)) ++rangeRejectedPixels;
++            z = 0.f;
++        }
++    }
++}
+ // V0.13.7：原本 160x120 的快照是「逐顶点颜色 GLB」的唯一色彩来源，
+ // 分辨率太低 -> 顶点颜色糊成一团，模型看上去「和被扫描物体差别很大、模糊不清楚」。
+ // 提到 320x240 后顶点颜色采样密度翻 4 倍，纹理烘焙失败退回 vertex color 时也清晰可辨。
+@@ -607,6 +654,9 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
+     // 深度/相机分辨率比降采样，否则几何会被拉伸到相机分辨率量级。
+     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
++    std::vector<float> ranged(depth, depth + static_cast<size_t>(w) * h);
++    filterScanRange(ranged, w, h, dFx, dFy, dCx, dCy);
++    depth = ranged.data();
+     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
+                         dFx, dFy, dCx, dCy, s.R, s.t, confidence);
+ 
+@@ -669,6 +719,7 @@ static int buildStereoSparseDepth(
+         0.f);
+ 
+     const int step = std::clamp(pixelStep, 1, 4);
++    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, outW, outH);
+     int accepted = 0;
+ 
+     for (const auto& a : batch.anchors) {
+@@ -678,6 +729,10 @@ static int buildStereoSparseDepth(
+             continue;
+         }
+ 
++        // Stereo already carries physical meters: never compare zWorld directly to meters.
++        if (!scanRangeAccepts(a.zMetric, a.u * (outW - 1), a.v * (outH - 1),
++                              dk.fx, dk.fy, dk.cx, dk.cy, 1.f)) continue;
++
+         if (normalizedMask &&
+             !normalizedMask->empty() &&
+             normalizedMask->type() == CV_8U) {
+@@ -933,7 +988,8 @@ static constexpr float kTargetScaleMax = 20.f;
+ static float currentTargetDepthScale() {
+     // 全局深度标定已经把深度对齐到 VINS 尺度时，不再叠加「目标专属尺度」——
+     // 两者目标完全相同，叠加就变成双重缩放。
+-    if (depthCalibrationEnabled && depthCalibrator.usable()) {
++    if (depthCalibrationEnabled) {
++        // Frozen epoch depth is already calibrated even during live-fit dropout.
+         return 1.f;
+     }
+     if (targetDepthScaleSamples < kTargetScaleMinSamples) {
+@@ -987,6 +1043,7 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
+     // 评审 P0-2：深度以 256² 到达，内参按深度/相机比降采样。
+     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
++    filterScanRange(masked, w, h, dFx, dFy, dCx, dCy);
+     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
+                               dFx, dFy, dCx, dCy, s.R, s.t, confidence);
+ 
+@@ -1193,6 +1250,11 @@ Java_com_mobilescan3d_NativeBridge_nativeCreate(JNIEnv*, jobject, jint w, jint h
+     objectTracker = std::make_shared<ObjectTracker>();
+     aiBackend.initialize(w, h);
+     frames = 0;
++    rangeRejectedPixels = frozenEvidenceRecoveries = 0;
++    frozenEvidenceStreak = 0;
++    scanWorldPerMeter = 1.f;
++    haveRetainedDepthSnap = false;
++    retainedDepthSnap = FrameSnap{};
+     lastKF = 0;
+     haveExternalDepth = false;
+     vinsPoseOk = false;
+@@ -1627,41 +1689,8 @@ static void nativeOnCameraFrameImpl(
+         frames++;
+     }
+ 
+-    {
+-        std::lock_guard<std::mutex> lk(gStateMutex);
+-        // V0.12：启用深度标定后**不再**灌合成 Gaussian 兜底深度。
+-        //
+-        // 这段 fallback 是「没有外部 depth 时用 VIO 特征数编一个假深度场」，
+-        // 尺度是随手定的（depthBase ≈ 1.15）。以前它在第一批真 depth 到来之前
+-        // 会先往 TSDF 灌若干帧 —— 等到真 depth（带标定）接上时，体素场里
+-        // 已经躺着一套完全不同尺度的零交叉面，这就是「覆盖大半屏幕的黑壳」的
+-        // 另一个入口。没有真深度时宁可这一帧不建。
+-        if (!haveExternalDepth && !depthCalibrationEnabled && (frames % 2 == 0)) {
+-            int sx = std::max(1, w / 96);
+-            int sy = std::max(1, h / 72);
+-            float depthBase = 1.15f + 0.25f * std::min(1.f, vio.features() / 1200.f);
+-            for (int yy0 = sy; yy0 < h; yy0 += sy) {
+-                for (int x = sx; x < w; x += sx) {
+-                    float z = depthBase;
+-                    float Xc = (x - gCx) * z / gFx;
+-                    float Yc = (yy0 - gCy) * z / gFy;
+-                    float Xw, Yw, Zw;
+-                    rotatePoint(R, T, Xc, Yc, z, Xw, Yw, Zw);
+-                    int yi = yy0 * rs + x;
+-                    int ui = (yy0 / 2) * urs + (x / 2) * ups;
+-                    int Y = yy[yi];
+-                    int U = uu[ui] - 128;
+-                    int V = vv[ui] - 128;
+-                    int C = Y - 16;
+-                    int Rr = std::clamp((298 * C + 409 * V + 128) >> 8, 0, 255);
+-                    int Gg = std::clamp((298 * C - 100 * U - 208 * V + 128) >> 8, 0, 255);
+-                    int Bb = std::clamp((298 * C + 516 * U + 128) >> 8, 0, 255);
+-                    g.ingestPoint(Xw, Yw, Zw, (uint8_t)Rr, (uint8_t)Gg, (uint8_t)Bb,
+-                                  ai.q().sharpness * ai.q().exposure);
+-                }
+-            }
+-        }
+-    }
++    // No synthetic depth fallback: tracking features are not measured geometry.
++
+ }
+ 
+ extern "C" JNIEXPORT void JNICALL
+@@ -1763,6 +1792,7 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
+             if (!(z > 0.08f && z < 8.f)) {
+                 continue;
+             }
++            if (!scanRangeAccepts(z, x, y, dk.fx, dk.fy, dk.cx, dk.cy)) continue;
+             targetDebugValidPixels++;
+             if (targetDebugPointCount >= kTargetDebugMaxPoints) {
+                 continue;
+@@ -1821,6 +1851,7 @@ static void nativeOnDepthMapImpl(
+         objectTracker->updateFromDepth(d.data(), w, h, static_cast<uint64_t>(t));
+     }
+ 
++    bool frozenEvidenceGood = false;
+     // ---- V0.9 深度标定：VINS 稀疏深度 + stereo metric anchors ----
+     //
+     // VINS is still the pose/world scale. Stereo first passes a robust physical
+@@ -1878,6 +1909,8 @@ static void nativeOnDepthMapImpl(
+         int stereoUniqueSamples = 0;
+         int stereoWeightedCopies = 0;
+ 
++        // Count distinct VINS observations before weighted stereo duplicates.
++        frozenEvidenceGood = epochActive && scan_policy::validatesFrozen(epochCalib, dPairs, zPairs);
+         mobilescan3d::stereo_anchor::CalibrationBatch stereoBatch;
+         while (
+             mobilescan3d::stereo_anchor::takeCalibrationBatch(
+@@ -1981,6 +2014,8 @@ static void nativeOnDepthMapImpl(
+     // Calibrated depth is also the input to the metric-threshold target mask.
+     // Before calibration, retain appearance tracking but do not classify presence
+     // from uncalibrated model values.
++    scanWorldPerMeter = mobilescan3d::stereo_anchor::worldScaleUsable()
++        ? mobilescan3d::stereo_anchor::worldPerMeter() : 1.f;
+     const bool calibratedNow = depthCalibrationEnabled && depthCalibrator.usable();
+     std::vector<float> zCal;
+     const float* depthForFusion = d.data();
+@@ -2129,7 +2164,7 @@ static void nativeOnDepthMapImpl(
+                 // 附加「持续 kEpochCatastrophicFrames 帧」这个条件，是因为
+                 // 在线标定偶尔会在两种模型之间跳一下 —— 那是估计器的形式
+                 // 差异，不是现实尺度变了，绝不能拿它去判一个 epoch 作废。
+-                if (epochLastDriftRel > kEpochCatastrophicRatio) {
++                if (epochLastDriftRel > kEpochCatastrophicRatio && !frozenEvidenceGood) {
+                     ++epochCatastrophicStreak;
+                 } else {
+                     epochCatastrophicStreak = 0;
+@@ -2164,11 +2199,21 @@ static void nativeOnDepthMapImpl(
+         }
+     }
+ 
++    // Recover a frozen epoch only after six consecutive independent confirmations.
++    // This closes the 8%-75% drift dead zone without mixing calibration scales.
++    frozenEvidenceStreak = frozenEvidenceGood ? std::min(kEpochResumeFrames, frozenEvidenceStreak + 1) : 0;
++    if (epochActive && epochSuspended && frozenEvidenceStreak >= kEpochResumeFrames) {
++        epochSuspended = false;
++        epochBadStreak = epochSuspendStreak = epochResumeStreak = epochCatastrophicStreak = 0;
++        ++frozenEvidenceRecoveries;
++    }
++
+     // epoch 生效时才做「冻结参数」的第二份换算 —— 这一份才是真正进 TSDF 的。
+     std::vector<float> zEpoch;
+     const float* epochFusionDepth = nullptr;
+-    // V0.13：暂停期间不生成 epoch 深度 -> 融合门控自然这一帧不融合。
+-    if (epochActive && !epochSuspended) {
++    // Masks use the same frozen mapping even while integration is suspended.
++    // Only epochFusionDepth grants permission to write new geometry.
++    if (epochActive && depthCalibrationEnabled) {
+         zEpoch.assign((size_t)w * h, 0.f);
+         for (size_t i = 0; i < zEpoch.size(); ++i) {
+             const float dv = d[i];
+@@ -2180,7 +2225,8 @@ static void nativeOnDepthMapImpl(
+                 zEpoch[i] = zz;
+             }
+         }
+-        epochFusionDepth = zEpoch.data();
++        depthForFusion = zEpoch.data();
++        if (!epochSuspended) epochFusionDepth = zEpoch.data();
+     }
+ 
+     df.ingestExternalDepth(d.data(), w, h, confidence, (uint64_t)t);
+@@ -2203,7 +2249,7 @@ static void nativeOnDepthMapImpl(
+     // ---- 目标分割 Mask + PresenceGate ----
+     bool presenceOk = false;
+     bool maskOk = false;
+-    if (haveTi && calibratedNow) {
++    if (haveTi && (calibratedNow || (epochActive && depthCalibrationEnabled))) {
+         const int bx0 = std::max(0, static_cast<int>(ti.x0 * w));
+         const int by0 = std::max(0, static_cast<int>(ti.y0 * h));
+         const int bx1 = std::min(w - 1, static_cast<int>(ti.x1 * w));
+@@ -2256,8 +2302,8 @@ static void nativeOnDepthMapImpl(
+     // V0.12：标定还没 usable 时**宁可暂时不画**。此时 depthForFusion 还是 raw
+     // 量级（实机 ~4~5），画出来就是一个「看起来已经扫出来了」的错误大壳 ——
+     // 用户会以为模型长歪了，实际只是标定没到位。空白比错误的大壳诚实。
+-    if (haveTi && maskOk &&
+-        (!depthCalibrationEnabled || calibratedNow)) {
++    if (haveTi && maskOk && presenceOk && maskTemporalOk &&
++        depthCalibrationEnabled && (calibratedNow || epochActive)) {
+         buildTargetDebugLayer(
+             depthForFusion, w, h, ti, targetMaskMat);
+         targetDebugTs = static_cast<uint64_t>(t);
+@@ -2268,6 +2314,10 @@ static void nativeOnDepthMapImpl(
+ 
+     const FrameSnap* match = nullptr;
+     int64_t bestSnapDiffNs = kDepthSnapMaxDiffNs;
++    if (haveRetainedDepthSnap && retainedDepthSnap.ts == static_cast<uint64_t>(t)) {
++        match = &retainedDepthSnap;
++        bestSnapDiffNs = 0;
++    }
+     for (const auto& snap : snaps) {
+         int64_t diff =
+             static_cast<int64_t>(snap.ts) -
+@@ -2337,7 +2387,7 @@ static void nativeOnDepthMapImpl(
+         // 直接融合 `depthForFusion`（未标定的 raw 尺度）。否则「关掉标定」
+         // 会静默变成「永远不融合」，那是比标定不准更糟的失败形态。
+         const float* fusionDepth =
+-            depthCalibrationEnabled ? epochFusionDepth : depthForFusion;
++            depthCalibrationEnabled ? epochFusionDepth : (representation == 0 ? depthForFusion : nullptr);
+ 
+         if (fusionDepth != nullptr) {
+             // 全场景地图
+@@ -2402,7 +2452,7 @@ static void nativeOnDepthMapImpl(
+             const bool targetMaskUsable =
+                 haveTi &&
+                 presenceOk &&
+-                maskOk &&
++                maskOk && maskTemporalOk &&
+                 targetDt <= kStereoTargetMaskMaxDiffNs;
+ 
+             if (targetMaskUsable) {
+@@ -3021,6 +3071,10 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
+       << "VINS last step: " << lastVinsStep << "\n"
+       << "VINS reject count: " << vinsRejectCount << "\n"
+       << "VINS reject reason: " << vinsRejectReason << "\n"
++      << "ScanRange: maxMeters=" << scanMaxDistanceMeters
++      << " worldPerMeter=" << scanWorldPerMeter
++      << " rejectedPixels=" << rangeRejectedPixels
++      << " frozenEvidenceRecoveries=" << frozenEvidenceRecoveries << "\n"
+       << "VINS lost latch: " << (vinsLostAfterInit ? "true" : "false") << "\n"
+       << "VINS recoveries: " << vinsRecoveryCount
+       << " rejectStreak: " << vinsRejectStreak << "\n"
+diff --git a/app/src/main/cpp/object_tracker.cpp b/app/src/main/cpp/object_tracker.cpp
+index 1eae520..dae2739 100644
+--- a/app/src/main/cpp/object_tracker.cpp
++++ b/app/src/main/cpp/object_tracker.cpp
+@@ -621,7 +621,10 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
+                              static_cast<int>(std::ceil(hw * 2.f)),
+                              static_cast<int>(std::ceil(hh * 2.f)));
+             lastBox &= cv::Rect(0, 0, w, h);
++            // This branch has no Nano score: unavailable identity (-1) cannot
++            // be treated as positive evidence, unlike ordinary tracking updates.
+             if (lastBox.width >= 16 && lastBox.height >= 16 &&
++                computeIdentityScore(lastBox, owned) >= kIdentityAcceptMin &&
+                 adoptNanoBox(lastBox, w, h, owned, timestamp)) {
+                 info_.state = TargetState::TRACKING;
+                 info_.lastEvent = "reacquired via identity-anchored last-good box";
+@@ -672,13 +675,15 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
+         // pose 造成坐标错乱。物体在画面就续命继续找回；真正离开（presence 失效）
+         // 或更久(6×超时≈9s)才放弃，给正常找回留足窗口。
+         const bool objectGone = !info_.presenceValid;
+-        if (objectGone) {
++        if (objectGone && reacquireFrames_ > kReacquireTimeoutFrames) {
+             markLost("target reacquire timeout (object gone)");
+         } else if (reacquireFrames_ > kReacquireTimeoutFrames * 6) {
+             markLost("target reacquire timeout (extended, giving up)");
+         } else {
+-            reacquireFrames_ = kReacquireTimeoutFrames; // 续命：再给一个超时周期
+-            info_.lastEvent = "reacquiring (presence ok, extended)";
++            // Keep a monotonic counter. Resetting to 45 each frame made the
++            // 270-frame deadline unreachable and could leave fusion paused forever.
++            info_.lastEvent = objectGone ? "reacquiring (presence lost, searching)"
++                                         : "reacquiring (presence ok, extended)";
+         }
+         return;
+     }
+diff --git a/app/src/main/cpp/scan_policy.h b/app/src/main/cpp/scan_policy.h
+new file mode 100644
+index 0000000..015b609
+--- /dev/null
++++ b/app/src/main/cpp/scan_policy.h
+@@ -0,0 +1,35 @@
++#pragma once
++#include <algorithm>
++#include <cmath>
++#include <vector>
++#include "depth_calib.h"
++
++namespace scan_policy {
++// Euclidean camera-to-surface distance, not optical-axis Z or world origin.
++inline bool inRange(float z, float rayX, float rayY, float maxMeters,
++                    float worldPerMeter = 1.f) {
++    if (!std::isfinite(z) || z <= 0.08f || !std::isfinite(rayX) ||
++        !std::isfinite(rayY) || !std::isfinite(maxMeters) || maxMeters <= 0.f ||
++        !std::isfinite(worldPerMeter) || worldPerMeter <= 0.f) return false;
++    const double distanceSquared = double(z) * z *
++        (1.0 + double(rayX) * rayX + double(rayY) * rayY);
++    const double limit = double(maxMeters) * worldPerMeter;
++    return distanceSquared <= limit * limit;
++}
++
++// Independent current sparse observations can vindicate a frozen mapping even
++// when a newer fit drifted at an old reference value. Never resume on time alone.
++inline bool validatesFrozen(const DepthCalibration& frozen,
++                            const std::vector<float>& raw,
++                            const std::vector<float>& world) {
++    if (!frozen.valid || raw.size() != world.size()) return false;
++    int valid = 0, good = 0;
++    for (size_t i = 0; i < raw.size(); ++i) {
++        if (!std::isfinite(raw[i]) || !std::isfinite(world[i]) || world[i] <= .08f) continue;
++        ++valid;
++        const float z = frozen.toMetric(raw[i], 0.f);
++        if (z > 0.f && std::fabs(z - world[i]) <= .08f * world[i]) ++good;
++    }
++    return valid >= 20 && good >= 20 && good * 5 >= valid * 4;
++}
++} // namespace scan_policy
+diff --git a/app/src/main/java/com/mobilescan3d/AutoLightPolicy.kt b/app/src/main/java/com/mobilescan3d/AutoLightPolicy.kt
+new file mode 100644
+index 0000000..6cbb670
+--- /dev/null
++++ b/app/src/main/java/com/mobilescan3d/AutoLightPolicy.kt
+@@ -0,0 +1,23 @@
++package com.mobilescan3d
++
++/** Camera-thread policy. A scan latches fill light to avoid torch/AE feedback flicker. */
++class AutoLightPolicy {
++    private var darkSinceMs = -1L
++    private var lastSampleMs = -1L
++    var enabled = false
++        private set
++
++    fun reset() { darkSinceMs = -1L; lastSampleMs = -1L; enabled = false }
++
++    fun update(nowMs: Long, p50: Float, p95: Float, iso: Int, exposureNs: Long): Boolean {
++        if (enabled) return true
++        if (!p50.isFinite() || !p95.isFinite() || p50 < 0 || p95 < p50) return false
++        if (lastSampleMs >= 0 && (nowMs < lastSampleMs || nowMs - lastSampleMs > 1500)) darkSinceMs = -1
++        lastSampleMs = nowMs
++        val dark = (p50 < 55f && p95 < 150f) || (iso >= 800 && exposureNs >= 20_000_000L)
++        if (!dark) { darkSinceMs = -1L; return false }
++        if (darkSinceMs < 0) darkSinceMs = nowMs
++        if (nowMs - darkSinceMs >= 900L) enabled = true
++        return enabled
++    }
++}
+diff --git a/app/src/main/java/com/mobilescan3d/BurstCompletion.kt b/app/src/main/java/com/mobilescan3d/BurstCompletion.kt
+new file mode 100644
+index 0000000..85e3246
+--- /dev/null
++++ b/app/src/main/java/com/mobilescan3d/BurstCompletion.kt
+@@ -0,0 +1,18 @@
++package com.mobilescan3d
++
++/** Order-independent Camera2 terminal result accounting; duplicate callbacks are ignored. */
++class BurstCompletion(private val expected: Int) {
++    init { require(expected > 0) }
++    private val seen = BooleanArray(expected)
++    var completed = 0
++        private set
++    var failed = 0
++        private set
++    val done: Boolean get() = completed + failed == expected
++    fun record(index: Int, success: Boolean): Boolean {
++        if (index !in seen.indices || seen[index]) return false
++        seen[index] = true
++        if (success) completed++ else failed++
++        return true
++    }
++}
+diff --git a/app/src/main/java/com/mobilescan3d/HqCaptureController.kt b/app/src/main/java/com/mobilescan3d/HqCaptureController.kt
+index 4a4699e..642cd66 100644
+--- a/app/src/main/java/com/mobilescan3d/HqCaptureController.kt
++++ b/app/src/main/java/com/mobilescan3d/HqCaptureController.kt
+@@ -286,6 +286,8 @@ private class BurstContext(
+      */
+     val jpegPathByIndex = arrayOfNulls<String>(BURST_FRAME_SLOTS)
+     val jpegLock = Any()
++    var completion: BurstCompletion? = null
++    var captureSequenceId = -1
+     /** 本组期望的帧数 */
+     var expectedFrames = 0
+     /** 正常模式只保留一张参考 RAW */
+@@ -526,6 +528,27 @@ class HqCaptureController(
+ 
+     val caps: HqCameraCaps
+     val stats = HqCaptureStats()
++    @Volatile var torchEnabled = false
++        private set
++    private var lightingSettleUntilMs = 0L
++
++    /** Called on the camera handler, between bursts; wait for fresh 3A convergence. */
++    fun setFillLight(enabled: Boolean) {
++        if (torchEnabled == enabled) return
++        torchEnabled = enabled
++        lightingSettleUntilMs = android.os.SystemClock.elapsedRealtime() + 1200L
++        synchronized(historyLock) { threeAHistory.clear() }
++        stats.threeAReady = false
++        readyStreak = 0
++        readyAeStreak = 0
++        readyAwbStreak = 0
++        readyAfStreak = 0
++        lastConvergedResult = null
++        locked3a = null
++    }
++
++    fun canChangeFillLight(): Boolean = !burstInFlight && !processingInFlight
++
+ 
+     private var jpegReader: ImageReader? = null
+     private var rawReader: ImageReader? = null
+@@ -683,6 +706,7 @@ class HqCaptureController(
+     }
+ 
+     fun detachSurfaces() {
++        endScan() // interrupted camera sessions must not leave burst guards latched
+         active = false
+         jpegReader?.close(); jpegReader = null
+         rawReader?.close(); rawReader = null
+@@ -813,6 +837,8 @@ class HqCaptureController(
+     // ---------------------------------------------------------------- metadata
+ 
+     fun onCaptureResult(result: TotalCaptureResult) {
++        val captureTag = result.request.tag as? BurstFrameTag
++        if (captureTag != null && captureTag.ctx.sessionId != currentSessionId) return
+         stats.aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+         stats.awbState = result.get(CaptureResult.CONTROL_AWB_STATE)
+         stats.afState = result.get(CaptureResult.CONTROL_AF_STATE)
+@@ -1105,6 +1131,8 @@ class HqCaptureController(
+         // 打 tag：只有带 BurstFrameTag 的结果才进 HQ 配对表，
+         // preview result 会被 onCaptureResult 直接忽略。
+         b.setTag(tag)
++        b.set(CaptureRequest.FLASH_MODE,
++            if (torchEnabled) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+         if (frameMode != FRAME_MODE_RAW) {
+             jpegReader?.surface?.let { b.addTarget(it) }
+         }
+@@ -1399,6 +1427,10 @@ class HqCaptureController(
+         // 而不是像之前那样只能看到 burstStarted 和一堆模糊的 skip。
+         stats.schedulerCandidates++
+ 
++        if (android.os.SystemClock.elapsedRealtime() < lightingSettleUntilMs) {
++            stats.lastCaptureRejectReason = "补光切换后等待曝光稳定"
++            return
++        }
+         if (currentPhase != STATE_READY || !stats.threeAReady) {
+             stats.reject3A++
+             stats.triggerRejectReason =
+@@ -1583,8 +1615,17 @@ class HqCaptureController(
+                     BurstFrameTag(ctx, i, FRAME_MODE_JPEG)
+                 )
+             }
++            ctx.completion = BurstCompletion(count)
+             burstInFlight = true
+-            session.captureBurst(requests, burstCallback, handler)
++            ctx.captureSequenceId = session.captureBurst(requests, burstCallback, handler)
++            // Some HALs omit terminal callbacks after a capture error. Never leave
++            // the scheduler permanently busy; the existing image timeout handles gaps.
++            handler.postDelayed({
++                if (activeBurst === ctx && burstInFlight) {
++                    stats.lastCaptureRejectReason = "burst callbacks timed out"
++                    finishBurstRound()
++                }
++            }, 5_000L)
+         } catch (e: Exception) {
+             burstInFlight = false
+             stats.burstDropped += count
+@@ -1603,12 +1644,10 @@ class HqCaptureController(
+             request: CaptureRequest,
+             result: TotalCaptureResult
+         ) {
++            val tag = request.tag as? BurstFrameTag ?: return
++            if (activeBurst !== tag.ctx || !burstInFlight) return
+             onCaptureResult(result)
+-            burstCompletedThisRound++
+-            stats.burstCompleted = burstCompletedThisRound
+-            if (burstCompletedThisRound >= burstExpectedFrames) {
+-                finishBurstRound()
+-            }
++            recordBurstTerminal(tag, true)
+         }
+ 
+         override fun onCaptureFailed(
+@@ -1616,12 +1655,25 @@ class HqCaptureController(
+             request: CaptureRequest,
+             failure: android.hardware.camera2.CaptureFailure
+         ) {
+-            stats.burstDropped++
+-            burstFailedThisRound++
+-            if (burstCompletedThisRound + burstFailedThisRound >= burstExpectedFrames) {
+-                finishBurstRound()
+-            }
++            val tag = request.tag as? BurstFrameTag ?: return
++            if (activeBurst !== tag.ctx || !burstInFlight) return
++            recordBurstTerminal(tag, false)
+         }
++
++        override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
++            val ctx = activeBurst ?: return
++            if (burstInFlight && ctx.captureSequenceId == sequenceId) finishBurstRound()
++        }
++    }
++
++    private fun recordBurstTerminal(tag: BurstFrameTag, success: Boolean) {
++        val progress = tag.ctx.completion ?: return
++        if (!progress.record(tag.index, success)) return
++        if (!success) stats.burstDropped++
++        burstCompletedThisRound = progress.completed
++        burstFailedThisRound = progress.failed
++        stats.burstCompleted = progress.completed
++        if (progress.done) finishBurstRound()
+     }
+ 
+     private fun finishBurstRound() {
+@@ -2058,8 +2110,18 @@ class HqCaptureController(
+                 false
+             }
+             handler.post {
+-                applyFusionStats(ctx, ok, out, statsOut, frameStatsOut, paths)
+-                finishFusion(ctx)
++                try {
++                    if (activeBurst === ctx && ctx.sessionId == currentSessionId) {
++                        applyFusionStats(ctx, ok, out, statsOut, frameStatsOut, paths)
++                    } else {
++                        out.delete() // stale scan: do not register texture into a new model
++                    }
++                } catch (error: Throwable) {
++                    android.util.Log.e("HqCapture", "Unable to publish fused frame", error)
++                    stats.lastCaptureRejectReason = "fusion publish: ${error.message}"
++                } finally {
++                    finishFusion(ctx)
++                }
+             }
+         }.start()
+     }
+@@ -2073,9 +2135,11 @@ class HqCaptureController(
+         synchronized(ctx.jpegLock) {
+             for (i in ctx.jpegPathByIndex.indices) ctx.jpegPathByIndex[i] = null
+         }
+-        if (activeBurst === ctx) activeBurst = null
+-        fusionStarted = false
+-        processingInFlight = false
++        if (activeBurst === ctx) {
++            activeBurst = null
++            fusionStarted = false
++            processingInFlight = false
++        }
+     }
+ 
+     private fun applyFusionStats(
+diff --git a/app/src/main/java/com/mobilescan3d/MainActivity.kt b/app/src/main/java/com/mobilescan3d/MainActivity.kt
+index 54b30de..a838a87 100644
+--- a/app/src/main/java/com/mobilescan3d/MainActivity.kt
++++ b/app/src/main/java/com/mobilescan3d/MainActivity.kt
+@@ -126,8 +126,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
+     /** 深度标定读取缓冲，复用避免每帧分配。 */
+     private val calibBuf = FloatArray(NativeBridge.DEPTH_CALIBRATION_SLOTS)
+ 
+-    @Volatile
+-    private var depthBusy = false
++    private val depthBusy = AtomicBoolean(false)
++    @Volatile private var depthCompletedMs = 0L
++    @Volatile private var depthErrors = 0L
++    @Volatile private var depthLastError = ""
++    @Volatile private var scanMaxDistanceMeters = 1f
++    @Volatile private var autoFillLight = true
++    @Volatile private var torchRequested = false
++    @Volatile private var torchAvailable = false
++    @Volatile private var torchFailed = false
++    private val autoLightPolicy = AutoLightPolicy()
+     // V0.5：会话世代号。停止/重开扫描时自增，用来丢弃「晚到达」的深度推理
+     // 结果 —— 否则上一轮会话的深度会喂进已经被 reset 的 TSDF。
+     @Volatile private var depthGeneration = 0L
+@@ -512,6 +520,10 @@ private var lastRelocPollMs = 0L
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
++        val scanPrefs = getSharedPreferences("scan_settings", Context.MODE_PRIVATE)
++        val savedDistance = scanPrefs.getFloat("max_distance_m", 1f)
++        scanMaxDistanceMeters = if (savedDistance.isFinite()) savedDistance.coerceIn(.2f, 5f) else 1f
++        autoFillLight = scanPrefs.getBoolean("auto_fill_light", true)
+ 
+         val root = android.widget.FrameLayout(this)
+         val density = resources.displayMetrics.density
+@@ -813,6 +825,7 @@ private var lastRelocPollMs = 0L
+             Gravity.CENTER_VERTICAL or Gravity.END
+         ).apply { rightMargin = 8 })
+ 
++        settingsButton.bringToFront()
+         setContentView(root)
+ 
+         // V0.12: 默认进「实时」图层 —— 半透明网格 + 累计 surfel(hits>=1)
+@@ -997,6 +1010,8 @@ private var lastRelocPollMs = 0L
+             val id = currentCameraId
+             abandonedOpen = false
+             val chars = cameraManager.getCameraCharacteristics(id)
++            torchAvailable = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
++            torchFailed = false
+             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+             deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}"
+             lensFacing = chars.get(CameraCharacteristics.LENS_FACING) ?: 0
+@@ -1519,6 +1534,11 @@ private var lastRelocPollMs = 0L
+     }
+ 
+     private fun applyCaptureSettings() {
++        val handler = cameraHandler ?: return
++        if (android.os.Looper.myLooper() != handler.looper) {
++            handler.post { applyCaptureSettings() }
++            return
++        }
+         val session = captureSession ?: return
+         val camera = cameraDevice ?: return
+         val readerSurface = reader?.surface ?: return
+@@ -1536,6 +1556,8 @@ private var lastRelocPollMs = 0L
+                 // 这里绝不能再跟随控制器写 AE_MODE_OFF / 手动曝光 / 手动焦距——
+                 // 那会把 AE_STATE 打成 INACTIVE，让控制器自己的收敛判定永远不成立。
+                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
++                set(CaptureRequest.FLASH_MODE, if (torchRequested && torchAvailable)
++                    CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+                 if (aeLockAvailable) set(CaptureRequest.CONTROL_AE_LOCK, aeLock)
+                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                 if (awbLockAvailable) set(CaptureRequest.CONTROL_AWB_LOCK, awbLock)
+@@ -1591,13 +1613,23 @@ private var lastRelocPollMs = 0L
+                         set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+                         set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
+                     }
++                    set(CaptureRequest.FLASH_MODE, if (torchRequested && torchAvailable)
++                        CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+                     set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                 }.build()
+                 session.capture(trigger, null, cameraHandler)
+             }
+             session.setRepeatingRequest(req, captureResultCallback, cameraHandler)
+         } catch (e: Exception) {
+-            toast("应用相机参数失败：${e.message}")
++            if (torchRequested) {
++                torchRequested = false
++                torchFailed = true
++                if (::hqCapture.isInitialized) hqCapture.setFillLight(false)
++                android.util.Log.w("AutoFillLight", "Torch request rejected; restoring preview", e)
++                applyCaptureSettings() // bounded retry: torchRequested is now false
++            } else {
++                toast("应用相机参数失败：${e.message}")
++            }
+         }
+     }
+ 
+@@ -2002,6 +2034,8 @@ private var lastRelocPollMs = 0L
+      */
+     private fun buildFeedbackReport(): String {
+         val sb = StringBuilder()
++        sb.appendLine("Scan settings: maxDistanceMeters=$scanMaxDistanceMeters autoFillLight=$autoFillLight torchRequested=$torchRequested torchAvailable=$torchAvailable torchFailed=$torchFailed")
++        sb.appendLine("Depth worker: busy=${depthBusy.get()} errors=$depthErrors lastError=$depthLastError lastCompletedElapsedMs=$depthCompletedMs")
+         sb.appendLine("MobileScan3D 配置反馈报告")
+         sb.appendLine("时间戳: ${System.currentTimeMillis()}")
+         sb.appendLine()
+@@ -2370,6 +2404,7 @@ private var lastRelocPollMs = 0L
+     }
+ 
+     private fun processImage(image: Image) {
++        if (!resumed) { image.close(); return }
+         val ts = image.timestamp
+         try {
+             val p = image.planes
+@@ -2387,6 +2422,7 @@ private var lastRelocPollMs = 0L
+                     // 曝光直方图预检：clipping 过高时不要发 still capture
+                     if (::hqCapture.isInitialized) {
+                         hqCapture.onPreviewLuma(y, image.width, image.height, p[0].rowStride)
++                        updateAutoFillLight()
+                     }
+                     val meta = synchronized(frameMetaLock) {
+                         val ready = frameMeta.remove(ts)
+@@ -2417,7 +2453,8 @@ private var lastRelocPollMs = 0L
+                 }
+                 glView.requestRender()
+             }
+-        } catch (_: Throwable) {
++        } catch (error: Throwable) {
++            android.util.Log.e("ScanFrame", "Camera frame rejected", error)
+         } finally {
+             image.close()
+         }
+@@ -2439,44 +2476,68 @@ private var lastRelocPollMs = 0L
+      * 深度与位姿差一帧，表现为「边走边扫时模型层层错位」。
+      */
+     private fun scheduleDepth(y: ByteArray, u: ByteArray, v: ByteArray, w: Int, h: Int, rowStride: Int, uRowStride: Int, uPixelStride: Int, t: Long) {
+-        if (depthBusy) return
+-        val handler = depthHandler
+-        if (handler == null) {
+-            // 没有深度线程就不能把 depthBusy 永久置起，否则深度链从此静默死掉。
+-            depthBusy = false
+-            return
+-        }
+-        depthBusy = true
+-        // V0.5：记下派发时的会话世代；推理是异步的，回来时可能已经停扫/重开。
++        val handler = depthHandler ?: return
++        if (!depthBusy.compareAndSet(false, true)) return
+         val generation = depthGeneration
+-        handler.post {
+-            try {
+-                val provider = depthProvider
+-                if (provider.available) {
+-                    val produced = provider.submitFrame(
+-                        y, u, v, w, h, rowStride, uRowStride, uPixelStride, t
+-                    )
+-                    val res = if (produced) provider.latest() else null
+-                    if (res != null && res.depth.isNotEmpty()) {
+-                        // 世代不一致说明这帧属于上一轮会话，必须丢弃。
+-                        synchronized(depthSessionLock) {
+-                            if (generation == depthGeneration && scanning && scanNativeReady && !isDestroyed) {
+-                                NativeBridge.nativeOnDepthMap(
+-                                    res.depth, res.width, res.height, 0.5f,
+-                                    res.timestampNs, res.representation.nativeCode
+-                                )
++        try {
++            NativeBridge.nativeRetainDepthFrame(t)
++            val accepted = handler.post {
++                try {
++                    // Queued work may belong to a scan that has already stopped.
++                    if (generation != depthGeneration || !scanning || !scanNativeReady || !resumed) return@post
++                    val provider = depthProvider
++                    if (provider.available && provider.submitFrame(
++                            y, u, v, w, h, rowStride, uRowStride, uPixelStride, t)) {
++                        val res = provider.latest()
++                        if (res != null && res.depth.isNotEmpty()) synchronized(depthSessionLock) {
++                            if (generation == depthGeneration && scanning && scanNativeReady && resumed && !isDestroyed) {
++                                NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height,
++                                    .5f, res.timestampNs, res.representation.nativeCode)
++                                depthCompletedMs = android.os.SystemClock.elapsedRealtime()
++                                depthLastError = ""
+                                 glView.requestRender()
+                             }
+                         }
+                     }
++                } catch (error: Throwable) {
++                    depthErrors++
++                    depthLastError = "${error.javaClass.simpleName}: ${error.message}"
++                    android.util.Log.e("ScanDepth", "Depth frame failed; next frame can retry", error)
++                } finally {
++                    depthBusy.set(false)
+                 }
+-            } catch (_: Throwable) {
+-            } finally {
+-                depthBusy = false
+             }
++            if (!accepted) {
++                depthBusy.set(false)
++                depthErrors++
++                depthLastError = "深度线程拒绝任务"
++            }
++        } catch (error: Throwable) {
++            depthBusy.set(false)
++            depthErrors++
++            depthLastError = "${error.javaClass.simpleName}: ${error.message}"
++            android.util.Log.e("ScanDepth", "Unable to schedule depth frame", error)
+         }
+     }
+ 
++    private fun updateAutoFillLight() {
++        if (!scanning || !resumed || !autoFillLight || !torchAvailable || torchFailed || torchRequested) return
++        if (!::hqCapture.isInitialized || !hqCapture.canChangeFillLight()) return
++        val st = hqCapture.stats
++        if (autoLightPolicy.update(android.os.SystemClock.elapsedRealtime(),
++                st.lumaP50, st.lumaP95, st.iso, st.exposureNs)) {
++            torchRequested = true
++            hqCapture.setFillLight(true)
++            applyCaptureSettings()
++        }
++    }
++
++    private fun resetFillLight() {
++        torchRequested = false
++        autoLightPolicy.reset()
++        if (::hqCapture.isInitialized) hqCapture.setFillLight(false)
++    }
++
+     private fun extractPlane(plane: Image.Plane): ByteArray {
+         val b = plane.buffer
+         val out = ByteArray(b.remaining())
+@@ -2493,7 +2554,15 @@ private var lastRelocPollMs = 0L
+             toast("模型正在生成或恢复，请稍候")
+             return
+         }
++        if (cameraDevice == null || captureSession == null || nativeW <= 0 || nativeH <= 0) {
++            toast("请等待相机预览就绪再开始扫描")
++            return
++        }
+         scanning = true
++        depthCompletedMs = android.os.SystemClock.elapsedRealtime()
++        depthErrors = 0
++        depthLastError = ""
++        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
+         // V0.13.4 P0-C：会话令牌必须先推进 —— 从这一刻起，所有仍在飞的
+         // 后台任务（上一轮的最终导出 / 恢复 / 后台建网格）回跳时都会发现
+         // 令牌变了，从而丢弃自己的结果而不是污染这一轮。
+@@ -2557,6 +2626,7 @@ private var lastRelocPollMs = 0L
+             // 立体深度噪声典型 5~15mm，尚在容忍带内。
+             // 注意：nativeCreate 已 reset TSDF，这里在复位后设置档位才有效。
+             NativeBridge.nativeSetVoxelProfile(0)
++            NativeBridge.nativeSetScanMaxDistance(scanMaxDistanceMeters)
+             NativeBridge.nativeSetDepthCalibrationEnabled(true)
+             if (objectLockEnabled) {
+                 NativeBridge.nativeSetObjectLockEnabled(true)
+@@ -2620,6 +2690,7 @@ private var lastRelocPollMs = 0L
+ 
+     private fun stopScan() {
+         scanning = false
++        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
+         multiCam?.updateScanState(false, sessionId, false)
+         // V0.5：停扫后不再派发深度推理 / TSDF 融合（见 processImage 的
+         // nativeFrameActive），但 **VINS 必须继续跑** —— cameraToView 靠它更新，
+@@ -3693,7 +3764,15 @@ private var lastRelocPollMs = 0L
+ 
+     private fun updateHeader() {
+         val vinsOk = NativeBridge.nativeVinsInitialized()
+-        headerStatus.text = "FPS %.1f · %s".format(fps, if (scanning) "扫描中" else "空闲")
++        val lightStatus = when {
++            torchFailed -> "补光不可用"
++            torchRequested -> "补光已开启"
++            !torchAvailable -> "无闪光灯"
++            autoFillLight -> "自动补光"
++            else -> "补光关闭"
++        }
++        headerStatus.text = "FPS %.1f · %s · ≤%.1fm · %s".format(
++            fps, if (scanning) "扫描中" else "空闲", scanMaxDistanceMeters, lightStatus)
+         if (objectLockEnabled) {
+             // Overlay 的刷新已移到 30Hz 的 updateTargetUiTick()，这里只保留
+             // AF 重锁 —— 而且**必须**留在这条 1Hz 路径上。
+@@ -3727,6 +3806,9 @@ private var lastRelocPollMs = 0L
+             val notice = when {
+                 !::depthProvider.isInitialized || !depthProvider.available ->
+                     "深度模型不可用，请检查模型文件后重新开始"
++                depthLastError.isNotEmpty() -> "深度帧处理失败，正在重试；详情见反馈报告"
++                android.os.SystemClock.elapsedRealtime() - depthCompletedMs > 4000L ->
++                    "深度处理延迟，等待当前帧完成；请放慢移动"
+                 count < epoch.size || epoch[NativeBridge.FUSION_EPOCH_INDEX_ACTIVE] < 0.5f ->
+                     "正在标定深度：请缓慢平移，让目标和周围纹理保持清晰"
+                 epoch[NativeBridge.FUSION_EPOCH_INDEX_SUSPENDED] > 0.5f ->
+@@ -3963,10 +4045,12 @@ private var lastRelocPollMs = 0L
+         android.widget.PopupMenu(this, settingsButton).apply {
+             menu.add("相机参数")
+             menu.add("模式选择")
++            menu.add("扫描距离与补光")
+             setOnMenuItemClickListener { item ->
+                 when (item.title.toString()) {
+                     "相机参数" -> showCameraParams()
+                     "模式选择" -> showModeDialog()
++                    "扫描距离与补光" -> showScanSettings()
+                 }
+                 true
+             }
+@@ -3974,6 +4058,48 @@ private var lastRelocPollMs = 0L
+         }
+     }
+ 
++    private fun showScanSettings() {
++        if (scanning) {
++            toast("请先停止扫描再调整距离或补光；新设置用于下一次扫描")
++            return
++        }
++        val panel = android.widget.LinearLayout(this).apply {
++            orientation = android.widget.LinearLayout.VERTICAL
++            setPadding(36, 20, 36, 12)
++        }
++        val label = TextView(this)
++        val slider = android.widget.SeekBar(this).apply {
++            max = 48
++            progress = ((scanMaxDistanceMeters - .2f) * 10f).toInt().coerceIn(0, 48)
++        }
++        fun updateLabel() { label.text = "最大扫描距离：%.1f 米（估计值）".format(.2f + slider.progress / 10f) }
++        slider.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
++            override fun onProgressChanged(bar: android.widget.SeekBar?, value: Int, fromUser: Boolean) = updateLabel()
++            override fun onStartTrackingTouch(bar: android.widget.SeekBar?) {}
++            override fun onStopTrackingTouch(bar: android.widget.SeekBar?) {}
++        })
++        updateLabel()
++        val light = android.widget.CheckBox(this).apply {
++            text = "暗光时自动持续补光"
++            isChecked = autoFillLight
++        }
++        panel.addView(label)
++        panel.addView(slider)
++        panel.addView(light)
++        panel.addView(TextView(this).apply {
++            text = "仅在设定距离内采集点云和模型，默认 1 米。单目距离依赖定位和深度标定，并非测距仪。补光开启后保持至停扫或退到后台，避免反复闪烁；无闪光灯的镜头无法补光。"
++        })
++        android.app.AlertDialog.Builder(this).setTitle("扫描距离与补光").setView(panel)
++            .setNegativeButton("取消", null)
++            .setPositiveButton("保存") { _, _ ->
++                scanMaxDistanceMeters = .2f + slider.progress / 10f
++                autoFillLight = light.isChecked
++                getSharedPreferences("scan_settings", Context.MODE_PRIVATE).edit()
++                    .putFloat("max_distance_m", scanMaxDistanceMeters)
++                    .putBoolean("auto_fill_light", autoFillLight).apply()
++            }.show()
++    }
++
+     private fun saveLatestGlb() {
+         if (!::exportManager.isInitialized || modelOperationBusy || pendingModelCopy != null) {
+             toast("请等待当前模型操作完成")
+@@ -4124,6 +4250,9 @@ private var lastRelocPollMs = 0L
+ 
+     private fun closeCamera() {
+         abandonedOpen = true
++        // Closing the owning CameraDevice extinguishes its torch; serialize policy reset.
++        torchRequested = false
++        cameraHandler?.post { resetFillLight() }
+         cameraHandler?.removeCallbacks(resetFocusRunnable)
+         captureSession?.close(); captureSession = null
+         cameraDevice?.close(); cameraDevice = null
+@@ -4146,6 +4275,7 @@ private var lastRelocPollMs = 0L
+ 
+     override fun onPause() {
+         resumed = false
++        synchronized(depthSessionLock) { depthGeneration++ }
+         closeCamera()
+         glView.onPause()
+         super.onPause()
+diff --git a/app/src/main/java/com/mobilescan3d/NativeBridge.kt b/app/src/main/java/com/mobilescan3d/NativeBridge.kt
+index 592ad2d..655a6d7 100644
+--- a/app/src/main/java/com/mobilescan3d/NativeBridge.kt
++++ b/app/src/main/java/com/mobilescan3d/NativeBridge.kt
+@@ -1,5 +1,10 @@
+ package com.mobilescan3d
+ object NativeBridge {
++    /** Set before starting a scan. Changing it does not erase existing geometry. */
++    external fun nativeSetScanMaxDistance(meters: Float)
++    /** Pin the exact source pose/RGB while one depth inference is in flight. */
++    external fun nativeRetainDepthFrame(timestampNs: Long)
++
+     init { System.loadLibrary("mobilescan3d") }
+ 
+     /**
+@@ -322,7 +327,7 @@ object NativeBridge {
+      * AR 渲染路径原本走 strict 版，但实测 Preview(SurfaceTexture) 流时间戳与
+      * 历史库(YUV ImageReader 流)时间戳基准不一致、差 >300ms，strict 永远查不到
+      * → 长期回退冻结 pose → 模型不跟随。故 AR 现已改用本 tolerant 版 + 500ms
+-     * 窗口（最近邻仍只在时间最接近的位姿里取，不会拿错时刻的 pose）。
++     * 窗口；这是最近邻近似，快速移动时仍可能存在时差，不能视为精确同步。
+      */
+     external fun nativeGetRenderPoseAtTol(
+         timestampNs: Long,
+diff --git a/app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt b/app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt
+index 5907033..778cba7 100644
+--- a/app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt
++++ b/app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt
+@@ -473,7 +473,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
+         // strict 永远查不到 → 长期回退冻结 pose → 模型不跟随。
+         // 关键帧路径 nativeGetRenderPoseAtTol(500ms) 已验证可用（同基准 Image
+         // 时间戳），这里对齐到同一宽松窗口；最近邻只在时间最接近的位姿里取，
+-        // 不会拿错时刻的 pose。burst 空洞(>500ms) 仍回退，行为与现一致。
++        // 快速运动下仍可能有可见时差。burst 空洞(>500ms) 仍回退，行为与现一致。
+         val ts = previewTimestampNs
+         var ok = false
+         if (ts > 0L) {
+diff --git a/docs/review_01315/REVIEW_ZH.md b/docs/review_01315/REVIEW_ZH.md
+new file mode 100644
+index 0000000..d78137b
+--- /dev/null
++++ b/docs/review_01315/REVIEW_ZH.md
+@@ -0,0 +1,97 @@
++# V0.13.15 审查与修改结果
++
++## 基线与范围
++
++仓库：https://github.com/tianlangxing-zhou/MobileScan3D_V0.4_HQ_RECON
++
++基线提交：`98e15aecc835648422b54366f4b28fb1ef8f0ade`。本轮检查近期跟踪恢复、AR 位姿容差、xatlas UV、纹理关键帧改动，并沿 Camera2 → 深度推理 → 标定/目标掩膜 → 场景和目标融合 → 实时显示/导出检查。修改记录基于源码分析；仓库内历史设备日志属于旧版本证据，不作为本次真机测试。
++
++## 已修改的问题
++
++| 问题 | 修改与结果 |
++|---|---|
++| 没有扫描距离设置，远景可进入场景与目标模型 | 加入持久化的 0.2–5 米最大距离设置，默认 1 米。按相机坐标射线计算欧氏距离，在 TSDF 和 surfel 写入前过滤，并覆盖实时深度显示。 |
++| 双目稀疏融合可能绕过普通深度过滤 | 使用双目锚点自身的物理米制深度过滤，不把 VINS-world 数值直接当米。目标双目入口同时执行掩膜时序门控。 |
++| 单目与物理距离尺度不同 | 稳定双目 world-per-meter 可用时执行尺度换算；否则使用 VINS 米制估计，界面明确标注估计值。距离估计误差不能由软件阈值消除。 |
++| 暗光只拒绝 HQ 拍摄，没有主动补光 | 预览亮度分位数与曝光/ISO 联合检测。持续暗光约 0.9 秒后启用 Camera2 TORCH。灯在本次扫描中保持开启，防止亮度反馈使灯反复闪烁。 |
++| 预览亮灯而 still 请求关灯会导致照片暗、曝光错配 | Preview、对焦单次请求、HQ JPEG/RAW 请求使用同一补光状态。补光切换后清除旧曝光稳定历史，等待约 1.2 秒与重新收敛。 |
++| 相机不支持补光、请求失败 | 检查当前镜头 FLASH_INFO_AVAILABLE；补光请求抛异常时关闭补光重发预览参数，保留可继续扫描的相机请求，界面和反馈报告记录状态。 |
++| 深度任务入队失败后 busy 无法释放 | 使用 AtomicBoolean 获取单任务资格，检查 Handler.post 返回值；异常、任务拒绝、正常完成均释放资格。错误不再静默吞掉。 |
++| 慢推理时源帧可能被 60 帧环形缓存淘汰 | 派发深度任务前固定保存这一帧的 RGB/位姿，返回后优先按精确时间戳匹配。最多额外保留一帧，约 225 KiB RGB，不积压推理任务。 |
++| 暂停/重开时旧深度可能迟到 | 保留并加强会话世代检查；后台退出时推进世代，前台状态不满足时不处理或提交新深度，避免旧结果进入当前模型。 |
++| 活跃标定短暂不可用时目标深度可能再次缩放 | 标定开启时目标深度始终视为已经完成尺度换算，不再因当前拟合失效而乘上目标局部缩放。 |
++| 目标 mask 用动态标定，TSDF 用冻结标定 | epoch 建立后，目标掩膜、presence 与融合使用同一冻结深度映射，减少掩膜随标定漂移而误拒绝。 |
++| 中等标定漂移可能令 epoch 长期暂停 | 增加独立证据恢复：至少 20 个 VINS 有效样本，至少 20 个且 80% 样本与冻结映射相差不超过 8%，连续 6 帧后恢复原冻结映射。不会把新尺度直接混进旧几何，也不会仅凭等待时间强制恢复。 |
++| 关闭深度标定后可能把合成假深度/原始逆深度写入几何 | 删除基于特征数编造的深度兜底；标定关闭时不允许把 inverse-depth 原值当作米制融合。 |
++| 最新 REACQUIRING 分支每帧把计数重置为 45 | 删除该赋值，保留单调计数，让 270 帧扩展期限真正可达。当前重试周期为 1 帧，所以此修复主要解决超时失效，并非当前周期性检测缺失。 |
++| presence=false 后只给一帧找回机会 | 恢复正常的 45 帧找回窗口，窗口内继续 NanoTrack 检测，短暂遮挡不立即变成永久 LOST。 |
++| last-good box 找回可能把身份“不可判断”当成匹配 | 无 Nano 分数的 last-good 分支要求实际 identity score 达标，再采用候选框；不能用 -1 作为恢复证据。 |
++| presence 不成立时仍显示绿色当前帧点云 | 显示也要求 presence 和掩膜时序有效，减少“已生成目标”的误导。 |
++| 连拍先失败再成功时，成功回调只计成功数，可能永不收尾 | 改为按帧编号去重，统一统计成功与失败的终态总数；顺序无关，重复回调不提前完成。 |
++| HAL 丢失终态回调或序列被取消，HQ 忙状态可能永久保持 | 增加取消回调处理与 5 秒终态超时，然后进入已有图像配对/补拍路径。不会生成缺帧的虚假融合结果。 |
++| 旧扫描的 HQ 融合回调可能污染新扫描、释放新扫描 busy | 发布前检查当前 burst 身份与 sessionId；旧结果丢弃。收尾只清理自己的状态；发布失败也通过 finally 清理。关闭相机会清除中断的 burst 状态。 |
++| 设置入口被后添加的顶部信息栏遮挡 | 把设置按钮置于上层，确保距离设置可点击。 |
++| 相机参数在 UI/相机线程交错提交 | 统一调度到相机 Handler。新增深度工作状态、范围和补光诊断。 |
++
++范围只影响新的几何观测，不限制用于定位的远景特征。远景特征可帮助定位，但不会因此直接变成新模型表面。已有模型和历史扫描包保持原有内容。
++
++## 近期改动的审查结论与边界
++
++- 保留 xatlas 按索引构建有效面、跳过未 chart 面的修复，未恢复遇到孤儿顶点就整批 fallback 的旧行为；该文件通过宿主语法检查。
++- 保留 RGB 快照分辨率与纹理关键帧改进，GLB 导出回归仍通过。
++- 500ms AR 位姿查询是最近邻近似，并非精确同步；纠正了源码中“不会拿错时刻”的过度保证。快速运动时的位姿时间差仍需设备测量。
++- 上一版本的“AR 上下方向”修改是诊断探针。仓库没有足以确定该问题根因的本轮真机轴向数据，本轮未随意翻转纹理或世界坐标，也不能声称真机方向问题已被验证修复。
++- VINS 失锁、几何不可信、目标身份不匹配时仍保留安全门控。目标确实离开且超时后可重新框选；没有以强行融合背景来维持点数增长。
++- 有限内存预算仍存在：满预算时已有体素可以继续更新，但不能无限添加全新区域。点数不增长不等于停止处理。
++
++## 已执行自检
++
++| 检查 | 结果与实际范围 |
++|---|---|
++| 新距离/恢复策略 C++ 回归 | 通过：近/远阈值、边界、斜射线欧氏距离、world-to-meter 换算、NaN/Inf/非法输入、冻结标定独立证据通过/拒绝。 |
++| 近距离 TSDF → 网格 | 通过：同一合成帧左面约 0.503m、右面 2m，最大距离 1m；提取网格只保留近面，顶点深度误差 <2mm。这是合成几何测试，不是手机精度承诺。 |
++| 自动补光 Kotlin/JVM 回归 | 通过：持续暗光延时、亮光打断、开灯保持、重置、帧间隔中断、AE 高增益场景、非法亮度。 |
++| 连拍终态 Kotlin/JVM 回归 | 通过：5 帧全部 120 种到达顺序 × 32 种成功/失败组合 = 3,840 组；包含重复终态与无效索引。 |
++| 既有 GLB 回归 | 通过：5 种 GLB、索引/边界/缓冲对齐、嵌入 JPEG、非法网格与逗号 locale。 |
++| 既有几何回归 | 通过：投影内参、固定逆深度标定、错长/无效样本、斜率翻转拒绝、世界坐标、TSDF 满预算更新、平面网格。 |
++| 既有 DEPTH16 JVM 回归 | 通过：位域、置信度、行/像素 padding、buffer 起点/边界、独立帧数组。 |
++| C++ 修改文件编译器语法检查 | native_engine.cpp、object_tracker.cpp，以及复核的 uv_unwrap.cpp 通过 g++ -fsyntax-only；使用 OpenCV 4.12/JNI/Vulkan 头文件、项目 Eigen 与 Android log 声明桩。不等同 Android ABI 链接。 |
++| Kotlin 宿主类型检查 | 全部生产 Kotlin 源码通过 Kotlin 2.0.21 编译器检查，使用 Android API 36 jar，AndroidX Activity、TFLite、BuildConfig 使用最小声明桩；仅有既有弃用警告。不等同真实依赖的 Gradle APK 构建。 |
++| ASan/UBSan | C++ 回归通过。宿主 /proc 限制使 LeakSanitizer 不可用，关闭泄漏检测；不声明内存泄漏检测通过。 |
++| 交付检查 | git diff --check、覆盖后 SHA-256 校验、ZIP CRC 和 patch 可应用性检查。 |
++
++没有 Android SDK/NDK 与项目所需 Ceres/OpenCV 本地构建配置，也没有连接手机。本轮没有产出或验证 APK，没有把真机帧率、发热、光照效果、AR 方向与长时稳定性记为通过。
++
++## 本地复验
++
++在工程根目录执行：
++
++```bash
++python tools/review_tests/run.py
++python tools/review_tests/run_geometry.py
++python tools/review_tests/run_scan_policy.py
++kotlinc app/src/main/java/com/mobilescan3d/AutoLightPolicy.kt tools/review_tests/AutoLightRegression.kt -include-runtime -d auto-light-test.jar
++java -jar auto-light-test.jar
++kotlinc app/src/main/java/com/mobilescan3d/BurstCompletion.kt tools/review_tests/BurstCompletionRegression.kt -include-runtime -d burst-test.jar
++java -jar burst-test.jar
++kotlinc app/src/main/java/com/mobilescan3d/depth/Depth16Decoder.kt tools/review_tests/Depth16Regression.kt -include-runtime -d depth16-test.jar
++java -jar depth16-test.jar
++python tools/review_tests/verify_overlay.py
++```
++
++C++ 回归需要 g++，GLB 检查还需 Python Pillow；JVM 检查需 Kotlin/JDK。新增回归源码和运行脚本均包含在覆盖包里。
++
++## 真机验收步骤
++
++1. Clean/Rebuild 后安装，确认标题版本 `0.13.15-near-scan`。设置最大距离 1 米，前景约 0.4–0.8 米，背景至少 2 米；新扫描并检查点云、GLB/PLY 中没有背景表面。再用 0.5/1.5 米分别复验，注意标定误差。
++2. 暗处开始扫描，检查约 0.9 秒后补光开启、HQ 照片曝光重新稳定；停扫/切后台关灯，返回继续扫描后重新检测。检查没有灯的镜头和关闭自动补光设置。
++3. 连续扫描 2–3 分钟，短暂遮挡后移回；查看点云是否恢复、定位不可信时是否明确提示。对已扫面点数可以不增，但融合帧/合并计数应继续变化。
++4. HQ 连拍中切后台再返回、停止后立即重开、生成模型后再次扫描；确认无永久 busy、无旧模型纹理混入。
++5. 检查 AR 方向、手机移动时模型跟随、GLB 外部查看器中的朝向与纹理。若仍有方向异常，保留 ArAxesProbe、ArPoseProbe 与完整反馈报告定位。
++
++## API 依据
++
++Camera2 FLASH_MODE_TORCH 配合 AE_MODE_ON/OFF，可用于预览与 still capture，需 FLASH_INFO_AVAILABLE：
++https://developer.android.com/reference/android/hardware/camera2/CaptureRequest#FLASH_MODE
++
++该依据仅说明接口行为，不代替当前设备 HAL 实测。
+diff --git a/tools/review_tests/AutoLightRegression.kt b/tools/review_tests/AutoLightRegression.kt
+new file mode 100644
+index 0000000..ff57938
+--- /dev/null
++++ b/tools/review_tests/AutoLightRegression.kt
+@@ -0,0 +1,23 @@
++import com.mobilescan3d.AutoLightPolicy
++fun main() {
++    val light = AutoLightPolicy()
++    check(!light.update(0, 30f, 90f, 100, 10_000_000))
++    check(!light.update(500, 30f, 90f, 100, 10_000_000))
++    check(light.update(900, 30f, 90f, 100, 10_000_000))
++    check(light.update(1500, 130f, 230f, 100, 10_000_000)) // no self-induced flicker
++    light.reset()
++    check(!light.enabled)
++    check(!light.update(2000, 30f, 90f, 100, 10_000_000))
++    check(!light.update(2400, 120f, 230f, 100, 10_000_000))
++    check(!light.update(2800, 30f, 90f, 100, 10_000_000)) // bright frame resets evidence
++    check(!light.update(3200, 30f, 90f, 100, 10_000_000))
++    check(!light.update(9000, 30f, 90f, 100, 10_000_000)) // dropped frames are not continuous evidence
++    check(light.update(9900, 30f, 90f, 100, 10_000_000))
++    light.reset()
++    check(!light.update(0, 120f, 200f, 1600, 30_000_000))
++    check(light.update(1000, 120f, 200f, 1600, 30_000_000)) // AE disguises dark scene
++    light.reset()
++    check(!light.update(0, Float.NaN, 100f, 100, 10_000_000))
++    check(!light.update(1000, 120f, 230f, 100, 10_000_000))
++    println("PASS auto-light delay, latch, reset, bright interruption, frame gaps, AE high gain, invalid input")
++}
+diff --git a/tools/review_tests/BurstCompletionRegression.kt b/tools/review_tests/BurstCompletionRegression.kt
+new file mode 100644
+index 0000000..9eb7e55
+--- /dev/null
++++ b/tools/review_tests/BurstCompletionRegression.kt
+@@ -0,0 +1,18 @@
++import com.mobilescan3d.BurstCompletion
++fun main() {
++    // Every ordering of five frames, and all success/failure combinations.
++    fun permutations(xs: List<Int>): List<List<Int>> = if (xs.isEmpty()) listOf(emptyList()) else
++        xs.flatMap { v -> permutations(xs - v).map { listOf(v) + it } }
++    for (order in permutations((0..4).toList())) for (mask in 0..31) {
++        val state = BurstCompletion(5)
++        order.forEachIndexed { n, i ->
++            check(state.record(i, mask and (1 shl i) != 0))
++            check(!state.record(i, true)) // duplicates cannot release a burst early
++            check(state.done == (n == 4))
++        }
++        check(state.completed == Integer.bitCount(mask))
++        check(state.completed + state.failed == 5)
++        check(!state.record(-1, true) && !state.record(5, false))
++    }
++    println("PASS 3840 mixed callback orders, duplicate callbacks, invalid frame indices")
++}
+diff --git a/tools/review_tests/run_scan_policy.py b/tools/review_tests/run_scan_policy.py
+new file mode 100644
+index 0000000..c2778c9
+--- /dev/null
++++ b/tools/review_tests/run_scan_policy.py
+@@ -0,0 +1,10 @@
++from pathlib import Path
++import os, subprocess, tempfile
++root=Path(__file__).resolve().parents[2]
++cpp=root/'app/src/main/cpp'
++with tempfile.TemporaryDirectory() as work:
++    binary=Path(work)/'scan_policy'
++    subprocess.run(['g++','-std=c++20','-O1','-g','-fsanitize=address,undefined',
++        '-fno-omit-frame-pointer','-I',str(cpp),str(Path(__file__).with_name('scan_policy_regression.cpp')),
++        str(cpp/'tsdf_engine.cpp'),str(cpp/'mesh/mesh_engine.cpp'),'-o',str(binary)],check=True)
++    subprocess.run([str(binary)],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True)
+diff --git a/tools/review_tests/scan_policy_regression.cpp b/tools/review_tests/scan_policy_regression.cpp
+new file mode 100644
+index 0000000..b7308ed
+--- /dev/null
++++ b/tools/review_tests/scan_policy_regression.cpp
+@@ -0,0 +1,50 @@
++#include "scan_policy.h"
++#include "tsdf_engine.h"
++#include "mesh/mesh_engine.h"
++#include <cassert>
++#include <iostream>
++#include <limits>
++extern "C" const char* __asan_default_options() { return "detect_leaks=0"; }
++int main() {
++    using scan_policy::inRange;
++    assert(inRange(.5f,0,0,1));
++    assert(inRange(1,0,0,1));
++    assert(!inRange(1.001f,0,0,1));
++    assert(!inRange(.8f,1,0,1)); // Z is close, Euclidean distance is far.
++    assert(inRange(2,0,0,1,2)); // physical-meter/world conversion
++    assert(!inRange(2.01f,0,0,1,2));
++    for(float v: {0.f,-1.f,std::numeric_limits<float>::infinity(),std::numeric_limits<float>::quiet_NaN()})
++        assert(!inRange(v,0,0,1));
++    assert(!inRange(.5f,0,0,1,0));
++    assert(!inRange(.5f,std::numeric_limits<float>::quiet_NaN(),0,1));
++
++    DepthCalibration frozen; frozen.valid=true; frozen.inverseDepthModel=true;
++    frozen.scale=.4f; frozen.shift=.1f;
++    std::vector<float> raw, world;
++    for(int i=0;i<30;++i){raw.push_back(1.f+i*.05f);world.push_back(frozen.toMetric(raw.back(),0));}
++    assert(scan_policy::validatesFrozen(frozen,raw,world));
++    auto wrong=world;for(auto& z:wrong)z*=1.3f;
++    assert(!scan_policy::validatesFrozen(frozen,raw,wrong));
++    assert(!scan_policy::validatesFrozen(frozen,raw,std::vector<float>(19,1)));
++    auto noisy=world;for(int i=0;i<6;++i)noisy[i]*=2;
++    assert(scan_policy::validatesFrozen(frozen,raw,noisy));
++    noisy[6]*=2;assert(!scan_policy::validatesFrozen(frozen,raw,noisy));
++
++    // Far geometry must never enter the reconstructed mesh. Two adjacent planes,
++    // same frame: left at 0.5m, right at 2m; only left survives a 1m limit.
++    constexpr int N=64;
++    std::vector<float> depth(N*N);
++    for(int y=0;y<N;++y)for(int x=0;x<N;++x){
++        const float z=x<N/2?.503f:2.f;
++        depth[y*N+x]=inRange(z,(x-32.f)/80,(y-32.f)/80,1)?z:0;
++    }
++    const float R[]={1,0,0,0,1,0,0,0,1},t[]={0,0,0};
++    TsdfEngine volume;volume.setVoxelSize(.01f);
++    for(int i=0;i<8;++i)volume.integrateDepth(depth.data(),N,N,nullptr,0,0,80,80,32,32,R,t,1);
++    MeshEngine mesh;MeshOptions options;MeshBuildStats stats;
++    options.enableSmoothing=false;options.enableComponentFilter=false;options.enableDecimation=false;
++    assert(mesh.build(volume,options,stats));assert(mesh.mesh().triangleCount()>20);
++    for(size_t i=2;i<mesh.mesh().positions.size();i+=3)
++        assert(std::fabs(mesh.mesh().positions[i]-.503f)<.002f);
++    std::cout<<"PASS radial range, meter conversion, invalid inputs, frozen evidence, near-only TSDF mesh\n";
++}

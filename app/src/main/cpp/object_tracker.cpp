@@ -621,7 +621,10 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
                              static_cast<int>(std::ceil(hw * 2.f)),
                              static_cast<int>(std::ceil(hh * 2.f)));
             lastBox &= cv::Rect(0, 0, w, h);
+            // This branch has no Nano score: unavailable identity (-1) cannot
+            // be treated as positive evidence, unlike ordinary tracking updates.
             if (lastBox.width >= 16 && lastBox.height >= 16 &&
+                computeIdentityScore(lastBox, owned) >= kIdentityAcceptMin &&
                 adoptNanoBox(lastBox, w, h, owned, timestamp)) {
                 info_.state = TargetState::TRACKING;
                 info_.lastEvent = "reacquired via identity-anchored last-good box";
@@ -672,13 +675,15 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         // pose 造成坐标错乱。物体在画面就续命继续找回；真正离开（presence 失效）
         // 或更久(6×超时≈9s)才放弃，给正常找回留足窗口。
         const bool objectGone = !info_.presenceValid;
-        if (objectGone) {
+        if (objectGone && reacquireFrames_ > kReacquireTimeoutFrames) {
             markLost("target reacquire timeout (object gone)");
         } else if (reacquireFrames_ > kReacquireTimeoutFrames * 6) {
             markLost("target reacquire timeout (extended, giving up)");
         } else {
-            reacquireFrames_ = kReacquireTimeoutFrames; // 续命：再给一个超时周期
-            info_.lastEvent = "reacquiring (presence ok, extended)";
+            // Keep a monotonic counter. Resetting to 45 each frame made the
+            // 270-frame deadline unreachable and could leave fusion paused forever.
+            info_.lastEvent = objectGone ? "reacquiring (presence lost, searching)"
+                                         : "reacquiring (presence ok, extended)";
         }
         return;
     }
