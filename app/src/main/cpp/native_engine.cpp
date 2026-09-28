@@ -202,6 +202,12 @@ static uint64_t fusionFusedFrames = 0;
 static uint64_t fusionGatedFrames = 0;
 // V0.13 Sticky 状态：冻结之后「暂停融合 / 恢复融合」而不是清几何。
 static bool epochSuspended = false;
+// V0.13.17-diag：融合卡死兜底（会话级）。若扫描活跃 >=30s、深度帧持续到达，
+// 但 depthCalibrator 始终不可用且 0 帧融合，则本会话退回「融合 raw depth」旧行为。
+// 项目注释已明确：「永远不融合」比「标定不准」更糟。仅本会话生效，会话重置即清除。
+static bool calibrationBypassed = false;
+static int64_t firstDepthTs = 0;
+static bool stallWarned = false;
 static int epochSuspendStreak = 0;
 static int epochResumeStreak = 0;
 static int epochCatastrophicStreak = 0;
@@ -257,6 +263,9 @@ static void resetFusionEpoch() {
     epochSuspendEvents = 0;
     epochCatastrophicRebuilds = 0;
     fusionSuspendedFrames = 0;
+    calibrationBypassed = false;
+    firstDepthTs = 0;
+    stallWarned = false;
 }
 
 /**
@@ -2016,7 +2025,9 @@ static void nativeOnDepthMapImpl(
     // from uncalibrated model values.
     scanWorldPerMeter = mobilescan3d::stereo_anchor::worldScaleUsable()
         ? mobilescan3d::stereo_anchor::worldPerMeter() : 1.f;
-    const bool calibratedNow = depthCalibrationEnabled && depthCalibrator.usable();
+    // V0.13.17-diag：会话级标定兜底；calibrationBypassed 时视为「关掉标定」。
+    const bool calibEnabledEff = depthCalibrationEnabled && !calibrationBypassed;
+    const bool calibratedNow = calibEnabledEff && depthCalibrator.usable();
     std::vector<float> zCal;
     const float* depthForFusion = d.data();
     if (calibratedNow) {
@@ -2078,7 +2089,7 @@ static void nativeOnDepthMapImpl(
         const float zLiveNow = calibratedNow ? liveCal.toMetric(epochRefRaw, 0.f) : 0.f;
         const bool liveOk = std::isfinite(zLiveNow) && zLiveNow > 0.f;
 
-        if (!depthCalibrationEnabled) {
+        if (!calibEnabledEff) {
             // 退路：整条标定链被关掉时，退回「融合 raw depth」的旧行为。
             // 否则「关掉标定」会静默变成「永远不融合」—— 比标定不准更糟。
             // 同时把 active 标记成 1，让诊断里的 active 与实际融合行为一致。
@@ -2213,7 +2224,7 @@ static void nativeOnDepthMapImpl(
     const float* epochFusionDepth = nullptr;
     // Masks use the same frozen mapping even while integration is suspended.
     // Only epochFusionDepth grants permission to write new geometry.
-    if (epochActive && depthCalibrationEnabled) {
+    if (epochActive && calibEnabledEff) {
         zEpoch.assign((size_t)w * h, 0.f);
         for (size_t i = 0; i < zEpoch.size(); ++i) {
             const float dv = d[i];
@@ -2233,6 +2244,38 @@ static void nativeOnDepthMapImpl(
     haveExternalDepth = true;
     depthFrames++;
 
+    // V0.13.17-diag：融合门控诊断 + 标定时钟卡死兜底。
+    if (firstDepthTs == 0 && t > 0) firstDepthTs = t;
+    const bool slowStall = firstDepthTs > 0
+        ? (t - firstDepthTs) > 30000000000LL
+        : depthFrames > 900;
+    if (!calibrationBypassed && fusionFusedFrames == 0 && !depthCalibrator.usable()
+        && depthFrames > 30 && slowStall) {
+        calibrationBypassed = true;
+    }
+    // 每 ~60 帧（约 2s@30fps）打一次融合状态，杜绝「静默 0 顶点」。
+    if ((depthFrames % 60) == 0) {
+        LOGI("FusionDiag depthFrames=%llu usable=%d calibNow=%d epochActive=%d "
+             "epochSusp=%d fused=%llu gated=%llu temporalRej=%llu "
+             "zValid=%llu zMin=%.2f zMax=%.2f zMean=%.2f bypass=%d",
+             (unsigned long long)depthFrames,
+             depthCalibrator.usable() ? 1 : 0, calibratedNow ? 1 : 0,
+             epochActive ? 1 : 0, epochSuspended ? 1 : 0,
+             (unsigned long long)fusionFusedFrames,
+             (unsigned long long)fusionGatedFrames,
+             (unsigned long long)temporalRejects,
+             (unsigned long long)lastFusionDepthValid,
+             lastFusionDepthMin, lastFusionDepthMax, lastFusionDepthMean,
+             calibrationBypassed ? 1 : 0);
+    }
+    if (calibrationBypassed && !stallWarned) {
+        stallWarned = true;
+        LOGI("FusionStall: depthCalibrator never usable after ~30s of active "
+             "scanning with depth frames flowing; bypassing calibration -> "
+             "fusing raw depth this session (scale approximate, geometry produced). "
+             "Re-enable depth calibration + restart scan to restore strict mode.");
+    }
+
     // 先抓一份当前 target 状态：mask / presence / 调试层都要用。
     //
     // 注意：本函数在这一段之前**已经持有 gStateMutex**（见上面的 lock_guard lk），
@@ -2249,7 +2292,7 @@ static void nativeOnDepthMapImpl(
     // ---- 目标分割 Mask + PresenceGate ----
     bool presenceOk = false;
     bool maskOk = false;
-    if (haveTi && (calibratedNow || (epochActive && depthCalibrationEnabled))) {
+    if (haveTi && (calibratedNow || (epochActive && calibEnabledEff))) {
         const int bx0 = std::max(0, static_cast<int>(ti.x0 * w));
         const int by0 = std::max(0, static_cast<int>(ti.y0 * h));
         const int bx1 = std::min(w - 1, static_cast<int>(ti.x1 * w));
@@ -2303,7 +2346,7 @@ static void nativeOnDepthMapImpl(
     // 量级（实机 ~4~5），画出来就是一个「看起来已经扫出来了」的错误大壳 ——
     // 用户会以为模型长歪了，实际只是标定没到位。空白比错误的大壳诚实。
     if (haveTi && maskOk && presenceOk && maskTemporalOk &&
-        depthCalibrationEnabled && (calibratedNow || epochActive)) {
+        calibEnabledEff && (calibratedNow || epochActive)) {
         buildTargetDebugLayer(
             depthForFusion, w, h, ti, targetMaskMat);
         targetDebugTs = static_cast<uint64_t>(t);
@@ -2387,7 +2430,11 @@ static void nativeOnDepthMapImpl(
         // 直接融合 `depthForFusion`（未标定的 raw 尺度）。否则「关掉标定」
         // 会静默变成「永远不融合」，那是比标定不准更糟的失败形态。
         const float* fusionDepth =
-            depthCalibrationEnabled ? epochFusionDepth : (representation == 0 ? depthForFusion : nullptr);
+            calibEnabledEff ? epochFusionDepth : (representation == 0 ? depthForFusion : nullptr);
+    // V0.13.17-diag：标定时钟卡死兜底——强制融合 raw depth，保证至少产出几何。
+    if (calibrationBypassed && fusionDepth == nullptr) {
+        fusionDepth = depthForFusion;
+    }
 
         if (fusionDepth != nullptr) {
             // 全场景地图
