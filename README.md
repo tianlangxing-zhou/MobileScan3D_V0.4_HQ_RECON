@@ -25,6 +25,9 @@ V0.4 不是“已经训练好的手机 AI 扫描器”。模型权重尚未捆�
 
 Android Studio + NDK + CMake。Android 官方文档建议 Vulkan 项目运行时检查实际 Vulkan 版本/驱动能力；NDK 25+ 含 Vulkan 1.3 headers。
 
+> **新机器 / 换电脑构建请看 [`SETUP.md`](SETUP.md)**：OpenCV 4.12 已 vendoring 进仓库（无需外部安装），
+> 只需本机准备 Android SDK/NDK r27 与一份 Ceres 2.2.0 预编译即可 clone 即构建。
+
 ## 设备方向
 
 首要目标仍是 ARM64 旗舰 Android。建议优先 Vulkan 1.3 + hardware compute；随后再扩大兼容范围。

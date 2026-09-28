@@ -66,8 +66,9 @@ find_package(Threads REQUIRED)
 
 set(CERES_SOURCE_DIR "" CACHE PATH "Ceres source directory")
 set(CERES_BUILD_DIR "" CACHE PATH "Ceres Android build directory")
-set(OPENCV_ANDROID_SDK "" CACHE PATH "OpenCV Android SDK directory")
+set(OPENCV_ANDROID_SDK "" CACHE PATH "OpenCV Android SDK directory (optional; if empty, use in-repo vendored OpenCV)")
 
+# --- Ceres：仍为外部预编译依赖，必须配置 ---
 if(NOT CERES_SOURCE_DIR)
     message(FATAL_ERROR "CERES_SOURCE_DIR is not configured. Set ceres.sourceDir in local.properties.")
 endif()
@@ -76,12 +77,41 @@ if(NOT CERES_BUILD_DIR)
     message(FATAL_ERROR "CERES_BUILD_DIR is not configured. Set ceres.buildDir in local.properties.")
 endif()
 
-if(NOT OPENCV_ANDROID_SDK)
-    message(FATAL_ERROR "OPENCV_ANDROID_SDK is not configured. Set opencv.sdkDir in local.properties.")
+set(CERES_STATIC_LIB "${CERES_BUILD_DIR}/lib/libceres.a")
+
+# --- OpenCV：仓库内 vendored 4.12 为默认；外部 SDK 仅作可选覆盖 ---
+# 默认路径下，头用 third_party/opencv4android 里的 4.12 头，链接库直接复用
+# app/src/main/jniLibs/${ANDROID_ABI}/libopencv_java4.so（同一份、已 git 跟踪、4.12）。
+# 这样 clone 后无需任何外部 OpenCV 配置，且「链接库 == 运行库」是结构性保证，
+# 不会再出现 4.10 头链接 / 4.12 库运行 的静默 ABI 错配闪退。
+if(OPENCV_ANDROID_SDK)
+    set(MOBILESCAN_OPENCV_INCLUDE "${OPENCV_ANDROID_SDK}/sdk/native/jni/include")
+    set(OPENCV_JAVA_LIB "${OPENCV_ANDROID_SDK}/sdk/native/libs/${ANDROID_ABI}/libopencv_java4.so")
+    message(STATUS "MobileScan3D: using EXTERNAL OpenCV SDK = ${OPENCV_ANDROID_SDK}")
+else()
+    set(MOBILESCAN_OPENCV_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opencv4android/sdk/native/jni/include")
+    set(OPENCV_JAVA_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libopencv_java4.so")
+    message(STATUS "MobileScan3D: using IN-REPO vendored OpenCV 4.12")
 endif()
 
-set(CERES_STATIC_LIB "${CERES_BUILD_DIR}/lib/libceres.a")
-set(OPENCV_JAVA_LIB "${OPENCV_ANDROID_SDK}/sdk/native/libs/${ANDROID_ABI}/libopencv_java4.so")
+# OpenCV 版本校验：头必须声明 4.12，否则链接/运行 ABI 必然错配。
+set(_opencv_ver_h "${MOBILESCAN_OPENCV_INCLUDE}/opencv2/core/version.hpp")
+if(NOT EXISTS "${_opencv_ver_h}")
+    message(FATAL_ERROR "OpenCV headers not found: ${_opencv_ver_h}")
+endif()
+file(READ "${_opencv_ver_h}" _opencv_ver_content)
+string(REGEX MATCH "#define CV_VERSION_MAJOR[ \t]+([0-9]+)" _opencv_major_match "${_opencv_ver_content}")
+set(_opencv_major "${CMAKE_MATCH_1}")
+string(REGEX MATCH "#define CV_VERSION_MINOR[ \t]+([0-9]+)" _opencv_minor_match "${_opencv_ver_content}")
+set(_opencv_minor "${CMAKE_MATCH_1}")
+if(NOT _opencv_major OR NOT _opencv_minor)
+    message(FATAL_ERROR "Cannot parse OpenCV version from ${_opencv_ver_h}")
+endif()
+if(NOT (_opencv_major STREQUAL "4" AND _opencv_minor STREQUAL "12"))
+    message(FATAL_ERROR
+        "OpenCV must be version 4.12 (link==runtime ABI guarantee). "
+        "Found ${_opencv_major}.${_opencv_minor}. Headers: ${MOBILESCAN_OPENCV_INCLUDE}")
+endif()
 
 if(NOT EXISTS "${CERES_SOURCE_DIR}/include/ceres/ceres.h")
     message(FATAL_ERROR "Ceres headers not found: ${CERES_SOURCE_DIR}/include/ceres/ceres.h")
@@ -89,10 +119,6 @@ endif()
 
 if(NOT EXISTS "${CERES_STATIC_LIB}")
     message(FATAL_ERROR "Ceres library not found: ${CERES_STATIC_LIB}")
-endif()
-
-if(NOT EXISTS "${OPENCV_ANDROID_SDK}/sdk/native/jni/include/opencv2/core.hpp")
-    message(FATAL_ERROR "OpenCV headers not found: ${OPENCV_ANDROID_SDK}")
 endif()
 
 if(NOT EXISTS "${OPENCV_JAVA_LIB}")
@@ -112,7 +138,7 @@ target_include_directories(
     ${CERES_BUILD_DIR}/include
     ${CERES_SOURCE_DIR}/internal/ceres/miniglog
 
-    ${OPENCV_ANDROID_SDK}/sdk/native/jni/include
+    ${MOBILESCAN_OPENCV_INCLUDE}
 )
 
 # 评审第七点：去掉全局 -ffast-math。

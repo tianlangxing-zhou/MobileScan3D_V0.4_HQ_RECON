@@ -16,9 +16,15 @@ fun requiredLocalPath(name: String): String {
         )
 }
 
+fun optionalLocalPath(name: String): String? {
+    return localProperties.getProperty(name)?.replace("\\", "/")
+}
+
 val ceresSourceDir = requiredLocalPath("ceres.sourceDir")
 val ceresBuildDir = requiredLocalPath("ceres.buildDir")
-val opencvSdkDir = requiredLocalPath("opencv.sdkDir")
+// OpenCV 4.12 已 vendoring 进仓库（third_party/opencv4android 头 + jniLibs 运行库），
+// opencv.sdkDir 仅作为可选覆盖；不设则 CMake 使用仓库内默认，链接库==运行库保证 4.12 一致。
+val opencvSdkDir: String? = optionalLocalPath("opencv.sdkDir")
 
 fun gitOutput(vararg args: String): String {
     return try {
@@ -70,9 +76,11 @@ android {
 
                 arguments += listOf(
                     "-DCERES_SOURCE_DIR=$ceresSourceDir",
-                    "-DCERES_BUILD_DIR=$ceresBuildDir",
-                    "-DOPENCV_ANDROID_SDK=$opencvSdkDir"
+                    "-DCERES_BUILD_DIR=$ceresBuildDir"
                 )
+                if (opencvSdkDir != null) {
+                    arguments += "-DOPENCV_ANDROID_SDK=$opencvSdkDir"
+                }
             }
         }
     }
