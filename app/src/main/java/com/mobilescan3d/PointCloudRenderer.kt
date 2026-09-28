@@ -99,7 +99,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     private var arPoseStatsLatest = 0
 
     /** 绘制模式：见 DRAW_* 常量 */
-    @Volatile var drawMode = DRAW_TARGET_DEBUG
+    @Volatile var drawMode = DRAW_LIVE
     /** 累计点云的 hits 过滤门限 */
     @Volatile var accumulatedMinHits = NativeBridge.AR_MIN_HITS_CONFIRMED
     /** 最近一次实际画出的点数（HUD / 报告用） */
@@ -433,20 +433,13 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
             return
         }
 
-        // ---- 位姿：优先按 Preview 时间戳查历史（放宽到 500ms 容差）----
-        // 屏幕画面有它自己的 SENSOR_TIMESTAMP；拿「此刻最新」的 pose 去画它，
-        // 手机一转点云就漂。nativeGetRenderPoseAt(strict 300ms) 实测 fromTs≈0%：
-        // 历史库是按 YUV(ImageReader) 流时间戳建的，而查询用的是 Preview
-        // (SurfaceTexture) 流的时间戳，两流时间戳基准不一致、差 >300ms，
-        // strict 永远查不到 → 长期回退冻结 pose → 模型不跟随。
-        // 关键帧路径 nativeGetRenderPoseAtTol(500ms) 已验证可用（同基准 Image
-        // 时间戳），这里对齐到同一宽松窗口；最近邻只在时间最接近的位姿里取，
-        // 快速运动下仍可能有可见时差。burst 空洞(>500ms) 仍回退，行为与现一致。
+        // Query the pose of this preview exposure. Missing tracking hides the AR
+        // overlay but keeps the world model; never draw with a stale latest pose.
         val ts = previewTimestampNs
         var ok = false
         if (ts > 0L) {
             ok = try {
-                NativeBridge.nativeGetRenderPoseAtTol(ts, 500_000_000L, poseBuf)
+                NativeBridge.nativeGetRenderPoseAt(ts, poseBuf)
             } catch (t: Throwable) {
                 false
             }
@@ -467,13 +460,6 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
                 )
             )
         }
-        if (!ok) {
-            ok = try {
-                NativeBridge.nativeGetRenderPose(poseBuf)
-            } catch (t: Throwable) {
-                false
-            }
-        }
         if (!ok) return
 
         // 三个图层的需求用显式判断表达，而不是 `!= 某一种」：
@@ -482,8 +468,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         val wantMesh = drawMode == DRAW_MESH || drawMode == DRAW_LIVE
         val wantAccum = drawMode == DRAW_ACCUMULATED || drawMode == DRAW_BOTH ||
             drawMode == DRAW_LIVE
-        val wantDebug = drawMode == DRAW_TARGET_DEBUG || drawMode == DRAW_BOTH ||
-            drawMode == DRAW_LIVE
+        val wantDebug = drawMode == DRAW_TARGET_DEBUG || drawMode == DRAW_BOTH
 
         var accumCount = 0
         if (wantAccum) {
@@ -693,13 +678,8 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         const val DRAW_MESH = 3
 
         /**
-         * V0.12 LIVE：**扫描期的默认图层**。
-         *
-         * 半透明网格 + 累计 surfel(hits>=1) + 当前帧 target depth 点，三者同时画。
-         * 为什么必须同时：扫描过程中用户唯一需要立刻回答的问题是
-         * 「模型到底有没有在长」，而它由两件事共同决定 ——
-         * 网格说明 TSDF 在收敛，当前帧点说明这一帧的数据真的到了。
-         * 分开看任一图层都无法判断「没长」是几何没收敛还是数据没进来。
+         * 扫描默认图层：同一世界坐标系下的累计 surfel + 网格。
+         * 单帧相机坐标点仅在显式调试图层中显示，不冒充累计重建。
          */
         const val DRAW_LIVE = 4
 

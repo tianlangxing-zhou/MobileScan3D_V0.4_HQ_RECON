@@ -13,6 +13,7 @@
 #include <opencv2/opencv.hpp>
 
 #include "vins/vins_bridge.h"
+#include "vins/pose_prediction.h"
 #include "vins/vins_params.h"
 #include "vins/feature_tracker/feature_tracker.h"
 #include "vins/estimator/estimator.h"
@@ -38,11 +39,10 @@ static bool g_firstFeaturePublish = true;
 static int g_vinsImageW = 0;
 static int g_vinsImageH = 0;
 
-struct ImuSample {
-    double t = 0.0;
-    Eigen::Vector3d acc = Eigen::Vector3d::Zero();
-    Eigen::Vector3d gyr = Eigen::Vector3d::Zero();
-};
+using ImuSample = scan_pose::ImuSample;
+static scan_pose::State g_predictionBase;
+static bool g_predictionValid = false;
+static std::atomic<bool> g_worldDiscontinuous{false};
 
 static std::deque<ImuSample> g_imuBuffer;
 static std::mutex g_imuBufferMutex;
@@ -235,6 +235,8 @@ void vinsInit(
     g_lastImuTimestamp = -1.0;
     g_lastFeaturePubTimestamp = -1.0;
     g_lastEstimatorImageTimestampNs = 0;
+    g_predictionValid = false;
+    g_worldDiscontinuous.store(false);
     g_firstFeaturePublish = true;
     g_vinsReady = true;
 }
@@ -428,11 +430,53 @@ void vinsInputImage(double t, const std::uint8_t* gray, int w, int h, int stride
 
     std_msgs::Header header;
     header.stamp.sec = t;
+    const bool wasInitialized = g_estimator.solver_flag == Estimator::NON_LINEAR;
     g_estimator.processImage(image, header);
+    g_predictionValid = g_estimator.solver_flag == Estimator::NON_LINEAR;
+    if (wasInitialized && !g_predictionValid) {
+        // Estimator::failureDetection reset its world. Old geometry must survive,
+        // but new-world observations cannot be integrated without relocalization.
+        g_worldDiscontinuous.store(true);
+    }
+    if (g_predictionValid) {
+        auto& b = g_predictionBase;
+        b.t = g_estimatorTime;
+        b.R = g_estimator.Rs[WINDOW_SIZE];
+        b.p = g_estimator.Ps[WINDOW_SIZE];
+        b.v = g_estimator.Vs[WINDOW_SIZE];
+        b.ba = g_estimator.Bas[WINDOW_SIZE];
+        b.bg = g_estimator.Bgs[WINDOW_SIZE];
+        b.gravity = g_estimator.g;
+        b.acc = g_lastEstimatorAcc;
+        b.gyr = g_lastEstimatorGyr;
+    }
     g_lastEstimatorImageTimestampNs =
         static_cast<std::uint64_t>(
             std::llround(
                 std::max(0.0, t) * 1e9));
+}
+
+bool vinsWorldDiscontinuous() { return g_worldDiscontinuous.load(); }
+
+bool vinsGetCameraPoseAt(std::uint64_t timestampNs, float* out7) {
+    if (!out7 || timestampNs == 0) return false;
+    std::lock_guard<std::mutex> lk(g_vinsMutex);
+    if (!g_vinsReady || !g_predictionValid || g_worldDiscontinuous.load() ||
+        g_estimator.solver_flag != Estimator::NON_LINEAR) return false;
+    const double time = static_cast<double>(timestampNs) * 1e-9 +
+                        (ESTIMATE_TD ? g_estimator.td : 0.);
+    scan_pose::State predicted;
+    {
+        std::lock_guard<std::mutex> imuLock(g_imuBufferMutex);
+        if (!scan_pose::predict(g_predictionBase, g_imuBuffer, time, predicted)) return false;
+    }
+    Eigen::Matrix3d Rwc;
+    Eigen::Vector3d twc;
+    scan_pose::cameraPose(predicted, g_estimator.ric[0], g_estimator.tic[0], Rwc, twc);
+    const Eigen::Quaterniond q(Rwc);
+    out7[0] = twc.x(); out7[1] = twc.y(); out7[2] = twc.z();
+    out7[3] = q.x(); out7[4] = q.y(); out7[5] = q.z(); out7[6] = q.w();
+    return true;
 }
 
 bool vinsGetPose(float* out7) {

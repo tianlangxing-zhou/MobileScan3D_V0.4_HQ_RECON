@@ -1,0 +1,62 @@
+{
+  "base_commit": "49f5e9a5a8bb8bf46bb55513e9bde0e052c5f9f7",
+  "version": "0.13.19-continuous-fusion",
+  "type": "project_root_overlay",
+  "files": [
+    {
+      "path": "app/build.gradle.kts",
+      "sha256": "8ef92148c4d3d8f873fa9a1e7ee82960489b5af9e03a0a9acba89b97076457b6",
+      "base_sha256": "c2585d7e55c868279a1901be6172bc3c17746eaefd40c1c3459c77bff9979858"
+    },
+    {
+      "path": "app/src/main/cpp/native_engine.cpp",
+      "sha256": "b2f6227405f3628efe5bda937fa793740f5ce9d7637e29e35e7e4772572599cc",
+      "base_sha256": "1fed1a17d05d466336e97590408d9ed85381d4af7a403e0fb8bce96c205e8261"
+    },
+    {
+      "path": "app/src/main/cpp/vins/vins_bridge.cpp",
+      "sha256": "a439cb97a4aeff8a8d04906eb7148323caab65f9ec4c586f867513ca35894627",
+      "base_sha256": "a97e60096b3dc8d0245cc9d6c1dee081d0d0af13affdbc953b48419a944e2dee"
+    },
+    {
+      "path": "app/src/main/cpp/vins/vins_bridge.h",
+      "sha256": "8980cb3393f08be0b18bf9011fe6161f2f0db7e8367046c16dc34241ba6f59b2",
+      "base_sha256": "485ade9bac694c3cb88fd85a5c4c11c28c2ac1fc00e74991424c44938dc33318"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/MainActivity.kt",
+      "sha256": "493a3883cf7291be63017221cd35e09b47e56c762c1369b907ec03b22b98ab14",
+      "base_sha256": "5664399b58881a94e8d3c4a9a1e7c824907e9db02792307a81aefe72421e4624"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt",
+      "sha256": "d11fc9987b88bb2bd167fc1654d606280c49e7c9db53338b2d35c3cab883af45",
+      "base_sha256": "d7c6e3cc096c665c8251aa63c969aa7cdd8e60b75ff0978b2176a2a2c6d63d1a"
+    },
+    {
+      "path": "app/src/main/cpp/vins/pose_prediction.h",
+      "sha256": "9de87df8f8c36178e4becfd778840429094fa5dfd7bb10332ecf87fef960cdc9",
+      "base_sha256": null
+    },
+    {
+      "path": "tools/review_tests/continuity_regression.cpp",
+      "sha256": "53c5c94d5ce22f943788bb928424ba6b5716e13275445570f1943b123e3be7a7",
+      "base_sha256": null
+    },
+    {
+      "path": "tools/review_tests/run_continuity.py",
+      "sha256": "9b70d7a093ea4f39fb4d9cc75b2fd998eb3d2f9286abbdba8d49cd42172e471d",
+      "base_sha256": null
+    },
+    {
+      "path": "README_CONTINUOUS_FUSION_ZH.md",
+      "sha256": "41abd189676643090b274d0fc091490e31d5ba05c9e97084aba2e238c77819a7",
+      "base_sha256": null
+    },
+    {
+      "path": "docs/review_01319/REVIEW_ZH.md",
+      "sha256": "4687649ab5ab640f791cdb9431c7a0375d3e7d3a7362ad76d0eedce03184bf8b",
+      "base_sha256": null
+    }
+  ]
+}

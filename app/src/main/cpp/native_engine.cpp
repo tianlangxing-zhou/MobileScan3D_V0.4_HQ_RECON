@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "vins/vins_bridge.h"
+#include "vins/pose_prediction.h"
 #include "vins/estimator/feature_manager.h"
 #include "surfel_engine.h"
 #include "vio_engine.h"
@@ -134,47 +135,17 @@ static uint64_t lastFusionDepthValid = 0;
 static uint64_t lastFusionDepthConversionFallback = 0;
 static constexpr int kMaxCalibSamples = 256;
 
-// ------------------------------------------- V0.12 Fusion Calibration Epoch
-// V0.11 的实测结论：标定器本身没问题，问题是它**每帧都在动**（EMA）。
-// TSDF 需要的是「一段时间内恒定」的尺度 —— 同一面墙如果先按 scale=A 灌进去、
-// 下几帧又按 scale=B 灌进去，体素场里会同时存在两套零交叉面，mesh 就长成
-// 双层 / 撕裂，而且这种错误**越扫越严重**。
-//
-// 做法：标定连续稳定 kEpochStableFrames 帧后**冻结**一套 scale/shift/inverse，
-// 冻结期间只用它换算；一旦「同一个 raw 深度工作点按当前标定算出的 z」相对冻结
-// 时漂移超过 kEpochRebuildRatio，就作废并重新等稳定 —— 而不是把不同的尺度
-// 继续往旧 TSDF 里灌。
-//
-// 判据刻意选「同一 raw 值下两条映射的差」而不是「本帧深度均值」：
-// 后者在用户走近走远时会剧烈变化，那和标定漂移完全是两回事。
-//
-// V0.12 加固（采纳外部补丁包的保守参数）：
-//   * 漂移阈值 6% -> 8%，且必须**连续 kEpochDriftBadFrames 帧**都超标才重建。
-//     单帧超标就重建会让几何被反复清空，得不偿失。
-//   * 重建时**同时清空几何**（见 clearGeometryForFusionEpochRestart）：
-//     旧体素场是用旧 scale 灌的，留着它继续叠新 scale，正是「大模型壳 /
-//     双层撕裂」的来源。
-//   * 标定**短暂**失效不再立即停融合：epoch 生效期间继续用冻结参数融合，
-//     连续 kEpochCalibLossFrames 帧都拿不到可用标定才重建。
-// ---- V0.13 Sticky Fusion Epoch ----
-// V0.12 实测：12 opens / 11 rebuilds，等于每 ~2.5s 把几何清一次，屏幕上
-// 自然永远只剩一块残片。根因是**在线标定在 linear / inverse 两种候选之间
-// 来回跳**（linear scale=0.105 vs frozen inverse scale=-1.714），而 epoch
-// 判据 `|liveCal.toMetric(ref) - epochCal.toMetric(ref)| / zFrozen` 把这个
-// **估计器形式差异**误读成了「现实尺度变了 11 次」。
-//
-// V0.13 的处理：选定 mapping 后**冻结到底**；在线标定降级为纯诊断。
-//   * 不一致时只**暂停新融合**，绝不清空已建模型；
-//   * 只有映射差到荒谬程度且持续很久（真极端失效）才允许重建 epoch。
+// Fusion calibration is immutable within a scan. Drift suspends new writes;
+// only explicit new-scan / new-target actions may erase geometry.
+// Independent sparse evidence or recovery of the fit can resume the same epoch.
 static constexpr int kEpochStableFrames = 8;
-static constexpr int kEpochDriftBadFrames = 2;
 static constexpr int kEpochCalibLossFrames = 5;
 static constexpr float kEpochRebuildRatio = 0.08f;
 /** V0.13：连续多少帧漂移超标 -> 暂停新融合（几何保持不动）。 */
 static constexpr int kEpochDriftSuspendFrames = 3;
 /** V0.13：漂移连续恢复正常多少帧 -> 解除暂停。 */
 static constexpr int kEpochResumeFrames = 6;
-/** V0.13：极端失效判据 1（映射相对差）。只有它才允许重建 epoch。 */
+/** V0.13：极端映射差诊断阈值；不再触发几何清空。 */
 static constexpr float kEpochCatastrophicRatio = 0.75f;
 /** V0.13：极端失效判据 2（必须持续这么多帧才算真的塌了，不是抖动）。 */
 static constexpr int kEpochCatastrophicFrames = 30;
@@ -202,12 +173,6 @@ static uint64_t fusionFusedFrames = 0;
 static uint64_t fusionGatedFrames = 0;
 // V0.13 Sticky 状态：冻结之后「暂停融合 / 恢复融合」而不是清几何。
 static bool epochSuspended = false;
-// V0.13.17-diag：融合卡死兜底（会话级）。若扫描活跃 >=30s、深度帧持续到达，
-// 但 depthCalibrator 始终不可用且 0 帧融合，则本会话退回「融合 raw depth」旧行为。
-// 项目注释已明确：「永远不融合」比「标定不准」更糟。仅本会话生效，会话重置即清除。
-static bool calibrationBypassed = false;
-static int64_t firstDepthTs = 0;
-static bool stallWarned = false;
 static int epochSuspendStreak = 0;
 static int epochResumeStreak = 0;
 static int epochCatastrophicStreak = 0;
@@ -263,9 +228,6 @@ static void resetFusionEpoch() {
     epochSuspendEvents = 0;
     epochCatastrophicRebuilds = 0;
     fusionSuspendedFrames = 0;
-    calibrationBypassed = false;
-    firstDepthTs = 0;
-    stallWarned = false;
 }
 
 /**
@@ -360,7 +322,7 @@ static uint64_t vinsRejectStreak = 0;
 static uint64_t depthSnapMatches = 0;
 static uint64_t depthSnapMisses = 0;
 static int64_t lastDepthSnapDiffNs = -1;
-static constexpr int64_t kDepthSnapMaxDiffNs = 80'000'000LL;
+static constexpr int64_t kDepthSnapMaxDiffNs = 12'000'000LL;
 static float rawVinsT[3] = {0.f, 0.f, 0.f};
 static float rawVinsQ[4] = {0.f, 0.f, 0.f, 1.f};
 static float acceptedVinsT[3] = {0.f, 0.f, 0.f};
@@ -379,7 +341,11 @@ static uint64_t vinsFrames = 0;
 static uint64_t depthFrames = 0;
 static double lastVinsMs = 0.0;
 
+static uint64_t targetGeneration = 0;
+
 struct FrameSnap {
+    uint64_t targetGeneration = 0;
+    TargetTrackInfo target;
     uint64_t ts = 0;
     float t[3] = {0, 0, 0};
     float R[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
@@ -457,24 +423,12 @@ static std::vector<uint8_t> gTrackerGray;
  *
  * 正确做法：拿 Preview 的时间戳回来查表，取那一时刻的 pose。
  */
-struct RenderPoseSample {
-    uint64_t ts = 0;
-    float R[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
-    float t[3] = {0.f, 0.f, 0.f};
-};
+using RenderPoseSample = scan_pose::CameraSample;
 
 static std::deque<RenderPoseSample> renderPoseHistory;
 static constexpr size_t kRenderPoseHistoryMax = 120;
-// 查询允许的最大 pose 年龄；超过就说明这段历史里没有对应时刻的位姿
-// V0.13.11：80ms -> 300ms。
-// 旧值 80ms 是首版占位（见 nativeGetRenderPoseAt 注释「< 80ms 就返回…以后
-// 若发现快速运动下仍有偏差再升级」）。真机数据（diag_live_20260927_2155）显示
-// AR 预览管线延迟使 Preview 的 SENSOR_TIMESTAMP 系统性落后 VINS 历史位姿
-// >80ms（nativeOnCameraFrame 均值 44.9ms、峰值 1.1s），导致 strict 查询 100%
-// 失败、AR 渲染回退到「冻结的最新 pose」——模型坐标错乱、不跟随物体。放宽到
-// 300ms 后，最近邻查找仍能取到「距当前 ≤300ms」的时序位姿，世界系 mesh 即可随
-// 手机近期运动正确锚定。300ms 在世界锚定下仅对应手持扫描的轻微滞后，远优于冻结。
-static constexpr int64_t kRenderPoseMaxAgeNs = 300'000'000LL; // 300ms
+// Bound exposure mismatch; never substitute a half-second-old view.
+static constexpr int64_t kRenderPoseMaxAgeNs = 80'000'000LL; // 80ms
 
 // ------------------------------------------------- 当前帧 target depth 调试层
 /**
@@ -559,6 +513,8 @@ static void storeSnap(uint64_t ts, int w, int h, int rs, int urs, int ups,
                       const float R[9], const float t[3]) {
     FrameSnap s;
     s.ts = ts;
+    s.targetGeneration = targetGeneration;
+    if (objectTracker) s.target = objectTracker->info();
     for (int i = 0; i < 3; i++) {
         s.t[i] = t[i];
     }
@@ -674,7 +630,7 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
     std::vector<float> ranged(depth, depth + static_cast<size_t>(w) * h);
     filterScanRange(ranged, w, h, dFx, dFy, dCx, dCy);
     depth = ranged.data();
-    const float diag = std::sqrtf(static_cast<float>(w * w + h * h));
+    const float diag = std::sqrt(static_cast<float>(w * w + h * h));
     for (int y = 0; y < h; ++y) {
         const int yy = std::min(s.h - 1, y * s.h / h);
         for (int x = 0; x < w; ++x) {
@@ -686,14 +642,14 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
             // ---- 中心加权：屏幕中心 + 被追踪物体中心 ----
             const float u = (x + 0.5f) / w;
             const float v = (y + 0.5f) / h;
-            const float dc = std::sqrtf((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f));
+            const float dc = std::sqrt((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f));
             float wScreen = 1.f - std::min(1.f, dc * 1.41421356f) * kScreenEdgeFalloff;
             wScreen = std::max(kScreenMin, wScreen);
             float wObj = 1.f;
             if (haveObj) {
                 const float dx = static_cast<float>(x) - objCx;
                 const float dy = static_cast<float>(y) - objCy;
-                const float dobj = std::sqrtf(dx * dx + dy * dy) / diag;
+                const float dobj = std::sqrt(dx * dx + dy * dy) / diag;
                 wObj = 1.f - std::min(1.f, dobj * kObjFalloff);
                 wObj = std::max(kObjMin, wObj);
             }
@@ -729,8 +685,7 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
                         dFx, dFy, dCx, dCy, s.R, s.t, confidence);
     // 注意：场景 surfel（g）的喂入已**解耦**到 feedSceneSurfels()，
-    // 在 nativeOnCameraFrameImpl 里独立于融合门控持续喂入，避免 epoch 挂起时
-    // 点云冻结/错位。此处只负责 TSDF 融合（仍受 fusionDepth != nullptr 门控）。
+    // 与 TSDF 共用融合门控；暂停时保留已有几何，不再喂不可信观测。
 }
 
 // ------------------------------------------------------------- V0.9 stereo anchors
@@ -987,30 +942,8 @@ static void resetMeshPipeline() {
     ++depthCalibKeptAcrossTarget;
 }
 
-/**
- * V0.12：Fusion Epoch 重建时**必须连几何一起清掉**。
- *
- * 旧体素场是用**旧 scale** 灌进 TSDF 的。如果只把 epoch 状态重置、让新 scale
- * 继续往同一个体素场里叠加，同一面墙就会同时在两套尺度上产生零交叉面 ——
- * mesh 长成双层 / 撕裂，而且越扫越严重（这正是「大模型壳」的来源之一）。
- *
- * 注意：**不动深度标定本身**（那是 resetDepthCalibration 的事，只在新会话 /
- * 销毁会话时调用）。epoch 重建只是「这一批几何不可信了」，与标定器无关。
- *
- * 必须在 gStateMutex 下调用。
- */
-static void clearGeometryForFusionEpochRestart() {
-    g.reset();
-    tsdf.reset();
-    targetG.reset();
-    targetTsdf.reset();
-    resetMeshPipeline();
-    lastFusedDepth.clear();
-    haveLastFusePose = false;
-    lastFuseCalibrated = false;
-}
-
 static void resetTargetModel() {
+    ++targetGeneration; // In-flight depth cannot be assigned to a newly selected object.
     targetG.reset();
     targetTsdf.reset();
     targetMaskMat.release();
@@ -1587,8 +1520,8 @@ static void nativeOnCameraFrameImpl(
         }
     }
 
-    float vp[7];
-    const bool poseOk = vinsGetPose(vp);
+    float vp[7] = {};
+    const bool poseOk = vinsGetCameraPoseAt(static_cast<uint64_t>(vinsTs), vp);
     if (poseOk) {
         rawVinsT[0] = vp[0];
         rawVinsT[1] = vp[1];
@@ -1700,6 +1633,8 @@ static void nativeOnCameraFrameImpl(
                     }
                     vinsLostAfterInit = true;
                     snaps.clear();
+                    renderPoseHistory.clear();
+                    haveRetainedDepthSnap = false;
                 }
             }
         } else {
@@ -1725,8 +1660,11 @@ static void nativeOnCameraFrameImpl(
                 }
                 vinsLostAfterInit = true;
                 snaps.clear();
+                renderPoseHistory.clear();
+                haveRetainedDepthSnap = false;
             }
             vinsPoseOk = false;
+            vinsRejectReason = vinsWorldDiscontinuous() ? "world_reset_restart_required" : "no_time_aligned_pose";
         }
 
         if (vinsPoseOk) {
@@ -1891,6 +1829,33 @@ static void nativeOnDepthMapImpl(
     float frameSamples[kMaxCalibSamples * 3];
     const int ns = vinsFeatureSamples(frameSamples, kMaxCalibSamples, static_cast<uint64_t>(t));
     std::lock_guard<std::mutex> lk(gStateMutex);
+    if (vinsWorldDiscontinuous()) return; // Preserve the old-world model.
+    const FrameSnap* match = nullptr;
+    int64_t bestSnapDiffNs = kDepthSnapMaxDiffNs;
+    if (haveRetainedDepthSnap && retainedDepthSnap.ts == static_cast<uint64_t>(t)) {
+        match = &retainedDepthSnap;
+        bestSnapDiffNs = 0;
+    }
+    for (const auto& snap : snaps) {
+        int64_t diff =
+            static_cast<int64_t>(snap.ts) -
+            static_cast<int64_t>(t);
+        if (diff < 0) diff = -diff;
+        if (diff < bestSnapDiffNs) {
+            bestSnapDiffNs = diff;
+            match = &snap;
+        }
+    }
+    if (match != nullptr) {
+        ++depthSnapMatches;
+        lastDepthSnapDiffNs = bestSnapDiffNs;
+    } else {
+        ++depthSnapMisses;
+        lastDepthSnapDiffNs = -1;
+    }
+
+    if (!match || match->targetGeneration != targetGeneration) return;
+
     // V0.9: raw model depth retained briefly for exact-timestamp stereo pairing.
     mobilescan3d::stereo_anchor::onDepthFrame(
         static_cast<uint64_t>(t),
@@ -1902,7 +1867,7 @@ static void nativeOnDepthMapImpl(
     config.allowInverseDepth = representation == 1;
     config.forceInverseDepth = representation == 1;
     depthCalibrator.setConfig(config);
-    if (objectTracker && objectTracker->isTracking()) {
+    if (objectTracker && objectTracker->info().lastFrameTs == static_cast<uint64_t>(t)) {
         objectTracker->updateFromDepth(d.data(), w, h, static_cast<uint64_t>(t));
     }
 
@@ -2071,8 +2036,7 @@ static void nativeOnDepthMapImpl(
     // from uncalibrated model values.
     scanWorldPerMeter = mobilescan3d::stereo_anchor::worldScaleUsable()
         ? mobilescan3d::stereo_anchor::worldPerMeter() : 1.f;
-    // V0.13.17-diag：会话级标定兜底；calibrationBypassed 时视为「关掉标定」。
-    const bool calibEnabledEff = depthCalibrationEnabled && !calibrationBypassed;
+    const bool calibEnabledEff = depthCalibrationEnabled;
     const bool calibratedNow = calibEnabledEff && depthCalibrator.usable();
     std::vector<float> zCal;
     const float* depthForFusion = d.data();
@@ -2153,7 +2117,7 @@ static void nativeOnDepthMapImpl(
             // 比「标定略旧几帧」更影响体验。
             //
             // 只有**连续** kEpochCalibLossFrames 帧都拿不到可用标定，才判定这个
-            // epoch 已无法证明尺度一致 —— 清几何 + 回到 warmup。
+            // epoch 暂时无法证明尺度一致 —— 暂停新增，保留当前模型。
             ++epochBadStreak;
             if (!epochActive) {
                 epochStableStreak = 0;
@@ -2196,9 +2160,8 @@ static void nativeOnDepthMapImpl(
                 ++epochOpens;
             }
         } else {
-            // epoch 生效中：监控漂移。冻结参数与当前参数在 epochRefRaw 上算出的
-            // z 相差超过 kEpochRebuildRatio -> 记一次漂移，**连续
-            // kEpochDriftBadFrames 帧**都超标才重建（单帧超标不重建）。
+            // Monitor the frozen/live mapping disagreement at the SAME raw value.
+            // Sustained disagreement suspends writes, without changing map scale.
             const float zFrozen = epochCalib.toMetric(epochRefRaw, 0.f);
             const float zLiveAtRef = liveCal.toMetric(epochRefRaw, 0.f);
             const bool bothOk = std::isfinite(zFrozen) && zFrozen > 0.f &&
@@ -2217,29 +2180,16 @@ static void nativeOnDepthMapImpl(
                     epochSuspended = true;
                     ++epochSuspendEvents;
                 }
-                // 极端失效才允许重建 epoch（连同几何一起清）。
-                // 附加「持续 kEpochCatastrophicFrames 帧」这个条件，是因为
-                // 在线标定偶尔会在两种模型之间跳一下 —— 那是估计器的形式
-                // 差异，不是现实尺度变了，绝不能拿它去判一个 epoch 作废。
+                // Keep extreme disagreement as a bounded diagnostic only.
+                // A different fit is not proof that the old geometry should be erased.
                 if (epochLastDriftRel > kEpochCatastrophicRatio && !frozenEvidenceGood) {
                     ++epochCatastrophicStreak;
                 } else {
                     epochCatastrophicStreak = 0;
                 }
-                if (epochCatastrophicStreak >= kEpochCatastrophicFrames) {
-                    clearGeometryForFusionEpochRestart();
-                    epochActive = false;
-                    epochSuspended = false;
-                    epochStableStreak = 0;
-                    haveEpochPrevZ = true;
-                    epochPrevZ = zLiveNow;
-                    epochBadStreak = 0;
-                    epochSuspendStreak = 0;
-                    epochResumeStreak = 0;
-                    epochCatastrophicStreak = 0;
-                    ++epochRebuilds;
-                    ++epochCatastrophicRebuilds;
-                }
+                // Even prolonged fit disagreement cannot justify erasing a scan.
+                // Keep the frozen mapping and geometry; resume only on evidence.
+                epochCatastrophicStreak = std::min(epochCatastrophicStreak, kEpochCatastrophicFrames);
             } else if (bothOk) {
                 // 漂移回到门限内：连续 kEpochResumeFrames 帧正常就解除暂停。
                 epochBadStreak = 0;
@@ -2290,36 +2240,11 @@ static void nativeOnDepthMapImpl(
     haveExternalDepth = true;
     depthFrames++;
 
-    // V0.13.17-diag：融合门控诊断 + 标定时钟卡死兜底。
-    if (firstDepthTs == 0 && t > 0) firstDepthTs = t;
-    const bool slowStall = firstDepthTs > 0
-        ? (t - firstDepthTs) > 30000000000LL
-        : depthFrames > 900;
-    if (!calibrationBypassed && fusionFusedFrames == 0 && !depthCalibrator.usable()
-        && depthFrames > 30 && slowStall) {
-        calibrationBypassed = true;
-    }
-    // 每 ~60 帧（约 2s@30fps）打一次融合状态，杜绝「静默 0 顶点」。
     if ((depthFrames % 60) == 0) {
-        LOGI("FusionDiag depthFrames=%llu usable=%d calibNow=%d epochActive=%d "
-             "epochSusp=%d fused=%llu gated=%llu temporalRej=%llu "
-             "zValid=%llu zMin=%.2f zMax=%.2f zMean=%.2f bypass=%d",
-             (unsigned long long)depthFrames,
-             depthCalibrator.usable() ? 1 : 0, calibratedNow ? 1 : 0,
+        LOGI("FusionDiag depthFrames=%llu usable=%d epochActive=%d epochSusp=%d fused=%llu gated=%llu",
+             (unsigned long long)depthFrames, depthCalibrator.usable() ? 1 : 0,
              epochActive ? 1 : 0, epochSuspended ? 1 : 0,
-             (unsigned long long)fusionFusedFrames,
-             (unsigned long long)fusionGatedFrames,
-             (unsigned long long)temporalRejects,
-             (unsigned long long)lastFusionDepthValid,
-             lastFusionDepthMin, lastFusionDepthMax, lastFusionDepthMean,
-             calibrationBypassed ? 1 : 0);
-    }
-    if (calibrationBypassed && !stallWarned) {
-        stallWarned = true;
-        LOGI("FusionStall: depthCalibrator never usable after ~30s of active "
-             "scanning with depth frames flowing; bypassing calibration -> "
-             "fusing raw depth this session (scale approximate, geometry produced). "
-             "Re-enable depth calibration + restart scan to restore strict mode.");
+             (unsigned long long)fusionFusedFrames, (unsigned long long)fusionGatedFrames);
     }
 
     // 先抓一份当前 target 状态：mask / presence / 调试层都要用。
@@ -2328,12 +2253,12 @@ static void nativeOnDepthMapImpl(
     // 所以这里只能直接读全局 objectTracker，绝不能再 lock 一次 ——
     // std::mutex 不可重入，再锁一次就是自锁死。ObjectTracker 内部有自己的
     // mutex_，isTracking()/info() 都会自己去拿，不会和外层冲突。
-    TargetTrackInfo ti;
-    bool haveTi = false;
-    if (objectTracker && objectTracker->isTracking()) {
-        ti = objectTracker->info();
-        haveTi = true;
-    }
+    // Inference completes later: use the source exposure's target rectangle,
+    // not the rectangle from the camera's newer viewpoint.
+    const TargetTrackInfo ti = match->target;
+    const bool haveTi = objectTracker && ti.state == TargetState::TRACKING;
+    const bool targetStateIsCurrent = objectTracker &&
+        objectTracker->info().lastFrameTs == static_cast<uint64_t>(t);
 
     // ---- 目标分割 Mask + PresenceGate ----
     bool presenceOk = false;
@@ -2368,7 +2293,7 @@ static void nativeOnDepthMapImpl(
             presenceFailStreak = 0;
         } else {
             presenceFailStreak++;
-            if (presenceFailStreak >= kPresenceFailFrames) {
+            if (targetStateIsCurrent && presenceFailStreak >= kPresenceFailFrames) {
                 // 连续两帧判「目标不在」：立刻退回 REACQUIRING 并清 confidence。
                 // UI 同一帧就会把绿框收掉 —— 绝不能等 bbox 滑出画面才反应，
                 // 因为「物体走了但 tracker 停在墙上」时 bbox 永远不会出界。
@@ -2377,7 +2302,7 @@ static void nativeOnDepthMapImpl(
             }
         }
         // 只更新诊断位（不参与状态机）：连续 1 帧失败就已经不该再画绿框了。
-        objectTracker->setPresenceValid(presenceFailStreak == 0);
+        if (targetStateIsCurrent) objectTracker->setPresenceValid(presenceFailStreak == 0);
     } else {
         targetMaskStats = TargetMaskStats{};
         targetMaskMat.release();
@@ -2401,35 +2326,12 @@ static void nativeOnDepthMapImpl(
         targetDebugValidPixels = 0;
     }
 
-    const FrameSnap* match = nullptr;
-    int64_t bestSnapDiffNs = kDepthSnapMaxDiffNs;
-    if (haveRetainedDepthSnap && retainedDepthSnap.ts == static_cast<uint64_t>(t)) {
-        match = &retainedDepthSnap;
-        bestSnapDiffNs = 0;
-    }
-    for (const auto& snap : snaps) {
-        int64_t diff =
-            static_cast<int64_t>(snap.ts) -
-            static_cast<int64_t>(t);
-        if (diff < 0) diff = -diff;
-        if (diff < bestSnapDiffNs) {
-            bestSnapDiffNs = diff;
-            match = &snap;
-        }
-    }
-    if (match != nullptr) {
-        ++depthSnapMatches;
-        lastDepthSnapDiffNs = bestSnapDiffNs;
-    } else {
-        ++depthSnapMisses;
-        lastDepthSnapDiffNs = -1;
-    }
-
     if (match != nullptr) {
         // ---- 时序一致性：上一帧深度按相对位姿重投影到当前帧 ----
         // 单目深度网络在细节上本来就会抖，动得快时更明显。这里把「同一表面在
         // 两帧里深度不一致」的像素识别出来，用一致性比例给融合降权。
         float conf = confidence;
+        bool temporalAccepted = true;
         if (haveLastFusePose && lastFuseCalibrated == calibratedNow &&
             lastFusedDepth.size() == (size_t)w * h) {
             // Pc_cur = Rcur^T * Rprev * Pc_prev + Rcur^T * (tprev - tcur)
@@ -2459,9 +2361,10 @@ static void nativeOnDepthMapImpl(
             temporalChecks++;
             if (lastTemporalRatio < 0.35f) {
                 temporalRejects++;
+                temporalAccepted = false;
             }
-            // 下限 0.25：一致性差就降权，但不至于完全不融合 ——
-            // 否则一边走一边扫时根本重建不出来。
+            // Strong disagreement in the overlapping area rejects dense writes.
+            // Sparse/no overlap is neutral (temporalConsistencyRatio returns 1).
             conf = confidence * std::clamp(lastTemporalRatio, 0.25f, 1.f);
         }
 
@@ -2475,12 +2378,9 @@ static void nativeOnDepthMapImpl(
         // 退路：`nativeSetDepthCalibrationEnabled(false)` 时退回旧行为 ——
         // 直接融合 `depthForFusion`（未标定的 raw 尺度）。否则「关掉标定」
         // 会静默变成「永远不融合」，那是比标定不准更糟的失败形态。
-        const float* fusionDepth =
-            calibEnabledEff ? epochFusionDepth : (representation == 0 ? depthForFusion : nullptr);
-    // V0.13.17-diag：标定时钟卡死兜底——强制融合 raw depth，保证至少产出几何。
-    if (calibrationBypassed && fusionDepth == nullptr) {
-        fusionDepth = depthForFusion;
-    }
+        const float* fusionDepth = temporalAccepted
+            ? (calibEnabledEff ? epochFusionDepth : (representation == 0 ? depthForFusion : nullptr))
+            : nullptr;
 
         if (fusionDepth != nullptr) {
             // 全场景地图
@@ -2502,16 +2402,10 @@ static void nativeOnDepthMapImpl(
             }
         }
 
-        // 场景 surfel 解耦喂入：epoch 挂起时融合被门控（fusionDepth==nullptr），
-        // 但 zEpoch（已标定的深度）仍每帧重建 —— 用它在挂起期间持续喂场景点云，
-        // 让实时点云不冻结、且随当前相机位姿更新（消除"点云错位/滞后"）。
-        // 中心加权（屏幕中心 + 被追踪物体中心）实现"从中心向外、由物体向外"生成。
-        const float* surfelDepth = fusionDepth;
-        if (surfelDepth == nullptr && epochActive && calibEnabledEff && epochSuspended) {
-            surfelDepth = zEpoch.data();
-        }
-        if (surfelDepth != nullptr) {
-            feedSceneSurfels(surfelDepth, w, h, *match, conf,
+        // Point cloud and TSDF share the same accepted pose/depth transaction.
+        // Suspended/uncalibrated depth must not create a second shell of points.
+        if (fusionDepth != nullptr) {
+            feedSceneSurfels(fusionDepth, w, h, *match, conf,
                              (haveTi && maskOk), targetMaskStats.centerX, targetMaskStats.centerY);
         }
 
@@ -2585,16 +2479,18 @@ static void nativeOnDepthMapImpl(
             }
         }
 
-        // 记录本帧，供下一帧做时序一致性检查
-        lastFusedDepth.assign(depthForFusion, depthForFusion + (size_t)w * h);
-        for (int i = 0; i < 9; ++i) {
-            lastFuseR[i] = match->R[i];
+        // Retain an accepted reference, never an uncalibrated/rejected observation.
+        if (fusionDepth != nullptr) {
+            lastFusedDepth.assign(depthForFusion, depthForFusion + (size_t)w * h);
+            for (int i = 0; i < 9; ++i) {
+                lastFuseR[i] = match->R[i];
+            }
+            for (int i = 0; i < 3; ++i) {
+                lastFuseT[i] = match->t[i];
+            }
+            haveLastFusePose = true;
+            lastFuseCalibrated = calibratedNow;
         }
-        for (int i = 0; i < 3; ++i) {
-            lastFuseT[i] = match->t[i];
-        }
-        haveLastFusePose = true;
-        lastFuseCalibrated = calibratedNow;
 
         // 体素场变了 -> 网格变脏
         meshDirty = true;
@@ -3169,7 +3065,8 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
     s << "V0.5.1 HQ Reconstruction\n"
       << "Tracking frames: " << vio.frames() << "  features: " << vio.features() << "\n"
       << "VINS: " << (vinsInitialized() ? "nonlinear initialized" : "initializing")
-      << "  poseSource: " << (vinsPoseOk ? "vins" : "vio") << "\n"
+      << "  poseSource: " << (vinsPoseOk ? "camera_at_exposure" : "unavailable") << "\n"
+      << "World continuity: " << (vinsWorldDiscontinuous() ? "RESET: export then restart scan" : "ok") << "\n"
       << "VINS raw q: (" << vinsQ[0] << ", " << vinsQ[1] << ", " << vinsQ[2] << ", " << vinsQ[3] << ")\n"
       << "VINS raw t: (" << vinsT[0] << ", " << vinsT[1] << ", " << vinsT[2] << ")\n"
       << "VINS estimator raw t: (" << rawVinsT[0] << ", " << rawVinsT[1] << ", " << rawVinsT[2] << ")\n"
@@ -3346,7 +3243,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " stableFrames=" << kEpochStableFrames
       << " stableStreak=" << epochStableStreak
       << " rebuildRatio=" << kEpochRebuildRatio
-      << " driftBadFrames=" << kEpochDriftBadFrames
+      << " driftSuspendFrames=" << kEpochDriftSuspendFrames
       << " calibLossFrames=" << kEpochCalibLossFrames
       << " badStreak=" << epochBadStreak
       << " driftRejects=" << epochDriftRejects
@@ -3430,7 +3327,8 @@ Java_com_mobilescan3d_NativeBridge_nativeGetGaussians(JNIEnv* e, jobject,
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeVinsInitialized(JNIEnv*, jobject) {
-    return vinsInitialized() ? JNI_TRUE : JNI_FALSE;
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    return (vinsPoseOk && !vinsWorldDiscontinuous()) ? JNI_TRUE : JNI_FALSE;
 }
 
 // V0.13.1：UI 靠它区分「还没初始化（该提示用户移动）」与「初始化后跟丢
@@ -3811,9 +3709,8 @@ Java_com_mobilescan3d_NativeBridge_nativeSetTargetDebugEnabled(JNIEnv*, jobject,
 /**
  * 按 SENSOR_TIMESTAMP 查历史位姿（AR 正确跟随的前提）。
  *
- * 第一版只做最近邻：|sample.ts - ts| 最小且 < 80ms 就返回。
- * 以后若发现快速运动下仍有偏差，再升级成 translation 线性插值 +
- * 四元数 slerp —— 但现在先把「用对时刻」这件事做出来。
+ * 使用相邻有效曝光位姿的 translation lerp + quaternion slerp。
+ * 历史不足时只允许 80ms 内的最近样本，拒绝跨越跟踪空洞。
  */
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAt(JNIEnv* env, jobject,
@@ -3825,33 +3722,13 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAt(JNIEnv* env, jobject,
     float pose[12];
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
-        if (renderPoseHistory.empty()) {
+        if (!vinsPoseOk || vinsWorldDiscontinuous() || renderPoseHistory.empty()) {
             return JNI_FALSE;
         }
-        const int64_t want = static_cast<int64_t>(timestampNs);
-        const RenderPoseSample* best = nullptr;
-        int64_t bestDelta = 0;
-        for (const RenderPoseSample& rp : renderPoseHistory) {
-            int64_t d = static_cast<int64_t>(rp.ts) - want;
-            if (d < 0) {
-                d = -d;
-            }
-            if (best == nullptr || d < bestDelta) {
-                best = &rp;
-                bestDelta = d;
-            }
-        }
-        // 找到的样本离目标时刻太远 = 这段历史里没有对应时刻的位姿。
-        // 此时宁可返回 false 让上层回退，也不要拿错时刻的 pose 去画 AR。
-        if (best == nullptr || bestDelta > kRenderPoseMaxAgeNs) {
+        if (timestampNs <= 0 || !scan_pose::lookup(renderPoseHistory,
+                static_cast<uint64_t>(timestampNs), kRenderPoseMaxAgeNs, pose)) {
             return JNI_FALSE;
         }
-        for (int i = 0; i < 9; ++i) {
-            pose[i] = best->R[i];
-        }
-        pose[9] = best->t[0];
-        pose[10] = best->t[1];
-        pose[11] = best->t[2];
     }
     // V0.7 saved-world transform (timestamp).
     float savedR[9];
@@ -3900,7 +3777,7 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject
     int64_t probeDeltaMs = 0;
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
-        if (renderPoseHistory.empty()) {
+        if (!vinsPoseOk || vinsWorldDiscontinuous() || renderPoseHistory.empty()) {
             return JNI_FALSE;
         }
         const int64_t want = static_cast<int64_t>(timestampNs);

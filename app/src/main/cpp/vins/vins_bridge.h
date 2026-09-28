@@ -37,6 +37,10 @@ void vinsInputImu(double t, double ax, double ay, double az, double gx, double g
 void vinsInputImage(double t, const std::uint8_t* gray, int w, int h, int stride);
 
 bool vinsGetPose(float* out7);
+// Camera-to-world pose propagated to the requested SENSOR_TIMESTAMP.
+// Returns false on stale state, missing IMU support, or a reset world.
+bool vinsGetCameraPoseAt(std::uint64_t timestampNs, float* out7);
+bool vinsWorldDiscontinuous();
 
 bool vinsReady();
 

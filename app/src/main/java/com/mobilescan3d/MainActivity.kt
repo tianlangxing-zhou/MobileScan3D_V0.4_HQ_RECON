@@ -834,8 +834,7 @@ private var lastRelocPollMs = 0L
         try {
             NativeBridge.nativeSetTargetDebugEnabled(
                 arDrawMode == PointCloudRenderer.DRAW_TARGET_DEBUG ||
-                    arDrawMode == PointCloudRenderer.DRAW_BOTH ||
-                    arDrawMode == PointCloudRenderer.DRAW_LIVE
+                    arDrawMode == PointCloudRenderer.DRAW_BOTH
             )
         } catch (_: Throwable) {
         }
@@ -3768,7 +3767,7 @@ private var lastRelocPollMs = 0L
                 false
             }
             warningBanner.text = if (everInit) {
-                "定位失锁：位姿不可用于拼接 · 请回到已扫描区域"
+                "定位不可用：已保留模型 · 回到已扫区域；若持续失锁，请先导出再重新扫描"
             } else {
                 "初始化中：请手持手机缓慢平移，建立定位后开始拼接"
             }
@@ -3890,8 +3889,7 @@ private var lastRelocPollMs = 0L
             }
         )
         val wantDebug = arDrawMode == PointCloudRenderer.DRAW_TARGET_DEBUG ||
-            arDrawMode == PointCloudRenderer.DRAW_BOTH ||
-            arDrawMode == PointCloudRenderer.DRAW_LIVE
+            arDrawMode == PointCloudRenderer.DRAW_BOTH
         try {
             NativeBridge.nativeSetTargetDebugEnabled(wantDebug)
         } catch (_: Throwable) {
@@ -3918,7 +3916,7 @@ private var lastRelocPollMs = 0L
                 PointCloudRenderer.DRAW_MESH ->
                     "只画重建网格（TSDF 零交叉面 -> Marching Tetrahedra）"
                 PointCloudRenderer.DRAW_LIVE ->
-                    "实时预览：半透明网格 + 累计点(青) + 当前帧点(亮绿)"
+                    "实时预览：世界坐标累计点云 + 连续融合网格"
                 else -> "只画当前帧 target depth 调试层（验证 AR 坐标链）"
             }
         )
