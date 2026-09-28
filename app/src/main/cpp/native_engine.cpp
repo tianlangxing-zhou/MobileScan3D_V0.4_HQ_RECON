@@ -655,6 +655,66 @@ static void downscaleYuvToBgr(const uint8_t* y, const uint8_t* u, const uint8_t*
     }
 }
 
+// 点云生成规律：从屏幕中心向外、由被追踪物体向外。
+// 中心置信度高、边缘低；被追踪物体中心附近高、远处低 —— 让实时点云
+// 在屏幕中心与物体周围最密，向边缘/远处自然变稀（"从中心向外生长"的观感）。
+static constexpr float kScreenEdgeFalloff = 0.85f; // 0=无中心加权, 1=边缘最强压低
+static constexpr float kScreenMin = 0.20f;          // 屏幕边缘点最低保留权重
+static constexpr float kObjFalloff = 2.2f;          // 物体中心向外衰减速率
+static constexpr float kObjMin = 0.30f;             // 远离物体点最低保留权重
+
+static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& s,
+                             float confidence, bool haveObj, float objCx, float objCy) {
+    if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
+        return;
+    }
+    // 与 fuseDepth 同一套内参降采样（深度 256² -> 相机分辨率）。
+    const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+    const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
+    std::vector<float> ranged(depth, depth + static_cast<size_t>(w) * h);
+    filterScanRange(ranged, w, h, dFx, dFy, dCx, dCy);
+    depth = ranged.data();
+    const float diag = std::sqrtf(static_cast<float>(w * w + h * h));
+    for (int y = 0; y < h; ++y) {
+        const int yy = std::min(s.h - 1, y * s.h / h);
+        for (int x = 0; x < w; ++x) {
+            const int xx = std::min(s.w - 1, x * s.w / w);
+            float z = depth[(size_t)y * w + x];
+            if (!(z > 0.08f && z < 8.f)) {
+                continue;
+            }
+            // ---- 中心加权：屏幕中心 + 被追踪物体中心 ----
+            const float u = (x + 0.5f) / w;
+            const float v = (y + 0.5f) / h;
+            const float dc = std::sqrtf((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f));
+            float wScreen = 1.f - std::min(1.f, dc * 1.41421356f) * kScreenEdgeFalloff;
+            wScreen = std::max(kScreenMin, wScreen);
+            float wObj = 1.f;
+            if (haveObj) {
+                const float dx = static_cast<float>(x) - objCx;
+                const float dy = static_cast<float>(y) - objCy;
+                const float dobj = std::sqrtf(dx * dx + dy * dy) / diag;
+                wObj = 1.f - std::min(1.f, dobj * kObjFalloff);
+                wObj = std::max(kObjMin, wObj);
+            }
+            const float wC = wScreen * wObj;
+            if (wC < 0.02f) {
+                continue;
+            }
+            const float c = confidence * wC;
+            if (c < 0.05f) {
+                continue; // 与 SurfelEngine::ingestPoint 丢弃阈值一致
+            }
+            float Xc = (x - dCx) * z / dFx;
+            float Yc = (y - dCy) * z / dFy;
+            float Xw, Yw, Zw;
+            rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
+            size_t o = ((size_t)yy * s.w + xx) * 3;
+            g.ingestPoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2], c);
+        }
+    }
+}
+
 static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
         return;
@@ -668,23 +728,9 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     depth = ranged.data();
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
                         dFx, dFy, dCx, dCy, s.R, s.t, confidence);
-
-    for (int y = 0; y < h; ++y) {
-        const int yy = std::min(s.h - 1, y * s.h / h);
-        for (int x = 0; x < w; ++x) {
-            const int xx = std::min(s.w - 1, x * s.w / w);
-            float z = depth[(size_t)y * w + x];
-            if (!(z > 0.08f && z < 8.f)) {
-                continue;
-            }
-            float Xc = (x - dCx) * z / dFx;
-            float Yc = (y - dCy) * z / dFy;
-            float Xw, Yw, Zw;
-            rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
-            size_t o = ((size_t)yy * s.w + xx) * 3;
-            g.ingestPoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2], confidence);
-        }
-    }
+    // 注意：场景 surfel（g）的喂入已**解耦**到 feedSceneSurfels()，
+    // 在 nativeOnCameraFrameImpl 里独立于融合门控持续喂入，避免 epoch 挂起时
+    // 点云冻结/错位。此处只负责 TSDF 融合（仍受 fusionDepth != nullptr 门控）。
 }
 
 // ------------------------------------------------------------- V0.9 stereo anchors
@@ -2454,6 +2500,19 @@ static void nativeOnDepthMapImpl(
             if (epochActive && epochSuspended) {
                 fusionSuspendedFrames++;
             }
+        }
+
+        // 场景 surfel 解耦喂入：epoch 挂起时融合被门控（fusionDepth==nullptr），
+        // 但 zEpoch（已标定的深度）仍每帧重建 —— 用它在挂起期间持续喂场景点云，
+        // 让实时点云不冻结、且随当前相机位姿更新（消除"点云错位/滞后"）。
+        // 中心加权（屏幕中心 + 被追踪物体中心）实现"从中心向外、由物体向外"生成。
+        const float* surfelDepth = fusionDepth;
+        if (surfelDepth == nullptr && epochActive && calibEnabledEff && epochSuspended) {
+            surfelDepth = zEpoch.data();
+        }
+        if (surfelDepth != nullptr) {
+            feedSceneSurfels(surfelDepth, w, h, *match, conf,
+                             (haveTi && maskOk), targetMaskStats.centerX, targetMaskStats.centerY);
         }
 
         // ---- V0.9 sparse stereo high-confidence TSDF constraints ----
