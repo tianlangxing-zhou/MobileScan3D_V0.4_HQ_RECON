@@ -2307,6 +2307,26 @@ static void nativeOnDepthMapImpl(
                  targetMaskStats.area, pd.centerOffsetRatio,
                  (int)pd.appearanceOk, (int)pd.motionOk, (int)pd.maskOk, (int)pd.centerOk);
         }
+        if ((depthFrames % 60) == 0) {
+            // V0.13.19.3 实时目标诊断：identity/mask/epoch-drift/depthscale 周期打印，
+            // 用于定位「目标漂移 / 锁不住 / 粗糙」根因。纯只读打印，不改行为。
+            LOGI("TargetDiag anchor=%d idScore=%.3f idRej=%llu bboxScale=%.3f "
+                 "maskArea=%.0f areaRatio=%.3f borderTouch=%.3f over=%d "
+                 "epochSusp=%d driftRej=%llu lastDriftRel=%.4f frozenScale=%.4f frozenShift=%.4f "
+                 "depthApplied=%.4f depthEma=%.4f depthSamp=%d "
+                 "targetG=%llu targetVox=%llu targetFuse=%llu",
+                 (int)ti.identityAnchorReady,
+                 ti.identityScore, (unsigned long long)ti.identityRejects,
+                 ti.bboxScaleFromInitial,
+                 (float)targetMaskStats.area, targetMaskStats.areaRatio,
+                 targetMaskStats.borderTouch, (int)targetMaskStats.overExpanded,
+                 (int)epochSuspended, (unsigned long long)epochDriftRejects,
+                 epochLastDriftRel, epochCalib.scale, epochCalib.shift,
+                 currentTargetDepthScale(), targetDepthScaleEma, (int)targetDepthScaleSamples,
+                 (unsigned long long)targetG.count(),
+                 (unsigned long long)targetTsdf.voxels(),
+                 (unsigned long long)targetFuseFrames);
+        }
         if (presenceOk) {
             presenceFailStreak = 0;
         } else {
