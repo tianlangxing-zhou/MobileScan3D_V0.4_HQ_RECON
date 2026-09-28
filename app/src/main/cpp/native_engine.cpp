@@ -2402,10 +2402,17 @@ static void nativeOnDepthMapImpl(
             }
         }
 
-        // Point cloud and TSDF share the same accepted pose/depth transaction.
-        // Suspended/uncalibrated depth must not create a second shell of points.
-        if (fusionDepth != nullptr) {
-            feedSceneSurfels(fusionDepth, w, h, *match, conf,
+        // 点云（场景 surfel g）与 TSDF 融合**解耦**：融合只在 epoch 稳定时写几何，
+        // 但点云显示必须连续——epoch 挂起(漂移/换视角)时用已标定的 zEpoch 持续喂，
+        // 消除 V0.13.19 重新耦合导致的"点云冻结 / 换视角不生成 / 不连续"。
+        // 仅用 zEpoch 喂**可视化点云**；TSDF 融合仍走 fusionDepth 门控，不会在 mesh 堆第二层壳
+        // （V0.13.19 担心的风险只针对融合写入，不针对点云显示层）。
+        const float* surfelDepth = fusionDepth;
+        if (!surfelDepth && epochActive && calibEnabledEff && !zEpoch.empty()) {
+            surfelDepth = zEpoch.data();
+        }
+        if (surfelDepth != nullptr) {
+            feedSceneSurfels(surfelDepth, w, h, *match, conf,
                              (haveTi && maskOk), targetMaskStats.centerX, targetMaskStats.centerY);
         }
 
