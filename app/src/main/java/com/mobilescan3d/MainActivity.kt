@@ -2490,8 +2490,8 @@ private var lastRelocPollMs = 0L
                         val res = provider.latest()
                         if (res != null && res.depth.isNotEmpty()) synchronized(depthSessionLock) {
                             if (generation == depthGeneration && scanning && scanNativeReady && resumed && !isDestroyed) {
-                                NativeBridge.nativeOnDepthMap(res.depth, res.width, res.height,
-                                    .5f, res.timestampNs, res.representation.nativeCode)
+                                NativeBridge.nativeOnDepthMapWeighted(res.depth, res.width, res.height,
+                                    .5f, res.timestampNs, res.representation.nativeCode, res.confidence)
                                 depthCompletedMs = android.os.SystemClock.elapsedRealtime()
                                 depthLastError = ""
                                 glView.requestRender()
@@ -2751,7 +2751,7 @@ private var lastRelocPollMs = 0L
      * 构建（Marching Tetrahedra + 去小分量 + 孤立面 + Taubin + QEM 简化）
      * 可能几百毫秒到数秒，所以整条链在后台线程，回调再回主线程挂到 Renderer。
      */
-    private fun buildMeshAndExport(sessionId: String, quality: Int) {
+    private fun buildMeshAndExport(sessionId: String, quality: Int, shape: Int = 0) {
         if (!::exportManager.isInitialized) return
         if (scanning || modelOperationBusy) {
             toast("请先停止扫描，并等待当前模型操作完成")
@@ -2761,7 +2761,7 @@ private var lastRelocPollMs = 0L
         val label = meshQualityLabel(quality)
         toast("正在重建网格（$label），请稍候…")
         try {
-            exportManager.buildAndExportGlb(sessionId, quality) { r ->
+            exportManager.buildAndExportGlb(sessionId, quality, shape) { r ->
                 modelOperationBusy = false
                 if (isDestroyed || this.sessionId != sessionId) return@buildAndExportGlb
                 renderer.clearTexturedMesh()
@@ -4122,7 +4122,10 @@ private var lastRelocPollMs = 0L
                     "生成网格 + 导出 GLB（常规）",
                     "生成网格 + 导出 GLB（HQ）",
                     "只生成网格（AR 预览）",
-                    "保存 GLB 到文件…"
+                    "保存 GLB 到文件…",
+                    "硬表面规整 + 照片贴图 GLB",
+                    "长方体拟合 + 照片贴图 GLB（可能补面）",
+                    "正方体拟合 + 照片贴图 GLB（可能补面）"
                 )
             ) { _, which ->
                 when (which) {
@@ -4131,6 +4134,9 @@ private var lastRelocPollMs = 0L
                     2 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_NORMAL)
                     3 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ)
                     5 -> saveLatestGlb()
+                    6 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 1)
+                    7 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 2)
+                    8 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 3)
                     else -> {
                         // 预览网格不需要每次都重建：缓存命中就直接挂上去。
                         val cached = if (::exportManager.isInitialized) exportManager.lastMesh else null

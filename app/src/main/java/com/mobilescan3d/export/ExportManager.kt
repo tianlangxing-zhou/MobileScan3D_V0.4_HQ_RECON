@@ -249,23 +249,28 @@ class ExportManager(context: Context) {
      *
      * 这是**扫描结束时的默认动作**：一次会话结束后端到端地给出可用的 AR 模型。
      */
-    fun buildAndExportGlb(sessionId: String, quality: Int, onDone: (GlbResult) -> Unit) {
+    fun buildAndExportGlb(sessionId: String, quality: Int, shape: Int = 0, onDone: (GlbResult) -> Unit) {
         val q = quality.coerceIn(0, 2)
+        val shapeMode = shape.coerceIn(0, 3)
+        val suffix = arrayOf("", "_planar", "_cuboid", "_cube")[shapeMode]
+        val exportId = sessionId + suffix
         io.execute {
-            val file = File(outputDir, "scan_$sessionId.glb")
-            val staging = File(outputDir, "scan_$sessionId.pending.glb")
+            val file = File(outputDir, "scan_$exportId.glb")
+            val staging = File(outputDir, "scan_$exportId.pending.glb")
             var verts = 0
             var tris = 0
             var ok = false
             var textured = false
             var persistenceMessage: String? = null
             var msg = ""
+            var shapeReport = ""
             try {
                 staging.delete()
                 lastMesh = null
                 // Never reuse an earlier bake when this export falls back to vertex color.
                 NativeBridge.nativeClearTexturedArAsset()
-                ok = NativeBridge.nativeBuildMesh(q)
+                ok = NativeBridge.nativeBuildMeshWithShape(q, shapeMode)
+                shapeReport = if (shapeMode > 0) NativeBridge.nativeGetHardSurfaceReport() else ""
                 if (ok) {
                     val mesh = pullMesh()
                     lastMesh = mesh
@@ -317,7 +322,7 @@ class ExportManager(context: Context) {
                     }
                     // Save before the completion callback releases the UI operation guard.
                     persistenceMessage = ScanPackageManager.saveCurrent(
-                        appContext, sessionId, file
+                        appContext, exportId, file
                     ).message
                 }
                 msg = when {
@@ -326,6 +331,7 @@ class ExportManager(context: Context) {
                     textured -> "HQ 纹理模型已导出：${file.absolutePath}"
                     else -> "网格已导出（vertex color；纹理烘焙未生效）：${file.absolutePath}"
                 }
+                if (shapeReport.isNotBlank()) msg += "\n$shapeReport"
                 // V0.13.9：烘焙诊断持久化。logcat 主缓冲区被相机 HAL 噪音冲刷极快，
                 // bakeDiag 行常在取证前丢失；改为落盘到 GLB 同目录，adb pull 随时可取。
                 if (ok) {
@@ -334,6 +340,8 @@ class ExportManager(context: Context) {
                         val cs = meshCleanupStats()
                         val diag = org.json.JSONObject().apply {
                             put("sessionId", sessionId)
+                            put("shapeMode", shapeMode)
+                            put("shapeReport", shapeReport)
                             put("ts", System.currentTimeMillis())
                             put("textured", textured)
                             put("vertices", verts)

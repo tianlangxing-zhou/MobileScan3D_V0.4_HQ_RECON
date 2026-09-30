@@ -1,0 +1,59 @@
+Running run.py
+==20==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==20==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS plain0.glb
+PASS plain1.glb
+PASS plain2.glb
+PASS plain3.glb
+PASS textured.glb
+PASS malformed mesh rejection, comma locale, unequal depth arrays; ASan/UBSan clean (leak detection disabled)
+PASS plain/textured GLB +Y up, preserved handedness, unchanged AR asset save/load
+Running run_geometry.py
+==35==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==35==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+plane z median=1.007 count=6721
+PASS projection, fixed inverse calibration, invalid samples, sign reversal, world coordinates, TSDF budget and plane mesh
+Running run_scan_policy.py
+==46==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==46==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS radial range, meter conversion, invalid inputs, frozen evidence, near-only TSDF mesh
+Running run_optimization.py
+==59==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==59==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+offset_fit_valid=1 offset_max_error_m=0
+inverse=0 noisy_max_relative_error=0.000274532
+inverse=1 noisy_max_relative_error=0.000324612
+calibration_samples=512
+centroid_error_m=2.5779e-08
+oversized_min_hits_copied=0
+fusion_digest=10245960488155071710 voxels=29432 blocks=128
+fusion_median_ms_per_frame=15.0015
+PASS calibration stability, noisy/outlier fits, sampling budget, centroid, hit threshold, fusion/reset
+Running run_continuity.py
+==72==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==72==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS: timestamp prediction, IMU gaps/bias, camera extrinsics, 20-view surfel merge, 7-view TSDF mesh; max plane error=0.00249171 m
+Running run_robustness.py
+==85==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==85==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS numeric
+==86==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==86==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS ray
+==87==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==87==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS cluster
+==88==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==88==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS asset
+PASS all host native suites
+
+NEW ROUND 2+3 SUITE
+==28==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==28==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS temporal identity, conflicts, visibility changes, z-buffer, huge projection, source confidence, resize, buffer reuse
+PASS zero weights prevent TSDF allocation; unit weights preserve voxel count
+cuboid support=1 rms=9.70252e-08 ms=33.0573
+PASS box UV unwrap indices=36
+PASS rotated/noisy/partial cuboid, cube constraint, hard normals/winding, planar, sphere/thin/two-face/separated/dented/invalid rejection
+PASS cuboid GLB header, 24 vertices / 36 indices

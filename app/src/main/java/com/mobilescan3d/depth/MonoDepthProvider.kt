@@ -30,6 +30,7 @@ class MonoDepthProvider(
 
     private val pre = DepthPreprocessor(inputSize)
     private val output = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
+    private val timing = DepthPerformance("DepthInferencePerf", "preprocess", "inference", "copy", "total")
     private val depthSmall = FloatArray(inputSize * inputSize)
 
     // 评审 P0-1：不再做会话级 min/max 动态映射，也不上采样到相机分辨率。
@@ -60,8 +61,11 @@ class MonoDepthProvider(
         val itp = interpreter ?: return false
         if (width <= 0 || height <= 0) return false
 
+        val started = System.nanoTime()
         pre.fill(y, u, v, width, height, rowStride, uRowStride, uPixelStride)
+        val prepared = System.nanoTime()
         itp.run(pre.tensor, output)
+        val inferred = System.nanoTime()
 
         // 评审 P0-1 + P0-2：直接取原始模型输出 q，固定 INVERSE_DEPTH 语义，
         // 不做会话级 min/max、不做 [0.4,6] 映射、不上采样到相机分辨率。
@@ -74,6 +78,9 @@ class MonoDepthProvider(
             }
         }
 
+        val copied = System.nanoTime()
+        timing.record((prepared-started)/1_000_000f, (inferred-prepared)/1_000_000f,
+            (copied-inferred)/1_000_000f, (copied-started)/1_000_000f)
         latestResult = DepthProvider.Result(
             depth = depthSmall,
             width = inputSize,
@@ -90,6 +97,7 @@ class MonoDepthProvider(
     override fun latest(): DepthProvider.Result? = latestResult
 
     override fun reset() {
+        timing.reset()
         latestResult = null
     }
 

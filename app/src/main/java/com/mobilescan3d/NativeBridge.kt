@@ -273,6 +273,9 @@ object NativeBridge {
     external fun nativeDestroy()
     external fun nativeOnImu(t:Long,ax:Float,ay:Float,az:Float,gx:Float,gy:Float,gz:Float)
     external fun nativeOnCameraFrame(y:ByteArray,u:ByteArray,v:ByteArray,w:Int,h:Int,rowStride:Int,uRowStride:Int,uPixelStride:Int,frameTimestampNs:Long,vinsTimestampNs:Long)
+    external fun nativeOnDepthMapWeighted(depth: FloatArray, w: Int, h: Int,
+        confidence: Float, timestampNs: Long, representation: Int, sourceConfidence: FloatArray?)
+
     external fun nativeOnDepthMap(depth:FloatArray,w:Int,h:Int,confidence:Float,timestamp:Long,representation:Int)
     external fun nativeExportPly(path:String):Boolean
     external fun nativeSetMode(m:Int)
@@ -446,6 +449,9 @@ object NativeBridge {
      * 有目标模型时优先用目标体素场（与「有目标就只导目标」的口径一致）。
      */
     external fun nativeBuildMesh(quality: Int): Boolean
+    // 0 scan, 1 planar, 2 cuboid, 3 cube. Failed fits export the original scan.
+    external fun nativeBuildMeshWithShape(quality: Int, shape: Int): Boolean
+    external fun nativeGetHardSurfaceReport(): String
 
     /** 网格统计（[MESH_STATS_SLOTS] 槽）。 */
     external fun nativeGetMeshStats(): IntArray

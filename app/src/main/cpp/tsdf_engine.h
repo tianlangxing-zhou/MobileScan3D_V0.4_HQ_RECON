@@ -104,12 +104,21 @@ public:
      *
      * @param depthScale / depthShift  深度标定后的仿射修正 z' = z*scale + shift。
      *        默认 1/0 表示「不做修正」，行为与旧版本一致。
+     * @param pixelWeight  可选的**逐像素**可信度图，长度 w*h，取值 [0,1]；
+     *        为 nullptr（默认）时退化为「整帧统一用 confidence」，行为与旧版本
+     *        完全一致，所以既有调用点不需要改动。
+     *
+     *        为什么需要逐像素：整帧一个 confidence 时，一帧里可靠的平面、
+     *        物体边缘和明显错误的深度拿不到区别。要么整帧一起降权（把好像素
+     *        也拖累），要么整帧照收（把坏像素也收进去）。逐像素权重让**同一帧
+     *        里**可靠的区域正常累积、局部错误被拒绝。
      */
     void integrateDepth(const float* depth, int w, int h,
                         const uint8_t* rgb, int rgbW, int rgbH,
                         float fx, float fy, float cx, float cy,
                         const float R[9], const float t[3], float confidence,
-                        float depthScale = 1.f, float depthShift = 0.f);
+                        float depthScale = 1.f, float depthShift = 0.f,
+                        const float* pixelWeight = nullptr);
 
     /** 已经分配且 weight > 0 的体素数。 */
     uint64_t voxels() const { return liveVoxels_; }

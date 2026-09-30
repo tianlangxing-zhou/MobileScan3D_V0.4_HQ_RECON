@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "../tsdf_engine.h"
 
@@ -93,6 +94,12 @@ public:
      */
     bool build(const TsdfEngine& tsdf, const MeshOptions& opt, MeshBuildStats& stats);
 
+    // Export-only geometry replacement. TSDF and retained scan observations stay intact.
+    void replaceExportMesh(Mesh replacement) {
+        mesh_ = std::move(replacement);
+        stats_.outVertices = mesh_.vertexCount();
+        stats_.outTriangles = mesh_.triangleCount();
+    }
     const Mesh& mesh() const { return mesh_; }
     const MeshBuildStats& stats() const { return stats_; }
 

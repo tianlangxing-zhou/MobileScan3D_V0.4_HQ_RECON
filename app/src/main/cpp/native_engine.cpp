@@ -2,6 +2,8 @@
 #include <android/log.h>
 #include <vulkan/vulkan.h>
 #include <sstream>
+#include <string>
+#include <cstdio>
 #include <algorithm>
 #include <mutex>
 #include <vector>
@@ -27,10 +29,12 @@
 #include "object_tracker.h"
 #include "target_mask_engine.h"
 #include "depth_calib.h"
+#include "depth_confidence.h"
 #include "depth_geometry.h"
 #include "scan_policy.h"
 #include "stereo_anchor_bridge.h"
 #include "mesh/mesh_engine.h"
+#include "mesh/hard_surface.h"
 #include "export/gltf_exporter.h"
 #include "v06/mesh_postprocess.h"
 #include "v06/uv_unwrap.h"
@@ -75,6 +79,8 @@ static TargetMaskEngine targetMaskEngine;
 //   TSDF -> Marching Tetrahedra -> 去小分量/平滑/简化 -> GLB
 // 链路。构建是一次性操作（用户点「生成网格」或停止扫描时），不是每帧。
 static MeshEngine meshEngine;
+static bool meshHasHardEdges = false;
+static HardSurfaceStats hardSurfaceStats;
 static MeshBuildStats meshStats;
 static int meshQuality = 1;            // 0 = preview / 1 = normal / 2 = hq
 static bool meshDirty = true;          // 体素场变了置脏，避免重复构建
@@ -263,9 +269,26 @@ static float lastFuseR[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
 static float lastFuseT[3] = {0.f, 0.f, 0.f};
 static bool haveLastFusePose = false;
 static bool lastFuseCalibrated = false;
+static int lastFuseW = 0, lastFuseH = 0;
+static uint64_t lastFuseTs = 0;
+static float lastFuseK[4]{};
 static float lastTemporalRatio = 1.f;
 static uint64_t temporalChecks = 0;
 static uint64_t temporalRejects = 0;
+
+// ---- 逐像素时序掩码 + 融合权重（复用缓冲） ----
+// 深度是 256² = 65536 个像素，每帧重新分配这几块纯属浪费。nativeOnDepthMapImpl
+// 全程持 gStateMutex，且 Kotlin 侧 depthBusy 的 CAS 保证同一时刻只有一帧在走
+// 这条路径，所以这里不需要额外加锁。
+static std::vector<float> gProjectedDepth;
+static std::vector<uint8_t> gTemporalMask;  // 未测试 / 一致 / 冲突 / 遮挡 / 显露
+static std::vector<float> gPixelWeight;     // 逐像素融合权重 [0,1]
+static std::vector<float> gRangedFusion;    // filterScanRange 后的待融合深度
+static std::vector<float> gRangedSurfel;    // 可视化点云路径单独过滤时的深度
+static int lastTemporalTested = 0;
+static int lastTemporalAgree = 0;
+static int lastTemporalDisagree = 0;
+static float lastLockWaitMs = 0.f;
 static cv::Mat targetMaskMat;        // 与 depth 同尺寸的 CV_8U，目标内 255
 static TargetMaskStats targetMaskStats;
 
@@ -620,17 +643,24 @@ static constexpr float kScreenMin = 0.20f;          // 屏幕边缘点最低保�
 static constexpr float kObjFalloff = 2.2f;          // 物体中心向外衰减速率
 static constexpr float kObjMin = 0.30f;             // 远离物体点最低保留权重
 
+/**
+ * 喂场景点云（可视化 surfel）。
+ *
+ * **前置条件**：`depth` 必须已由调用方做过 filterScanRange() —— 与 fuseDepth()
+ * 共用同一份过滤结果，不再各复制各过滤一遍。
+ *
+ * @param pixelWeight 可选逐像素可信度，与 TSDF 用的是同一张图，保证「点云看到的」
+ *        与「体素写进去的」可信度一致。
+ */
 static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& s,
-                             float confidence, bool haveObj, float objCx, float objCy) {
+                             float confidence, bool haveObj, float objCx, float objCy,
+                             const float* pixelWeight = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
         return;
     }
     // 与 fuseDepth 同一套内参降采样（深度 256² -> 相机分辨率）。
     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
-    std::vector<float> ranged(depth, depth + static_cast<size_t>(w) * h);
-    filterScanRange(ranged, w, h, dFx, dFy, dCx, dCy);
-    depth = ranged.data();
     const float diag = std::sqrt(static_cast<float>(w * w + h * h));
     for (int y = 0; y < h; ++y) {
         const int yy = std::min(s.h - 1, y * s.h / h);
@@ -654,7 +684,14 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
                 wObj = 1.f - std::min(1.f, dobj * kObjFalloff);
                 wObj = std::max(kObjMin, wObj);
             }
-            const float wC = wScreen * wObj;
+            // 逐像素可信度（TSDF 用同一张图，二者口径一致）
+            float wP = 1.f;
+            if (pixelWeight) {
+                const float pw = pixelWeight[(size_t)y * w + x];
+                if (!std::isfinite(pw) || pw <= 0.f) continue;
+                wP = std::clamp(pw, 0.f, 1.f);
+            }
+            const float wC = wScreen * wObj * wP;
             if (wC < 0.02f) {
                 continue;
             }
@@ -672,7 +709,17 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
     }
 }
 
-static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence) {
+/**
+ * 融合一帧深度进场景 TSDF。
+ *
+ * **前置条件**：`depth` 必须已经由调用方做过 filterScanRange()。原来这里自己
+ * 复制一份再过滤，而 feedSceneSurfels() 对同一份深度又复制过滤了一遍 —— 同一
+ * 帧被复制两次、过滤两次。现在上移到调用方做一次、两个消费者共用。
+ *
+ * @param pixelWeight 可选逐像素可信度（长度 w*h，[0,1]），nullptr 表示整帧同权。
+ */
+static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence,
+                      const float* pixelWeight = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
         return;
     }
@@ -680,13 +727,98 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     // 深度/相机分辨率比降采样，否则几何会被拉伸到相机分辨率量级。
     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
-    std::vector<float> ranged(depth, depth + static_cast<size_t>(w) * h);
-    filterScanRange(ranged, w, h, dFx, dFy, dCx, dCy);
-    depth = ranged.data();
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
-                        dFx, dFy, dCx, dCy, s.R, s.t, confidence);
+                        dFx, dFy, dCx, dCy, s.R, s.t, confidence,
+                        1.f, 0.f, pixelWeight);
     // 注意：场景 surfel（g）的喂入已**解耦**到 feedSceneSurfels()，
     // 与 TSDF 共用融合门控；暂停时保留已有几何，不再喂不可信观测。
+}
+
+// ------------------------------------------------------------- 分阶段耗时统计
+//
+// 真机上「这帧慢」只是个总数，定位不到慢在哪个阶段。而后面两件想做的事
+// （缩短 gStateMutex 占用、TSDF 改成「活跃块筛选 + 体素投影」两阶段）都该
+// 先有基线数据再决定投入 —— 否则既判断不了收益，也发现不了回退。
+//
+// 每个阶段留一个环形缓冲，周期输出 P50/P95（不是均值：均值会被少数极端帧
+// 拉平，而卡顿恰恰是由尾部的那几帧决定的）。
+static constexpr int kPerfWindow = 120;
+// 深度回调在真机上只有几 fps（TFLite 单目 256² 的推理是瓶颈），60 帧要十几秒
+// 才出一条，排查时太稀疏；30 帧在 3fps 下约 10 秒一条，够用又不至于刷屏。
+static constexpr int kPerfLogInterval = 30;
+
+class PerfRing {
+public:
+    void push(float v) {
+        buf_[head_] = v;
+        head_ = (head_ + 1) % kPerfWindow;
+        if (n_ < kPerfWindow) ++n_;
+    }
+    /** 只在周期输出时调用（每 kPerfLogInterval 帧一次），不在热路径上分配。 */
+    float percentile(float q) const {
+        if (n_ == 0) return 0.f;
+        float v[kPerfWindow];
+        std::copy(buf_, buf_ + n_, v);
+        std::sort(v, v + n_);
+        int idx = std::clamp(int(q * (n_ - 1) + 0.5f), 0, n_ - 1);
+        return v[idx];
+    }
+    void reset() { n_ = 0; head_ = 0; }
+private:
+    float buf_[kPerfWindow]{};
+    int n_ = 0;
+    int head_ = 0;
+};
+
+enum PerfStage : int {
+    kPerfCalib = 0,
+    kPerfTemporal,
+    kPerfWeight,
+    kPerfFuse,
+    kPerfSurfel,
+    kPerfStereo,
+    kPerfLock,
+    kPerfTotal,
+    kPerfStageCount,
+};
+
+static PerfRing gPerf[kPerfStageCount];
+static const char* const kPerfStageNames[kPerfStageCount] = {
+    "calib", "temporal", "weight", "fuse", "surfel", "stereo", "lock", "total"};
+// entered 与 completed 分开计数：深度回调里有几条 early return（位姿快照找不到、
+// VINS world 不连续、target 换代）。只统计走到末尾的帧会让人误以为「深度没在跑」，
+// 而实际可能是每帧都提前退出了 —— 这是两种完全不同的故障，必须能分开看。
+static uint64_t gPerfFrames = 0;      // 进入回调的帧数（入口处递增）
+static uint64_t gPerfCompleted = 0;   // 走到函数末尾的帧数
+
+static inline float perfMsSince(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
+static void perfLogIfDue() {
+    if (gPerfFrames % kPerfLogInterval != 0) {
+        return;
+    }
+    std::string s;
+    for (int i = 0; i < kPerfStageCount; ++i) {
+        char b[72];
+        snprintf(b, sizeof(b), "%s p50=%.1f p95=%.1f",
+                 kPerfStageNames[i],
+                 gPerf[i].percentile(0.5f),
+                 gPerf[i].percentile(0.95f));
+        if (i) s += " | ";
+        s += b;
+    }
+    // tmask 三项用来观察逐像素掩码到底判定出了多少东西：tested 太少说明重投影
+    // 几乎没有重叠（位姿动得太快或深度缺失），disagree 长期偏高说明深度本身不稳。
+    // lockWait 是锁等待 —— 只统计持锁时长会漏掉它，而它正是"渲染线程被卡住"的来源。
+    __android_log_print(ANDROID_LOG_INFO, "PerfStage",
+                        "entered=%llu done=%llu %s | tmask tested=%d agree=%d disagree=%d | lockWait=%.1f",
+                        static_cast<unsigned long long>(gPerfFrames),
+                        static_cast<unsigned long long>(gPerfCompleted), s.c_str(),
+                        lastTemporalTested, lastTemporalAgree, lastTemporalDisagree,
+                        static_cast<double>(lastLockWaitMs));
 }
 
 // ------------------------------------------------------------- V0.9 stereo anchors
@@ -920,11 +1052,27 @@ static void resetDepthCalibration() {
     lastTemporalRatio = 1.f;
     temporalChecks = 0;
     temporalRejects = 0;
+    lastTemporalTested = 0;
+    lastTemporalAgree = 0;
+    lastTemporalDisagree = 0;
+    gProjectedDepth.clear();
+    lastFuseW = lastFuseH = 0; lastFuseTs = 0;
+    gPerfFrames = gPerfCompleted = 0;
+    lastLockWaitMs = 0.f;
+    gTemporalMask.clear();
+    gPixelWeight.clear();
+    gRangedFusion.clear();
+    gRangedSurfel.clear();
+    for (int i = 0; i < kPerfStageCount; ++i) {
+        gPerf[i].reset();
+    }
     resetFusionEpoch();
 }
 
 static void resetMeshPipeline() {
     meshEngine = MeshEngine();
+    meshHasHardEdges = false;
+    hardSurfaceStats = {};
     meshStats = MeshBuildStats{};
     meshCleanupStats = MeshPostProcessStats{};
     gTextureKeyframes.clear();
@@ -1001,7 +1149,8 @@ static float currentTargetDepthScale() {
  *      完全不依赖 depth 的绝对准确性）。
  */
 static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s,
-                            const cv::Mat& maskIn, float confidence) {
+                            const cv::Mat& maskIn, float confidence,
+                            const float* pixelWeight = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || maskIn.empty()) {
         return;
     }
@@ -1012,7 +1161,10 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
 
     const float scale = currentTargetDepthScale();
 
-    std::vector<float> masked(static_cast<size_t>(w) * h, 0.f);
+    // 复用缓冲：目标融合每帧都走这里，256² = 65536 float 的分配完全没必要每帧做。
+    // （nativeOnDepthMapImpl 全程持 gStateMutex，本函数只在该上下文被调用。）
+    static std::vector<float> masked;
+    masked.assign(static_cast<size_t>(w) * h, 0.f);
     for (int y = 0; y < h; y++) {
         const float* srcRow = depth + static_cast<size_t>(y) * w;
         const uint8_t* mRow = mask.ptr<uint8_t>(y);
@@ -1034,7 +1186,8 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
     filterScanRange(masked, w, h, dFx, dFy, dCx, dCy);
     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
-                              dFx, dFy, dCx, dCy, s.R, s.t, confidence);
+                              dFx, dFy, dCx, dCy, s.R, s.t, confidence,
+                              1.f, 0.f, pixelWeight);
 
     for (int y = 0; y < h; ++y) {
         const int yy = std::min(s.h - 1, y * s.h / h);
@@ -1048,12 +1201,21 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
             if (!(z > 0.08f && z < 8.f)) {
                 continue;
             }
+            // 与场景侧同口径：目标点云也吃逐像素可信度，避免「体素里被降权的
+            // 像素，点云里还是满权重」这种两套容器不一致。
+            float wP = 1.f;
+            if (pixelWeight) {
+                const float pw = pixelWeight[static_cast<size_t>(y) * w + x];
+                if (!std::isfinite(pw) || pw <= 0.f) continue;
+                wP = std::clamp(pw, 0.f, 1.f);
+            }
             const float Xc = (x - dCx) * z / dFx;
             const float Yc = (y - dCy) * z / dFy;
             float Xw, Yw, Zw;
             rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
             const size_t o = (static_cast<size_t>(yy) * s.w + xx) * 3;
-            targetG.ingestPoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2], confidence);
+            targetG.ingestPoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2],
+                                confidence * wP);
         }
     }
     targetFuseFrames++;
@@ -1822,7 +1984,10 @@ static void buildTargetDebugLayer(const float* d, int w, int h,
 /** nativeOnDepthMap 的实现体；JNI 包装负责兜住所有 C++ 异常。 */
 static void nativeOnDepthMapImpl(
         JNIEnv* e, jfloatArray depth, jint w, jint h,
-        jfloat confidence, jlong t, jint representation) {
+        jfloat confidence, jlong t, jint representation, jfloatArray sourceConfidence = nullptr) {
+    // Serialize JNI callers before reusable storage; reset only takes gStateMutex.
+    static std::mutex depthCallbackMutex;
+    std::lock_guard<std::mutex> depthCallbackLock(depthCallbackMutex);
     if (!depth || w <= 0 || h <= 0 || w > 4096 || h > 4096 ||
         !std::isfinite(confidence) || confidence <= 0.f || representation < 0 || representation > 1) {
         return;
@@ -1831,14 +1996,42 @@ static void nativeOnDepthMapImpl(
     if (n < (jsize)(w * h)) {
         return;
     }
-    std::vector<float> d((size_t)w * h);
+    const auto tFrameStart = std::chrono::steady_clock::now();
+    // 复用缓冲：深度回调每帧都要一块 256² 的 float，没必要每帧分配一次。
+    // 由原生 depthCallbackMutex 串行保护，不依赖 Kotlin 调用约定。
+    static std::vector<float> d;
+    d.resize(static_cast<size_t>(w) * h);
     e->GetFloatArrayRegion(depth, 0, w * h, d.data());
+    if (e->ExceptionCheck()) return;
+    static std::vector<float> sourceWeights;
+    sourceWeights.clear();
+    if (sourceConfidence) {
+        if (e->GetArrayLength(sourceConfidence) != w*h) return;
+        sourceWeights.resize(static_cast<size_t>(w)*h);
+        e->GetFloatArrayRegion(sourceConfidence, 0, w*h, sourceWeights.data());
+        if (e->ExceptionCheck()) return;
+    }
 
     // Fetch timestamp-aligned sparse observations before taking gStateMutex.
     // Every calibrator read/write below is protected against reset/UI diagnostics.
     float frameSamples[kMaxCalibSamples * 3];
     const int ns = vinsFeatureSamples(frameSamples, kMaxCalibSamples, static_cast<uint64_t>(t));
+    // 锁等待也算进总耗时：锁本身竞争是卡顿的来源之一，只统计持锁时长会漏掉它。
+    const auto tLockWait = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(gStateMutex);
+    const float lockWaitMs = perfMsSince(tLockWait);
+    ++gPerfFrames;
+    lastLockWaitMs = lockWaitMs;
+    gPerf[kPerfLock].push(lockWaitMs);
+    struct FrameTiming {
+        std::chrono::steady_clock::time_point start;
+        ~FrameTiming() noexcept {
+            try { gPerf[kPerfTotal].push(perfMsSince(start)); perfLogIfDue(); }
+            catch (...) { /* Logging must never terminate an unwinding JNI call. */ }
+        }
+    } frameTiming{tFrameStart};
+    lastTemporalRatio = 1.f;
+    lastTemporalTested = lastTemporalAgree = lastTemporalDisagree = 0;
     if (vinsWorldDiscontinuous()) return; // Preserve the old-world model.
     const FrameSnap* match = nullptr;
     int64_t bestSnapDiffNs = kDepthSnapMaxDiffNs;
@@ -1888,6 +2081,7 @@ static void nativeOnDepthMapImpl(
     // meter -> VINS-world scale gate. Until that scale is stable, stereo is
     // diagnostics-only. Once stable, clean stereo samples enter the existing
     // MAD + Huber IRLS + EMA calibrator at 2-3x sample weight.
+    const auto tCalib = std::chrono::steady_clock::now();
     if (depthCalibrationEnabled) {
         std::vector<float> dPairs;
         std::vector<float> zPairs;
@@ -2048,7 +2242,8 @@ static void nativeOnDepthMapImpl(
         ? mobilescan3d::stereo_anchor::worldPerMeter() : 1.f;
     const bool calibEnabledEff = depthCalibrationEnabled;
     const bool calibratedNow = calibEnabledEff && depthCalibrator.usable();
-    std::vector<float> zCal;
+    static std::vector<float> zCal;
+    zCal.clear();
     const float* depthForFusion = d.data();
     if (calibratedNow) {
         const DepthCalibration& c = depthCalibrator.calibration();
@@ -2224,9 +2419,12 @@ static void nativeOnDepthMapImpl(
         epochBadStreak = epochSuspendStreak = epochResumeStreak = epochCatastrophicStreak = 0;
         ++frozenEvidenceRecoveries;
     }
+    gPerf[kPerfCalib].push(perfMsSince(tCalib));
 
     // epoch 生效时才做「冻结参数」的第二份换算 —— 这一份才是真正进 TSDF 的。
-    std::vector<float> zEpoch;
+    // 复用容量但每帧 clear，保留 !zEpoch.empty() 的逐帧有效性语义。
+    static std::vector<float> zEpoch;
+    zEpoch.clear();
     const float* epochFusionDepth = nullptr;
     // Masks use the same frozen mapping even while integration is suspended.
     // Only epochFusionDepth grants permission to write new geometry.
@@ -2371,8 +2569,13 @@ static void nativeOnDepthMapImpl(
         // 两帧里深度不一致」的像素识别出来，用一致性比例给融合降权。
         float conf = confidence;
         bool temporalAccepted = true;
+        bool temporalMaskValid = false;
+        const auto temporalK = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+        const bool sameK = temporalK.fx == lastFuseK[0] && temporalK.fy == lastFuseK[1] &&
+                           temporalK.cx == lastFuseK[2] && temporalK.cy == lastFuseK[3];
         if (haveLastFusePose && lastFuseCalibrated == calibratedNow &&
-            lastFusedDepth.size() == (size_t)w * h) {
+            lastFusedDepth.size() == (size_t)w * h && lastFuseW == w && lastFuseH == h && sameK &&
+            static_cast<uint64_t>(t) > lastFuseTs && static_cast<uint64_t>(t) - lastFuseTs < 1'500'000'000ULL) {
             // Pc_cur = Rcur^T * Rprev * Pc_prev + Rcur^T * (tprev - tcur)
             float Rrel[9];
             float trel[3];
@@ -2394,17 +2597,33 @@ static void nativeOnDepthMapImpl(
                 trel[i] = acc;
             }
             const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
-            lastTemporalRatio = temporalConsistencyRatio(
-                lastFusedDepth.data(), depthForFusion, w, h,
-                dk.fx, dk.fy, dk.cx, dk.cy, Rrel, trel);
-            temporalChecks++;
-            if (lastTemporalRatio < 0.35f) {
-                temporalRejects++;
+            const auto tTemporal = std::chrono::steady_clock::now();
+            gTemporalMask.resize(static_cast<size_t>(w) * h);
+            int mTested = 0, mAgree = 0;
+            temporalConsistencyMask(lastFusedDepth.data(), depthForFusion, w, h,
+                                    dk.fx, dk.fy, dk.cx, dk.cy, Rrel, trel,
+                                    gTemporalMask.data(), /*step=*/1,
+                                    0.015f, 0.025f, &mTested, &mAgree, &gProjectedDepth);
+            temporalMaskValid = true;
+            lastTemporalRatio = mTested < 16 ? 1.f : float(mAgree)/mTested;
+            ++temporalChecks;
+            if (lastTemporalRatio < 0.35f && mTested > w*h/4) {
+                ++temporalRejects;
                 temporalAccepted = false;
             }
+            lastTemporalTested = mTested;
+            lastTemporalAgree = mAgree;
+            lastTemporalDisagree = mTested - mAgree;
+            gPerf[kPerfTemporal].push(perfMsSince(tTemporal));
+
             // Strong disagreement in the overlapping area rejects dense writes.
             // Sparse/no overlap is neutral (temporalConsistencyRatio returns 1).
-            conf = confidence * std::clamp(lastTemporalRatio, 0.25f, 1.f);
+            //
+            // 有逐像素掩码后，整帧因子的下限从 0.25 提到 0.5：局部该降多少由
+            // 掩码精确决定，整帧再乘一个 0.25 会把「掩码已经判一致的像素」也
+            // 一起拖下去 —— 那是双重惩罚，会让表面整体偏薄。整帧因子现在只当
+            // 粗粒度安全网（整帧明显不对时整体收敛慢一点），细粒度交给掩码。
+            conf = confidence * std::clamp(lastTemporalRatio, 0.5f, 1.f);
         }
 
         // V0.12 融合门控：只有「标定已连续稳定、尺度已冻结」的 epoch 才允许写
@@ -2421,16 +2640,42 @@ static void nativeOnDepthMapImpl(
             ? (calibEnabledEff ? epochFusionDepth : (representation == 0 ? depthForFusion : nullptr))
             : nullptr;
 
+        // ---- 逐像素融合权重 ----
+        // 两个消费者（TSDF 融合、可视化点云）用同一张图，保证「点云看到的」与
+        // 「体素写进去的」可信度口径一致。首帧没有上一帧可比对时退化为纯边缘因子。
+        const float* pixelWeight = nullptr;
+        if (fusionDepth != nullptr || (epochActive && calibEnabledEff && !zEpoch.empty())) {
+            const float* weightDepth = fusionDepth ? fusionDepth : zEpoch.data();
+            const auto tWeight = std::chrono::steady_clock::now();
+            buildPixelWeight(weightDepth, w, h,
+                             temporalMaskValid ? gTemporalMask.data() : nullptr,
+                             gPixelWeight, sourceWeights.empty() ? nullptr : sourceWeights.data());
+            gPerf[kPerfWeight].push(perfMsSince(tWeight));
+            pixelWeight = gPixelWeight.data();
+        }
+
+        // 过滤：一帧只做一次。原来 fuseDepth() 和 feedSceneSurfels() 各自复制一份
+        // 再 filterScanRange 一遍，同一帧被复制两次、过滤两次。
+        const float* fusionRanged = nullptr;
         if (fusionDepth != nullptr) {
+            const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+            gRangedFusion.assign(fusionDepth, fusionDepth + static_cast<size_t>(w) * h);
+            filterScanRange(gRangedFusion, w, h, dk.fx, dk.fy, dk.cx, dk.cy);
+            fusionRanged = gRangedFusion.data();
+        }
+
+        if (fusionRanged != nullptr) {
+            const auto tFuse = std::chrono::steady_clock::now();
             // 全场景地图
-            fuseDepth(fusionDepth, w, h, *match, conf);
+            fuseDepth(fusionRanged, w, h, *match, conf, pixelWeight);
 
             // 目标专用模型：**只有 presenceOk、mask 有效、且 mask 时序稳定
             // 才允许融合**。这是「墙/天花板/桌子进不了目标点云」的落地点；
             // V0.13 又加了一道 —— mask 单帧整块跳变的那一帧也不进。
             if (haveTi && presenceOk && maskOk && maskTemporalOk) {
-                fuseTargetDepth(fusionDepth, w, h, *match, targetMaskMat, conf);
+                fuseTargetDepth(fusionRanged, w, h, *match, targetMaskMat, conf, pixelWeight);
             }
+            gPerf[kPerfFuse].push(perfMsSince(tFuse));
             fusionFusedFrames++;
         } else {
             fusionGatedFrames++;
@@ -2451,11 +2696,26 @@ static void nativeOnDepthMapImpl(
             surfelDepth = zEpoch.data();
         }
         if (surfelDepth != nullptr) {
-            feedSceneSurfels(surfelDepth, w, h, *match, conf,
-                             (haveTi && maskOk), targetMaskStats.centerX, targetMaskStats.centerY);
+            // 与融合同源时直接共用上面那份过滤结果；只有走 zEpoch 兜底路径
+            // （epoch 挂起时点云仍要连续）才需要单独过滤一份。
+            const float* surfelRanged = nullptr;
+            if (surfelDepth == fusionDepth && fusionRanged != nullptr) {
+                surfelRanged = fusionRanged;
+            } else {
+                const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
+                gRangedSurfel.assign(surfelDepth, surfelDepth + static_cast<size_t>(w) * h);
+                filterScanRange(gRangedSurfel, w, h, dk.fx, dk.fy, dk.cx, dk.cy);
+                surfelRanged = gRangedSurfel.data();
+            }
+            const auto tSurfel = std::chrono::steady_clock::now();
+            feedSceneSurfels(surfelRanged, w, h, *match, conf,
+                             (haveTi && maskOk), targetMaskStats.centerX, targetMaskStats.centerY,
+                             pixelWeight);
+            gPerf[kPerfSurfel].push(perfMsSince(tSurfel));
         }
 
         // ---- V0.9 sparse stereo high-confidence TSDF constraints ----
+        const auto tStereo = std::chrono::steady_clock::now();
         auto stereoWorldBatches =
             mobilescan3d::stereo_anchor::takeWorldAnchorBatches(
                 static_cast<uint64_t>(t),
@@ -2524,6 +2784,7 @@ static void nativeOnDepthMapImpl(
                     false);
             }
         }
+        gPerf[kPerfStereo].push(perfMsSince(tStereo));
 
         // Retain an accepted reference, never an uncalibrated/rejected observation.
         if (fusionDepth != nullptr) {
@@ -2536,6 +2797,9 @@ static void nativeOnDepthMapImpl(
             }
             haveLastFusePose = true;
             lastFuseCalibrated = calibratedNow;
+            lastFuseW = w; lastFuseH = h; lastFuseTs = static_cast<uint64_t>(t);
+            lastFuseK[0] = temporalK.fx; lastFuseK[1] = temporalK.fy;
+            lastFuseK[2] = temporalK.cx; lastFuseK[3] = temporalK.cy;
         }
 
         // 体素场变了 -> 网格变脏
@@ -2547,6 +2811,8 @@ static void nativeOnDepthMapImpl(
         // 关掉时把上一帧的残留清空，否则切换开关后屏幕上会留着旧点
         targetDebugPointCount = 0;
     }
+
+    ++gPerfCompleted;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2575,6 +2841,19 @@ Java_com_mobilescan3d_NativeBridge_nativeOnDepthMap(
     } catch (...) {
         __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Depth",
                             "nativeOnDepthMap unknown exception");
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeOnDepthMapWeighted(
+        JNIEnv* e, jobject, jfloatArray depth, jint w, jint h,
+        jfloat confidence, jlong t, jint representation, jfloatArray sourceConfidence) {
+    try {
+        nativeOnDepthMapImpl(e, depth, w, h, confidence, t, representation, sourceConfidence);
+    } catch (const std::exception& ex) {
+        __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Depth", "weighted depth: %s", ex.what());
+    } catch (...) {
+        __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Depth", "weighted depth: unknown exception");
     }
 }
 
@@ -4178,16 +4457,36 @@ Java_com_mobilescan3d_NativeBridge_nativeGetDepthCalibration(JNIEnv* e, jobject,
  * 有目标模型时优先用 targetTsdf —— 与「有目标就只导目标」的 PLY / 点云口径一致。
  * 这是一次性操作，可能耗时几百毫秒，不要在帧回调里调。
  */
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_mobilescan3d_NativeBridge_nativeBuildMesh(JNIEnv*, jobject, jint quality) {
+static jboolean buildMeshWithShape(jint quality, jint shape) {
     std::lock_guard<std::mutex> lk(gStateMutex);
+    const auto started = std::chrono::steady_clock::now();
     meshQuality = std::clamp((int)quality, 0, 2);
 
     MeshOptions opt;
     opt.quality = meshQuality;
+    meshHasHardEdges = false;
+    hardSurfaceStats = {};
+    const bool requestedShape = shape >= 1 && shape <= 3;
+    if (requestedShape) { opt.enableSmoothing = false; opt.enableDecimation = false; }
     const TsdfEngine& src = (targetTsdf.voxels() > 0) ? targetTsdf : tsdf;
 
-    const bool ok = meshEngine.build(src, opt, meshStats);
+    bool ok = meshEngine.build(src, opt, meshStats);
+    if (ok && requestedShape) {
+        Mesh fitted;
+        if (fitHardSurface(meshEngine.mesh(), static_cast<HardSurfaceMode>(shape),
+                           meshStats.voxelSize, fitted, hardSurfaceStats)) {
+            meshEngine.replaceExportMesh(std::move(fitted));
+            meshStats.outVertices = meshEngine.mesh().vertexCount();
+            meshStats.outTriangles = meshEngine.mesh().triangleCount();
+            meshHasHardEdges = true;
+        } else {
+            // Use the original scan quality pipeline on a rejected fit.
+            opt.enableSmoothing = true; opt.enableDecimation = true;
+            ok = meshEngine.build(src, opt, meshStats);
+        }
+        meshStats.note += " | " + hardSurfaceStats.message;
+    }
+    meshStats.totalMs = perfMsSince(started);
     meshBuilds++;
     // 构建成功后体素场与网格一致；失败则保持脏，允许用户重试。
     meshDirty = !ok;
@@ -4200,6 +4499,25 @@ Java_com_mobilescan3d_NativeBridge_nativeBuildMesh(JNIEnv*, jobject, jint qualit
          meshStats.componentsRemoved, meshStats.componentsBefore,
          meshStats.decimated ? 1 : 0, meshStats.totalMs, meshStats.note.c_str());
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeBuildMesh(JNIEnv*, jobject, jint quality) {
+    try { return buildMeshWithShape(quality, 0); }
+    catch (const std::exception& ex) { LOGI("mesh build: %s", ex.what()); return JNI_FALSE; }
+    catch (...) { return JNI_FALSE; }
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeBuildMeshWithShape(JNIEnv*, jobject, jint quality, jint shape) {
+    if (shape < 0 || shape > 3) return JNI_FALSE;
+    try { return buildMeshWithShape(quality, shape); }
+    catch (const std::exception& ex) { LOGI("shape build: %s", ex.what()); return JNI_FALSE; }
+    catch (...) { return JNI_FALSE; }
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetHardSurfaceReport(JNIEnv* env, jobject) {
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    return env->NewStringUTF(hardSurfaceStats.message.c_str());
 }
 
 /** mesh 统计（16 槽，全部为整型）。 */
@@ -4336,6 +4654,8 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeResetMesh(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lk(gStateMutex);
     meshEngine = MeshEngine();
+    meshHasHardEdges = false;
+    hardSurfaceStats = {};
     meshStats = MeshBuildStats{};
     meshDirty = true;
 }
@@ -4515,6 +4835,7 @@ Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
     AosMesh meshCopy;
     float sourceVoxelSize = 0.f;
     int sourceQuality = 1;
+    bool preserveHardEdges = false;
     std::vector<TextureKeyframe> keyframes;
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
@@ -4524,6 +4845,7 @@ Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
         }
         sourceVoxelSize = meshStats.voxelSize;
         sourceQuality = meshQuality;
+        preserveHardEdges = meshHasHardEdges;
         meshCopy = toAosMesh(src);
         keyframes = gTextureKeyframes;
     }
@@ -4549,7 +4871,12 @@ Java_com_mobilescan3d_NativeBridge_nativeBakeTexturedGlb(
     cleanup.preserveBoundary = true;
 
     MeshPostProcessStats cleanupStats;
-    if (!MeshPostProcessor::run(meshCopy, cleanup, &cleanupStats)) {
+    // Welding/smoothing a fitted box destroys its independent face normals and may
+    // remove its two-triangle components. Keep the fitted geometry exactly as built.
+    if (preserveHardEdges) {
+        cleanupStats.inputTriangles = cleanupStats.outputTriangles = meshCopy.triangleCount();
+    }
+    if (!preserveHardEdges && !MeshPostProcessor::run(meshCopy, cleanup, &cleanupStats)) {
         LOGI("nativeBakeTexturedGlb FAILED: mesh cleanup");
         return JNI_FALSE;
     }

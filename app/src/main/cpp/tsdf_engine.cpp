@@ -163,7 +163,8 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                                 const uint8_t* rgb, int rgbW, int rgbH,
                                 float fx, float fy, float cx, float cy,
                                 const float R[9], const float t[3], float confidence,
-                                float depthScale, float depthShift) {
+                                float depthScale, float depthShift,
+                                const float* pixelWeight) {
     if (!depth || w < 4 || h < 4 || !R || !t) {
         return;
     }
@@ -193,10 +194,20 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
 
     for (int y = 0; y < h; y += step) {
         const float* drow = depth + static_cast<size_t>(y) * w;
+        const float* wrow = pixelWeight ? pixelWeight + static_cast<size_t>(y) * w : nullptr;
         for (int x = 0; x < w; x += step) {
             const float raw = drow[x];
             if (!std::isfinite(raw) || raw <= 0.f) {
                 continue;
+            }
+            // 逐像素可信度：整帧 confidence 只作为上限，实际写入权重再乘该像素
+            // 自己的可信度。nullptr 时 obsWeight == baseWeight，与旧行为一致。
+            float obsWeight = baseWeight;
+            if (wrow) {
+                const float pw = wrow[x];
+                if (!std::isfinite(pw) || pw <= 0.f) continue;
+                obsWeight = std::clamp(baseWeight * std::clamp(pw, 0.f, 1.f),
+                                       0.01f, 1.f);
             }
             // 深度标定：z' = z * scale + shift（默认 1/0 即不修正）。
             const float z = raw * depthScale + depthShift;
@@ -282,9 +293,9 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                 sdf = sdf < -1.f ? -1.f : (sdf > 1.f ? 1.f : sdf);
 
                 const float wOld = dequantWeight(v->weight);
-                const float wSum = wOld + baseWeight;
+                const float wSum = wOld + obsWeight;
                 const float merged = (wOld > 0.f)
-                    ? (v->tsdf / kTsdfValueScale * wOld + sdf * baseWeight) / wSum
+                    ? (v->tsdf / kTsdfValueScale * wOld + sdf * obsWeight) / wSum
                     : sdf;
                 v->tsdf = quantTsdf(merged);
                 const float satur = std::min(wSum, kTsdfMaxWeight);
@@ -302,10 +313,10 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                         ++liveColoredVoxels_;
                     } else {
                         v->color565 = blendRgb565(
-                            v->color565, obsColor, colorOld, baseWeight);
+                            v->color565, obsColor, colorOld, obsWeight);
                     }
                     v->colorWeight = quantWeight(
-                        std::min(colorOld + baseWeight, kTsdfMaxWeight));
+                        std::min(colorOld + obsWeight, kTsdfMaxWeight));
                 }
 
                 // Revisiting an observed voxel cannot expand the bounds.

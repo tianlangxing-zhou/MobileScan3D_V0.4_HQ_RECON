@@ -366,47 +366,73 @@ float temporalConsistencyRatio(const float* prevDepth, const float* curDepth,
                                float fx, float fy, float cx, float cy,
                                const float Rrel[9], const float trel[3],
                                float minAbsTol, float relTol) {
-    if (!prevDepth || !curDepth || w < 4 || h < 4 || !Rrel || !trel) {
-        return 1.f;
-    }
-    const float invFx = 1.f / (std::fabs(fx) > 1e-3f ? fx : 1.f);
-    const float invFy = 1.f / (std::fabs(fy) > 1e-3f ? fy : 1.f);
+    std::vector<uint8_t> mask;
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return 1.f;
+    mask.resize(static_cast<size_t>(w) * h);
+    int tested = 0, agree = 0;
+    temporalConsistencyMask(prevDepth, curDepth, w, h, fx, fy, cx, cy,
+                            Rrel, trel, mask.data(), 4, minAbsTol, relTol,
+                            &tested, &agree);
+    return tested < 16 ? 1.f : float(agree) / tested;
+}
 
-    long long tested = 0;
-    long long consistent = 0;
-    const int step = 4;
-    for (int y = step; y < h; y += step) {
-        for (int x = step; x < w; x += step) {
-            const float zp = prevDepth[y * w + x];
-            if (!(zp > 0.05f) || !std::isfinite(zp)) {
-                continue;
-            }
-            const float xc = (x - cx) * zp * invFx;
-            const float yc = (y - cy) * zp * invFy;
-            const float nx = Rrel[0] * xc + Rrel[1] * yc + Rrel[2] * zp + trel[0];
-            const float ny = Rrel[3] * xc + Rrel[4] * yc + Rrel[5] * zp + trel[1];
-            const float nz = Rrel[6] * xc + Rrel[7] * yc + Rrel[8] * zp + trel[2];
-            if (!(nz > 0.05f) || !std::isfinite(nz)) {
-                continue;
-            }
-            const int ux = static_cast<int>(std::lround(nx * fx / nz + cx));
-            const int uy = static_cast<int>(std::lround(ny * fy / nz + cy));
-            if (ux < 1 || uy < 1 || ux >= w - 1 || uy >= h - 1) {
-                continue;
-            }
-            const float zc = curDepth[uy * w + ux];
-            if (!(zc > 0.05f) || !std::isfinite(zc)) {
-                continue;
-            }
-            ++tested;
-            const float tol = std::max(minAbsTol, zc * relTol);
-            if (std::fabs(zc - nz) <= tol) {
-                ++consistent;
-            }
+int temporalConsistencyMask(const float* prevDepth, const float* curDepth,
+                            int w, int h, float fx, float fy, float cx, float cy,
+                            const float Rrel[9], const float trel[3],
+                            uint8_t* mask, int step, float minAbsTol, float relTol,
+                            int* outTested, int* outAgree,
+                            std::vector<float>* projectedDepth) {
+    if (outTested) *outTested = 0;
+    if (outAgree) *outAgree = 0;
+    if (!mask || w <= 0 || h <= 0 || w > 4096 || h > 4096) return 0;
+    const size_t n = static_cast<size_t>(w) * h;
+    std::fill(mask, mask + n, uint8_t(kTemporalUntested));
+    if (!prevDepth || !curDepth || !Rrel || !trel ||
+        !std::isfinite(fx) || !std::isfinite(fy) || fx <= 0 || fy <= 0 ||
+        !std::isfinite(cx) || !std::isfinite(cy) ||
+        !std::isfinite(minAbsTol) || !std::isfinite(relTol) || minAbsTol < 0 || relTol < 0 ||
+        !std::all_of(Rrel, Rrel+9, [](float v){return std::isfinite(v);}) ||
+        !std::all_of(trel, trel+3, [](float v){return std::isfinite(v);})) return 0;
+    std::vector<float> local;
+    auto& zbuf = projectedDepth ? *projectedDepth : local;
+    zbuf.assign(n, 0.f);
+    step = std::max(1, step);
+    // A nearest-surface z-buffer makes collisions independent of traversal order.
+    for (int y=0; y<h; y+=step) for (int x=0; x<w; x+=step) {
+        float z=prevDepth[size_t(y)*w+x];
+        if (!std::isfinite(z) || z<=0.05f) continue;
+        float px=(x-cx)*z/fx, py=(y-cy)*z/fy;
+        float X=Rrel[0]*px+Rrel[1]*py+Rrel[2]*z+trel[0];
+        float Y=Rrel[3]*px+Rrel[4]*py+Rrel[5]*z+trel[1];
+        float Z=Rrel[6]*px+Rrel[7]*py+Rrel[8]*z+trel[2];
+        if (!std::isfinite(Z) || Z<=0.05f) continue;
+        float u=X*fx/Z+cx, v=Y*fy/Z+cy;
+        if (!std::isfinite(u) || !std::isfinite(v) || u<0 || v<0 || u>w-1 || v>h-1) continue;
+        size_t j=size_t(std::lround(v))*w+std::lround(u);
+        if (zbuf[j]==0 || Z<zbuf[j]) zbuf[j]=Z;
+    }
+    int tested=0, agree=0;
+    for (int y=0; y<h; ++y) for (int x=0; x<w; ++x) {
+        size_t j=size_t(y)*w+x;
+        float a=zbuf[j], b=curDepth[j];
+        if (!(a>0.05f) || !(b>0.05f) || !std::isfinite(b)) continue;
+        float tol=std::max(minAbsTol,b*relTol);
+        if (std::fabs(a-b)<=tol) { mask[j]=kTemporalAgree; ++tested; ++agree; continue; }
+        // Large jumps near a depth silhouette are visibility changes, not errors.
+        // Interior mismatches (including small jitter) remain genuine conflicts.
+        bool edge=false;
+        for (int dy=-2;dy<=2 && !edge;++dy) for (int dx=-2;dx<=2;++dx) {
+            int xx=x+dx, yy=y+dy;
+            if(xx<0 || yy<0 || xx>=w || yy>=h) continue;
+            size_t k=size_t(yy)*w+xx;
+            float p=zbuf[k], c=curDepth[k];
+            if ((p>0.05f && std::fabs(p-a)>3*tol) ||
+                (std::isfinite(c) && c>0.05f && std::fabs(c-b)>3*tol)) {edge=true;break;}
         }
+        if(edge && std::fabs(a-b)>3*tol) mask[j]=b<a?kTemporalOccluded:kTemporalDisoccluded;
+        else {mask[j]=kTemporalDisagree; ++tested;}
     }
-    if (tested < 16) {
-        return 1.f;  // 样本太少不下结论，避免误伤
-    }
-    return static_cast<float>(consistent) / static_cast<float>(tested);
+    if(outTested) *outTested=tested;
+    if(outAgree) *outAgree=agree;
+    return tested;
 }

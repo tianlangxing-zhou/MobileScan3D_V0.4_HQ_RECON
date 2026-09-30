@@ -17,6 +17,7 @@ add_library(mobilescan3d SHARED
     appearance_tracker.cpp
     depth_calib.cpp
     mesh/mesh_engine.cpp
+    mesh/hard_surface.cpp
     export/gltf_exporter.cpp
     v06/mesh_postprocess.cpp
     v06/uv_unwrap.cpp

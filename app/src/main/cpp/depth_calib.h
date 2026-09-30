@@ -212,3 +212,42 @@ float temporalConsistencyRatio(const float* prevDepth, const float* curDepth,
                                const float Rrel[9], const float trel[3],
                                float minAbsTol = 0.015f,
                                float relTol = 0.025f);
+
+/**
+ * 逐像素时序一致性的三态判定。
+ *
+ * 0 = 未测试，1 = 一致，2 = 冲突。
+ *
+ * **为什么必须是三态而不是布尔**：一帧里总有大量像素拿不到可比较的上一帧
+ * 观测 —— 刚刚进入视野的新区域、被前景遮挡后重新露出的背景、重投影出界。
+ * 这些像素的深度**不是错的**，只是无从对照。把它们和真正的冲突（飞点、
+ * 动态物体、估计失败）混成同一类"不可信"去降权，会让模型边缘系统性变薄、
+ * 绕行一圈后新露出的表面补不上 —— 属于「过滤过度」，比飞点更难发现。
+ */
+enum TemporalMask : uint8_t {
+    kTemporalUntested = 0,
+    kTemporalAgree = 1,
+    kTemporalDisagree = 2,
+    kTemporalOccluded = 3, // current foreground hides the previous surface
+    kTemporalDisoccluded = 4, // previous foreground/edge reveals background
+};
+
+/**
+ * Reproject previous depth using a nearest-surface z-buffer, then classify current pixels.
+ * Conflicts count once per current pixel. Large jumps near silhouettes are visibility
+ * changes (neutral weight); interior mismatches are conflicts. This is a heuristic,
+ * not a complete multi-view occlusion detector.
+ * mask is cleared even for invalid camera parameters. Dimensions are limited to 4096.
+ * projectedDepth optionally supplies reusable w*h scratch storage (must not alias inputs).
+ * outTested excludes unknown/occluded/disoccluded pixels; outAgree counts agreements.
+ */
+int temporalConsistencyMask(const float* prevDepth, const float* curDepth,
+                            int w, int h,
+                            float fx, float fy, float cx, float cy,
+                            const float Rrel[9], const float trel[3],
+                            uint8_t* mask, int step = 1,
+                            float minAbsTol = 0.015f,
+                            float relTol = 0.025f,
+                            int* outTested = nullptr,
+                            int* outAgree = nullptr,
+                            std::vector<float>* projectedDepth = nullptr);
