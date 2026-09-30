@@ -416,8 +416,8 @@ class ExportManager(context: Context) {
     companion object {
         private const val TAG = "ExportManager"
 
-        /** V0.6：纹理 atlas 边长。2K 是手机端画质与内存的折中。 */
-        private const val ATLAS_RESOLUTION = 2048
+        /** V0.13.19.5：纹理 atlas 边长 2K->4K。V0.13.19.4 修复 epoch 挂起后几何密度涨 ~5x，2K atlas 像素预算被撑爆（覆盖掉到 44.5%）；4K 面积 x4，且刚好命中 native 的 resolution>=4096 高质量档（sourceMaxSide 2200 / gutter 10 / q94）。4096 是 native 上限（clamp 512..4096），内存/画质折中安全。 */
+        private const val ATLAS_RESOLUTION = 4096
 
         /** V0.6：最多挑多少个 HQ 视角做烘焙（native 侧还会按质量+视角多样性再筛）。 */
         private const val MAX_TEXTURE_KEYFRAMES = 12
