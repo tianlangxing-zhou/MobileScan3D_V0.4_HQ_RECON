@@ -1,0 +1,448 @@
+diff --git a/app/src/main/cpp/ar_textured_asset.cpp b/app/src/main/cpp/ar_textured_asset.cpp
+index 41903d2..9fe9d54 100644
+--- a/app/src/main/cpp/ar_textured_asset.cpp
++++ b/app/src/main/cpp/ar_textured_asset.cpp
+@@ -3,6 +3,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
++#include <cmath>
+ #include <cstring>
+ #include <fstream>
+ #include <limits>
+@@ -47,13 +48,18 @@ void ArTexturedAsset::clear() {
+ bool ArTexturedAsset::set(
+         const UvMesh& mesh,
+         const std::vector<std::uint8_t>& jpegBytes) {
+-    if (mesh.empty() ||
++    if (mesh.vertices.size() < 3 || mesh.indices.size() < 3 ||
++        mesh.indices.size() % 3 != 0 ||
+         jpegBytes.size() < 4 ||
+         jpegBytes[0] != 0xFFu ||
+         jpegBytes[1] != 0xD8u) {
+         return false;
+     }
+ 
++    for (const auto index : mesh.indices) {
++        if (index >= mesh.vertices.size()) return false;
++    }
++
+     if (mesh.vertices.size() > kMaxVertices ||
+         mesh.indices.size() > kMaxIndices ||
+         jpegBytes.size() > kMaxJpegBytes) {
+@@ -66,6 +72,10 @@ bool ArTexturedAsset::set(
+         static_cast<std::size_t>(kVertexFloats));
+ 
+     for (const auto& v : mesh.vertices) {
++        if (!std::isfinite(v.base.px) || !std::isfinite(v.base.py) ||
++            !std::isfinite(v.base.pz) || !std::isfinite(v.base.nx) ||
++            !std::isfinite(v.base.ny) || !std::isfinite(v.base.nz) ||
++            !std::isfinite(v.u) || !std::isfinite(v.v)) return false;
+         vertices.push_back(v.base.px);
+         vertices.push_back(v.base.py);
+         vertices.push_back(v.base.pz);
+@@ -80,9 +90,13 @@ bool ArTexturedAsset::set(
+             std::clamp(v.v, 0.0f, 1.0f));
+     }
+ 
++    // Prepare every allocation before publishing, including when callers pass
++    // jpeg() back into set(). Rejected input leaves the previous asset intact.
++    auto indices = mesh.indices;
++    auto jpeg = jpegBytes;
+     vertices_.swap(vertices);
+-    indices_ = mesh.indices;
+-    jpeg_ = jpegBytes;
++    indices_.swap(indices);
++    jpeg_.swap(jpeg);
+     return true;
+ }
+ 
+@@ -130,6 +144,7 @@ bool ArTexturedAsset::save(
+         reinterpret_cast<const char*>(jpeg_.data()),
+         static_cast<std::streamsize>(jpeg_.size()));
+ 
++    out.close(); // Report buffered write/close errors before claiming success.
+     return static_cast<bool>(out);
+ }
+ 
+@@ -159,7 +174,7 @@ bool ArTexturedAsset::load(
+     if (version != kVersion ||
+         vertexFloats !=
+             static_cast<std::uint32_t>(kVertexFloats) ||
+-        vertexCount == 0 ||
++        vertexCount < 3 ||
+         indexCount < 3 ||
+         (indexCount % 3u) != 0u ||
+         vertexCount > kMaxVertices ||
+@@ -173,6 +188,18 @@ bool ArTexturedAsset::load(
+         static_cast<std::size_t>(vertexCount) *
+         static_cast<std::size_t>(kVertexFloats);
+ 
++    // Validate the entire fixed-format payload before allocating from its header.
++    const auto payloadStart = in.tellg();
++    if (payloadStart == std::streampos(-1)) return false;
++    in.seekg(0, std::ios::end);
++    const auto end = in.tellg();
++    const std::uint64_t expected = static_cast<std::uint64_t>(floatCount) * sizeof(float) +
++        static_cast<std::uint64_t>(indexCount) * sizeof(std::uint32_t) + jpegBytes;
++    if (end == std::streampos(-1) || end < payloadStart ||
++        static_cast<std::uint64_t>(end - payloadStart) != expected) return false;
++    in.seekg(payloadStart);
++    if (!in) return false;
++
+     std::vector<float> vertices(floatCount);
+     std::vector<std::uint32_t> indices(indexCount);
+     std::vector<std::uint8_t> jpeg(jpegBytes);
+@@ -203,6 +230,9 @@ bool ArTexturedAsset::load(
+         }
+     }
+ 
++    if (!std::all_of(vertices.begin(), vertices.end(),
++                     [](float value) { return std::isfinite(value); })) return false;
++
+     vertices_.swap(vertices);
+     indices_.swap(indices);
+     jpeg_.swap(jpeg);
+diff --git a/app/src/main/cpp/mesh/mesh_engine.cpp b/app/src/main/cpp/mesh/mesh_engine.cpp
+index 9ff0848..d8cd577 100644
+--- a/app/src/main/cpp/mesh/mesh_engine.cpp
++++ b/app/src/main/cpp/mesh/mesh_engine.cpp
+@@ -1,4 +1,5 @@
+ #include "mesh_engine.h"
++#include "../grid_index.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -134,11 +135,19 @@ inline uint64_t edgePairKey(uint32_t a, uint32_t b) {
+ /**
+  * 顶点坐标的整数格子键（用于聚类简化）。
+  */
+-inline uint64_t cellKey(int32_t x, int32_t y, int32_t z) {
+-    return ((uint64_t)(uint32_t)x * 73856093ull) ^
+-           ((uint64_t)(uint32_t)y * 19349663ull) ^
+-           ((uint64_t)(uint32_t)z * 83492791ull);
+-}
++struct CellKey {
++    int x, y, z;
++    bool operator==(const CellKey& other) const {
++        return x == other.x && y == other.y && z == other.z;
++    }
++};
++struct CellKeyHash {
++    size_t operator()(const CellKey& key) const {
++        return ((uint64_t)(uint32_t)key.x * 73856093ull) ^
++               ((uint64_t)(uint32_t)key.y * 19349663ull) ^
++               ((uint64_t)(uint32_t)key.z * 83492791ull);
++    }
++};
+ 
+ }  // namespace
+ 
+@@ -707,7 +716,10 @@ void meshRecomputeNormals(Mesh& mesh) {
+ 
+ void meshClusterSimplify(Mesh& mesh, float cellMeters) {
+     const size_t nv = mesh.vertexCount();
+-    if (nv == 0 || cellMeters <= 1e-5f) {
++    if (nv == 0 || !std::isfinite(cellMeters) || cellMeters <= 1e-5f ||
++        mesh.positions.size() % 3 != 0 || mesh.indices.size() % 3 != 0 ||
++        std::any_of(mesh.indices.begin(), mesh.indices.end(),
++                    [nv](uint32_t index) { return index >= nv; })) {
+         return;
+     }
+     const float inv = 1.f / cellMeters;
+@@ -718,7 +730,7 @@ void meshClusterSimplify(Mesh& mesh, float cellMeters) {
+     };
+     std::vector<Acc> cells;
+     cells.reserve(nv / 2 + 8);
+-    std::unordered_map<uint64_t, uint32_t> cellOf;
++    std::unordered_map<CellKey, uint32_t, CellKeyHash> cellOf;
+     cellOf.reserve(nv * 2);
+     std::vector<uint32_t> vcell(nv, 0);
+     const bool hasColor = mesh.colors.size() >= nv * 3;
+@@ -727,10 +739,10 @@ void meshClusterSimplify(Mesh& mesh, float cellMeters) {
+         const float x = mesh.positions[i * 3 + 0];
+         const float y = mesh.positions[i * 3 + 1];
+         const float z = mesh.positions[i * 3 + 2];
+-        const int32_t kx = (int32_t)std::floor(x * inv);
+-        const int32_t ky = (int32_t)std::floor(y * inv);
+-        const int32_t kz = (int32_t)std::floor(z * inv);
+-        const uint64_t key = cellKey(kx, ky, kz);
++        int kx, ky, kz;
++        if (!checkedGridIndex(x * inv, kx) || !checkedGridIndex(y * inv, ky) ||
++            !checkedGridIndex(z * inv, kz)) return;
++        const CellKey key{kx, ky, kz};
+         auto it = cellOf.find(key);
+         uint32_t ci;
+         if (it == cellOf.end()) {
+diff --git a/app/src/main/cpp/tsdf_engine.cpp b/app/src/main/cpp/tsdf_engine.cpp
+index ca77d79..bb010ed 100644
+--- a/app/src/main/cpp/tsdf_engine.cpp
++++ b/app/src/main/cpp/tsdf_engine.cpp
+@@ -1,4 +1,5 @@
+ #include "tsdf_engine.h"
++#include "grid_index.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -169,6 +170,9 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
+     if (!std::isfinite(confidence) || confidence <= 0.f ||
+         !std::isfinite(fx) || !std::isfinite(fy) || fx <= 0.f || fy <= 0.f ||
+         !std::isfinite(cx) || !std::isfinite(cy)) return;
++    if (!std::isfinite(depthScale) || !std::isfinite(depthShift) ||
++        !std::all_of(R, R + 9, [](float v) { return std::isfinite(v); }) ||
++        !std::all_of(t, t + 3, [](float v) { return std::isfinite(v); })) return;
+ 
+     const int step = pixelStep_ < 1 ? 1 : pixelStep_;
+     const float mu = (trunc_ > 1e-4f) ? trunc_ : (voxel_ * kTsdfTruncVoxels);
+@@ -199,6 +203,7 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
+             // 沿射线推进时把步长按射线方向长度归一化（dzStep = voxel / |ray|），
+             // 否则掠射角下相邻采样点会跳过体素，表面上会出现空洞与条纹。
+             const float rayLen = std::sqrt(1.f + xn * xn + yn * yn);
++            if (!std::isfinite(rayLen)) continue;
+             float dzStep = voxel_ / (rayLen > 1e-4f ? rayLen : 1.f);
+             if (dzStep < 1e-5f) {
+                 dzStep = 1e-5f;
+@@ -212,13 +217,15 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
+ 
+             uint16_t obsColor = 0;
+             if (haveColor) {
+-                const int sx = std::min(rgbW - 1, x * rgbW / w);
+-                const int sy = std::min(rgbH - 1, y * rgbH / h);
++                const int sx = static_cast<int>(static_cast<int64_t>(x) * rgbW / w);
++                const int sy = static_cast<int>(static_cast<int64_t>(y) * rgbH / h);
+                 const size_t ci = (static_cast<size_t>(sy) * rgbW + sx) * 3;
+                 obsColor = packRgb565(rgb[ci], rgb[ci + 1], rgb[ci + 2]);
+             }
+ 
+             int guard = 0;
++            bool havePrevious = false;
++            int previousX = 0, previousY = 0, previousZ = 0;
+             for (float zi = z0; zi <= z1; zi += dzStep) {
+                 if (++guard > 4096) {
+                     break;
+@@ -231,9 +238,16 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
+                 if (!std::isfinite(Xw) || !std::isfinite(Yw) || !std::isfinite(Zw)) {
+                     continue;
+                 }
+-                const int vx = (int)std::floor(Xw / voxel_);
+-                const int vy = (int)std::floor(Yw / voxel_);
+-                const int vz = (int)std::floor(Zw / voxel_);
++                int vx, vy, vz;
++                if (!checkedGridIndex(Xw / voxel_, vx) ||
++                    !checkedGridIndex(Yw / voxel_, vy) ||
++                    !checkedGridIndex(Zw / voxel_, vz)) continue;
++
++                // A ray can sample the same voxel more than once. Its SDF and
++                // color are identical there: avoid duplicate weight and hash work.
++                if (havePrevious && vx == previousX && vy == previousY && vz == previousZ) continue;
++                previousX = vx; previousY = vy; previousZ = vz;
++                havePrevious = true;
+ 
+                 TsdfVoxel* v = voxelFor(vx, vy, vz, true);
+                 if (!v) {
+diff --git a/app/src/main/cpp/grid_index.h b/app/src/main/cpp/grid_index.h
+new file mode 100644
+index 0000000..2f06559
+--- /dev/null
++++ b/app/src/main/cpp/grid_index.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <cmath>
++#include <limits>
++
++// A finite float may still lie outside int range. Reserve a block-sized margin
++// for mesh extraction's neighboring lattice accesses before performing any cast.
++inline bool checkedGridIndex(float coordinate, int& index) {
++    constexpr double low = static_cast<double>(std::numeric_limits<int>::min()) + 16;
++    constexpr double high = static_cast<double>(std::numeric_limits<int>::max()) - 16;
++    if (!std::isfinite(coordinate) || coordinate < low || coordinate > high) return false;
++    index = static_cast<int>(std::floor(coordinate));
++    return true;
++}
+diff --git a/tools/review_tests/robustness_regression.cpp b/tools/review_tests/robustness_regression.cpp
+new file mode 100644
+index 0000000..a98063e
+--- /dev/null
++++ b/tools/review_tests/robustness_regression.cpp
+@@ -0,0 +1,131 @@
++#include "ar_textured_asset.h"
++#include "tsdf_engine.h"
++#include "mesh/mesh_engine.h"
++#include <algorithm>
++#include <cassert>
++#include <cmath>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <iterator>
++#include <limits>
++#include <string>
++#include <vector>
++
++// Match the existing host suites: LeakSanitizer cannot inspect sandbox /proc.
++extern "C" const char* __asan_default_options() { return "detect_leaks=0"; }
++
++static void numeric() {
++    float depth[16] = {}; depth[15] = 1.f;
++    const float R[] = {1,0,0,0,1,0,0,0,1};
++    TsdfEngine tsdf;
++    for (float x : {1e20f, -1e20f, std::numeric_limits<float>::max()}) {
++        const float t[] = {x,0,0};
++        tsdf.integrateDepth(depth,4,4,nullptr,0,0,3,3,0,0,R,t,1);
++        assert(tsdf.voxels() == 0 && tsdf.blocks() == 0);
++    }
++    const float t[] = {0,0,0};
++    float badR[] = {1,0,0,0,1,0,0,0,1};
++    badR[0] = std::numeric_limits<float>::quiet_NaN();
++    tsdf.integrateDepth(depth,4,4,nullptr,0,0,3,3,0,0,badR,t,1);
++    tsdf.integrateDepth(depth,4,4,nullptr,0,0,3,3,0,0,R,t,1,
++                        std::numeric_limits<float>::infinity(),0);
++    assert(tsdf.blocks() == 0);
++    tsdf.integrateDepth(depth,4,4,nullptr,0,0,3,3,0,0,R,t,1);
++    assert(tsdf.voxels() > 0); // Rejection must leave the engine usable.
++}
++
++static void ray() {
++    float depth[16] = {}; depth[15] = 1.f;
++    const float R[] = {1,0,0,0,1,0,0,0,1}, t[] = {0,0,0};
++    TsdfEngine tsdf;
++    tsdf.integrateDepth(depth,4,4,nullptr,0,0,3,3,0,0,R,t,1);
++    assert(tsdf.voxels() > 0);
++    tsdf.forEachBlock([](int,int,int,const TsdfBlock* b) {
++        for (const auto& v : b->voxels) assert(v.weight <= kTsdfWeightScale);
++    }); // A single pixel contributes at most once to each traversed voxel.
++    const auto count = tsdf.voxels();
++    tsdf.integrateDepth(depth,4,4,nullptr,0,0,3,3,0,0,R,t,1);
++    assert(tsdf.voxels()==count);
++    tsdf.forEachBlock([](int,int,int,const TsdfBlock* b) {
++        for (const auto& v : b->voxels) if (v.weight) assert(v.weight == 2*kTsdfWeightScale);
++    }); // Later frames must still refine all existing samples.
++}
++
++static void cluster() {
++    // These two cells have identical old XOR hashes, despite being far apart.
++    Mesh mesh;
++    mesh.positions = {3.9425f,.2825f,2.1125f, 3.0025f,2.9825f,3.3525f, .0025f,.0025f,.0025f};
++    mesh.indices = {0,1,2};
++    const auto original = mesh.positions;
++    meshClusterSimplify(mesh,.01f);
++    assert(mesh.vertexCount() == 3 && mesh.triangleCount() == 1);
++    assert(mesh.positions == original);
++    mesh.indices[2]=99;
++    meshClusterSimplify(mesh,.01f);
++    assert(mesh.indices[2]==99 && mesh.positions==original);
++    mesh.indices[2]=2;
++    meshClusterSimplify(mesh,std::numeric_limits<float>::quiet_NaN());
++    assert(mesh.positions==original);
++    mesh.positions[0] = std::numeric_limits<float>::max();
++    const auto huge = mesh.positions;
++    meshClusterSimplify(mesh,.001f);
++    assert(mesh.positions == huge); // Invalid coordinates leave the input intact.
++    Mesh close;
++    close.positions={.1f,.1f,.1f, .2f,.2f,.2f, 1.1f,0,0, 0,1.1f,0};
++    close.indices={0,2,3, 1,2,3};
++    meshClusterSimplify(close,1.f);
++    assert(close.vertexCount()==3); // Actual same-cell vertices still merge.
++}
++
++template<class T> static void put(std::vector<char>& bytes, size_t offset, T value) {
++    std::memcpy(bytes.data()+offset, &value, sizeof(value));
++}
++
++static void asset(const std::filesystem::path& root) {
++    UvMesh mesh; mesh.vertices.resize(3); mesh.indices = {0,1,2};
++    mesh.vertices[1].base.px=1; mesh.vertices[2].base.py=1;
++    const std::vector<uint8_t> jpeg = {0xff,0xd8,0xff,0xd9};
++    ArTexturedAsset a;
++    assert(a.set(mesh,jpeg));
++    const auto original = a.vertices();
++    auto bad = mesh; bad.indices[2]=3;
++    assert(!a.set(bad,jpeg));
++    bad=mesh; bad.indices.push_back(0); assert(!a.set(bad,jpeg));
++    bad=mesh; bad.vertices[0].base.px=std::numeric_limits<float>::quiet_NaN();
++    assert(!a.set(bad,jpeg));
++    bad=mesh; bad.vertices[0].u=std::numeric_limits<float>::infinity();
++    assert(!a.set(bad,jpeg));
++    assert(a.vertices()==original && a.indices()==mesh.indices && a.jpeg()==jpeg);
++    const auto valid=root/"valid.msar", broken=root/"broken.msar";
++    assert(a.save(valid.string()));
++    std::ifstream in(valid,std::ios::binary);
++    const std::vector<char> bytes((std::istreambuf_iterator<char>(in)),{});
++    auto reject=[&](const std::vector<char>& data) {
++        { std::ofstream out(broken,std::ios::binary); out.write(data.data(),data.size()); }
++        assert(!a.load(broken.string()));
++        assert(a.vertices()==original && a.indices()==mesh.indices && a.jpeg()==jpeg);
++    };
++    auto data=bytes; put(data,28,std::numeric_limits<float>::quiet_NaN()); reject(data);
++    data=bytes; put(data,28+3*8*sizeof(float),uint32_t(3)); reject(data);
++    data=bytes; data.pop_back(); reject(data);
++    data=bytes; data.push_back(0); reject(data);
++    // A tiny file must not allocate the maximum declared ~98 MiB payload.
++    data.resize(28); put(data,16,uint32_t(800000)); put(data,20,uint32_t(2400000));
++    put(data,24,uint32_t(64*1024*1024)); reject(data);
++    ArTexturedAsset restored; assert(restored.load(valid.string()));
++    assert(restored.vertices()==original);
++    if (std::filesystem::exists("/dev/full")) assert(!a.save("/dev/full"));
++}
++
++int main(int argc, char** argv) {
++    assert(argc==3);
++    const std::string mode=argv[1];
++    if(mode=="numeric") numeric();
++    else if(mode=="ray") ray();
++    else if(mode=="cluster") cluster();
++    else if(mode=="asset") asset(argv[2]);
++    else return 2;
++    std::cout << "PASS " << mode << '\n';
++}
+diff --git a/tools/review_tests/run_robustness.py b/tools/review_tests/run_robustness.py
+new file mode 100644
+index 0000000..22de53b
+--- /dev/null
++++ b/tools/review_tests/run_robustness.py
+@@ -0,0 +1,25 @@
++#!/usr/bin/env python3
++"""Production geometry/asset boundary regressions; g++ and Python only."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++cpp = root / 'app/src/main/cpp'
++with tempfile.TemporaryDirectory() as work:
++    binary = Path(work) / 'robustness'
++    subprocess.run(['g++', '-std=c++20', '-O1', '-g',
++        '-fsanitize=address,undefined,float-cast-overflow',
++        '-fno-sanitize-recover=all', '-fno-omit-frame-pointer', '-I', str(cpp),
++        str(Path(__file__).with_name('robustness_regression.cpp')),
++        *[str(cpp / name) for name in ['tsdf_engine.cpp',
++            'mesh/mesh_engine.cpp', 'ar_textured_asset.cpp']], '-o', str(binary)], check=True)
++    env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0')
++    failed = []
++    for mode in ('numeric', 'ray', 'cluster', 'asset'):
++        result = subprocess.run([str(binary), mode, work], env=env)
++        if result.returncode:
++            failed.append(mode)
++    if failed:
++        raise SystemExit('FAILED: ' + ', '.join(failed))
+diff --git a/tools/review_tests/run_native.py b/tools/review_tests/run_native.py
+new file mode 100644
+index 0000000..bed7634
+--- /dev/null
++++ b/tools/review_tests/run_native.py
+@@ -0,0 +1,12 @@
++#!/usr/bin/env python3
++"""Run all host native regression suites in order; Android is not required."""
++from pathlib import Path
++import subprocess
++import sys
++
++directory = Path(__file__).resolve().parent
++for name in ('run.py', 'run_geometry.py', 'run_scan_policy.py',
++             'run_continuity.py', 'run_robustness.py'):
++    print(f'Running {name}', flush=True)
++    subprocess.run([sys.executable, str(directory / name)], check=True)
++print('PASS all host native suites')

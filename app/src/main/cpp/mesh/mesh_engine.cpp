@@ -1,4 +1,5 @@
 #include "mesh_engine.h"
+#include "../grid_index.h"
 
 #include <algorithm>
 #include <array>
@@ -134,11 +135,19 @@ inline uint64_t edgePairKey(uint32_t a, uint32_t b) {
 /**
  * 顶点坐标的整数格子键（用于聚类简化）。
  */
-inline uint64_t cellKey(int32_t x, int32_t y, int32_t z) {
-    return ((uint64_t)(uint32_t)x * 73856093ull) ^
-           ((uint64_t)(uint32_t)y * 19349663ull) ^
-           ((uint64_t)(uint32_t)z * 83492791ull);
-}
+struct CellKey {
+    int x, y, z;
+    bool operator==(const CellKey& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+struct CellKeyHash {
+    size_t operator()(const CellKey& key) const {
+        return ((uint64_t)(uint32_t)key.x * 73856093ull) ^
+               ((uint64_t)(uint32_t)key.y * 19349663ull) ^
+               ((uint64_t)(uint32_t)key.z * 83492791ull);
+    }
+};
 
 }  // namespace
 
@@ -707,7 +716,10 @@ void meshRecomputeNormals(Mesh& mesh) {
 
 void meshClusterSimplify(Mesh& mesh, float cellMeters) {
     const size_t nv = mesh.vertexCount();
-    if (nv == 0 || cellMeters <= 1e-5f) {
+    if (nv == 0 || !std::isfinite(cellMeters) || cellMeters <= 1e-5f ||
+        mesh.positions.size() % 3 != 0 || mesh.indices.size() % 3 != 0 ||
+        std::any_of(mesh.indices.begin(), mesh.indices.end(),
+                    [nv](uint32_t index) { return index >= nv; })) {
         return;
     }
     const float inv = 1.f / cellMeters;
@@ -718,7 +730,7 @@ void meshClusterSimplify(Mesh& mesh, float cellMeters) {
     };
     std::vector<Acc> cells;
     cells.reserve(nv / 2 + 8);
-    std::unordered_map<uint64_t, uint32_t> cellOf;
+    std::unordered_map<CellKey, uint32_t, CellKeyHash> cellOf;
     cellOf.reserve(nv * 2);
     std::vector<uint32_t> vcell(nv, 0);
     const bool hasColor = mesh.colors.size() >= nv * 3;
@@ -727,10 +739,10 @@ void meshClusterSimplify(Mesh& mesh, float cellMeters) {
         const float x = mesh.positions[i * 3 + 0];
         const float y = mesh.positions[i * 3 + 1];
         const float z = mesh.positions[i * 3 + 2];
-        const int32_t kx = (int32_t)std::floor(x * inv);
-        const int32_t ky = (int32_t)std::floor(y * inv);
-        const int32_t kz = (int32_t)std::floor(z * inv);
-        const uint64_t key = cellKey(kx, ky, kz);
+        int kx, ky, kz;
+        if (!checkedGridIndex(x * inv, kx) || !checkedGridIndex(y * inv, ky) ||
+            !checkedGridIndex(z * inv, kz)) return;
+        const CellKey key{kx, ky, kz};
         auto it = cellOf.find(key);
         uint32_t ci;
         if (it == cellOf.end()) {

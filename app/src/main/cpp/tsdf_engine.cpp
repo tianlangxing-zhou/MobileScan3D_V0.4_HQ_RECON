@@ -1,4 +1,5 @@
 #include "tsdf_engine.h"
+#include "grid_index.h"
 
 #include <algorithm>
 #include <cmath>
@@ -169,6 +170,9 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
     if (!std::isfinite(confidence) || confidence <= 0.f ||
         !std::isfinite(fx) || !std::isfinite(fy) || fx <= 0.f || fy <= 0.f ||
         !std::isfinite(cx) || !std::isfinite(cy)) return;
+    if (!std::isfinite(depthScale) || !std::isfinite(depthShift) ||
+        !std::all_of(R, R + 9, [](float v) { return std::isfinite(v); }) ||
+        !std::all_of(t, t + 3, [](float v) { return std::isfinite(v); })) return;
 
     const int step = pixelStep_ < 1 ? 1 : pixelStep_;
     const float mu = (trunc_ > 1e-4f) ? trunc_ : (voxel_ * kTsdfTruncVoxels);
@@ -199,6 +203,7 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
             // 沿射线推进时把步长按射线方向长度归一化（dzStep = voxel / |ray|），
             // 否则掠射角下相邻采样点会跳过体素，表面上会出现空洞与条纹。
             const float rayLen = std::sqrt(1.f + xn * xn + yn * yn);
+            if (!std::isfinite(rayLen)) continue;
             float dzStep = voxel_ / (rayLen > 1e-4f ? rayLen : 1.f);
             if (dzStep < 1e-5f) {
                 dzStep = 1e-5f;
@@ -212,13 +217,15 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
 
             uint16_t obsColor = 0;
             if (haveColor) {
-                const int sx = std::min(rgbW - 1, x * rgbW / w);
-                const int sy = std::min(rgbH - 1, y * rgbH / h);
+                const int sx = static_cast<int>(static_cast<int64_t>(x) * rgbW / w);
+                const int sy = static_cast<int>(static_cast<int64_t>(y) * rgbH / h);
                 const size_t ci = (static_cast<size_t>(sy) * rgbW + sx) * 3;
                 obsColor = packRgb565(rgb[ci], rgb[ci + 1], rgb[ci + 2]);
             }
 
             int guard = 0;
+            bool havePrevious = false;
+            int previousX = 0, previousY = 0, previousZ = 0;
             for (float zi = z0; zi <= z1; zi += dzStep) {
                 if (++guard > 4096) {
                     break;
@@ -231,9 +238,16 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                 if (!std::isfinite(Xw) || !std::isfinite(Yw) || !std::isfinite(Zw)) {
                     continue;
                 }
-                const int vx = (int)std::floor(Xw / voxel_);
-                const int vy = (int)std::floor(Yw / voxel_);
-                const int vz = (int)std::floor(Zw / voxel_);
+                int vx, vy, vz;
+                if (!checkedGridIndex(Xw / voxel_, vx) ||
+                    !checkedGridIndex(Yw / voxel_, vy) ||
+                    !checkedGridIndex(Zw / voxel_, vz)) continue;
+
+                // A ray can sample the same voxel more than once. Its SDF and
+                // color are identical there: avoid duplicate weight and hash work.
+                if (havePrevious && vx == previousX && vy == previousY && vz == previousZ) continue;
+                previousX = vx; previousY = vy; previousZ = vz;
+                havePrevious = true;
 
                 TsdfVoxel* v = voxelFor(vx, vy, vz, true);
                 if (!v) {

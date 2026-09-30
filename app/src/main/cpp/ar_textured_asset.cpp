@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -47,11 +48,16 @@ void ArTexturedAsset::clear() {
 bool ArTexturedAsset::set(
         const UvMesh& mesh,
         const std::vector<std::uint8_t>& jpegBytes) {
-    if (mesh.empty() ||
+    if (mesh.vertices.size() < 3 || mesh.indices.size() < 3 ||
+        mesh.indices.size() % 3 != 0 ||
         jpegBytes.size() < 4 ||
         jpegBytes[0] != 0xFFu ||
         jpegBytes[1] != 0xD8u) {
         return false;
+    }
+
+    for (const auto index : mesh.indices) {
+        if (index >= mesh.vertices.size()) return false;
     }
 
     if (mesh.vertices.size() > kMaxVertices ||
@@ -66,6 +72,10 @@ bool ArTexturedAsset::set(
         static_cast<std::size_t>(kVertexFloats));
 
     for (const auto& v : mesh.vertices) {
+        if (!std::isfinite(v.base.px) || !std::isfinite(v.base.py) ||
+            !std::isfinite(v.base.pz) || !std::isfinite(v.base.nx) ||
+            !std::isfinite(v.base.ny) || !std::isfinite(v.base.nz) ||
+            !std::isfinite(v.u) || !std::isfinite(v.v)) return false;
         vertices.push_back(v.base.px);
         vertices.push_back(v.base.py);
         vertices.push_back(v.base.pz);
@@ -80,9 +90,13 @@ bool ArTexturedAsset::set(
             std::clamp(v.v, 0.0f, 1.0f));
     }
 
+    // Prepare every allocation before publishing, including when callers pass
+    // jpeg() back into set(). Rejected input leaves the previous asset intact.
+    auto indices = mesh.indices;
+    auto jpeg = jpegBytes;
     vertices_.swap(vertices);
-    indices_ = mesh.indices;
-    jpeg_ = jpegBytes;
+    indices_.swap(indices);
+    jpeg_.swap(jpeg);
     return true;
 }
 
@@ -130,6 +144,7 @@ bool ArTexturedAsset::save(
         reinterpret_cast<const char*>(jpeg_.data()),
         static_cast<std::streamsize>(jpeg_.size()));
 
+    out.close(); // Report buffered write/close errors before claiming success.
     return static_cast<bool>(out);
 }
 
@@ -159,7 +174,7 @@ bool ArTexturedAsset::load(
     if (version != kVersion ||
         vertexFloats !=
             static_cast<std::uint32_t>(kVertexFloats) ||
-        vertexCount == 0 ||
+        vertexCount < 3 ||
         indexCount < 3 ||
         (indexCount % 3u) != 0u ||
         vertexCount > kMaxVertices ||
@@ -172,6 +187,18 @@ bool ArTexturedAsset::load(
     const std::size_t floatCount =
         static_cast<std::size_t>(vertexCount) *
         static_cast<std::size_t>(kVertexFloats);
+
+    // Validate the entire fixed-format payload before allocating from its header.
+    const auto payloadStart = in.tellg();
+    if (payloadStart == std::streampos(-1)) return false;
+    in.seekg(0, std::ios::end);
+    const auto end = in.tellg();
+    const std::uint64_t expected = static_cast<std::uint64_t>(floatCount) * sizeof(float) +
+        static_cast<std::uint64_t>(indexCount) * sizeof(std::uint32_t) + jpegBytes;
+    if (end == std::streampos(-1) || end < payloadStart ||
+        static_cast<std::uint64_t>(end - payloadStart) != expected) return false;
+    in.seekg(payloadStart);
+    if (!in) return false;
 
     std::vector<float> vertices(floatCount);
     std::vector<std::uint32_t> indices(indexCount);
@@ -202,6 +229,9 @@ bool ArTexturedAsset::load(
             return false;
         }
     }
+
+    if (!std::all_of(vertices.begin(), vertices.end(),
+                     [](float value) { return std::isfinite(value); })) return false;
 
     vertices_.swap(vertices);
     indices_.swap(indices);

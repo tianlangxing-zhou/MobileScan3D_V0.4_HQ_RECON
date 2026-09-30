@@ -1,0 +1,37 @@
+Running run.py
+==29==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==29==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS plain0.glb
+PASS plain1.glb
+PASS plain2.glb
+PASS plain3.glb
+PASS textured.glb
+PASS malformed mesh rejection, comma locale, unequal depth arrays; ASan/UBSan clean (leak detection disabled)
+PASS plain/textured GLB +Y up, preserved handedness, unchanged AR asset save/load
+Running run_geometry.py
+==44==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==44==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+plane z median=1.007 count=6721
+PASS projection, fixed inverse calibration, invalid samples, sign reversal, world coordinates, TSDF budget and plane mesh
+Running run_scan_policy.py
+==55==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==55==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS radial range, meter conversion, invalid inputs, frozen evidence, near-only TSDF mesh
+Running run_continuity.py
+==68==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==68==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS: timestamp prediction, IMU gaps/bias, camera extrinsics, 20-view surfel merge, 7-view TSDF mesh; max plane error=0.00249171 m
+Running run_robustness.py
+==81==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==81==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS numeric
+==82==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==82==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS ray
+==83==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==83==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS cluster
+==84==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==84==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS asset
+PASS all host native suites
