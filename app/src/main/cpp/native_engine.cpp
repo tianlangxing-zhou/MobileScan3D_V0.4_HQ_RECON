@@ -661,6 +661,7 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
     // 与 fuseDepth 同一套内参降采样（深度 256² -> 相机分辨率）。
     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
+    g.beginFrame();
     const float diag = std::sqrt(static_cast<float>(w * w + h * h));
     for (int y = 0; y < h; ++y) {
         const int yy = std::min(s.h - 1, y * s.h / h);
@@ -704,9 +705,11 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
             float Xw, Yw, Zw;
             rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
             size_t o = ((size_t)yy * s.w + xx) * 3;
-            g.ingestPoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2], c);
+            const auto geometry = adaptive::geometry(depth,w,h,x,y,dFx,dFy,dCx,dCy,s.R);
+            g.ingestAdaptivePoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2], c, geometry, x, y);
         }
     }
+    g.endFrame();
 }
 
 /**
@@ -729,7 +732,7 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
                         dFx, dFy, dCx, dCy, s.R, s.t, confidence,
-                        1.f, 0.f, pixelWeight);
+                        1.f, 0.f, pixelWeight, true);
     // 注意：场景 surfel（g）的喂入已**解耦**到 feedSceneSurfels()，
     // 与 TSDF 共用融合门控；暂停时保留已有几何，不再喂不可信观测。
 }
@@ -1187,8 +1190,9 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
     filterScanRange(masked, w, h, dFx, dFy, dCx, dCy);
     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
                               dFx, dFy, dCx, dCy, s.R, s.t, confidence,
-                              1.f, 0.f, pixelWeight);
+                              1.f, 0.f, pixelWeight, true);
 
+    targetG.beginFrame();
     for (int y = 0; y < h; ++y) {
         const int yy = std::min(s.h - 1, y * s.h / h);
         const uint8_t* mRow = mask.ptr<uint8_t>(y);
@@ -1214,10 +1218,12 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
             float Xw, Yw, Zw;
             rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
             const size_t o = (static_cast<size_t>(yy) * s.w + xx) * 3;
-            targetG.ingestPoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2],
-                                confidence * wP);
+            const auto geometry = adaptive::geometry(masked.data(),w,h,x,y,dFx,dFy,dCx,dCy,s.R);
+            targetG.ingestAdaptivePoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2],
+                                       confidence * wP, geometry, x, y);
         }
     }
+    targetG.endFrame();
     targetFuseFrames++;
 }
 
@@ -3529,6 +3535,18 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << "PointCloud centroid=(" << pcx << ", " << pcy << ", " << pcz << ")\n"
       << "PointCloud vs Cam offset=(" << offX << ", " << offY << ", " << offZ
       << ")  dist=" << offDist << "\n"
+      << "AdaptiveScene candidates=" << tsdf.adaptiveStats().candidates
+      << " selected=" << tsdf.adaptiveStats().selected << " skipped=" << tsdf.adaptiveStats().skipped
+      << " protected=" << tsdf.adaptiveStats().protectedSamples << " reactivated=" << tsdf.adaptiveStats().reactivated
+      << " cells=" << tsdf.adaptiveCells() << "\n"
+      << "AdaptiveTarget candidates=" << targetTsdf.adaptiveStats().candidates
+      << " selected=" << targetTsdf.adaptiveStats().selected << " skipped=" << targetTsdf.adaptiveStats().skipped
+      << " protected=" << targetTsdf.adaptiveStats().protectedSamples << " reactivated=" << targetTsdf.adaptiveStats().reactivated
+      << " cells=" << targetTsdf.adaptiveCells() << "\n"
+      << "PreviewCompact scenePatches=" << g.compressedCount() << " reclaimed=" << g.reclaimedCount()
+      << " reactivated=" << g.reactivatedCount() << " storageEstimate=" << g.storageBytes()
+      << " targetPatches=" << targetG.compressedCount() << " targetReclaimed=" << targetG.reclaimedCount()
+      << " targetReactivated=" << targetG.reactivatedCount() << " targetStorageEstimate=" << targetG.storageBytes() << "\n"
       << "TSDF: voxels=" << tsdf.voxels()
       << " blocks=" << tsdf.blocks()
       << " voxelSize=" << tsdf.voxelSize()

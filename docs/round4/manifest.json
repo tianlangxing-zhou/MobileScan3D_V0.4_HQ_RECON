@@ -1,0 +1,169 @@
+{
+  "baseline_zip": "MobileScan3D_core_src_vc154_round23_20261001.zip",
+  "baseline_zip_sha256": "5de5b046cf1b3c9c306071d3c1522fd6cc3a6d183afcd4cfbcf033d9a967a7c3",
+  "description": "Only files added or changed from uploaded vc154 round23. Existing round2+3 preserved.",
+  "files": [
+    {
+      "path": "README_ROUND234_ZH.md",
+      "baseline_sha256": null,
+      "sha256": "afe6b986b0c0a133873cde51ebd1ce63567919924bc3c9e7616a6496028aa056"
+    },
+    {
+      "path": "app/src/main/cpp/adaptive_sampling.h",
+      "baseline_sha256": null,
+      "sha256": "69bfa66ecfbd367e38ea42b3364cc76f6e880d342420c3dbb223d14110f3f3dc"
+    },
+    {
+      "path": "app/src/main/cpp/native_engine.cpp",
+      "baseline_sha256": "e0a33365993f89203b104423e4e7e0a9f09cc0e0045e9a9170035a0596c35358",
+      "sha256": "c7fc066b0bb637968fc10acdaafdf0f7d2df11d31d6ac87ba875e1520af67cff"
+    },
+    {
+      "path": "app/src/main/cpp/surfel_engine.cpp",
+      "baseline_sha256": "4ef584644c2887d112cc5cc1985b1a65653a395ac6585177ad5aaa9ddf5490b8",
+      "sha256": "d86d5f6ea85958bb93ad041da2c486557d93c50493cd2e9f0f8b96c192dc3f3c"
+    },
+    {
+      "path": "app/src/main/cpp/surfel_engine.h",
+      "baseline_sha256": "c8c1543ed938e115fe2f9885cddb14126df8493c73e7f6a686a4e0e5aaaa3748",
+      "sha256": "865195ed1f4c7fe87c570c3a7516d636d46e495aace2889ca5ada63a2634f6cc"
+    },
+    {
+      "path": "app/src/main/cpp/tsdf_engine.cpp",
+      "baseline_sha256": "da8ebc291971a8b374bc4eda97e4e25e7a2db7e4c0efc1998a5340ad9e8c6f1e",
+      "sha256": "c4b81b39e4b82d94b4bcdf891444a84fe17767512d8175bc876bc276c779ce91"
+    },
+    {
+      "path": "app/src/main/cpp/tsdf_engine.h",
+      "baseline_sha256": "01726e53e8e44ec3dab827561ab15adf8c198dc8f77d60bbc441630f8571e540",
+      "sha256": "30c3bb539cc2dc592822764daeb2aaa4a3b317a9ca8cb5628c38c078c55b3370"
+    },
+    {
+      "path": "docs/round4/README_REPLACE_ZH.md",
+      "baseline_sha256": null,
+      "sha256": "7c1b754b2c9057f983d9179c2adf017f787295a2c86e6858166cdd207fb99b5b"
+    },
+    {
+      "path": "docs/round4/benchmark_host.log",
+      "baseline_sha256": null,
+      "sha256": "cbf0cc8bf6a2212d8e9f4cdf5c982b44e2231ac45767d1bfe9d9a45f4640eaf8"
+    },
+    {
+      "path": "docs/round4/validation_host.log",
+      "baseline_sha256": null,
+      "sha256": "04536427fb449ecdffb0b96523c394a9b7bf94b911b0195c838ec32e1f4aafc0"
+    },
+    {
+      "path": "tools/review_tests/round4_regression.cpp",
+      "baseline_sha256": null,
+      "sha256": "e09a6af0ab90cd405f5caaf1cf7b93bf44429b1c561f8ace7703079f40f16159"
+    },
+    {
+      "path": "tools/review_tests/run_native.py",
+      "baseline_sha256": "0f11686c3df7edeeb81d6fdc5fe035242532f1b47084c631d2683735989fc9e8",
+      "sha256": "047b25052e73fe684da680883b5660f9e80d3916f75d81362914d308076573a6"
+    },
+    {
+      "path": "tools/review_tests/run_round4.py",
+      "baseline_sha256": null,
+      "sha256": "5e1d2c1898355a1230046312b5b97809cbe72aede3aa2f6194bc870e896d76f5"
+    },
+    {
+      "path": "tools/review_tests/verify_round234_overlay.py",
+      "baseline_sha256": null,
+      "sha256": "88632e086c7ae98fa9d039d727a2cd06fa4b0dd5efc6f7f8835c056a0a21e321"
+    }
+  ],
+  "required_round23_files": [
+    {
+      "path": "README_ROUND23_ZH.md",
+      "baseline_sha256": "3cc822cb0ef0ea28828e2060726215bc95bdefcfd6c5b7741cfd986444522013",
+      "sha256": "3cc822cb0ef0ea28828e2060726215bc95bdefcfd6c5b7741cfd986444522013"
+    },
+    {
+      "path": "app/src/main/cpp/CMakeLists.txt",
+      "baseline_sha256": "5a40f451596cde1bf5ca553aa90c60ad2e1a91a7704ab1bd1d793246069a5141",
+      "sha256": "5a40f451596cde1bf5ca553aa90c60ad2e1a91a7704ab1bd1d793246069a5141"
+    },
+    {
+      "path": "app/src/main/cpp/depth_calib.cpp",
+      "baseline_sha256": "e7a6615b6142e092ee5cf580f0c67c5c71ca5fbe781e1e0a4190aedb2e76156c",
+      "sha256": "e7a6615b6142e092ee5cf580f0c67c5c71ca5fbe781e1e0a4190aedb2e76156c"
+    },
+    {
+      "path": "app/src/main/cpp/depth_calib.h",
+      "baseline_sha256": "d7d17ad93aa89c4b9b7ec46f07a9c6e583fe274f7846de27ad2c48d2253b710f",
+      "sha256": "d7d17ad93aa89c4b9b7ec46f07a9c6e583fe274f7846de27ad2c48d2253b710f"
+    },
+    {
+      "path": "app/src/main/cpp/depth_confidence.h",
+      "baseline_sha256": "ad83a8a9af984c7f922200e620c58ab2df029e4f87e5afeeffbb4adbde749e32",
+      "sha256": "ad83a8a9af984c7f922200e620c58ab2df029e4f87e5afeeffbb4adbde749e32"
+    },
+    {
+      "path": "app/src/main/cpp/mesh/hard_surface.cpp",
+      "baseline_sha256": "90f78f456559d2e95e8d030bd844469c22e0ebeb90f3b08e1a9ff9dc1503ea49",
+      "sha256": "90f78f456559d2e95e8d030bd844469c22e0ebeb90f3b08e1a9ff9dc1503ea49"
+    },
+    {
+      "path": "app/src/main/cpp/mesh/hard_surface.h",
+      "baseline_sha256": "d3dacdcaa0f79f2b9877eff6442b40e954bed337633be25a467e885a66a769ac",
+      "sha256": "d3dacdcaa0f79f2b9877eff6442b40e954bed337633be25a467e885a66a769ac"
+    },
+    {
+      "path": "app/src/main/cpp/mesh/mesh_engine.h",
+      "baseline_sha256": "11595901adf1b37051431b34f8d3be7dd059bfc72a10d1d9178410249f77e1ce",
+      "sha256": "11595901adf1b37051431b34f8d3be7dd059bfc72a10d1d9178410249f77e1ce"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/MainActivity.kt",
+      "baseline_sha256": "d897d2ccb6d463e3be942f80b99152f419163de2bce2471fbc9494f50c8cf72d",
+      "sha256": "d897d2ccb6d463e3be942f80b99152f419163de2bce2471fbc9494f50c8cf72d"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/NativeBridge.kt",
+      "baseline_sha256": "2e08b28ce0632996cf5ad55d7078be3381b01cad841aef6ab76ce76c58dc8b4c",
+      "sha256": "2e08b28ce0632996cf5ad55d7078be3381b01cad841aef6ab76ce76c58dc8b4c"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/depth/DepthPerformance.kt",
+      "baseline_sha256": "f742faca4d4ffe0734b103898b7f16bbbc76f5f586862fd3778c731fade13018",
+      "sha256": "f742faca4d4ffe0734b103898b7f16bbbc76f5f586862fd3778c731fade13018"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/depth/MonoDepthProvider.kt",
+      "baseline_sha256": "c662c43147498a43c5da3704d163a10fc005e6f9c6ab33b075d56c620de88785",
+      "sha256": "c662c43147498a43c5da3704d163a10fc005e6f9c6ab33b075d56c620de88785"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/export/ExportManager.kt",
+      "baseline_sha256": "9c3ea5d8ce0e0ade770ceead5588f493f65c1bb9f278bc8057bfb412f11afff5",
+      "sha256": "9c3ea5d8ce0e0ade770ceead5588f493f65c1bb9f278bc8057bfb412f11afff5"
+    },
+    {
+      "path": "docs/round23/README_REPLACE_ZH.md",
+      "baseline_sha256": "c2eef102666feb50ba196074f03888c3717582abc5ab9bd67e1909a246500319",
+      "sha256": "c2eef102666feb50ba196074f03888c3717582abc5ab9bd67e1909a246500319"
+    },
+    {
+      "path": "docs/round23/validation_host.log",
+      "baseline_sha256": "ccb0dab0ff73793e3e822dba695997e0fa5e9c55ed2f39ad035e594f39f71b0f",
+      "sha256": "ccb0dab0ff73793e3e822dba695997e0fa5e9c55ed2f39ad035e594f39f71b0f"
+    },
+    {
+      "path": "tools/review_tests/round23_regression.cpp",
+      "baseline_sha256": "0707cbb8db098955b201607c2ce7c0b8134505a386d374b89347c4dd0f9eccdf",
+      "sha256": "0707cbb8db098955b201607c2ce7c0b8134505a386d374b89347c4dd0f9eccdf"
+    },
+    {
+      "path": "tools/review_tests/run_round23.py",
+      "baseline_sha256": "e3c70940eeff20736aefd9bf13916f00e6f8d687238d0c5d13909f309b052ff5",
+      "sha256": "e3c70940eeff20736aefd9bf13916f00e6f8d687238d0c5d13909f309b052ff5"
+    },
+    {
+      "path": "tools/review_tests/verify_round23_overlay.py",
+      "baseline_sha256": "c77e39cf9a89314d3c7758d627b6d6feafef758db559748fe24b19d0bcf8424f",
+      "sha256": "c77e39cf9a89314d3c7758d627b6d6feafef758db559748fe24b19d0bcf8424f"
+    }
+  ]
+}

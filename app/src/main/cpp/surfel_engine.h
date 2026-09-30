@@ -6,7 +6,7 @@
 //
 // 评审指出命名与实现不符，这里改成如实的名字：
 //
-// 本类做的是「1cm 体素哈希 + 位置/颜色加权平均 + 固定 scale + 单位四元数 +
+// 本类做的是「1cm 体素哈希 + 稳定共面区域 2cm 压缩 + 位置/颜色加权平均 + 单位四元数 +
 // 置信度不透明度」。它 **没有** 3D Gaussian Splatting 的协方差、球谐系数、
 // 可微渲染与训练优化 —— 所以它本质上是 colored surfel（有向点），
 // 不是 3DGS。
@@ -19,6 +19,7 @@
 // ============================================================================
 
 #include <cstdint>
+#include "adaptive_sampling.h"
 #include <unordered_map>
 #include <vector>
 
@@ -29,12 +30,25 @@ struct Surfel {
     uint8_t r, g, b, opacity;
     uint16_t hits;
     uint8_t state;
+    float nx=0, ny=0, nz=0;
+    uint32_t lastFrame=0, protectedUntil=0;
+    bool detail=true, coarse=false;
 };
 
 class SurfelEngine {
 public:
     void reset();
     void ingestPoint(float x, float y, float z, uint8_t r, uint8_t g, uint8_t b, float confidence);
+    // Called once per accepted depth frame, under the existing native state lock.
+    void beginFrame();
+    void endFrame();
+    void ingestAdaptivePoint(float x,float y,float z,uint8_t r,uint8_t g,uint8_t b,
+                             float confidence,const adaptive::Geometry& geometry,int px,int py);
+    const adaptive::Stats& adaptiveStats() const { return sampler_.stats(); }
+    size_t compressedCount() const { return coarseIndex_.size(); }
+    size_t reclaimedCount() const { return reclaimed_; }
+    size_t reactivatedCount() const { return reactivated_; }
+    size_t storageBytes() const;
     size_t count() const;
     size_t stableCount() const;
     size_t mergedCount() const;
@@ -70,6 +84,14 @@ private:
         }
     };
 
+    void erasePoint(size_t i);
+    void rebuildIndex();
+    void updatePoint(Surfel& a,float x,float y,float z,uint8_t r,uint8_t g,uint8_t b,float confidence,bool countHit);
+    Key keyFor(const Surfel& a) const;
+    adaptive::Sampler sampler_;
+    std::unordered_map<Key, size_t, Hash> coarseIndex_;
+    uint32_t frame_=0;
+    size_t reclaimed_=0, reactivated_=0;
     std::vector<Surfel> g_;
     std::unordered_map<Key, size_t, Hash> index_;
     size_t stable_ = 0;

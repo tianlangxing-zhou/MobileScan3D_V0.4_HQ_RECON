@@ -1,4 +1,5 @@
 #pragma once
+#include "adaptive_sampling.h"
 
 #include <cstdint>
 #include <functional>
@@ -99,11 +100,13 @@ public:
     /**
      * 融合一帧深度。
      *
-     * 与旧版本签名**完全兼容**（最后两个参数有默认值），所以 native_engine.cpp
+     * 与旧版本调用兼容（新增尾部参数都有默认值），所以 native_engine.cpp
      * 里的两个调用点（fuseDepth / fuseTargetDepth）不需要改动。
      *
      * @param depthScale / depthShift  深度标定后的仿射修正 z' = z*scale + shift。
      *        默认 1/0 表示「不做修正」，行为与旧版本一致。
+     * @param adaptiveSampling 稠密深度路径启用自适应降频；默认 false，稀疏 stereo
+     *        约束和旧调用保留原行为。只减少重复更新，不删除最终 TSDF。
      * @param pixelWeight  可选的**逐像素**可信度图，长度 w*h，取值 [0,1]；
      *        为 nullptr（默认）时退化为「整帧统一用 confidence」，行为与旧版本
      *        完全一致，所以既有调用点不需要改动。
@@ -118,7 +121,10 @@ public:
                         float fx, float fy, float cx, float cy,
                         const float R[9], const float t[3], float confidence,
                         float depthScale = 1.f, float depthShift = 0.f,
-                        const float* pixelWeight = nullptr);
+                        const float* pixelWeight = nullptr, bool adaptiveSampling = false);
+
+    const adaptive::Stats& adaptiveStats() const { return adaptive_.stats(); }
+    size_t adaptiveCells() const { return adaptive_.cells(); }
 
     /** 已经分配且 weight > 0 的体素数。 */
     uint64_t voxels() const { return liveVoxels_; }
@@ -172,6 +178,7 @@ private:
     TsdfBlock* blockFor(int bx, int by, int bz, bool create);
     TsdfVoxel* voxelFor(int vx, int vy, int vz, bool create);
 
+    adaptive::Sampler adaptive_;
     std::unordered_map<BlockKey, TsdfBlock, BlockHash> blocks_;
     float voxel_ = 0.020f;     // 20mm：全场景默认（与旧版一致）
     float trunc_ = 0.080f;     // 4 * voxel_

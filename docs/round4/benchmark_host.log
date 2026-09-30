@@ -1,0 +1,66 @@
+REPEAT 1
+PASS planar normals, mask/hole halo, NaN, thin ridge and curvature protection
+PASS multi-frame stability, world-space novelty, reactivation, history budget/reset
+preview_points_before=1600 after=400 bytes_before=206872 after=49688 patches=400
+PASS planar point/memory reclamation, new region, compressed patch reactivation, negative grid, edge/normal protection
+moving coverage missing=5 / 6009 diff=0.00022071
+moving_noisy_plane_max_field_difference_m=0.00022071 checked_voxels=6009
+moving_plane_mesh_max_error_m=0.00130376 triangles_dense=33238 triangles_adaptive=33195
+PASS moving noisy slanted plane, novel view and sparse/default bypass
+tsdf_candidates=440640 skipped=159091 max_field_difference_m=0 triangles_dense=58371 triangles_adaptive=58371
+dense_ms_per_frame=2.80958 adaptive_ms_per_frame=2.74242
+PASS TSDF coverage/mesh retention, contradiction reactivation, zero-confidence rejection/reset
+
+REPEAT 2
+PASS planar normals, mask/hole halo, NaN, thin ridge and curvature protection
+PASS multi-frame stability, world-space novelty, reactivation, history budget/reset
+preview_points_before=1600 after=400 bytes_before=206872 after=49688 patches=400
+PASS planar point/memory reclamation, new region, compressed patch reactivation, negative grid, edge/normal protection
+moving coverage missing=5 / 6009 diff=0.00022071
+moving_noisy_plane_max_field_difference_m=0.00022071 checked_voxels=6009
+moving_plane_mesh_max_error_m=0.00130376 triangles_dense=33238 triangles_adaptive=33195
+PASS moving noisy slanted plane, novel view and sparse/default bypass
+tsdf_candidates=440640 skipped=159091 max_field_difference_m=0 triangles_dense=58371 triangles_adaptive=58371
+dense_ms_per_frame=2.76488 adaptive_ms_per_frame=2.74855
+PASS TSDF coverage/mesh retention, contradiction reactivation, zero-confidence rejection/reset
+
+REPEAT 3
+PASS planar normals, mask/hole halo, NaN, thin ridge and curvature protection
+PASS multi-frame stability, world-space novelty, reactivation, history budget/reset
+preview_points_before=1600 after=400 bytes_before=206872 after=49688 patches=400
+PASS planar point/memory reclamation, new region, compressed patch reactivation, negative grid, edge/normal protection
+moving coverage missing=5 / 6009 diff=0.00022071
+moving_noisy_plane_max_field_difference_m=0.00022071 checked_voxels=6009
+moving_plane_mesh_max_error_m=0.00130376 triangles_dense=33238 triangles_adaptive=33195
+PASS moving noisy slanted plane, novel view and sparse/default bypass
+tsdf_candidates=440640 skipped=159091 max_field_difference_m=0 triangles_dense=58371 triangles_adaptive=58371
+dense_ms_per_frame=2.84625 adaptive_ms_per_frame=2.94926
+PASS TSDF coverage/mesh retention, contradiction reactivation, zero-confidence rejection/reset
+
+REPEAT 4
+PASS planar normals, mask/hole halo, NaN, thin ridge and curvature protection
+PASS multi-frame stability, world-space novelty, reactivation, history budget/reset
+preview_points_before=1600 after=400 bytes_before=206872 after=49688 patches=400
+PASS planar point/memory reclamation, new region, compressed patch reactivation, negative grid, edge/normal protection
+moving coverage missing=5 / 6009 diff=0.00022071
+moving_noisy_plane_max_field_difference_m=0.00022071 checked_voxels=6009
+moving_plane_mesh_max_error_m=0.00130376 triangles_dense=33238 triangles_adaptive=33195
+PASS moving noisy slanted plane, novel view and sparse/default bypass
+tsdf_candidates=440640 skipped=159091 max_field_difference_m=0 triangles_dense=58371 triangles_adaptive=58371
+dense_ms_per_frame=2.6807 adaptive_ms_per_frame=2.59792
+PASS TSDF coverage/mesh retention, contradiction reactivation, zero-confidence rejection/reset
+
+REPEAT 5
+PASS planar normals, mask/hole halo, NaN, thin ridge and curvature protection
+PASS multi-frame stability, world-space novelty, reactivation, history budget/reset
+preview_points_before=1600 after=400 bytes_before=206872 after=49688 patches=400
+PASS planar point/memory reclamation, new region, compressed patch reactivation, negative grid, edge/normal protection
+moving coverage missing=5 / 6009 diff=0.00022071
+moving_noisy_plane_max_field_difference_m=0.00022071 checked_voxels=6009
+moving_plane_mesh_max_error_m=0.00130376 triangles_dense=33238 triangles_adaptive=33195
+PASS moving noisy slanted plane, novel view and sparse/default bypass
+tsdf_candidates=440640 skipped=159091 max_field_difference_m=0 triangles_dense=58371 triangles_adaptive=58371
+dense_ms_per_frame=2.82649 adaptive_ms_per_frame=2.68928
+PASS TSDF coverage/mesh retention, contradiction reactivation, zero-confidence rejection/reset
+
+host_median_dense_ms=2.809580 host_median_adaptive_ms=2.742420 reduction_percent=2.39

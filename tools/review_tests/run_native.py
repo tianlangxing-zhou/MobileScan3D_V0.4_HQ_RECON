@@ -6,7 +6,7 @@ import sys
 
 directory = Path(__file__).resolve().parent
 for name in ('run.py', 'run_geometry.py', 'run_scan_policy.py', 'run_optimization.py',
-             'run_continuity.py', 'run_robustness.py', 'run_round23.py'):
+             'run_continuity.py', 'run_robustness.py', 'run_round23.py', 'run_round4.py'):
     print(f'Running {name}', flush=True)
     subprocess.run([sys.executable, str(directory / name)], check=True)
 print('PASS all host native suites')

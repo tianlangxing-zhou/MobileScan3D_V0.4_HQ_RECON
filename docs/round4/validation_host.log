@@ -1,0 +1,86 @@
+Final host native suites. Eigen supplied via CPLUS_INCLUDE_PATH.
+LeakSanitizer disabled (restricted /proc); ASan/UBSan remain enabled.
+
+Host validation collected from individual successful suite runs.
+The initial continuity build lacked bundled Eigen; the successful rerun uses runtime-installed Eigen.
+No Android SDK/NDK build or device test. Leak detection disabled due to restricted /proc.
+
+=== export, geometry, scan policy, optimization ===
+Running run.py
+==19==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==19==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS plain0.glb
+PASS plain1.glb
+PASS plain2.glb
+PASS plain3.glb
+PASS textured.glb
+PASS malformed mesh rejection, comma locale, unequal depth arrays; ASan/UBSan clean (leak detection disabled)
+PASS plain/textured GLB +Y up, preserved handedness, unchanged AR asset save/load
+Running run_geometry.py
+==34==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==34==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+plane z median=1.007 count=6721
+PASS projection, fixed inverse calibration, invalid samples, sign reversal, world coordinates, TSDF budget and plane mesh
+Running run_scan_policy.py
+==45==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==45==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS radial range, meter conversion, invalid inputs, frozen evidence, near-only TSDF mesh
+Running run_optimization.py
+==58==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==58==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+offset_fit_valid=1 offset_max_error_m=0
+inverse=0 noisy_max_relative_error=0.000274532
+inverse=1 noisy_max_relative_error=0.000324612
+calibration_samples=512
+centroid_error_m=2.5779e-08
+oversized_min_hits_copied=0
+fusion_digest=10245960488155071710 voxels=29432 blocks=128
+fusion_median_ms_per_frame=13.7856
+PASS calibration stability, noisy/outlier fits, sampling budget, centroid, hit threshold, fusion/reset
+
+
+=== continuity (Eigen include resolved) ===
+==16==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==16==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS: timestamp prediction, IMU gaps/bias, camera extrinsics, 20-view surfel merge, 7-view TSDF mesh; max plane error=0.00249171 m
+
+
+=== robustness ===
+==16==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==16==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS numeric
+==17==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==17==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS ray
+==18==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==18==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS cluster
+==19==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==19==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS asset
+
+
+=== round23 ===
+==40==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==40==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS temporal identity, conflicts, visibility changes, z-buffer, huge projection, source confidence, resize, buffer reuse
+PASS zero weights prevent TSDF allocation; unit weights preserve voxel count
+cuboid support=1 rms=9.70252e-08 ms=31.4062
+PASS box UV unwrap indices=36
+PASS rotated/noisy/partial cuboid, cube constraint, hard normals/winding, planar, sphere/thin/two-face/separated/dented/invalid rejection
+PASS cuboid GLB header, 24 vertices / 36 indices
+
+
+=== round4 ===
+==17==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+==17==WARNING: reading executable name failed with errno 2, some stack frames may not be symbolized
+PASS planar normals, mask/hole halo, NaN, thin ridge and curvature protection
+PASS multi-frame stability, world-space novelty, reactivation, history budget/reset
+preview_points_before=1600 after=400 bytes_before=206872 after=49688 patches=400
+PASS planar point/memory reclamation, new region, compressed patch reactivation, negative grid, edge/normal protection
+moving coverage missing=5 / 6009 diff=0.00022071
+moving_noisy_plane_max_field_difference_m=0.00022071 checked_voxels=6009
+moving_plane_mesh_max_error_m=0.00130376 triangles_dense=33238 triangles_adaptive=33195
+PASS moving noisy slanted plane, novel view and sparse/default bypass
+tsdf_candidates=440640 skipped=159091 max_field_difference_m=0 triangles_dense=58371 triangles_adaptive=58371
+PASS TSDF coverage/mesh retention, contradiction reactivation, zero-confidence rejection/reset

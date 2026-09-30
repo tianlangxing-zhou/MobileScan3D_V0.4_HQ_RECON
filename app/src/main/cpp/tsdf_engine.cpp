@@ -54,6 +54,7 @@ static inline uint16_t blendRgb565(uint16_t a, uint16_t b, float wa, float wb) {
 // ============================================================================
 
 void TsdfEngine::reset() {
+    adaptive_.reset();
     blocks_.clear();
     liveVoxels_ = 0;
     liveColoredVoxels_ = 0;
@@ -164,7 +165,7 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                                 float fx, float fy, float cx, float cy,
                                 const float R[9], const float t[3], float confidence,
                                 float depthScale, float depthShift,
-                                const float* pixelWeight) {
+                                const float* pixelWeight, bool adaptiveSampling) {
     if (!depth || w < 4 || h < 4 || !R || !t) {
         return;
     }
@@ -175,7 +176,9 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
         !std::all_of(R, R + 9, [](float v) { return std::isfinite(v); }) ||
         !std::all_of(t, t + 3, [](float v) { return std::isfinite(v); })) return;
 
-    const int step = pixelStep_ < 1 ? 1 : pixelStep_;
+    if (adaptiveSampling) adaptive_.beginFrame(std::clamp(voxel_ * 4.f, .016f, .08f));
+    // Detail protection overrides a coarse configured stride on the adaptive path.
+    const int step = adaptiveSampling ? 1 : std::max(1, pixelStep_);
     const float mu = (trunc_ > 1e-4f) ? trunc_ : (voxel_ * kTsdfTruncVoxels);
     const float invMu = 1.f / mu;
     const float baseWeight = std::clamp(confidence, 0.05f, 1.f);
@@ -217,6 +220,22 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
 
             const float xn = (static_cast<float>(x) - cx) * invFx;
             const float yn = (static_cast<float>(y) - cy) * invFy;
+
+            if (adaptiveSampling) {
+                const auto geo = adaptive::geometry(depth,w,h,x,y,fx,fy,cx,cy,R,depthScale,depthShift);
+                const float xc=xn*z, yc=yn*z;
+                const float wx=R[0]*xc+R[1]*yc+R[2]*z+t[0];
+                const float wy=R[3]*xc+R[4]*yc+R[5]*z+t[1];
+                const float wz=R[6]*xc+R[7]*yc+R[8]*z+t[2];
+                if (!adaptive_.select(wx,wy,wz,geo,obsWeight,x,y)) {
+                    // A stable coarse plane must not suppress a previously unseen
+                    // surface voxel when camera motion changes the ray lattice.
+                    int vx,vy,vz;
+                    if (checkedGridIndex(wx/voxel_,vx) && checkedGridIndex(wy/voxel_,vy) &&
+                        checkedGridIndex(wz/voxel_,vz) && weightAt(vx,vy,vz)>0) continue;
+                    adaptive_.keepUnseenSample();
+                }
+            }
 
             // 沿射线推进时把步长按射线方向长度归一化（dzStep = voxel / |ray|），
             // 否则掠射角下相邻采样点会跳过体素，表面上会出现空洞与条纹。
