@@ -1,0 +1,46 @@
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag texTris=7233 fbTris=325 painted=233073 hq=223632 kf=11
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=0 project=0 border=1330 depth=411 facing=431 area=0 pass=5386
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=1 project=0 border=1667 depth=332 facing=418 area=0 pass=5141
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=2 project=0 border=2476 depth=589 facing=574 area=0 pass=3919
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=3 project=0 border=1884 depth=236 facing=665 area=0 pass=4773
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=4 project=0 border=827 depth=316 facing=472 area=1 pass=5942
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=5 project=0 border=1214 depth=220 facing=507 area=0 pass=5617
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=6 project=0 border=1857 depth=251 facing=456 area=0 pass=4994
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=7 project=0 border=2725 depth=291 facing=284 area=0 pass=4258
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=8 project=0 border=1285 depth=557 facing=483 area=0 pass=5233
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=9 project=0 border=2236 depth=265 facing=665 area=0 pass=4392
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag reject kf=10 project=0 border=2146 depth=490 facing=637 area=0 pass=4285
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.002,0.000,0.001) fwd=(-0.902,-0.120,-0.414) q=2.50 verts=3942 inFront=3942 inFrame=3211 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.003,-0.001,0.002) fwd=(-0.866,-0.308,-0.395) q=2.50 verts=3942 inFront=3942 inFrame=2525 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.006,-0.020,0.002) fwd=(-0.854,0.103,-0.510) q=2.50 verts=3942 inFront=3942 inFrame=3463 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.016,-0.045,0.008) fwd=(-0.781,0.294,-0.551) q=2.50 verts=3942 inFront=3942 inFrame=3266 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.028,-0.062,0.008) fwd=(-0.693,0.416,-0.588) q=2.50 verts=3942 inFront=3942 inFrame=3036 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.026,-0.052,0.011) fwd=(-0.710,0.409,-0.573) q=2.50 verts=3942 inFront=3942 inFrame=2946 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.017,0.025,0.005) fwd=(-0.856,-0.163,-0.491) q=1.50 verts=3942 inFront=3942 inFrame=3237 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.060,-0.018,0.035) fwd=(-0.680,0.060,-0.730) q=1.58 verts=3942 inFront=3942 inFrame=2741 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.050,-0.021,0.042) fwd=(-0.729,0.064,-0.681) q=1.69 verts=3942 inFront=3942 inFrame=2925 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.026,-0.052,-0.041) fwd=(-0.909,0.231,-0.346) q=2.04 verts=3942 inFront=3942 inFrame=2609 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:12:00.644 I/MobileScan3D(27864): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(-0.018,-0.049,-0.039) fwd=(-0.912,0.264,-0.314) q=1.67 verts=3942 inFront=3942 inFrame=2759 bbox=[(-0.23,-0.10,-0.14)-(-0.04,0.13,0.02)]
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag texTris=31316 fbTris=48674 painted=12235928 hq=4616937 kf=11
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=0 project=9782 border=50708 depth=6744 facing=3316 area=0 pass=9440
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=1 project=727 border=56575 depth=15100 facing=1784 area=0 pass=5804
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=2 project=16975 border=47926 depth=4148 facing=2342 area=0 pass=8599
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=3 project=26 border=55772 depth=12590 facing=3176 area=0 pass=8426
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=4 project=11922 border=51267 depth=4989 facing=2805 area=0 pass=9007
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=5 project=9560 border=38957 depth=20793 facing=3123 area=0 pass=7557
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=6 project=531 border=58663 depth=9171 facing=2875 area=0 pass=8750
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=7 project=34 border=58374 depth=9395 facing=2982 area=0 pass=9205
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=8 project=3147 border=45999 depth=19380 facing=3546 area=0 pass=7918
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=9 project=24289 border=44410 depth=2812 facing=1474 area=0 pass=7005
+09-30 17:45:11.899 I/MobileScan3D(18457): bakeDiag reject kf=10 project=23796 border=41997 depth=2936 facing=1921 area=1 pass=9339
+09-30 17:45:11.900 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.027,-0.036,0.010) fwd=(-0.875,-0.366,-0.316) q=2.50 verts=40818 inFront=35722 inFrame=10001 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.900 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.017,-0.013,0.011) fwd=(-0.955,-0.051,-0.292) q=2.50 verts=40818 inFront=40496 inFrame=10659 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.901 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.017,0.011,0.008) fwd=(-0.935,0.196,-0.295) q=2.50 verts=40818 inFront=40800 inFrame=12412 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.901 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.025,0.026,0.013) fwd=(-0.857,0.433,-0.280) q=2.50 verts=40818 inFront=39173 inFrame=15800 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.901 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.033,0.032,0.013) fwd=(-0.741,0.604,-0.293) q=2.50 verts=40818 inFront=35902 inFrame=16106 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.902 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.019,-0.002,0.015) fwd=(-0.970,-0.014,-0.244) q=2.50 verts=40818 inFront=40780 inFrame=11091 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.902 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.028,-0.099,0.009) fwd=(-0.820,-0.430,-0.376) q=2.50 verts=40818 inFront=32022 inFrame=7663 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.902 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.037,-0.103,0.013) fwd=(-0.766,-0.533,-0.358) q=1.07 verts=40818 inFront=28614 inFrame=7274 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.903 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.018,0.048,-0.005) fwd=(-0.785,0.219,-0.579) q=2.50 verts=40818 inFront=40427 inFrame=11665 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.904 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.023,-0.127,-0.005) fwd=(-0.683,-0.435,-0.587) q=1.30 verts=40818 inFront=28361 inFrame=5793 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
+09-30 17:45:11.904 I/MobileScan3D(18457): bakeDiag kf 4096x3072 fx=2883 fy=2884 t=(0.054,-0.075,-0.002) fwd=(-0.910,-0.403,-0.098) q=2.50 verts=40818 inFront=34633 inFrame=8592 bbox=[(-0.36,-0.35,-0.27)-(0.06,0.39,0.14)]
