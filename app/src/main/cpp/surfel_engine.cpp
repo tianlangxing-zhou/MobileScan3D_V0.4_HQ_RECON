@@ -101,7 +101,7 @@ size_t SurfelEngine::copyPoints(float* out, size_t maxPoints, int minHits) const
     if (out == nullptr || maxPoints == 0 || g_.empty()) {
         return 0;
     }
-    const uint16_t need = static_cast<uint16_t>(minHits > 1 ? minHits : 1);
+    const uint16_t need = static_cast<uint16_t>(std::clamp(minHits, 1, 65535));
 
     // 先数一遍「满足 minHits 的点」，再按它算采样步长。
     // 旧实现直接对 g_ 全体均匀抽样并全部画出来，于是未验证点也进了渲染 ——
@@ -171,13 +171,16 @@ void SurfelEngine::centroid(float* x, float* y, float* z) const {
     if (g_.empty()) {
         return;
     }
+    // Up to 600k world-space points: float accumulation can lose centimetres
+    // even when each individual coordinate is represented accurately.
+    double sx = 0, sy = 0, sz = 0;
     for (const Surfel& a : g_) {
-        *x += a.px;
-        *y += a.py;
-        *z += a.pz;
+        sx += a.px;
+        sy += a.py;
+        sz += a.pz;
     }
-    const float inv = 1.f / (float)g_.size();
-    *x *= inv;
-    *y *= inv;
-    *z *= inv;
+    const double inv = 1.0 / static_cast<double>(g_.size());
+    *x = static_cast<float>(sx * inv);
+    *y = static_cast<float>(sy * inv);
+    *z = static_cast<float>(sz * inv);
 }

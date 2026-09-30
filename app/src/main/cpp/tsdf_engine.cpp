@@ -184,6 +184,13 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
     // 颜色带：只有非常接近表面（|sdf| < 0.5）的体素才吃颜色。
     const float colorBand = 0.5f;
 
+    // unordered_map rehash preserves element pointers. Cache the last block,
+    // including a failed lookup at capacity, across adjacent ray samples.
+    // Local lifetime keeps reset()/a later integration from using stale pointers.
+    TsdfBlock* cachedBlock = nullptr;
+    int cachedX = 0, cachedY = 0, cachedZ = 0;
+    bool haveCachedBlock = false;
+
     for (int y = 0; y < h; y += step) {
         const float* drow = depth + static_cast<size_t>(y) * w;
         for (int x = 0; x < w; x += step) {
@@ -249,11 +256,21 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                 previousX = vx; previousY = vy; previousZ = vz;
                 havePrevious = true;
 
-                TsdfVoxel* v = voxelFor(vx, vy, vz, true);
-                if (!v) {
+                const int bx = vx >> kTsdfBlockShift;
+                const int by = vy >> kTsdfBlockShift;
+                const int bz = vz >> kTsdfBlockShift;
+                if (!haveCachedBlock || bx != cachedX || by != cachedY || bz != cachedZ) {
+                    cachedBlock = blockFor(bx, by, bz, true);
+                    cachedX = bx; cachedY = by; cachedZ = bz;
+                    haveCachedBlock = true;
+                }
+                if (!cachedBlock) {
                     // A full budget only prevents new blocks; existing surfaces keep refining.
                     continue;
                 }
+                TsdfVoxel* v = &cachedBlock->voxels[
+                    ((vz & kTsdfBlockMask) * kTsdfBlockSize + (vy & kTsdfBlockMask)) *
+                    kTsdfBlockSize + (vx & kTsdfBlockMask)];
 
                 // Evaluate at the voxel's stored lattice position, not at an arbitrary
                 // ray sample inside it. Mesh extraction uses this same lattice.
@@ -291,6 +308,8 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                         std::min(colorOld + baseWeight, kTsdfMaxWeight));
                 }
 
+                // Revisiting an observed voxel cannot expand the bounds.
+                if (!wasEmpty) continue;
                 if (!hasBounds_) {
                     hasBounds_ = true;
                     minV_[0] = maxV_[0] = vx;

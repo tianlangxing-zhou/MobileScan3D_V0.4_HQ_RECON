@@ -2,26 +2,30 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 // ============================================================================
 //  基础统计
 // ============================================================================
 
-float medianOf(std::vector<float> v) {
+namespace {
+template<class T> T medianInPlace(std::vector<T>& v) {
     if (v.empty()) {
         return 0.f;
     }
     const size_t mid = v.size() / 2;
     std::nth_element(v.begin(), v.begin() + mid, v.end());
-    float hi = v[mid];
+    const T hi = v[mid];
     if (v.size() % 2 == 1) {
         return hi;
     }
-    // 偶数个：再取一次较小的一半里的最大值
-    std::nth_element(v.begin(), v.begin() + (mid - 1), v.begin() + mid);
-    const float lo = v[mid - 1];
-    return 0.5f * (lo + hi);
+    // 偶数个：直接扫描已分区的较小一半，避免第二次 nth_element。
+    const T lo = *std::max_element(v.begin(), v.begin() + mid);
+    return T(0.5) * lo + T(0.5) * hi;
 }
+} // namespace
+
+float medianOf(std::vector<float> v) { return medianInPlace(v); }
 
 namespace {
 
@@ -32,30 +36,39 @@ struct Pair {
 };
 
 /** 加权最小二乘 y = a*x + b。返回 false 表示退化（x 方差过小）。 */
-bool weightedLineFit(const std::vector<Pair>& pts, float* outA, float* outB) {
-    double sw = 0, swx = 0, swy = 0, swxx = 0, swxy = 0;
+bool weightedLineFit(const std::vector<Pair>& pts, double* outA, double* outB) {
+    double sw = 0, swx = 0, swy = 0;
     for (const Pair& p : pts) {
         const double w = p.w;
         sw += w;
         swx += w * p.x;
         swy += w * p.y;
-        swxx += w * static_cast<double>(p.x) * p.x;
-        swxy += w * static_cast<double>(p.x) * p.y;
     }
     if (sw <= 1e-12) {
         return false;
     }
-    const double det = sw * swxx - swx * swx;
-    if (std::fabs(det) <= 1e-12 * std::max(1.0, sw * swxx)) {
+    // Center before multiplying: E[x*x]-E[x]*E[x] loses the small
+    // variance when a depth provider supplies values with a large offset.
+    const double mx = swx / sw, my = swy / sw;
+    double sxx = 0, sxy = 0;
+    for (const Pair& p : pts) {
+        const double dx = static_cast<double>(p.x) - mx;
+        const double dy = static_cast<double>(p.y) - my;
+        sxx += p.w * dx * dx;
+        sxy += p.w * dx * dy;
+    }
+    if (!(sxx > std::numeric_limits<double>::min()) || !std::isfinite(sxx)) {
         return false;
     }
-    const double a = (sw * swxy - swx * swy) / det;
-    const double b = (swxx * swy - swx * swxy) / det;
-    if (!std::isfinite(a) || !std::isfinite(b)) {
+    const double a = sxy / sxx;
+    const double b = my - a * mx;
+    if (!std::isfinite(a) || !std::isfinite(b) ||
+        std::fabs(a) > std::numeric_limits<float>::max() ||
+        std::fabs(b) > std::numeric_limits<float>::max()) {
         return false;
     }
-    *outA = static_cast<float>(a);
-    *outB = static_cast<float>(b);
+    *outA = a;
+    *outB = b;
     return true;
 }
 
@@ -76,14 +89,14 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
             z[i] <= 0.05f || z[i] > 50.f) continue;
         float zp;
         if (inverse) {
-            const float inv = a * d[i] + b;
+            const double inv = static_cast<double>(a) * d[i] + b;
             if (!(inv > 1e-6f) || !std::isfinite(inv)) {
                 rel.push_back(1e6f);
                 continue;
             }
             zp = 1.f / inv;
         } else {
-            zp = a * d[i] + b;
+            zp = static_cast<float>(static_cast<double>(a) * d[i] + b);
         }
         if (!(zp > 1e-4f) || !std::isfinite(zp)) {
             rel.push_back(1e6f);
@@ -95,7 +108,7 @@ ModelScore scoreModel(const std::vector<float>& d, const std::vector<float>& z,
     if (rel.size() < 4) {
         return s;
     }
-    const float med = medianOf(rel);
+    const float med = medianInPlace(rel);
     s.ok = true;
     s.medianRelResidual = med;
     const float thr = std::max(0.05f, 3.f * med);
@@ -153,46 +166,49 @@ DepthCalibration fitDepthRobust(const std::vector<float>& d,
         }
 
         // ---- 初值：普通最小二乘 ----
-        float a = 0.f, b = 0.f;
+        double a = 0, b = 0;
         if (!weightedLineFit(pts, &a, &b)) {
             return false;
         }
 
         // ---- MAD 剔除 + Huber IRLS ----
-        for (int it = 0; it < maxIterations; ++it) {
-            std::vector<float> absRes;
-            absRes.reserve(pts.size());
+        std::vector<double> residuals(pts.size()), dev(pts.size());
+        for (int it = 0; it < std::clamp(maxIterations, 0, 64); ++it) {
+            size_t i = 0;
             for (const Pair& p : pts) {
-                absRes.push_back(std::fabs(a * p.x + b - p.y));
+                residuals[i++] = a * p.x + b - p.y;
             }
-            const float med = medianOf(absRes);
-            std::vector<float> dev;
-            dev.reserve(absRes.size());
-            for (float r : absRes) {
-                dev.push_back(std::fabs(r - med));
+            // MAD is defined on signed residuals, not on their magnitudes.
+            // The latter underestimates sigma and rejects valid noisy samples.
+            const double med = medianInPlace(residuals);
+            for (i = 0; i < residuals.size(); ++i) {
+                dev[i] = std::fabs(residuals[i] - med);
             }
-            const float mad = medianOf(dev);
+            const double mad = medianInPlace(dev);
             // 1.4826 * MAD 是正态分布下 sigma 的稳健估计
-            const float sigma = std::max(1e-6f, 1.4826f * mad);
-            const float huberK = 1.345f * sigma;
+            const double sigma = std::max(1e-6, 1.4826 * mad);
+            const double huberK = 1.345 * sigma;
 
             for (Pair& p : pts) {
-                const float r = std::fabs(a * p.x + b - p.y);
+                const double signedResidual = a * p.x + b - p.y;
+                const double r = std::fabs(signedResidual);
                 // MAD 硬剔除（> 5 sigma）+ Huber 软降权
-                if (r > 5.f * sigma) {
+                // Center the rejection gate too: an initial intercept bias
+                // must not reject the entire consensus set before refitting.
+                if (std::fabs(signedResidual - med) > 5.0 * sigma) {
                     p.w = 0.f;
                 } else if (r <= huberK) {
                     p.w = 1.f;
                 } else {
-                    p.w = huberK / std::max(1e-9f, r);
+                    p.w = static_cast<float>(huberK / std::max(1e-9, r));
                 }
             }
-            float na = 0.f, nb = 0.f;
+            double na = 0, nb = 0;
             if (!weightedLineFit(pts, &na, &nb)) {
                 break;
             }
-            const float da = std::fabs(na - a);
-            const float db = std::fabs(nb - b);
+            const double da = std::fabs(na - a);
+            const double db = std::fabs(nb - b);
             a = na;
             b = nb;
             if (da < 1e-7f && db < 1e-7f) {
@@ -272,13 +288,13 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
         ++rejectedFrames_;
         return false;
     }
-    totalSamples_ += d.size();
+    totalSamples_ += std::min(d.size(), z.size());
 
     // 超量时均匀抽稀，保证调用耗时可控
     std::vector<float> dd, zz;
     const size_t n = std::min(d.size(), z.size());
     const size_t step = (n > static_cast<size_t>(cfg_.maxSamples))
-                            ? (n / static_cast<size_t>(cfg_.maxSamples) + 1)
+                            ? (1 + (n - 1) / static_cast<size_t>(cfg_.maxSamples))
                             : 1;
     dd.reserve(n / step + 2);
     zz.reserve(n / step + 2);

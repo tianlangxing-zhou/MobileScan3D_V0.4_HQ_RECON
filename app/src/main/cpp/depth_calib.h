@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 // ============================================================================
@@ -74,10 +75,14 @@ struct DepthCalibration {
         if (!std::isfinite(aOld) || !std::isfinite(bOld) ||
             !std::isfinite(aNew) || !std::isfinite(bNew)) return false;
         if (std::fabs(aOld) < 1e-12f || std::fabs(aNew) < 1e-12f) return false;
-        const float k = aOld / aNew;
-        const float newScale = scale * k;
-        const float newShift = shift + scale * bOld - newScale * bNew;
-        if (!std::isfinite(newScale) || !std::isfinite(newShift)) return false;
+        const double k = static_cast<double>(aOld) / aNew;
+        const double scaled = scale * k;
+        if (!std::isfinite(scaled) || std::fabs(scaled) > std::numeric_limits<float>::max()) return false;
+        const float newScale = static_cast<float>(scaled);
+        const double shifted = static_cast<double>(shift) +
+            static_cast<double>(scale) * bOld - static_cast<double>(newScale) * bNew;
+        if (!std::isfinite(shifted) || std::fabs(shifted) > std::numeric_limits<float>::max()) return false;
+        const float newShift = static_cast<float>(shifted);
         scale = newScale;
         shift = newShift;
         return true;
@@ -103,17 +108,19 @@ struct DepthCalibration {
             !std::isfinite(d)) {
             return fallback;
         }
-        const float v = scale * d + shift;
+        // Keep cancellation in double even though the stored model/input are float.
+        const double v = static_cast<double>(scale) * d + shift;
         if (inverseDepthModel) {
             if (!(v > 1e-6f) || !std::isfinite(v)) {
                 return fallback;
             }
             return 1.f / v;
         }
-        if (!(v > 1e-4f) || !std::isfinite(v)) {
+        if (!(v > 1e-4f) || !std::isfinite(v) || v > std::numeric_limits<float>::max()) {
             return fallback;
         }
-        return v;
+        const float metric = static_cast<float>(v);
+        return std::isfinite(metric) ? metric : fallback;
     }
 };
 

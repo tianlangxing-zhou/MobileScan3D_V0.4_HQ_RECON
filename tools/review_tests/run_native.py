@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 directory = Path(__file__).resolve().parent
-for name in ('run.py', 'run_geometry.py', 'run_scan_policy.py',
+for name in ('run.py', 'run_geometry.py', 'run_scan_policy.py', 'run_optimization.py',
              'run_continuity.py', 'run_robustness.py'):
     print(f'Running {name}', flush=True)
     subprocess.run([sys.executable, str(directory / name)], check=True)
