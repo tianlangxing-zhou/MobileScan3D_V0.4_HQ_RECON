@@ -3042,6 +3042,7 @@ private var lastRelocPollMs = 0L
         modelViewerActive = true
         glView.isClickable = true
         modelViewerButton?.text = "退出查看"
+        setScanOverlayVisible(false)
         glView.requestRender()
         toast("拖动=旋转 · 双指=缩放 · 长按后拖=移动 · 长按「退出查看」重置视角")
     }
@@ -3055,7 +3056,17 @@ private var lastRelocPollMs = 0L
         glView.isClickable = false
         renderer.drawMode = arDrawMode
         modelViewerButton?.text = "查看模型"
+        setScanOverlayVisible(true)
         glView.requestRender()
+    }
+
+    /** 进入/退出模型查看器时，显隐扫描页浮层，避免全屏模型下按钮仍可点击造成误触。 */
+    private fun setScanOverlayVisible(visible: Boolean) {
+        val v = if (visible) android.view.View.VISIBLE else android.view.View.GONE
+        listOf(
+            R.id.statusCard, R.id.toolRail, R.id.scanReticle, R.id.tvZoom,
+            R.id.hudCard, R.id.btnExport, R.id.btnStartScan
+        ).forEach { findViewById<android.view.View>(it).visibility = v }
     }
 
     /** VINS world uses +Z up: yaw must preserve height, with the center at the anchor. */
