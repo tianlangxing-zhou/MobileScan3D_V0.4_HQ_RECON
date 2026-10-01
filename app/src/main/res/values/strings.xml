@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">MobileScan 3D</string>
-    <string name="version_text">v0.13.30-epoch-reanchor</string>
     <string name="fps">FPS</string>
     <string name="distance">距离</string>
     <string name="auto_light">自动补光</string>

@@ -36,6 +36,8 @@
 #include "fusion_guard.h"
 #include "depth_geometry.h"
 #include "scan_policy.h"
+#include "fusion_evidence.h"
+#include "target_mask_temporal.h"
 #include "stereo_anchor_bridge.h"
 #include "mesh/mesh_engine.h"
 #include "mesh/hard_surface.h"
@@ -66,6 +68,7 @@ static float scanWorldPerMeter = 1.f; // VINS estimate until stereo scale is val
 static uint64_t rangeRejectedPixels = 0;
 static uint64_t frozenEvidenceRecoveries = 0;
 static int frozenEvidenceStreak = 0;
+static scan_policy::FusionEvidence frozenEvidenceWindow;
 
 static NullAiBackend aiBackend;
 static SurfelEngine g;
@@ -172,9 +175,8 @@ static constexpr float kEpochCatastrophicRatio = 0.75f;
 /** V0.13：极端失效判据 2（必须持续这么多帧才算真的塌了，不是抖动）。 */
 static constexpr int kEpochCatastrophicFrames = 30;
 // V0.13.30：live 标定器 EMA 平滑（漂移检测的鲁棒参考）+ 稳定性门。
-// 瞬时 live 因低接受率（~28%）+ 场景相关拟合而噪声大，直接比 frozen 会被
-// 误判为永久漂移 -> susp=1 再也解不开。EMA 平滑后对比才稳；只有 live 帧间
-// 离散度足够小（稳定）才认作「真实漂移」，否则视为噪声不挂起、不重锚。
+// VC171: only fresh accepted fits update this diagnostic. Recovery also needs
+// current geometric evidence; EMA convergence cannot authorize a scale change.
 static constexpr float kEpochLiveEmaNew = 0.15f;        // EMA 新观测权重
 static constexpr float kEpochLiveVarSuspendRel = 0.05f; // 相对方差门限（stddev<~22% 才认作稳定）
 static bool epochActive = false;
@@ -219,7 +221,7 @@ static float epochLiveEmaShift = 0.f;
 static bool  epochLiveEmaInvDepth = false;
 static bool  epochLiveEmaInit = false;
 static float epochLiveEmaVar = 0.f;   // (instant - ema)^2 的 EMA，用于稳定性判据
-static uint64_t epochReanchors = 0;   // 重锚次数（诊断：永久 susp 是否被解除）
+static uint64_t epochReanchors = 0;   // Legacy diagnostic; unsafe re-anchoring disabled in VC171.
 
 // ============================================================================
 //  V0.13.4 深度数值域（归一化映射）追踪
@@ -247,6 +249,8 @@ static float gDepthNormLastScaleRel = 0.f;
 static uint64_t gDepthNormChangesWhileEpoch = 0;
 
 static void resetFusionEpoch() {
+    frozenEvidenceWindow.reset();
+    frozenEvidenceStreak = 0;
     epochActive = false;
     epochCalib = DepthCalibration{};
     epochRefRaw = 0.f;
@@ -284,22 +288,22 @@ static void resetFusionEpoch() {
  * 必须是一个「与场景无关、只与映射有关」的输入值，才能用
  * `toMetric(raw)` 的前后差判断标定是否漂了。
  */
-static float rawDepthSampleMedian(const float* d, int w, int h) {
+static float rawDepthSampleMedian(const float* d, int w, int h, bool inverse) {
     if (!d || w < 4 || h < 4) {
-        return 0.f;
+        return std::numeric_limits<float>::quiet_NaN();
     }
     std::vector<float> s;
     s.reserve(static_cast<size_t>(w / 4 + 1) * static_cast<size_t>(h / 4 + 1));
     for (int y = 2; y < h; y += 4) {
         for (int x = 2; x < w; x += 4) {
             const float v = d[static_cast<size_t>(y) * w + x];
-            if (std::isfinite(v) && v > 0.05f && v < 60.f) {
+            if (depth_refinement::valid(v, inverse)) {
                 s.push_back(v);
             }
         }
     }
     if (s.empty()) {
-        return 0.f;
+        return std::numeric_limits<float>::quiet_NaN();
     }
     return medianOf(s);
 }
@@ -365,9 +369,8 @@ static constexpr float kMaskTemporalMinIou = 0.30f;
 static constexpr float kMaskAreaJumpRatio = 0.60f;
 static constexpr float kMaskCenterJumpFrac = 0.15f;
 static cv::Mat prevTargetMask;
-static int prevTargetMaskArea = 0;
-static float prevTargetMaskCx = 0.f;
-static float prevTargetMaskCy = 0.f;
+static cv::Rect2f prevTargetBox;
+static cv::Mat alignedTargetMask;
 static float maskTemporalIou = 0.f;
 static uint64_t maskTemporalRejects = 0;
 static bool maskTemporalOk = true;
@@ -1238,9 +1241,8 @@ static void resetTargetModel() {
     // V0.13：换目标/新会话时 mask 时序历史必须一起作废，否则第一帧就会
     // 拿新目标的 mask 去和上一个目标的 mask 求 IoU，白白触发一次时序拒绝。
     prevTargetMask.release();
-    prevTargetMaskArea = 0;
-    prevTargetMaskCx = 0.f;
-    prevTargetMaskCy = 0.f;
+    prevTargetBox = {};
+    alignedTargetMask.release();
     maskTemporalIou = 0.f;
     maskTemporalOk = true;
     presenceFailStreak = 0;
@@ -1441,9 +1443,8 @@ static PresenceDecision evaluatePresence(const TargetTrackInfo& ti,
 /** 当前帧没有可用 mask（目标出界 / 无目标）时清掉时序历史。 */
 static void resetMaskTemporalGate() {
     prevTargetMask.release();
-    prevTargetMaskArea = 0;
-    prevTargetMaskCx = 0.f;
-    prevTargetMaskCy = 0.f;
+    prevTargetBox = {};
+    alignedTargetMask.release();
     maskTemporalIou = 0.f;
     maskTemporalOk = true;
 }
@@ -1467,39 +1468,19 @@ static void updateMaskTemporalGate(const TargetTrackInfo& ti, int depthW, int de
         resetMaskTemporalGate();
         return;
     }
-    if (!prevTargetMask.empty() && prevTargetMask.size() == targetMaskMat.size() &&
-        prevTargetMask.type() == targetMaskMat.type() && prevTargetMaskArea > 0) {
-        cv::Mat inter;
-        cv::Mat uni;
-        cv::bitwise_and(prevTargetMask, targetMaskMat, inter);
-        cv::bitwise_or(prevTargetMask, targetMaskMat, uni);
-        const int ia = cv::countNonZero(inter);
-        const int ua = cv::countNonZero(uni);
-        maskTemporalIou = ua > 0 ? static_cast<float>(ia) / static_cast<float>(ua) : 0.f;
-
-        const float areaJump =
-            std::fabs(static_cast<float>(targetMaskStats.area - prevTargetMaskArea)) /
-            static_cast<float>(prevTargetMaskArea);
-
-        const float bw = (ti.x1 - ti.x0) * static_cast<float>(depthW);
-        const float bh = (ti.y1 - ti.y0) * static_cast<float>(depthH);
-        const float diag = std::sqrt(bw * bw + bh * bh);
-        const float cdx = targetMaskStats.centerX - prevTargetMaskCx;
-        const float cdy = targetMaskStats.centerY - prevTargetMaskCy;
-        const float centerJump =
-            diag > 1.f ? std::sqrt(cdx * cdx + cdy * cdy) / diag : 0.f;
-
-        if (maskTemporalIou < kMaskTemporalMinIou ||
-            areaJump > kMaskAreaJumpRatio ||
-            centerJump > kMaskCenterJumpFrac) {
-            maskTemporalOk = false;
-            ++maskTemporalRejects;
-        }
+    const cv::Rect2f box(ti.x0 * depthW, ti.y0 * depthH,
+                         (ti.x1-ti.x0) * depthW, (ti.y1-ti.y0) * depthH);
+    const auto comparison = compareTargetMasks(prevTargetMask, targetMaskMat,
+                                               prevTargetBox, box, alignedTargetMask);
+    maskTemporalIou = comparison.comparable ? comparison.iou : 0.f;
+    if (comparison.comparable && (comparison.iou < kMaskTemporalMinIou ||
+        comparison.areaJump > kMaskAreaJumpRatio || comparison.centerJump > kMaskCenterJumpFrac)) {
+        maskTemporalOk = false;
+        ++maskTemporalRejects;
     }
-    prevTargetMask = targetMaskMat.clone();
-    prevTargetMaskArea = targetMaskStats.area;
-    prevTargetMaskCx = targetMaskStats.centerX;
-    prevTargetMaskCy = targetMaskStats.centerY;
+    // Reuse storage; history is source-exposure aligned, just like ti.
+    targetMaskMat.copyTo(prevTargetMask);
+    prevTargetBox = box;
 }
 
 static jboolean nativeCreateImpl(jint w, jint h, jfloat fx, jfloat fy, jfloat cx, jfloat cy) {
@@ -2183,6 +2164,7 @@ static void nativeOnDepthMapImpl(
         sourceWeights.resize(static_cast<size_t>(w)*h);
         e->GetFloatArrayRegion(sourceConfidence, 0, w*h, sourceWeights.data());
         if (e->ExceptionCheck()) return;
+        depth_refinement::applySourceConfidence(d.data(), sourceWeights.data(), d.size());
     }
 
     static std::vector<float> refinedDepth;
@@ -2255,6 +2237,7 @@ static void nativeOnDepthMapImpl(
     }
 
     bool frozenEvidenceGood = false;
+    bool frozenEvidenceContradicted = false;
     bool calibrationUpdatedThisFrame = false;
     // ---- V0.9 深度标定：VINS 稀疏深度 + stereo metric anchors ----
     //
@@ -2264,8 +2247,8 @@ static void nativeOnDepthMapImpl(
     // MAD + Huber IRLS + EMA calibrator at 2-3x sample weight.
     const auto tCalib = std::chrono::steady_clock::now();
     if (depthCalibrationEnabled) {
-        std::vector<float> dPairs;
-        std::vector<float> zPairs;
+        static std::vector<float> dPairs, zPairs;
+        dPairs.clear(); zPairs.clear();
         dPairs.reserve(
             static_cast<size_t>(std::max(0, ns)) + 288u);
         zPairs.reserve(
@@ -2314,6 +2297,7 @@ static void nativeOnDepthMapImpl(
 
         // Count distinct VINS observations before weighted stereo duplicates.
         frozenEvidenceGood = epochActive && scan_policy::validatesFrozen(epochCalib, dPairs, zPairs);
+        frozenEvidenceContradicted = epochActive && dPairs.size() >= 20 && !frozenEvidenceGood;
         mobilescan3d::stereo_anchor::CalibrationBatch stereoBatch;
         while (
             mobilescan3d::stereo_anchor::takeCalibrationBatch(
@@ -2509,18 +2493,22 @@ static void nativeOnDepthMapImpl(
     // ---- V0.12 Fusion Calibration Epoch 状态机 ----
     // 判据一律在**同一个 raw 工作点**上比较，这样场景远近变化不会污染结论。
     {
-        const float rawNow = rawDepthSampleMedian(d.data(), w, h);
+        // The frozen reference is immutable; no per-frame median allocation.
+        // Relative inverse q has no physical [0.05,60] range or sign constraint.
+        const float rawNow = epochActive ? epochRefRaw :
+            rawDepthSampleMedian(d.data(), w, h, representation == 1);
         const DepthCalibration liveCal = depthCalibrator.calibration();
         if (!epochActive && !haveEpochPrevZ && std::isfinite(rawNow)) epochRefRaw = rawNow;
         const float zLiveNow = calibratedNow ? liveCal.toMetric(epochRefRaw, 0.f) : 0.f;
-        const bool liveOk = std::isfinite(zLiveNow) && zLiveNow > 0.f;
+        const bool liveOk = std::isfinite(rawNow) && std::isfinite(zLiveNow) && zLiveNow > 0.f;
 
-        // V0.13.30：维护 live 标定器的 EMA，作为漂移检测的鲁棒参考。
+        // VC171: update EMA only on a newly accepted fit, never a cached replay.
+        // Maintain live calibration EMA as a drift diagnostic.
         // 瞬时 live 因低接受率（~28%）+ 场景相关拟合而噪声大，直接比 frozen
         // 会被误判为永久漂移 -> susp=1 再也解不开。EMA 平滑后对比才稳。
-        if (calibratedNow && liveCal.valid &&
+        if (calibrationUpdatedThisFrame && calibratedNow && liveCal.valid &&
             std::isfinite(liveCal.scale) && std::isfinite(liveCal.shift)) {
-            if (!epochLiveEmaInit) {
+            if (!epochLiveEmaInit || epochLiveEmaInvDepth != liveCal.inverseDepthModel) {
                 epochLiveEmaScale = liveCal.scale;
                 epochLiveEmaShift = liveCal.shift;
                 epochLiveEmaInvDepth = liveCal.inverseDepthModel;
@@ -2546,6 +2534,11 @@ static void nativeOnDepthMapImpl(
                 ++epochIndex;
                 ++epochOpens;
             }
+        } else if (epochActive && frozenEvidenceGood) {
+            // Current sparse geometry supports the mapping that built this map.
+            // A disagreeing live fit cannot veto this independent observation.
+            epochBadStreak = epochSuspendStreak = epochCatastrophicStreak = 0;
+            epochResumeStreak = 0;
         } else if (!calibratedNow || !liveOk ||
                    // V0.13.28 修复：`hasCurrentCalibrationEvidence` 的「本帧必须刚拟合成功」
                    // 语义**只对已开启的 epoch 有意义**（防止用陈旧缓存为冻结参数背书）。
@@ -2567,6 +2560,7 @@ static void nativeOnDepthMapImpl(
             // 只有**连续** kEpochCalibLossFrames 帧都拿不到可用标定，才判定这个
             // epoch 暂时无法证明尺度一致 —— 暂停新增，保留当前模型。
             ++epochBadStreak;
+            epochResumeStreak = 0;
             if (!epochActive) {
                 epochStableStreak = 0;
                 haveEpochPrevZ = false;
@@ -2624,12 +2618,6 @@ static void nativeOnDepthMapImpl(
             const float zLiveAtRef = emaLive.toMetric(epochRefRaw, 0.f);
             const bool bothOk = std::isfinite(zFrozen) && zFrozen > 0.f &&
                                 std::isfinite(zLiveAtRef) && zLiveAtRef > 0.f;
-            // 稳定性判据：live 标定器帧间离散度足够小才认作「真实漂移」，
-            // 否则视为噪声（不挂起、不重锚）。
-            const float liveRelVar = (epochLiveEmaScale * epochLiveEmaScale > 1e-12f)
-                                         ? epochLiveEmaVar / (epochLiveEmaScale * epochLiveEmaScale)
-                                         : 1e9f;
-            const bool liveStable = epochLiveEmaInit && liveRelVar < kEpochLiveVarSuspendRel;
             if (bothOk) {
                 epochLastDriftRel = std::fabs(zLiveAtRef - zFrozen) / zFrozen;
             }
@@ -2654,7 +2642,9 @@ static void nativeOnDepthMapImpl(
                 // Even prolonged fit disagreement cannot justify erasing a scan.
                 // Keep the frozen mapping and geometry; resume only on evidence.
                 epochCatastrophicStreak = std::min(epochCatastrophicStreak, kEpochCatastrophicFrames);
-            } else if (bothOk) {
+            } else if (bothOk && calibrationUpdatedThisFrame &&
+                       scan_policy::mappingsAgree(epochCalib, liveCal, d.data(), w*h,
+                                                  kEpochRebuildRatio)) {
                 // 漂移回到门限内：连续 kEpochResumeFrames 帧正常就解除暂停。
                 epochBadStreak = 0;
                 epochSuspendStreak = 0;
@@ -2666,38 +2656,23 @@ static void nativeOnDepthMapImpl(
                         epochResumeStreak = 0;
                     }
                 }
-            }
-            // V0.13.30 重锚（re-anchor）：持续且稳定的背离 = 真实尺度已落到新值，
-            // 采用平滑后的 live 标定继续融合，避免永久 susp=1 让几何停止生长。
-            // 仅在 live 已收敛稳定（liveStable）时才重锚，否则只是噪声不动作。
-            if (epochSuspended && epochSuspendStreak >= kEpochDriftSuspendFrames &&
-                liveStable && epochLiveEmaInit &&
-                std::isfinite(epochLiveEmaScale) && std::isfinite(epochLiveEmaShift)) {
-                epochCalib.scale = epochLiveEmaScale;
-                epochCalib.shift = epochLiveEmaShift;
-                epochCalib.inverseDepthModel = epochLiveEmaInvDepth;
-                epochCalib.valid = true;
-                epochCalib.confidence = liveCal.confidence;
-                epochCalib.samples = liveCal.samples;
-                epochRefRaw = rawDepthSampleMedian(d.data(), w, h);
-                epochRefZ = epochCalib.toMetric(epochRefRaw, 0.f);
-                epochSuspended = false;
-                epochSuspendStreak = 0;
-                epochBadStreak = 0;
+            } else {
                 epochResumeStreak = 0;
-                epochCatastrophicStreak = 0;
-                epochLastDriftRel = 0.f;
-                epochLiveEmaVar = 0.f;
-                ++epochIndex;
-                ++epochReanchors;
             }
+            // Do not change epochCalib while old geometry is retained. A stable
+            // new fit alone cannot align already fused points to the new mapping.
+            // Frozen sparse evidence below can safely resume the original scale.
+
         }
     }
 
-    // Recover a frozen epoch only after six consecutive independent confirmations.
-    // This closes the 8%-75% drift dead zone without mixing calibration scales.
-    frozenEvidenceStreak = frozenEvidenceGood ? std::min(kEpochResumeFrames, frozenEvidenceStreak + 1) : 0;
-    if (epochActive && epochSuspended && frozenEvidenceStreak >= kEpochResumeFrames) {
+    // Require six distinct supporting exposures; tolerate short sample gaps,
+    // but expire stale support and cancel on observed geometric contradiction.
+    const bool frozenConfirmed = frozenEvidenceWindow.observe(
+        static_cast<uint64_t>(t), epochActive && frozenEvidenceGood,
+        frozenEvidenceContradicted, kEpochResumeFrames);
+    frozenEvidenceStreak = frozenEvidenceWindow.count();
+    if (epochActive && epochSuspended && frozenConfirmed) {
         epochSuspended = false;
         epochBadStreak = epochSuspendStreak = epochResumeStreak = epochCatastrophicStreak = 0;
         ++frozenEvidenceRecoveries;
@@ -4050,10 +4025,12 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << " mean=" << lastFusionDepthMean
       << " valid=" << lastFusionDepthValid
       << " conversionFallback=" << lastFusionDepthConversionFallback << "\n"
+      << "CorePatch: vc171-continuity-identity reanchor=disabled" << "\n"
       << "V13FusionEpoch: active=" << (epochActive ? 1 : 0)
       // V0.13：sticky=1 表示这一代 epoch **冻结后不再因为漂移清几何**，
       // suspended=1 表示当前只是暂停了新融合（几何还在）。
       << " sticky=1"
+      << " evidenceWindow=" << frozenEvidenceStreak
       << " suspended=" << (epochSuspended ? 1 : 0)
       << " suspendEvents=" << epochSuspendEvents
       << " suspendedFrames=" << fusionSuspendedFrames
@@ -4861,6 +4838,11 @@ Java_com_mobilescan3d_NativeBridge_nativeSetDepthNormMapping(JNIEnv*, jobject,
 
     depthCalibrator.reparameterizeInput(aOld, bOld, aNew, bNew);
     epochCalib.reparameterizeLinearInput(aOld, bOld, aNew, bNew);
+    epochLiveEmaInit = false;
+    epochLiveEmaVar = 0.f;
+    epochResumeStreak = 0;
+    frozenEvidenceWindow.reset();
+    frozenEvidenceStreak = 0;
     // epoch 参考工作点：旧域 -> 新域
     if (epochActive && std::isfinite(epochRefRaw)) {
         epochRefRaw = DepthCalibration::remapRaw(epochRefRaw, aOld, bOld, aNew, bNew);

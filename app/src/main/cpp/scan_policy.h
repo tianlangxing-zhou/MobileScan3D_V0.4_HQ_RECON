@@ -10,6 +10,23 @@ namespace scan_policy {
 inline bool hasCurrentCalibrationEvidence(bool updated, bool active, bool frozenGood) {
     return updated || (active && frozenGood);
 }
+// Test the actual working domain, not only one reference q where two different
+// scale/shift lines may cross. Bounded sampling keeps this independent of size.
+inline bool mappingsAgree(const DepthCalibration& a, const DepthCalibration& b,
+                          const float* raw, int count, float relativeTolerance) {
+    if (!a.valid || !b.valid || a.inverseDepthModel != b.inverseDepthModel ||
+        !raw || count <= 0 || !std::isfinite(relativeTolerance) || relativeTolerance < 0) return false;
+    int tested = 0;
+    const int step = std::max(1, count / 128);
+    for (int i = 0; i < count; i += step) {
+        if (!std::isfinite(raw[i])) continue;
+        const float za = a.toMetric(raw[i], 0.f), zb = b.toMetric(raw[i], 0.f);
+        if (!(za > .08f) || !(zb > .08f)) return false;
+        if (std::fabs(za-zb) > relativeTolerance * za) return false;
+        ++tested;
+    }
+    return tested >= 16;
+}
 // Euclidean camera-to-surface distance, not optical-axis Z or world origin.
 inline bool inRange(float z, float rayX, float rayY, float maxMeters,
                     float worldPerMeter = 1.f) {

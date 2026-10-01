@@ -1383,7 +1383,7 @@ void ObjectTracker::captureIdentityAnchor(const cv::Mat& gray, const cv::Rect& r
  */
 float ObjectTracker::computeIdentityScore(const cv::Rect& box, const cv::Mat& gray) const
 {
-    if (!identityReady_ || identityTemplate_.empty() || gray.empty()) {
+    if (!identityReady_ || identityTemplate_.empty() || gray.empty() || gray.type() != CV_8U) {
         return -1.f;
     }
     if (box.width <= 0 || box.height <= 0) {
@@ -1396,6 +1396,22 @@ float ObjectTracker::computeIdentityScore(const cv::Rect& box, const cv::Mat& gr
     if (boxArea <= 0.f ||
         static_cast<float>(inside.area()) / boxArea < 0.55f) {
         return -1.f;
+    }
+
+    // Test the predicted core on the same resampling grid as capture first.
+    // Resizing a larger sliding window can shift the pixel phase enough to
+    // reject a small detailed object even when its box is exactly correct.
+    float bestScore = 0.f;
+    const int coreW = std::max(16, int(std::lround(box.width * kIdentityCenterCrop)));
+    const int coreH = std::max(16, int(std::lround(box.height * kIdentityCenterCrop)));
+    const cv::Rect core(box.x + (box.width-coreW)/2, box.y + (box.height-coreH)/2, coreW, coreH);
+    if ((core & cv::Rect(0,0,gray.cols,gray.rows)) == core) {
+        cv::Mat normalized, response;
+        cv::resize(gray(core), normalized, identityTemplate_.size(), 0, 0, cv::INTER_AREA);
+        cv::matchTemplate(normalized, identityTemplate_, response, cv::TM_CCOEFF_NORMED);
+        const float score = response.at<float>(0,0);
+        if (std::isfinite(score)) bestScore = std::clamp(score, 0.f, 1.f);
+        if (bestScore >= .8f) return bestScore;
     }
 
     const float cx = static_cast<float>(box.x) + static_cast<float>(box.width) * 0.5f;
@@ -1411,14 +1427,22 @@ float ObjectTracker::computeIdentityScore(const cv::Rect& box, const cv::Mat& gr
         return -1.f;
     }
 
-    cv::Mat patch = gray(search).clone();
+    const cv::Mat patch = gray(search);
     if (patch.empty() || patch.type() != CV_8U) {
         return -1.f;
     }
-    // 把搜索窗缩放到「模板尺寸 x kIdentitySearchScale」，多出来的那一圈
-    // 就是位置容差。
-    const int pw = std::max(8, static_cast<int>(std::lround(identityTemplate_.cols * kIdentitySearchScale)));
-    const int ph = std::max(8, static_cast<int>(std::lround(identityTemplate_.rows * kIdentitySearchScale)));
+    // The template represents only the original central crop. Scale the search
+    // image by template/core, not template/full-box; otherwise even an identical
+    // target is 30% too small to match. Use the actual clipped search dimensions
+    // so approaching an image edge does not stretch the target.
+    const float initialW = 2.f * identityHalfWpx_;
+    const float initialH = 2.f * identityHalfHpx_;
+    const float cropW = std::max(16.f, float(std::lround(initialW * kIdentityCenterCrop))) / initialW;
+    const float cropH = std::max(16.f, float(std::lround(initialH * kIdentityCenterCrop))) / initialH;
+    const int pw = std::max(1, int(std::lround(identityTemplate_.cols * search.width /
+                                               (box.width * cropW))));
+    const int ph = std::max(1, int(std::lround(identityTemplate_.rows * search.height /
+                                               (box.height * cropH))));
     cv::Mat scaled;
     cv::resize(patch, scaled, cv::Size(pw, ph), 0, 0, cv::INTER_AREA);
     if (scaled.empty() || scaled.cols < identityTemplate_.cols ||
@@ -1438,7 +1462,8 @@ float ObjectTracker::computeIdentityScore(const cv::Rect& box, const cv::Mat& gr
     double minV = 0.0;
     double maxV = 0.0;
     cv::minMaxLoc(resp, &minV, &maxV);
-    return static_cast<float>(std::clamp(maxV, -1.0, 1.0));
+    // A negative NCC is evidence of mismatch, not the -1 unavailable sentinel.
+    return std::isfinite(maxV) ? std::max(bestScore, static_cast<float>(std::clamp(maxV, 0.0, 1.0))) : bestScore;
 }
 
 bool ObjectTracker::runNanoUpdate(const cv::Mat& frame, int width, int height, cv::Rect& outRect)
@@ -1586,9 +1611,10 @@ bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
         const bool recovering = info_.state == TargetState::LOST || info_.state == TargetState::REACQUIRING;
         const bool idOk = geometricIdentity || (idScore >= (recovering ? .60f : kIdentityAcceptMin)) ||
                           (!recovering && idScore < 0.f);
-        // 膨胀/长宽比守卫**不受 -1 影响**：它们是纯几何判据，永远有效。
-        const bool sizeOk = scaleFromInitial <= kIdentityMaxBBoxScale;
-        const bool aspectOk = aspectDrift <= kIdentityMaxAspectDrift;
+        // ORB already bounds affine scale and support. A rotated slender target
+        // naturally changes axis-aligned aspect/size; only unverified boxes need these limits.
+        const bool sizeOk = geometricIdentity || scaleFromInitial <= kIdentityMaxBBoxScale;
+        const bool aspectOk = geometricIdentity || aspectDrift <= kIdentityMaxAspectDrift;
 
         if (!idOk || !sizeOk || !aspectOk) {
             ++identityRejects_;

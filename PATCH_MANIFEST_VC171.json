@@ -1,0 +1,71 @@
+{
+  "baseline_commit": "4329794100c9f0b5c6a36aca829360718f3d2a5c",
+  "patch": "vc171-continuity-identity",
+  "production_files": [
+    {
+      "path": "app/src/main/cpp/depth_refinement.h",
+      "change": "modified",
+      "uploaded_path": "cpp/cpp/depth_refinement.h",
+      "base_sha256": "afd2c506f695bd567a12ab2ba782a8f5dc6736e8f736e50141624e6a2223a6fe",
+      "base_lf_sha256": "0cab234d3d8ad29b4becf9ea54575c6540710827facf5645495047794eb97c25",
+      "new_sha256": "a614faa38cb10daa1436558262de3c5c49e2a30e3f4bb3f6846c7377187efb70"
+    },
+    {
+      "path": "app/src/main/cpp/fusion_evidence.h",
+      "change": "added",
+      "uploaded_path": null,
+      "base_sha256": null,
+      "base_lf_sha256": null,
+      "new_sha256": "0135a9111103eaa92b7ef5f2a9f1e398d9bf67b2eaeb473a6f7de2e10159d73a"
+    },
+    {
+      "path": "app/src/main/cpp/native_engine.cpp",
+      "change": "modified",
+      "uploaded_path": "cpp/cpp/native_engine.cpp",
+      "base_sha256": "5d1282aff3335d0950bd72e77e6e4578b27b99cb7ddd6a09dd1d1a25c0b85f50",
+      "base_lf_sha256": "5d1282aff3335d0950bd72e77e6e4578b27b99cb7ddd6a09dd1d1a25c0b85f50",
+      "new_sha256": "da9efa8d44006d18c0c0ed0cdca380f87450e8f945f48492c8d59b5be04ab906"
+    },
+    {
+      "path": "app/src/main/cpp/object_tracker.cpp",
+      "change": "modified",
+      "uploaded_path": "cpp/cpp/object_tracker.cpp",
+      "base_sha256": "ae26768c8deef75db8bd7088c41f2b32933f4b708b9bef0fb3cd317f72530106",
+      "base_lf_sha256": "7f67f83b479c2fe07850a4e5e0a0b782ef841ad86697e9947118462447921c99",
+      "new_sha256": "750d17a64e0b16ae20953d11bdff97e10e42a4289358747328eca6ebcd8197f8"
+    },
+    {
+      "path": "app/src/main/cpp/scan_policy.h",
+      "change": "modified",
+      "uploaded_path": "cpp/cpp/scan_policy.h",
+      "base_sha256": "91766b76effdadbd385e90a1f5dd260833c26d2026da29b124a8ba318ededa79",
+      "base_lf_sha256": "91766b76effdadbd385e90a1f5dd260833c26d2026da29b124a8ba318ededa79",
+      "new_sha256": "42b86801893f49325bc30969a3c5801827ce790c3e851d1e818873bbd4730fe3"
+    },
+    {
+      "path": "app/src/main/cpp/target_mask_temporal.h",
+      "change": "added",
+      "uploaded_path": null,
+      "base_sha256": null,
+      "base_lf_sha256": null,
+      "new_sha256": "05831397eecd85d507a804d6e17bb75488ced855340eba424d3fa071c818099e"
+    },
+    {
+      "path": "app/src/main/cpp/target_reacquirer.h",
+      "change": "modified",
+      "uploaded_path": "cpp/cpp/target_reacquirer.h",
+      "base_sha256": "6585d357a3972f91e03ad91ceef7ce7006559cb5bd9aa59dbbd2166d7f4552ae",
+      "base_lf_sha256": "3d79c171f0b69177613b5f59696215ff5bbf4d18a520a4487432dfe4dd5b0877",
+      "new_sha256": "6a094f4acae4ea484733d5b400093ec72224948ee8f4618e1ed2e955afa85706"
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/depth/DepthPreprocessor.kt",
+      "change": "modified",
+      "uploaded_path": "java/com/mobilescan3d/depth/DepthPreprocessor.kt",
+      "base_sha256": "d0a5e1f7932ffb41142b4e7287e48d12f34e891c795c725716981d9487a5a843",
+      "base_lf_sha256": "6af6f0e56eaf9a1e0c567d9eefa99cd9180b28f07e0d0d34762a9440baba81c3",
+      "new_sha256": "0fbc73d2d9c913a8c317774afd87c817f66f01ddb304cac62874639b818c731a"
+    }
+  ],
+  "deletions": []
+}

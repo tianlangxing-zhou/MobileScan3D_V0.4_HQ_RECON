@@ -2,8 +2,20 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <limits>
 
 namespace depth_refinement {
+// Inverse-depth q=0 is valid, so represent absent source evidence with NaN.
+// Sanitize before filtering/calibration; final fusion weighting alone is too late.
+inline void applySourceConfidence(float* depth, float* confidence, size_t count) {
+    if (!depth || !confidence) return;
+    for (size_t i=0; i<count; ++i) {
+        if (!std::isfinite(confidence[i]) || confidence[i] <= 0.f) {
+            depth[i] = std::numeric_limits<float>::quiet_NaN();
+            confidence[i] = 0.f;
+        } else confidence[i] = std::min(1.f, confidence[i]);
+    }
+}
 inline bool valid(float v, bool inverse) {
     // Relative inverse models may legitimately emit zero/negative q.
     return std::isfinite(v) && (inverse || v > .05f);

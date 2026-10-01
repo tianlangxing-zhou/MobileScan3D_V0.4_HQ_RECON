@@ -80,6 +80,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var statusBarText: TextView
     private lateinit var hudText: TextView
 
+    // ---- V0.13.31：替换包 UI 状态卡（100% 设计还原，结构化单项）----
+    // headerStatus/hudText/statusBarText 影子化后，数据拆解写入以下包设计 id。
+    private lateinit var tvFps: TextView
+    private lateinit var tvDistance: TextView
+    private lateinit var tvAutoLight: TextView
+    private lateinit var tvCameraMode: TextView
+    private lateinit var tvDepth: TextView
+    private lateinit var tvMapCount: TextView
+    private lateinit var tvDrawCount: TextView
+    private lateinit var tvUnit: TextView
+
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var reader: ImageReader? = null
@@ -719,17 +730,27 @@ private var lastRelocPollMs = 0L
             visibility = android.view.View.GONE
         }
 
-        // —— 新 UI（activity_mobile_scan.xml）控件绑定 ——
-        // 复用既有状态字段，使其指向新布局 TextView，updateHeader/updateStatusBar/toggleHud 无需改动：
-        //   headerStatus->tvFps, warningBanner->tvDepth, statusBarText->tvUnit, hudText->tvDrawCount
+        // —— 新 UI（activity_mobile_scan.xml）控件绑定（100% 替换包设计还原）——
+        // 包设计把状态拆为结构化单项：tvFps/tvDistance/tvAutoLight/tvCameraMode +
+        // tvDepth/tvMapCount/tvDrawCount/tvUnit；中央提示位 tvScanHint 承载动态提示。
+        // 旧复合文本字段（headerStatus/hudText/statusBarText）影子化：逻辑保留、
+        // 不入视图树，避免原有多处 setText 写点回归（updateHeader 末尾做数据拆解）。
         primaryButton = findViewById(R.id.btnStartScan)
         modelViewerButton = findViewById(R.id.btnViewModel)
         placeButton = findViewById(R.id.toolPlacementLabel)
         arLayerButton = findViewById(R.id.toolRealtimeLabel)
-        headerStatus = findViewById(R.id.tvFps)
-        warningBanner = findViewById(R.id.tvDepth)
-        statusBarText = findViewById(R.id.tvUnit)
-        hudText = findViewById(R.id.tvDrawCount)
+        headerStatus = android.widget.TextView(this)
+        hudText = android.widget.TextView(this)
+        statusBarText = android.widget.TextView(this)
+        warningBanner = findViewById(R.id.tvScanHint)
+        tvFps = findViewById(R.id.tvFps)
+        tvDistance = findViewById(R.id.tvDistance)
+        tvAutoLight = findViewById(R.id.tvAutoLight)
+        tvCameraMode = findViewById(R.id.tvCameraMode)
+        tvDepth = findViewById(R.id.tvDepth)
+        tvMapCount = findViewById(R.id.tvMapCount)
+        tvDrawCount = findViewById(R.id.tvDrawCount)
+        tvUnit = findViewById(R.id.tvUnit)
 
         findViewById<android.view.View>(R.id.btnStartScan).setOnClickListener { toggleScan() }
         findViewById<android.view.View>(R.id.btnExport).setOnClickListener { showExportDrawer() }
@@ -838,6 +859,8 @@ private var lastRelocPollMs = 0L
             } else {
                 primaryButton.text = "启用相机"
                 headerStatus.text = "需要相机权限；点击启用相机后可扫描"
+                warningBanner.text = "需要相机权限；点击启用相机后可扫描"
+                warningBanner.visibility = android.view.View.VISIBLE
             }
         }
     }
@@ -871,6 +894,8 @@ private var lastRelocPollMs = 0L
         cameraIds = rearCameraIds.ifEmpty { allCameraIds }
         if (cameraIds.isEmpty()) {
             headerStatus.text = "没有可用摄像头"
+            warningBanner.text = "没有可用摄像头"
+            warningBanner.visibility = android.view.View.VISIBLE
             toast("没有可用摄像头，无法扫描")
             return
         }
@@ -4003,6 +4028,22 @@ private var lastRelocPollMs = 0L
                 (if (renderer.drawnDebug > 0) " + ${renderer.drawnDebug}" else "") +
                 " · " + metricLabel()
         }
+        // V0.13.31：替换包状态卡拆解写入（100% 设计还原，结构化单项）
+        tvFps.text = "%.1f".format(fps)
+        tvDistance.text = "≤%.1fm".format(scanMaxDistanceMeters)
+        tvAutoLight.text = when {
+            torchFailed -> "故障"
+            torchRequested || autoFillLight -> "开"
+            !torchAvailable -> "无"
+            else -> "关"
+        }
+        tvCameraMode.text = cameraRangeStatus.substringBefore("·").trim()
+        val depthOk = ::depthProvider.isInitialized && depthProvider.available && depthLastError.isEmpty()
+        tvDepth.text = if (depthOk) "深度: 有效" else "深度: 等待"
+        tvMapCount.text = "地图: $shown"
+        tvDrawCount.text = "绘制: ${renderer.drawnAccumulated}" +
+            (if (renderer.drawnDebug > 0) " +${renderer.drawnDebug}" else "")
+        tvUnit.text = metricLabel()
     }
 
     private fun updateStatusBar() {

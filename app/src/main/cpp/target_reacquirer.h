@@ -41,7 +41,11 @@ public:
     bool ready()const{return anchorDescriptors_.rows>=12;}
     bool search(const cv::Mat& gray,uint64_t ts,cv::Rect& result) {
         if(!ready() || gray.empty() || gray.size()!=anchorSize_ || !ts)return false;
-        if(lastSearchTs_ && (ts<=lastSearchTs_ || ts-lastSearchTs_<200000000ULL))return false;
+        // Once a candidate exists, verify on a new exposure promptly. Keep the
+        // expensive full-frame search at 5 Hz when there is no candidate.
+        const bool pendingFresh = pendingTs_ && ts > pendingTs_ && ts-pendingTs_ <= 750000000ULL;
+        const uint64_t interval = pendingFresh ? 80000000ULL : 200000000ULL;
+        if(lastSearchTs_ && (ts<=lastSearchTs_ || ts-lastSearchTs_<interval))return false;
         lastSearchTs_=ts;++searches;lastInliers=0;
         cv::Rect candidate;
         if(!locate(gray,candidate)) { confirmations_=0;pendingTs_=0;return false; }
