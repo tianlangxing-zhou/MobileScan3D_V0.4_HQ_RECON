@@ -237,7 +237,7 @@ static float epochLiveEmaShift = 0.f;
 static bool  epochLiveEmaInvDepth = false;
 static bool  epochLiveEmaInit = false;
 static float epochLiveEmaVar = 0.f;   // (instant - ema)^2 的 EMA，用于稳定性判据
-static uint64_t epochReanchors = 0;   // Legacy diagnostic; unsafe re-anchoring disabled in VC171.
+static uint64_t epochReanchors = 0;   // V0.13.36 复用：灾难超时恢复时对健康 live 的受控重锚（VC171 曾无条件重锚导致不安全而禁用；现要求 usable + 正 scale + 工作点分歧 >75% 三重条件，见恢复分支）。
 
 // ============================================================================
 //  V0.13.4 深度数值域（归一化映射）追踪
@@ -2679,6 +2679,46 @@ static void nativeOnDepthMapImpl(
                 epochResumeStreak = 0;
                 epochBadStreak = epochSuspendStreak = epochCatastrophicStreak = 0;
                 ++epochCatastrophicTimeoutResumes;
+                // ---- V0.13.36 (vc176)：超时恢复时用健康 live 重锚 ----
+                // 实机证据（PLK110 23:03 会话）：近处健康冻结（scale=+0.0026/
+                // shift=4.97, refZ=0.17）后用户后退扫全屋，live 拟合健康自适应
+                // （liveEma stable=1, shift 4.97→0.79, fusionDepth 0.14→0.46m），
+                // frozen 在工作点失真 105% → 灾难挂起。旧的纯恢复会继续用失真
+                // frozen 写几何 → 立刻再次触发灾难 → 「停写 10s → 恢复 → 再挂」
+                // 循环，扫描永远停在冻结时刻的场景尺度上。
+                // 重锚接受尺度接缝（旧几何保留，不再追加），换取后续几何正确：
+                // 对拉丝薄壳来说接缝无意义，对新区域这是唯一能写对的路径。
+                // 防线：仅当 live 标定可用、工作点映射有限为正、且分歧仍是
+                // 灾难级（>75%）时才重锚 —— 分歧已回落说明 frozen 仍可信，
+                // 保持不动。epochIndex 不动（重锚不是新 epoch 的稳定链路）。
+                if (depthCalibrator.usable()) {
+                    const DepthCalibration liveAnchor =
+                        depthCalibrator.calibration();
+                    const float zLiveAnchor =
+                        liveAnchor.toMetric(epochRefRaw, 0.f);
+                    const float zFrozenAnchor =
+                        epochCalib.toMetric(epochRefRaw, 0.f);
+                    if (liveAnchor.scale > 0.f &&
+                        std::isfinite(zLiveAnchor) && zLiveAnchor > 0.f &&
+                        std::isfinite(zFrozenAnchor) && zFrozenAnchor > 0.f &&
+                        std::fabs(zLiveAnchor - zFrozenAnchor) / zFrozenAnchor >
+                            kEpochCatastrophicRatio) {
+                        epochCalib = liveAnchor;
+                        epochCalib.valid = true;
+                        epochRefZ = zLiveAnchor;
+                        epochLastDriftRel = 0.f;
+                        ++epochReanchors;
+                        LOGI("EpochReanchor: reanchored to live calib "
+                             "scale=%.5f shift=%.4f at refRaw=%.2f "
+                             "(zFrozen=%.4f zLive=%.4f) total=%llu",
+                             static_cast<double>(liveAnchor.scale),
+                             static_cast<double>(liveAnchor.shift),
+                             static_cast<double>(epochRefRaw),
+                             static_cast<double>(zFrozenAnchor),
+                             static_cast<double>(zLiveAnchor),
+                             (unsigned long long)epochReanchors);
+                    }
+                }
             }
             // Do not change epochCalib while old geometry is retained. A stable
             // new fit alone cannot align already fused points to the new mapping.
