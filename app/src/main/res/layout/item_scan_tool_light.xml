@@ -1,38 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="64dp"
-    android:layout_marginBottom="2dp"
-    android:background="@drawable/bg_tool_item"
-    android:clickable="true"
-    android:focusable="true"
-    android:foreground="?android:attr/selectableItemBackgroundBorderless"
-    android:gravity="center"
-    android:orientation="vertical">
-
-    <ImageView
-        android:layout_width="20dp"
-        android:layout_height="20dp"
-        android:contentDescription="补光"
-        android:src="@drawable/ic_brightness" />
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:includeFontPadding="false"
-        android:text="补光"
-        android:textColor="@color/scan_text_primary"
-        android:textSize="9.5sp"
-        android:textStyle="bold" />
-
-    <TextView
-        android:id="@+id/toolLightLabel"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
-        android:includeFontPadding="false"
-        android:text="自动"
-        android:textColor="@color/scan_primary"
-        android:textSize="8.5sp" />
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:minHeight="60dp" android:layout_marginBottom="8dp"
+    android:background="@drawable/bg_focus_surface"
+    android:clickable="true" android:focusable="true"
+    android:foreground="?android:attr/selectableItemBackground"
+    android:gravity="center" android:orientation="vertical" android:padding="6dp">
+    <ImageView android:layout_width="20dp" android:layout_height="20dp"
+        android:contentDescription="补光" android:src="@drawable/ic_brightness" />
+    <TextView android:id="@+id/toolLightLabel" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:layout_marginTop="4dp"
+        android:gravity="center" android:text="自动"
+        android:textColor="@color/scan_text_primary" android:textSize="10sp" />
 </LinearLayout>

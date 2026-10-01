@@ -98,6 +98,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var tvMotionState: TextView
     private lateinit var tvDistanceState: TextView
     private lateinit var tvTrackingState: TextView
+    private lateinit var tvViewpointSummary: TextView
     private lateinit var tvScanStateBadge: TextView
     private lateinit var mainScanUi: android.view.View
     private lateinit var viewerBackdrop: android.view.View
@@ -805,7 +806,7 @@ private var lastRelocPollMs = 0L
         // 目标离屏提示（原 hudText 区域保留：常驻文案而非 Toast）
         targetWarningText = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
-            textSize = 15f
+            textSize = 12f
             setTypeface(null, android.graphics.Typeface.BOLD)
             setBackgroundColor(android.graphics.Color.argb(225, 210, 40, 40))
             setPadding((16 * density).toInt(), (10 * density).toInt(),
@@ -813,20 +814,15 @@ private var lastRelocPollMs = 0L
             gravity = Gravity.CENTER
             visibility = android.view.View.GONE
         }
-        container.addView(
-            targetWarningText,
-            android.widget.FrameLayout.LayoutParams(
+        findViewById<android.widget.LinearLayout>(R.id.scanNotices).addView(
+            targetWarningText, 0,
+            android.widget.LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            ).apply {
-                topMargin = dp(178)
-                marginStart = dp(18)
-                marginEnd = dp(18)
-            }
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
         )
 
-        // —— 新 UI（activity_mobile_scan.xml）控件绑定（100% 替换包设计还原）——
+        // Focus UI: visible scan essentials plus on-demand telemetry.
         // 包设计把状态拆为结构化单项：tvFps/tvDistance/tvAutoLight/tvCameraMode +
         // tvDepth/tvMapCount/tvDrawCount/tvUnit；中央提示位 tvScanHint 承载动态提示。
         // 旧复合文本字段（headerStatus/hudText/statusBarText）影子化：逻辑保留、
@@ -839,25 +835,26 @@ private var lastRelocPollMs = 0L
         hudText = android.widget.TextView(this)
         statusBarText = android.widget.TextView(this)
         warningBanner = findViewById(R.id.tvScanHint)
-        tvFps = findViewById(R.id.tvFps)
+        tvFps = TextView(this) // On-demand details; no permanent viewport overlay.
         tvDistance = findViewById(R.id.tvDistance)
-        tvAutoLight = findViewById(R.id.tvAutoLight)
-        tvCameraMode = findViewById(R.id.tvCameraMode)
+        tvAutoLight = TextView(this) // On-demand details; no permanent viewport overlay.
+        tvCameraMode = TextView(this) // On-demand details; no permanent viewport overlay.
         tvDepth = findViewById(R.id.tvDepth)
-        tvMapCount = findViewById(R.id.tvMapCount)
-        tvDrawCount = findViewById(R.id.tvDrawCount)
+        tvMapCount = TextView(this) // On-demand details; no permanent viewport overlay.
+        tvDrawCount = TextView(this) // On-demand details; no permanent viewport overlay.
         tvUnit = findViewById(R.id.tvUnit)
-        hudCompact = findViewById(R.id.hudCompact)
+        hudCompact = TextView(this) // On-demand details; no permanent viewport overlay.
         pauseButton = findViewById(R.id.btnPauseScan)
         scanReticleView = findViewById(R.id.scanReticle)
         scanProgressView = findViewById(R.id.scanProgress)
         tvScanProgressPercent = findViewById(R.id.tvScanProgressPercent)
-        tvMotionState = findViewById(R.id.tvMotionState)
-        tvDistanceState = findViewById(R.id.tvDistanceState)
-        tvTrackingState = findViewById(R.id.tvTrackingState)
+        tvMotionState = TextView(this) // On-demand details; no permanent viewport overlay.
+        tvDistanceState = TextView(this) // On-demand details; no permanent viewport overlay.
+        tvTrackingState = TextView(this) // On-demand details; no permanent viewport overlay.
+        tvViewpointSummary = findViewById(R.id.tvViewpointSummary)
         tvScanStateBadge = findViewById(R.id.tvScanStateBadge)
         mainScanUi = findViewById(R.id.mainScanUi)
-        viewpointCoverageView = findViewById(R.id.viewpointCoverage)
+        viewpointCoverageView = com.mobilescan3d.ui.ViewpointCoverageView(this)
         scanReviewOverlay = findViewById(R.id.scanReviewOverlay)
         reviewContinueButton = findViewById(R.id.btnReviewContinue)
         reviewGenerateButton = findViewById(R.id.btnReviewGenerate)
@@ -877,11 +874,11 @@ private var lastRelocPollMs = 0L
         viewerBackdrop = findViewById(R.id.viewerBackdrop)
         modelViewerOverlay = findViewById(R.id.modelViewerOverlay)
         tvViewerStats = findViewById(R.id.tvViewerStats)
-        toolAutoLabel = findViewById(R.id.toolAutoLabel)
-        toolModeLabel = findViewById(R.id.toolModeLabel)
+        toolAutoLabel = TextView(this) // On-demand details; no permanent viewport overlay.
+        toolModeLabel = TextView(this) // On-demand details; no permanent viewport overlay.
         toolLightLabel = findViewById(R.id.toolLightLabel)
-        toolCameraLabel = findViewById(R.id.toolCameraLabel)
-        toolLockLabel = findViewById(R.id.toolLockLabel)
+        toolCameraLabel = TextView(this) // On-demand details; no permanent viewport overlay.
+        toolLockLabel = TextView(this) // On-demand details; no permanent viewport overlay.
         viewerModeTexture = findViewById(R.id.viewerModeTexture)
         viewerModeSolid = findViewById(R.id.viewerModeSolid)
         viewerModeWire = findViewById(R.id.viewerModeWire)
@@ -891,41 +888,15 @@ private var lastRelocPollMs = 0L
         tvReviewSurface = findViewById(R.id.tvReviewSurface)
         tvViewerDimensions = findViewById(R.id.tvViewerDimensions)
         tvViewerTopology = findViewById(R.id.tvViewerTopology)
-        // 参考稿：标题 "MobileScan" 白 + "3D" 主蓝
-        val titleTv = findViewById<TextView>(R.id.title)
-        val titleStr = titleTv.text.toString()
-        val i3d = titleStr.indexOf("3D")
-        if (i3d >= 0) {
-            val sp = android.text.SpannableString(titleStr)
-            sp.setSpan(
-                android.text.style.ForegroundColorSpan(getColor(R.color.scan_primary)),
-                i3d, i3d + 2, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
-            )
-            titleTv.text = sp
-        }
-
         findViewById<android.view.View>(R.id.btnStartScan).setOnClickListener { handlePrimaryScanAction() }
         findViewById<android.view.View>(R.id.btnPauseScan).setOnClickListener { togglePauseScan() }
         reviewContinueButton.setOnClickListener { resumeFromScanReview() }
         reviewGenerateButton.setOnClickListener { finalizeFromScanReview() }
         reviewDiscardButton.setOnClickListener { confirmDiscardScan() }
-        findViewById<android.view.View>(R.id.btnExport).setOnClickListener { showExportDrawer() }
         findViewById<android.view.View>(R.id.btnViewModel).setOnClickListener { toggleModelViewer() }
         findViewById<android.view.View>(R.id.btnSettings).setOnClickListener { showSettingsMenu() }
-        findViewById<android.view.View>(R.id.btnHelp).setOnClickListener { showScanUiHelp() }
-        findViewById<android.view.View>(R.id.toolAuto).setOnClickListener { showScanSettings() }
-        findViewById<android.view.View>(R.id.toolMode).setOnClickListener { showModeDialog() }
+        findViewById<android.view.View>(R.id.statusCard).setOnClickListener { showScanDetails() }
         findViewById<android.view.View>(R.id.toolLight).setOnClickListener { toggleAutoFillLightFromToolbar() }
-        findViewById<android.view.View>(R.id.tabLiveScan).setOnClickListener {
-            if (modelViewerActive) exitModelViewer()
-        }
-        findViewById<android.view.View>(R.id.tabReviewScan).setOnClickListener {
-            when {
-                scanning || scanPaused -> enterScanReview()
-                else -> toggleModelViewer()
-            }
-        }
-        findViewById<android.view.View>(R.id.tabModelProcess).setOnClickListener { showExportDrawer() }
         findViewById<android.view.View>(R.id.btnViewerClose).setOnClickListener { exitModelViewer() }
         findViewById<android.view.View>(R.id.btnViewerReset).setOnClickListener {
             glView.queueEvent { renderer.resetViewerView() }
@@ -940,23 +911,6 @@ private var lastRelocPollMs = 0L
         viewerModeWire.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_WIREFRAME) }
         viewerModeInspect.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_INSPECT) }
         viewerModeSurface.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_SURFACE) }
-        findViewById<android.view.View>(R.id.toolCamera).setOnClickListener { showCameraRangeDialog() }
-        findViewById<android.view.View>(R.id.toolLock).setOnClickListener {
-            objectLockEnabled = !objectLockEnabled
-            NativeBridge.nativeSetObjectLockEnabled(objectLockEnabled)
-            if (objectLockEnabled) {
-                targetOverlay.state = TargetUiState(visible = true, state = 1)
-            } else {
-                NativeBridge.nativeClearTarget()
-                targetOverlay.state = TargetUiState()
-                targetOverlay.dragRect = null
-                dragSelecting = false
-                lastTargetUiState = NativeBridge.TARGET_STATE_OFF
-                targetWarningText.visibility = android.view.View.GONE
-            }
-            toast(if (objectLockEnabled) "点击需要扫描的物体" else "已退出物体锁定")
-        }
-        findViewById<android.view.View>(R.id.toolFocus).setOnClickListener { showFocusStabDialog() }
         findViewById<android.view.View>(R.id.toolPlacement).setOnClickListener { togglePlacement() }
         findViewById<android.view.View>(R.id.toolRealtime).setOnClickListener { cycleArLayer() }
         findViewById<android.view.View>(R.id.toolRestoreAr).setOnClickListener { restoreLatestPersistentAr() }
@@ -2961,7 +2915,6 @@ private var lastRelocPollMs = 0L
         multiCam?.updateScanState(false, sessionId, false)
 
         pauseButton.text = "继续"
-        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_play_circle, 0, 0, 0)
         primaryButton.text = "完成扫描"
         warningBanner.text = "扫描已暂停 · 调整位置后点“继续”，或直接完成本次扫描"
         warningBanner.visibility = android.view.View.VISIBLE
@@ -2980,7 +2933,6 @@ private var lastRelocPollMs = 0L
         applyScanArLayer(true)
 
         pauseButton.text = "暂停"
-        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_pause_circle, 0, 0, 0)
         primaryButton.text = "完成扫描"
         updateHeader()
     }
@@ -3150,7 +3102,6 @@ private var lastRelocPollMs = 0L
         primaryButton.text = "完成扫描"
         pauseButton.visibility = android.view.View.VISIBLE
         pauseButton.text = "暂停"
-        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_pause_circle, 0, 0, 0)
         updateHeader()
     }
 
@@ -3393,7 +3344,6 @@ private var lastRelocPollMs = 0L
         primaryButton.text = "完成扫描"
         pauseButton.visibility = android.view.View.VISIBLE
         pauseButton.text = "暂停"
-        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_pause_circle, 0, 0, 0)
         updateHeader()
     }
 
@@ -3608,7 +3558,6 @@ private var lastRelocPollMs = 0L
         primaryButton.text = "开始扫描"
         pauseButton.visibility = android.view.View.GONE
         pauseButton.text = "暂停"
-        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_pause_circle, 0, 0, 0)
         if (!hadReadyScan) {
             toast("扫描尚未就绪，本次未导出模型")
             return
@@ -5034,7 +4983,7 @@ private var lastRelocPollMs = 0L
                 (if (renderer.drawnDebug > 0) " + ${renderer.drawnDebug}" else "") +
                 " · " + metricLabel()
         }
-        // V0.13.31：替换包状态卡拆解写入（100% 设计还原，结构化单项）
+        // Update compact status and the on-demand detail fields.
         tvFps.text = "%.1f".format(fps)
         val uiNow = android.os.SystemClock.elapsedRealtime()
         val freshDistance = if (latestScanDistanceMs > 0L &&
@@ -5103,11 +5052,16 @@ private var lastRelocPollMs = 0L
         }
         val depthOk = ::depthProvider.isInitialized && depthProvider.available && depthLastError.isEmpty()
         tvDepth.text = if (depthOk) "深度: 有效" else "深度: 等待"
+        tvDepth.setTextColor(getColor(if (depthOk) R.color.scan_success else R.color.scan_warning))
+        findViewById<android.view.View>(R.id.toolLight).contentDescription =
+            "补光：${toolLightLabel.text}，点按切换自动补光"
+        findViewById<android.view.View>(R.id.toolRealtime).contentDescription =
+            "预览图层：${arDrawModeLabel()}，点按切换"
         tvMapCount.text = "地图: $shown"
         tvDrawCount.text = "绘制: ${renderer.drawnAccumulated}" +
             (if (renderer.drawnDebug > 0) " +${renderer.drawnDebug}" else "")
         tvUnit.text = metricLabel()
-        // 参考稿左下 HUD 卡：图标 + 三行竖排统计
+        // Keep the compact telemetry available to existing reporting code.
         hudCompact.text = "地图 $shown · 绘制 ${renderer.drawnAccumulated}" +
             (if (renderer.drawnDebug > 0) " +${renderer.drawnDebug}" else "") +
             " · " + metricLabel()
@@ -5188,7 +5142,8 @@ private var lastRelocPollMs = 0L
         }
 
         scanProgressView.progress = lastScanSufficiency
-        tvScanProgressPercent.text = "$lastScanSufficiency%"
+        tvScanProgressPercent.text = "采集 $lastScanSufficiency%"
+        tvViewpointSummary.text = "视角 $lastViewpointCoveragePercent%"
         tvScanProgressPercent.setTextColor(
             getColor(if (lastScanSufficiency >= 82) R.color.scan_success else R.color.scan_primary)
         )
@@ -5888,13 +5843,15 @@ private var lastRelocPollMs = 0L
 
     private fun showScanUiHelp() {
         val message =
-            "主界面已按 20:9 竖屏扫描工作流整理：\n\n" +
-                "• 左侧：扫描设置 / 重建模式 / 对焦防抖\n" +
-                "• 右侧：镜头 / 补光 / 物体锁定 / 实时预览\n" +
-                "• 中央：保持目标在扫描框内，缓慢环绕\n" +
-                "• 底部：导出 / 开始或完成扫描 / 3D模型\n\n" +
-                "顶部区域通过 Android DisplayCutout 动态避让前置摄像头，" +
-                "不会依赖固定挖孔尺寸。"
+            "取景优先的扫描界面：\n\n" +
+                "• 顶部：深度 / 距离 / 尺度，点按查看完整状态\n" +
+                "• 右侧：自动补光 / 预览图层，点按切换\n" +
+                "• 更多：物体锁定 / 镜头 / 对焦 / 重建档位 / 导出\n" +
+                "• 底部：开始或完成扫描 / 暂停继续 / 模型\n\n" +
+                "采集百分比表示采集充分度；视角百分比是估算的环绕覆盖，" +
+                "均不代表真实表面积的完整度。完成扫描后仍会进入检查页，" +
+                "可继续补扫或生成模型。\n\n" +
+                "控件会自动避让系统栏与屏幕挖孔；中央画面保留点按对焦和物体框选。"
         android.app.AlertDialog.Builder(this)
             .setTitle("扫描界面")
             .setMessage(message)
@@ -6310,25 +6267,101 @@ private var lastRelocPollMs = 0L
         }
     }
 
+    private fun toggleObjectLockFromMenu() {
+        objectLockEnabled = !objectLockEnabled
+        NativeBridge.nativeSetObjectLockEnabled(objectLockEnabled)
+        if (objectLockEnabled) {
+            targetOverlay.state = TargetUiState(visible = true, state = 1)
+        } else {
+            NativeBridge.nativeClearTarget()
+            targetOverlay.state = TargetUiState()
+            targetOverlay.dragRect = null
+            dragSelecting = false
+            lastTargetUiState = NativeBridge.TARGET_STATE_OFF
+            targetWarningText.visibility = android.view.View.GONE
+        }
+        toast(if (objectLockEnabled) "点击需要扫描的物体" else "已退出物体锁定")
+        updateHeader()
+    }
+
+    /** Less-used controls stay reachable without permanently covering the object. */
     private fun showSettingsMenu() {
         android.widget.PopupMenu(this, findViewById(R.id.btnSettings)!!).apply {
-            menu.add("相机参数")
-            menu.add("设备标定中心")
-            menu.add("扫描质量诊断")
-            menu.add("重建档位")
-            menu.add("扫描距离与补光")
+            menu.add(0, 1, 0, if (objectLockEnabled) "退出物体锁定" else "物体锁定")
+            menu.add(0, 2, 1, "镜头与距离")
+            menu.add(0, 3, 2, "对焦 / 防抖")
+            menu.add(0, 4, 3, "重建档位")
+            menu.add(0, 5, 4, "扫描距离与补光")
+            menu.add(0, 6, 5, "扫描状态详情")
+            menu.add(0, 7, 6, "扫描检查")
+            menu.add(0, 8, 7, "导出 / 模型处理")
+            val advanced = menu.addSubMenu("高级与帮助")
+            advanced.add(0, 9, 0, "相机参数")
+            advanced.add(0, 10, 1, "设备标定中心")
+            advanced.add(0, 11, 2, "扫描质量诊断")
+            advanced.add(0, 12, 3, "使用帮助")
             setOnMenuItemClickListener { item ->
-                when (item.title.toString()) {
-                    "相机参数" -> showCameraParams()
-                    "设备标定中心" -> showCalibrationCenter()
-                    "扫描质量诊断" -> showScanQualityReport()
-                    "重建档位" -> showModeDialog()
-                    "扫描距离与补光" -> showScanSettings()
+                when (item.itemId) {
+                    1 -> toggleObjectLockFromMenu()
+                    2 -> showCameraRangeDialog()
+                    3 -> showFocusStabDialog()
+                    4 -> showModeDialog()
+                    5 -> showScanSettings()
+                    6 -> showScanDetails()
+                    7 -> if (scanning || scanPaused) enterScanReview() else toggleModelViewer()
+                    8 -> showExportDrawer()
+                    9 -> showCameraParams()
+                    10 -> showCalibrationCenter()
+                    11 -> showScanQualityReport()
+                    12 -> showScanUiHelp()
+                    else -> return@setOnMenuItemClickListener false
                 }
                 true
             }
             show()
         }
+    }
+
+    private fun showScanDetails() {
+        // Snapshot is captured when opened; the native scan continues normally.
+        updateHeader()
+        // 注意：onCreate 里的局部 fun dp() 在此作用域不可见，用局部 px() 换算
+        val uiDensity = resources.displayMetrics.density
+        fun px(value: Int) = (value * uiDensity + .5f).toInt()
+        val panel = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(px(20), px(12), px(20), px(16))
+        }
+        val details = TextView(this).apply {
+            textSize = 14f
+            text = listOf(
+                "${tvDepth.text} · ${tvUnit.text}",
+                "FPS ${tvFps.text} · 距离 ${tvDistance.text}",
+                "镜头 ${tvCameraMode.text} · 补光 ${toolLightLabel.text}",
+                "${tvMapCount.text} · ${tvDrawCount.text}",
+                tvMotionState.text.toString(),
+                tvDistanceState.text.toString(),
+                tvTrackingState.text.toString(),
+                "物体锁定：${toolLockLabel.text}",
+                "重建档位：${toolModeLabel.text}",
+                "采集充分度 $lastScanSufficiency% · 视角覆盖 $lastViewpointCoveragePercent%",
+                "打开时的状态快照；视角覆盖为估算值。"
+            ).joinToString("\n")
+        }
+        panel.addView(details)
+        val coverage = com.mobilescan3d.ui.ViewpointCoverageView(this).apply {
+            contentDescription = "估算视角覆盖 $lastViewpointCoveragePercent%"
+            setCoverage(viewpointCoverage, coverageCurrentSector, lastViewpointCoveragePercent)
+        }
+        panel.addView(coverage, android.widget.LinearLayout.LayoutParams(px(160), px(160)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = px(16)
+        })
+        android.app.AlertDialog.Builder(this)
+            .setTitle("扫描状态详情")
+            .setView(android.widget.ScrollView(this).apply { addView(panel) })
+            .setPositiveButton("关闭", null)
+            .show()
     }
 
     private fun showScanSettings() {
