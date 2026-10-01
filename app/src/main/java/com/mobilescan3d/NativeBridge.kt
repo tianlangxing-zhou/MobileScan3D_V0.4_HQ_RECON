@@ -310,6 +310,9 @@ object NativeBridge {
     external fun nativeSetObjectLockEnabled(enabled: Boolean)
     external fun nativeGetTargetState(out: FloatArray): Int
     external fun nativeGetDepthDiagnostics(out: FloatArray): Int
+
+    /** metres, coverage, relative spread, source (0 invalid / 1 VINS estimate / 2 stereo). */
+    external fun nativeGetCameraDistance(timestampNs: Long, out: FloatArray): Int
     external fun nativeGetTargetDiagnostics(): String
     external fun nativeGetRenderPose(out: FloatArray): Boolean
     /**

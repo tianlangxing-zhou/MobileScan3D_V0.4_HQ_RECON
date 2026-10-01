@@ -29,6 +29,7 @@
 #include "object_tracker.h"
 #include "target_mask_engine.h"
 #include "depth_calib.h"
+#include "camera_distance.h"
 #include "depth_confidence.h"
 #include "color_contours.h"
 #include "fusion_guard.h"
@@ -136,6 +137,9 @@ static uint64_t calibFrames = 0;
 static uint64_t calibRejectFrames = 0;
 // V0.10: exact depth field entering TSDF after calibration.
 static bool lastFusionDepthCalibrated = false;
+static camera_distance::Estimate cameraDistance;
+static uint64_t cameraDistanceTs = 0;
+static int cameraDistanceSource = 0; // 1: VINS-scale estimate, 2: stereo-verified metres
 static float lastFusionDepthMin = 0.f;
 static float lastFusionDepthMax = 0.f;
 static float lastFusionDepthMean = 0.f;
@@ -350,6 +354,13 @@ static uint64_t vinsRecoveryCount = 0;
 static uint64_t vinsRejectStreak = 0;
 static uint64_t depthSnapMatches = 0;
 static uint64_t depthSnapMisses = 0;
+// VC160+：深度回调早退归因。entered/done 长期只有 ~22%，但旧日志只能看出
+// 「早退了」看不出「为什么」。实机 10:23–10:32 的 PerfStage 显示 entered=270
+// done=61，而每帧单目深度推理要 262–424ms CPU —— 白烧掉的算力直接变成发热，
+// 所以必须能一眼看出主导原因，否则只能靠猜。
+static uint64_t depthEarlyWorldDiscont = 0;  // VINS 世界跳变，保模型
+static uint64_t depthEarlyNoSnap = 0;        // 12ms 窗口里没有对应相机帧快照
+static uint64_t depthEarlyStaleGen = 0;      // 快照属于上一代目标
 static int64_t lastDepthSnapDiffNs = -1;
 static constexpr int64_t kDepthSnapMaxDiffNs = 12'000'000LL;
 static float rawVinsT[3] = {0.f, 0.f, 0.f};
@@ -387,18 +398,43 @@ static std::deque<FrameSnap> snaps;
 // One in-flight inference owns its source RGB + pose independently of the ring.
 static FrameSnap retainedDepthSnap;
 static bool haveRetainedDepthSnap = false;
+// VC160+：钉快照失败归因（见 nativeRetainDepthFrame 注释）。
+static uint64_t retainOk = 0;
+static uint64_t retainMissNoPose = 0;
+static uint64_t retainMissMismatch = 0;
+static uint64_t retainMissBadTs = 0;
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeRetainDepthFrame(JNIEnv*, jobject, jlong ts) {
     std::lock_guard<std::mutex> lk(gStateMutex);
     haveRetainedDepthSnap = false;
-    if (!snaps.empty() && snaps.back().ts == static_cast<uint64_t>(ts)) {
+    // VC160+：0.13.x 这里只看 snaps.back()。若该帧没有位姿（storeSnap 只在
+    // vinsPoseOk 时执行），钉不住；而 nativeOnDepthMapImpl 里那个 12ms 窗口在
+    // 推理结束（300–400ms 后）早已滑走，结果整帧深度被丢 —— 白烧一次单目推理。
+    // 实机 entered/done 长期只有 ~22%，到底是「这一帧本来就没位姿」还是
+    // 「快照在、只是时间戳对不上」，用两个计数器分开，避免继续靠猜。
+    const uint64_t want = ts > 0 ? static_cast<uint64_t>(ts) : 0u;
+    if (want == 0) {
+        ++retainMissBadTs;
+        return;
+    }
+    // 从后往前找同时间戳的那一帧，而不是只看最新一帧。
+    for (auto it = snaps.rbegin(); it != snaps.rend(); ++it) {
+        if (it->ts != want) continue;
         try {
-            retainedDepthSnap = snaps.back();
+            retainedDepthSnap = *it;
             haveRetainedDepthSnap = true;
+            ++retainOk;
         } catch (const std::exception& error) {
             LOGI("Unable to pin depth snapshot: %s", error.what());
+            ++retainMissMismatch;
         }
+        return;
+    }
+    if (!vinsPoseOk) {
+        ++retainMissNoPose;   // 该帧没有可用位姿，storeSnap 根本没存
+    } else {
+        ++retainMissMismatch; // 有位姿，但快照已滑出 60 帧窗口 / 时间戳对不上
     }
 }
 
@@ -803,6 +839,14 @@ static const char* const kPerfStageNames[kPerfStageCount] = {
 // 而实际可能是每帧都提前退出了 —— 这是两种完全不同的故障，必须能分开看。
 static uint64_t gPerfFrames = 0;      // 进入回调的帧数（入口处递增）
 static uint64_t gPerfCompleted = 0;   // 走到函数末尾的帧数
+// VC160+：宽容位姿查询（HQ burst 用）失败归因。实机 10:23–10:32 有 21/46 个
+// burst 被「pose gate」丢弃，其中 87 次宽容查询是成功的（平均偏差 379ms、
+// 最大 499ms，已经贴着 500ms 上限），说明失败不是"历史没有位姿"这么简单。
+// 把三种失败原因分开计数，下一轮才能确切知道该放宽容差还是修时间轴。
+static uint64_t poseTolMissWorld = 0;   // 世界跳变，拒绝
+static uint64_t poseTolMissEmpty = 0;   // 位姿历史为空（VINS 从未初始化）
+static uint64_t poseTolMissOver = 0;    // 历史非空，但最近样本超出容差
+static uint64_t poseTolHit = 0;         // 成功命中（含宽松回退）
 
 static inline float perfMsSince(const std::chrono::steady_clock::time_point& t0) {
     return std::chrono::duration<float, std::milli>(
@@ -832,6 +876,23 @@ static void perfLogIfDue() {
                         static_cast<unsigned long long>(gPerfCompleted), s.c_str(),
                         lastTemporalTested, lastTemporalAgree, lastTemporalDisagree,
                         static_cast<double>(lastLockWaitMs));
+    // 早退/失败归因单独一行，保持 PerfStage 主行格式不变（外部脚本在解析它）。
+    __android_log_print(ANDROID_LOG_INFO, "PerfGate",
+                        "depthEarly world=%llu noSnap=%llu staleGen=%llu dup=%llu | "
+                        "retain ok=%llu noPose=%llu mismatch=%llu badTs=%llu | "
+                        "poseTol hit=%llu missWorld=%llu missEmpty=%llu missOver=%llu",
+                        static_cast<unsigned long long>(depthEarlyWorldDiscont),
+                        static_cast<unsigned long long>(depthEarlyNoSnap),
+                        static_cast<unsigned long long>(depthEarlyStaleGen),
+                        static_cast<unsigned long long>(duplicateDepthRejects),
+                        static_cast<unsigned long long>(retainOk),
+                        static_cast<unsigned long long>(retainMissNoPose),
+                        static_cast<unsigned long long>(retainMissMismatch),
+                        static_cast<unsigned long long>(retainMissBadTs),
+                        static_cast<unsigned long long>(poseTolHit),
+                        static_cast<unsigned long long>(poseTolMissWorld),
+                        static_cast<unsigned long long>(poseTolMissEmpty),
+                        static_cast<unsigned long long>(poseTolMissOver));
 }
 
 // ------------------------------------------------------------- V0.9 stereo anchors
@@ -1041,6 +1102,7 @@ static int integrateStereoAnchorBatch(
  * 必须在 gStateMutex 下调用。
  */
 static void resetDepthCalibration() {
+    cameraDistance = {}; cameraDistanceTs = 0; cameraDistanceSource = 0;
     ++depthCalibFullResets;
     depthCalibrator.reset();
     // V0.9: invalidate stereo world-scale whenever depth calibration resets.
@@ -1061,6 +1123,8 @@ static void resetDepthCalibration() {
     lastFusionDepthConversionFallback = 0;
     fusionGuard.reset(); colorContours.reset();
     lastConsumedDepthTs=duplicateDepthRejects=0;
+    depthEarlyWorldDiscont=depthEarlyNoSnap=depthEarlyStaleGen=0;
+    retainOk=retainMissNoPose=retainMissMismatch=retainMissBadTs=0;
     lastFusedDepth.clear();
     haveLastFusePose = false;
     lastFuseCalibrated = false;
@@ -2055,7 +2119,7 @@ static void nativeOnDepthMapImpl(
     } frameTiming{tFrameStart};
     lastTemporalRatio = 1.f;
     lastTemporalTested = lastTemporalAgree = lastTemporalDisagree = 0;
-    if (vinsWorldDiscontinuous()) return; // Preserve the old-world model.
+    if (vinsWorldDiscontinuous()) { ++depthEarlyWorldDiscont; return; } // Preserve the old-world model.
     const FrameSnap* match = nullptr;
     int64_t bestSnapDiffNs = kDepthSnapMaxDiffNs;
     if (haveRetainedDepthSnap && retainedDepthSnap.ts == static_cast<uint64_t>(t)) {
@@ -2080,7 +2144,8 @@ static void nativeOnDepthMapImpl(
         lastDepthSnapDiffNs = -1;
     }
 
-    if (!match || match->targetGeneration != targetGeneration) return;
+    if (!match) { ++depthEarlyNoSnap; return; }
+    if (match->targetGeneration != targetGeneration) { ++depthEarlyStaleGen; return; }
     if(t<=0 || static_cast<uint64_t>(t)<=lastConsumedDepthTs){++duplicateDepthRejects;return;}
     lastConsumedDepthTs=static_cast<uint64_t>(t);
 
@@ -2492,6 +2557,25 @@ static void nativeOnDepthMapImpl(
     const bool haveTi = objectTracker && ti.state == TargetState::TRACKING;
     const bool targetStateIsCurrent = objectTracker &&
         objectTracker->info().lastFrameTs == static_cast<uint64_t>(t);
+
+    // VC160: sample the LIVE calibrated field, before scan-range clipping. Raw
+    // monocular values and the diagnostic shadow scale must never drive lenses.
+    cameraDistance = {};
+    cameraDistanceTs = static_cast<uint64_t>(t);
+    cameraDistanceSource = 0;
+    const bool reliableRangeTarget = haveTi && ti.presenceValid &&
+        std::isfinite(ti.confidence) && ti.confidence >= .7f;
+    if (calibratedNow && !epochSuspended && lastCalibConfidence >= .5f && !zCal.empty() &&
+        (ti.state == TargetState::OFF || ti.state == TargetState::ARMED || reliableRangeTarget)) {
+        const bool reliableTarget = reliableRangeTarget;
+        const bool stereoMetric = mobilescan3d::stereo_anchor::worldScaleUsable();
+        cameraDistance = camera_distance::estimate(zCal.data(), w, h,
+            stereoMetric ? scanWorldPerMeter : 1.f,
+            reliableTarget ? ti.x0 : .3f, reliableTarget ? ti.y0 : .3f,
+            reliableTarget ? ti.x1 : .7f, reliableTarget ? ti.y1 : .7f,
+            sourceWeights.empty() ? nullptr : sourceWeights.data());
+        if (cameraDistance.meters > 0) cameraDistanceSource = stereoMetric ? 2 : 1;
+    }
 
     // ---- 目标分割 Mask + PresenceGate ----
     bool presenceOk = false;
@@ -3899,6 +3983,23 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetState(JNIEnv* env, jobject, jf
     return static_cast<jint>(info.state);
 }
 
+// Exact source timestamp prevents rejected frames from reusing a stale distance.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetCameraDistance(JNIEnv* env, jobject,
+                                                         jlong timestampNs, jfloatArray out) {
+    if (!out || env->GetArrayLength(out) < 4) return 0;
+    std::lock_guard<std::mutex> lock(gStateMutex);
+    float values[4] = {};
+    if (timestampNs > 0 && cameraDistanceTs == static_cast<uint64_t>(timestampNs)) {
+        values[0] = cameraDistance.meters;
+        values[1] = cameraDistance.coverage;
+        values[2] = cameraDistance.spread;
+        values[3] = static_cast<float>(cameraDistanceSource);
+    }
+    env->SetFloatArrayRegion(out, 0, 4, values);
+    return env->ExceptionCheck() ? 0 : 4;
+}
+
 // 深度尺度诊断：只上报可观测量，不自动施加任何 scale 修正。
 // out[0]=targetDepthP10 out[1]=targetDepthMedian out[2]=targetDepthP90
 // out[3]=vinsTriangulatedDepthMedian
@@ -4148,7 +4249,20 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject
     int64_t probeDeltaMs = 0;
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
-        if (!vinsPoseOk || vinsWorldDiscontinuous() || renderPoseHistory.empty()) {
+        // VC160+：宽容路径不再因为「最新一帧 VINS 被 step 门拒绝」而整体放弃。
+        // 本函数存在的理由恰恰是「burst 期间预览管线停摆、没有新位姿」，所以瞬时
+        // vinsPoseOk=false 正是它应当容忍的场景，而不是判废依据。实机 10:23–10:32
+        // 有 21/46 个 HQ burst 拿到 poseValid=false poseAtOk=false 被静默丢弃，而
+        // 同窗口宽容查询成功 87 次（平均偏差 379ms）—— 位姿历史是好的，只是被这个
+        // 瞬时标志挡住了。世界跳变仍拒绝（那才是真的不能沿用旧位姿）；历史为空也
+        // 拒绝（VINS 从未初始化，没有可用近似）。容差仍由调用方给（burst 用 500ms），
+        // AR 渲染走 strict 80ms 版，本改动不影响它。
+        if (vinsWorldDiscontinuous()) {
+            ++poseTolMissWorld;
+            return JNI_FALSE;
+        }
+        if (renderPoseHistory.empty()) {
+            ++poseTolMissEmpty;
             return JNI_FALSE;
         }
         const int64_t want = static_cast<int64_t>(timestampNs);
@@ -4165,8 +4279,10 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtTol(JNIEnv* env, jobject
             }
         }
         if (best == nullptr || bestDelta > tol) {
+            ++poseTolMissOver;
             return JNI_FALSE;
         }
+        ++poseTolHit;
         // V0.13.2 诊断：cov 异常低时需要区分「宽容窗口拿到了过期位姿（扫描中
         // 手机已转动）」与「旋转约定错误」。年龄大 => 过期；年龄小但投影仍偏 =>
         // 约定错误。只在宽容查询路径打日志（AR 用的 strict 版不打，避免刷屏）。

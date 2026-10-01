@@ -87,6 +87,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var reader: ImageReader? = null
     /** V0.8: logical CameraDevice + two explicitly bound physical YUV streams. */
     private var multiCam: MultiCameraFusionController? = null
+    private val cameraRangePolicy = CameraRangePolicy() // camera thread only
+    private val cameraDistanceBuffer = FloatArray(4) // depth thread only
+    @Volatile private var cameraRangeStatus = "自动 · 等待有效深度"
+    @Volatile private var cameraRangeSwitching = false
+    private val cameraRangeSerial = java.util.concurrent.atomic.AtomicLong(0)
+    private var rangeLogicalSurfaces = emptyList<Surface>()
+    private var rangeHqActive = false
+    private var rangeTimeout: Runnable? = null
+    private var lastDepthScaleSampleNs = 0L
+    @Volatile private var latestCameraTimestampNs = 0L
+    private var lastRangeDepthTimestampNs = 0L
+
     private lateinit var hqCapture: HqCaptureController
     private var cameraThread: HandlerThread? = null
     private var sensorThread: HandlerThread? = null
@@ -129,6 +141,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private val depthBusy = AtomicBoolean(false)
     @Volatile private var depthCompletedMs = 0L
+    @Volatile private var depthAttemptCompletedMs = 0L
     @Volatile private var depthErrors = 0L
     @Volatile private var depthLastError = ""
     @Volatile private var scanMaxDistanceMeters = 1f
@@ -271,6 +284,24 @@ private var lastRelocPollMs = 0L
     private var viewerDownY = 0f
     private var viewerPanMode = false
     private var viewerMoved = false
+    private var viewerMultiTouch = false
+    private val viewerScaleDetector by lazy {
+        android.view.ScaleGestureDetector(this,
+            object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScaleBegin(detector: android.view.ScaleGestureDetector): Boolean {
+                    cancelViewerLongPress()
+                    viewerPanMode = false
+                    return modelViewerActive
+                }
+                override fun onScale(detector: android.view.ScaleGestureDetector): Boolean {
+                    val factor = detector.scaleFactor
+                    glView.queueEvent { renderer.zoomViewer(factor) }
+                    glView.requestRender()
+                    return true
+                }
+            }).apply { isQuickScaleEnabled = false }
+    }
+
     /** 长按判定：按下后 300ms 内没动过就切到「平移」手势 */
     private val viewerLongPressMs = 300L
     private val viewerHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -505,16 +536,17 @@ private var lastRelocPollMs = 0L
             request: CaptureRequest,
             result: android.hardware.camera2.TotalCaptureResult
         ) {
-            activePhysicalCameraId =
-                result.get(android.hardware.camera2.CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+            if (session !== captureSession || cameraRangeSwitching) return
+            activePhysicalCameraId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                result.get(android.hardware.camera2.CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID) else null
             rollingShutterSkewNs =
                 result.get(android.hardware.camera2.CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW)
             exposureTimeNs =
                 result.get(android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME)
             lastCropRegion =
                 result.get(android.hardware.camera2.CaptureResult.SCALER_CROP_REGION)
-            lastDistortionCorrectionMode =
-                result.get(android.hardware.camera2.CaptureResult.DISTORTION_CORRECTION_MODE)
+            lastDistortionCorrectionMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                result.get(android.hardware.camera2.CaptureResult.DISTORTION_CORRECTION_MODE) else null
             lastAfState =
                 result.get(android.hardware.camera2.CaptureResult.CONTROL_AF_STATE)
             lastLensFocusDistance =
@@ -524,6 +556,17 @@ private var lastRelocPollMs = 0L
             lastAwbState =
                 result.get(android.hardware.camera2.CaptureResult.CONTROL_AWB_STATE)
             multiCam?.onCaptureResult(result)
+            if (scanning && scanNativeReady && multiCam?.primaryProjectionMismatch == true) {
+                scanNativeReady = false // no more frames may enter fusion with changed primary K
+                cameraRangeStatus = "主摄裁剪变化 · 已保护模型并停止融合"
+                runOnUiThread {
+                    if (!resumed || multiCam?.primaryProjectionMismatch != true) return@runOnUiThread
+                    if (scanning) stopScan()
+                    closeCamera()
+                    if (texture.isAvailable) openCamera()
+                    toast("HAL 改变了主摄裁剪，已保留模型并停止扫描；请导出后重新开始")
+                }
+            }
             if (::hqCapture.isInitialized) {
                 hqCapture.onCaptureResult(result)
             }
@@ -780,6 +823,13 @@ private var lastRelocPollMs = 0L
             setBackgroundColor(android.graphics.Color.argb(200, 88, 86, 214))
             setPadding(20, 12, 20, 12)
             setOnClickListener { toggleModelViewer() }
+            setOnLongClickListener {
+                if (modelViewerActive) {
+                    glView.queueEvent { renderer.resetViewerView() }
+                    glView.requestRender()
+                    true
+                } else false
+            }
         }
         bottom.addView(exportButton, android.widget.LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = 8 })
@@ -808,7 +858,7 @@ private var lastRelocPollMs = 0L
                 setPadding(8, 6, 8, 6)
                 setOnClickListener { onClick() }
             }
-        toolbar.addView(toolButton("镜头") { switchCamera() },
+        toolbar.addView(toolButton("镜头") { showCameraRangeDialog() },
             android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
         toolbar.addView(toolButton("物体锁定") {
             objectLockEnabled = !objectLockEnabled
@@ -1089,7 +1139,8 @@ private var lastRelocPollMs = 0L
             awbLockAvailable = chars.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) ?: false
             minFocusDistance = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
             manualFocusAvailable = minFocusDistance > 0f
-            lensDistortion = chars.get(CameraCharacteristics.LENS_DISTORTION)
+            lensDistortion = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                chars.get(CameraCharacteristics.LENS_DISTORTION) else null
             noiseModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: intArrayOf()
             edgeModes = chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: intArrayOf()
             val streamConfig = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
@@ -1171,7 +1222,7 @@ private var lastRelocPollMs = 0L
             cameraManager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     openingCamera = false
-                    if (abandonedOpen) {
+                    if (abandonedOpen || id != currentCameraId || !resumed) {
                         camera.close()
                         reopenIfPending()
                         return
@@ -1203,12 +1254,17 @@ private var lastRelocPollMs = 0L
                             session: CameraCaptureSession,
                             hqActive: Boolean
                         ) {
-                            if (abandonedOpen) {
+                            if (abandonedOpen || cameraDevice !== camera || !resumed) {
                                 session.close()
                                 return
                             }
                             hqCapture.onSessionConfigured(hqActive)
                             captureSession = session
+                            rangeHqActive = hqActive
+                            rangeLogicalSurfaces = listOf(previewSurface!!) + if (hqActive) hqSurfaces else emptyList()
+                            multiCam?.resumePairs()
+                            cameraRangePolicy.reset()
+                            cameraRangePolicy.committed(CameraRangePolicy.Range.MID, android.os.SystemClock.elapsedRealtime())
                             // Some HALs reset SurfaceTexture transform around first frame.
                             texture.post {
                                 configureTransform(texture.width, texture.height)
@@ -2160,6 +2216,7 @@ private var lastRelocPollMs = 0L
         sb.appendLine("    lastGyro: (${lastImu[3]}, ${lastImu[4]}, ${lastImu[5]})")
         sb.appendLine()
         sb.appendLine("[3] 点云采集计算数据:")
+        sb.appendLine("CameraRange: $cameraRangeStatus switching=$cameraRangeSwitching")
         sb.appendLine(NativeBridge.nativeGetStats())
         sb.appendLine()
         sb.appendLine("[4] 相机防抖(EIS): ${if (stabilization) "开" else "关"}，设备支持: ${videoStabModes.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)}")
@@ -2431,6 +2488,7 @@ private var lastRelocPollMs = 0L
         sb.appendLine("    meshPipeline=marching_tetrahedra+component_filter+taubin+qem")
         sb.appendLine("    glbFormat=glTF2 binary, POSITION+NORMAL+COLOR_0, uint32 indices")
         sb.appendLine()
+        sb.appendLine("CameraRange: $cameraRangeStatus switching=$cameraRangeSwitching")
         sb.appendLine(NativeBridge.nativeGetStats())
 
         return sb.toString()
@@ -2468,7 +2526,12 @@ private var lastRelocPollMs = 0L
     private fun processImage(image: Image) {
         if (!resumed) { image.close(); return }
         val ts = image.timestamp
+        latestCameraTimestampNs = ts
         try {
+            if (!((scanning && scanNativeReady) || arMeshViewing)) {
+                onFrameTick(ts)
+                return // finally closes the image, including the idle preview path
+            }
             val p = image.planes
             val y = extractPlane(p[0])
             val u = extractPlane(p[1])
@@ -2543,8 +2606,9 @@ private var lastRelocPollMs = 0L
         // 66MB 模型的 CPU 占空比从 ~100% 降到 30~40%。冷机时 minInterval=0，
         // 完全不影响原有节奏。（这里先于 CAS 判定，避免占用 depthBusy。）
         val minInterval = thermalDepthMinIntervalMs()
-        if (minInterval > 0L && depthCompletedMs != 0L &&
-            android.os.SystemClock.elapsedRealtime() - depthCompletedMs < minInterval) return
+        if (!depthProvider.available) return
+        if (minInterval > 0L && depthAttemptCompletedMs != 0L &&
+            android.os.SystemClock.elapsedRealtime() - depthAttemptCompletedMs < minInterval) return
         if (!depthBusy.compareAndSet(false, true)) return
         val generation = depthGeneration
         try {
@@ -2562,6 +2626,19 @@ private var lastRelocPollMs = 0L
                                 NativeBridge.nativeOnDepthMapWeighted(res.depth, res.width, res.height,
                                     .5f, res.timestampNs, res.representation.nativeCode, res.confidence)
                                 depthCompletedMs = android.os.SystemClock.elapsedRealtime()
+                                val distanceCount = NativeBridge.nativeGetCameraDistance(res.timestampNs, cameraDistanceBuffer)
+                                val distance = if (distanceCount == 4) cameraDistanceBuffer[0] else 0f
+                                val source = if (distanceCount == 4) cameraDistanceBuffer[3].toInt() else 0
+                                val completed = depthCompletedMs
+                                cameraHandler?.post {
+                                    if (generation == depthGeneration && scanning && resumed &&
+                                        android.os.SystemClock.elapsedRealtime() - completed < 1_500L &&
+                                        res.timestampNs > lastRangeDepthTimestampNs &&
+                                        latestCameraTimestampNs - res.timestampNs in 0L..1_500_000_000L) {
+                                        lastRangeDepthTimestampNs = res.timestampNs
+                                        updateCameraRange(distance, source)
+                                    }
+                                }
                                 depthLastError = ""
                                 glView.requestRender()
                             }
@@ -2572,6 +2649,7 @@ private var lastRelocPollMs = 0L
                     depthLastError = "${error.javaClass.simpleName}: ${error.message}"
                     android.util.Log.e("ScanDepth", "Depth frame failed; next frame can retry", error)
                 } finally {
+                    depthAttemptCompletedMs = android.os.SystemClock.elapsedRealtime()
                     depthBusy.set(false)
                 }
             }
@@ -2673,6 +2751,8 @@ private var lastRelocPollMs = 0L
         awbLock = false
         captureState = "IDLE"
         depthScaleEstimator.reset()
+        lastDepthScaleSampleNs = 0L
+        cameraHandler?.post { cameraRangePolicy.reset() }
         if (::hqCapture.isInitialized) {
             hqCapture.beginScan(sessionId)
             // 状态机由 HqCaptureController 持有，这里只做镜像
@@ -2945,7 +3025,6 @@ private var lastRelocPollMs = 0L
 
     /** 用一份网格数据进入查看模式：算包围球 -> 自动构图 -> 切图层。 */
     private fun enterModelViewerWith(mesh: com.mobilescan3d.export.ExportManager.MeshData) {
-        renderer.setMesh(mesh.vertices, mesh.indices)
         // 包围球：顶点交错布局 x,y,z 每 9 个 float 一组。几十万顶点的
         // 线性扫描在 UI 线程 ~10ms 量级，一次性成本可接受。
         var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var minZ = Float.MAX_VALUE
@@ -2955,6 +3034,7 @@ private var lastRelocPollMs = 0L
         val n = v.size - 8
         while (i < n) {
             val x = v[i]; val y = v[i + 1]; val z = v[i + 2]
+            if (!x.isFinite() || !y.isFinite() || !z.isFinite()) { i += 9; continue }
             if (x < minX) minX = x
             if (x > maxX) maxX = x
             if (y < minY) minY = y
@@ -2963,6 +3043,11 @@ private var lastRelocPollMs = 0L
             if (z > maxZ) maxZ = z
             i += 9
         }
+        if (minX > maxX || minY > maxY || minZ > maxZ) {
+            toast("模型没有有效顶点，无法查看")
+            return
+        }
+        renderer.setMesh(mesh.vertices, mesh.indices)
         val cx = (minX + maxX) * 0.5f
         val cy = (minY + maxY) * 0.5f
         val cz = (minZ + maxZ) * 0.5f
@@ -2979,13 +3064,13 @@ private var lastRelocPollMs = 0L
             renderer.setModelMatrix(null)
         }
         modelViewerPrevMode = arDrawMode
-        renderer.setViewerFrame(cx, cy, cz, radius)
+        glView.queueEvent { renderer.setViewerFrame(cx, cy, cz, radius) }
         renderer.drawMode = PointCloudRenderer.DRAW_MODEL_VIEWER
         modelViewerActive = true
         glView.isClickable = true
         modelViewerButton?.text = "退出查看"
         glView.requestRender()
-        toast("拖动=旋转 · 按住不动再拖=移动 · 「退出查看」返回相机")
+        toast("拖动=旋转 · 双指=缩放 · 长按后拖=移动 · 长按「退出查看」重置视角")
     }
 
     /** 退出查看模式：恢复 AR 图层与触摸穿透。 */
@@ -3011,6 +3096,7 @@ private var lastRelocPollMs = 0L
 
     /** 「摆放」按钮：把模型放到当前相机前方（新地点也能放）。 */
     private fun togglePlacement() {
+        if (modelViewerActive) exitModelViewer()
         if (placeModeActive) {
             // 回到原位恢复：清掉 model-to-world，模型回到保存时的世界坐标。
             placeModeActive = false
@@ -3045,6 +3131,7 @@ private var lastRelocPollMs = 0L
         val n = v.size - 8
         while (i < n) {
             val x = v[i]; val y = v[i + 1]; val z = v[i + 2]
+            if (!x.isFinite() || !y.isFinite() || !z.isFinite()) { i += 9; continue }
             if (x < minX) minX = x
             if (x > maxX) maxX = x
             if (y < minY) minY = y
@@ -3078,6 +3165,22 @@ private var lastRelocPollMs = 0L
      *  - 按住 300ms 未动 -> 震动一下进入平移，之后拖动 = 物体跟手平移
      */
     private fun handleModelViewerTouch(event: android.view.MotionEvent) {
+        if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN) viewerMultiTouch = false
+        if (event.pointerCount > 1) {
+            viewerMultiTouch = true
+            cancelViewerLongPress()
+            viewerPanMode = false
+        }
+        viewerScaleDetector.onTouchEvent(event)
+        // After a pinch, wait for ALL fingers to lift. Pointer-index changes must not rotate/pan.
+        if (viewerMultiTouch) {
+            if (event.actionMasked == android.view.MotionEvent.ACTION_UP ||
+                event.actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
+                viewerMultiTouch = false
+                viewerMoved = false
+            }
+            return
+        }
         when (event.actionMasked) {
             android.view.MotionEvent.ACTION_DOWN -> {
                 viewerDownX = event.x
@@ -3121,9 +3224,9 @@ private var lastRelocPollMs = 0L
                     }
                 }
                 if (viewerPanMode) {
-                    renderer.panViewer(dx, dy)
+                    glView.queueEvent { renderer.panViewer(dx, dy) }
                 } else {
-                    renderer.rotateViewer(dx * viewerRotRadPerPx, dy * viewerRotRadPerPx)
+                    glView.queueEvent { renderer.rotateViewer(dx * viewerRotRadPerPx, dy * viewerRotRadPerPx) }
                 }
                 glView.requestRender()
             }
@@ -3813,6 +3916,9 @@ private var lastRelocPollMs = 0L
      */
     private fun sampleDepthScale(nowNs: Long) {
         if (!objectLockEnabled) return
+        if (lastDepthScaleSampleNs != 0L && nowNs >= lastDepthScaleSampleNs &&
+            nowNs - lastDepthScaleSampleNs < DepthScaleEstimator.SAMPLE_INTERVAL_NS) return
+        lastDepthScaleSampleNs = nowNs
         val state = NativeBridge.nativeGetTargetState(depthScaleTargetBuf)
         NativeBridge.nativeGetDepthDiagnostics(depthScaleDepthBuf)
         depthScaleEstimator.maybeSample(
@@ -3836,7 +3942,7 @@ private var lastRelocPollMs = 0L
         // V0.12: 网格快照走自己的 5s 节拍（函数内部自带节流与忙碌门），
         // 这里绝不做任何按相机帧率的 native 重操作。
         maybeRefreshLiveMesh()
-        if (::hqCapture.isInitialized) {
+        if (::hqCapture.isInitialized && !cameraRangeSwitching) {
             hqCapture.onFrameTick(ts, scanning, cameraDevice, captureSession)
             syncCaptureStateFromController()
         }
@@ -3880,8 +3986,8 @@ private var lastRelocPollMs = 0L
             autoFillLight -> "自动补光"
             else -> "补光关闭"
         }
-        headerStatus.text = "FPS %.1f · %s · ≤%.1fm · %s".format(
-            fps, if (scanning) "扫描中" else "空闲", scanMaxDistanceMeters, lightStatus)
+        headerStatus.text = "FPS %.1f · %s · ≤%.1fm · %s\n镜头：%s".format(
+            fps, if (scanning) "扫描中" else "空闲", scanMaxDistanceMeters, lightStatus, cameraRangeStatus)
         if (objectLockEnabled) {
             // Overlay 的刷新已移到 30Hz 的 updateTargetUiTick()，这里只保留
             // AF 重锁 —— 而且**必须**留在这条 1Hz 路径上。
@@ -4060,8 +4166,114 @@ private var lastRelocPollMs = 0L
         updateHeader()
     }
 
+    private fun showCameraRangeDialog() {
+        val items = arrayOf("自动：按深度调配辅助摄像头", "近距：优先广角辅助", "中距：优先融合几何",
+            "远距：优先长焦辅助", "切换主摄（停止扫描后，重建新会话）")
+        android.app.AlertDialog.Builder(this)
+            .setTitle("摄像头调配 · 保持定位主摄")
+            .setItems(items) { _, which ->
+                if (which == 4) { switchCamera(); return@setItems }
+                val mode = CameraRangePolicy.Mode.entries[which]
+                cameraHandler?.post {
+                    cameraRangePolicy.setMode(mode)
+                    updateCameraRange(Float.NaN, 0)
+                }
+            }.show()
+    }
+
+    private fun updateCameraRange(distance: Float, source: Int) {
+        if (!resumed || cameraRangeSwitching) return
+        val mc = multiCam
+        if (mc?.active != true) { cameraRangeStatus = "单摄回退 · 无可调配物理镜头"; return }
+        if (mc.primaryProjectionMismatch) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        val desired = cameraRangePolicy.update(distance, source > 0, now)
+        val observation = if (source > 0 && distance.isFinite() && distance > 0f)
+            "%.2fm%s".format(distance, if (source == 2) "" else "（估计）") else "等待有效深度"
+        cameraRangeStatus = "${cameraRangePolicy.mode.label}/${cameraRangePolicy.range.label} · $observation · 辅摄${mc.secondaryId}"
+        if (desired == null || modelOperationBusy || openingCamera || modelViewerActive) return
+        if (::hqCapture.isInitialized && !hqCapture.canChangeFillLight()) return
+        val nextId = mc.candidateForRange(desired, distance)
+        if (nextId == null) {
+            cameraRangeStatus = "${desired.label}距无可用辅助镜头 · 保留当前摄像头"
+            cameraRangePolicy.failed(now)
+            return
+        }
+        if (nextId == mc.secondaryId) {
+            cameraRangePolicy.committed(desired, now)
+            cameraRangeStatus = "${cameraRangePolicy.mode.label}/${desired.label} · $observation · 辅摄$nextId（共用）"
+            return
+        }
+        reconfigureAuxiliaryCamera(mc, nextId, desired)
+    }
+
+    /** Rebuild physical outputs with the SAME primary reader, device and VIO world. */
+    private fun reconfigureAuxiliaryCamera(mc: MultiCameraFusionController, nextId: String,
+                                           desired: CameraRangePolicy.Range) {
+        val camera = cameraDevice ?: return
+        val previousSession = captureSession ?: return
+        val handler = cameraHandler ?: return
+        val previousId = mc.secondaryId ?: return
+        val logical = rangeLogicalSurfaces.toList()
+        if (logical.isEmpty()) return
+        cameraRangeSwitching = true
+        cameraRangeStatus = "切换${desired.label}距辅助镜头…"
+        mc.pausePairs()
+        runCatching { previousSession.stopRepeating() }
+        runCatching { previousSession.abortCaptures() }
+        previousSession.close()
+        captureSession = null
+        var attempt = 0L
+        fun start(id: String, rollback: Boolean) {
+            val serial = cameraRangeSerial.incrementAndGet()
+            attempt = serial
+            fun current() = resumed && multiCam === mc && cameraDevice === camera &&
+                serial == cameraRangeSerial.get() && serial == attempt
+            fun failed() {
+                if (!current()) return
+                rangeTimeout?.let { handler.removeCallbacks(it) }
+                cameraRangePolicy.failed(android.os.SystemClock.elapsedRealtime())
+                if (!rollback) { start(previousId, true); return }
+                cameraRangeSwitching = false
+                cameraRangeStatus = "切换失败，已保留模型；正在恢复相机"
+                runOnUiThread {
+                    if (!resumed || multiCam !== mc || cameraDevice !== camera) return@runOnUiThread
+                    if (scanning) stopScan()
+                    closeCamera()
+                    if (texture.isAvailable) openCamera()
+                    toast("辅助镜头切换失败，已停止扫描并保留模型，请重新检查定位")
+                }
+            }
+            if (!mc.selectSecondary(id)) { failed(); return }
+            val callback = object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    if (!current()) { session.close(); return }
+                    rangeTimeout?.let { handler.removeCallbacks(it) }
+                    rangeTimeout = null
+                    captureSession = session
+                    cameraRangeSwitching = false
+                    mc.resumePairs()
+                    mc.noteSessionMode(if (rangeHqActive) "range-physical+HQ" else "range-physical")
+                    if (!rollback) cameraRangePolicy.committed(desired, android.os.SystemClock.elapsedRealtime())
+                    cameraRangeStatus = if (rollback) "HAL 拒绝切换 · 已恢复辅摄$previousId"
+                        else "${cameraRangePolicy.mode.label}/${desired.label} · 辅摄$id · 重新标定双目"
+                    applyCaptureSettings()
+                    if (!rollback && cameraRangePolicy.mode != CameraRangePolicy.Mode.AUTO) {
+                        handler.post { if (current()) updateCameraRange(Float.NaN, 0) }
+                    }
+                }
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    session.close(); failed()
+                }
+            }
+            rangeTimeout = Runnable { failed() }.also { handler.postDelayed(it, 4_000L) }
+            if (!mc.createPhysicalSession(camera, logical, callback)) failed()
+        }
+        start(nextId, false)
+    }
+
     private fun switchCamera() {
-        if (scanning || modelOperationBusy) {
+        if (scanning || modelOperationBusy || cameraRangeSwitching) {
             toast("请在扫描及模型保存完成后切换镜头")
             return
         }
@@ -4069,14 +4281,13 @@ private var lastRelocPollMs = 0L
         cameraIndex = (cameraIndex + 1) % cameraIds.size
         currentCameraId = cameraIds[cameraIndex]
         closeCamera()
-        if (texture.isAvailable) {
-            // openCamera 会同步读取新镜头的 activeArray/内参标定并更新 nativeW/Fx 等，
-            // 之后再投递 native 重建（与相机帧处理线程串行化，避免 reset 竞争）。
-            openCamera()
-            cameraHandler?.post {
+        cameraHandler?.post {
+            synchronized(depthSessionLock) {
+                depthGeneration++
                 NativeBridge.nativeDestroy()
-                NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
+                sessionCreated = false
             }
+            runOnUiThread { if (resumed && texture.isAvailable) openCamera() }
         }
     }
 
@@ -4363,6 +4574,11 @@ private var lastRelocPollMs = 0L
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
     private fun closeCamera() {
+        cameraRangeSerial.incrementAndGet()
+        cameraRangeSwitching = false
+        rangeTimeout?.let { cameraHandler?.removeCallbacks(it) }
+        rangeTimeout = null
+        rangeLogicalSurfaces = emptyList()
         abandonedOpen = true
         // Closing the owning CameraDevice extinguishes its torch; serialize policy reset.
         torchRequested = false
@@ -4389,6 +4605,8 @@ private var lastRelocPollMs = 0L
 
     override fun onPause() {
         resumed = false
+        cancelViewerLongPress()
+        viewerMultiTouch = false
         synchronized(depthSessionLock) { depthGeneration++ }
         closeCamera()
         glView.onPause()

@@ -1,3 +1,5 @@
+> VC160 更新：深度驱动辅助摄像头调配、模型双指缩放、性能与生命周期修复。请先阅读 [README_VC160_ZH.md](README_VC160_ZH.md) 的替换方法、验证范围和实机验收步骤。
+
 # MobileScan3D HQ Reconstruction
 
 无 ARCore、纯 Android 本地 3D 重建工程继续版。

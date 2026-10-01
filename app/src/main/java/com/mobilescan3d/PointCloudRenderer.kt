@@ -146,19 +146,31 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     @Volatile private var viewerTargetZ = 0f
     /** 模型包围球半径，setViewerFrame 时记录，用于最小 dist 保护。 */
     @Volatile private var viewerRadius = 0.2f
+    private val viewerHome = FloatArray(3)
+    private val viewerPoseBuffer = FloatArray(12)
+    private val viewerPanPoseBuffer = FloatArray(12)
 
     /**
      * 设置查看相框：模型包围球中心与半径。进入查看模式时调用一次，
      * 自动把轨道距离放到「整球正好入画」的位置。
      */
     fun setViewerFrame(cx: Float, cy: Float, cz: Float, radius: Float) {
+        if (!cx.isFinite() || !cy.isFinite() || !cz.isFinite() || !radius.isFinite()) return
         viewerTargetX = cx
         viewerTargetY = cy
         viewerTargetZ = cz
+        viewerHome[0] = cx; viewerHome[1] = cy; viewerHome[2] = cz
         viewerRadius = radius.coerceAtLeast(0.02f)
+        viewerYaw = .9f; viewerPitch = .35f
         // 竖直半 FOV = atan(0.5 / 1.2) ≈ 22.6°，dist = r / sin(22.6°) ≈ 2.6r；
         // 留 8% 边距，并保证不小于 0.3m（MeshRenderer 着色器有 5cm 近裁剪）。
-        viewerDist = (viewerRadius * 2.8f).coerceAtLeast(0.3f)
+        val focal = VIEWER_FOCAL_NORM * maxOf(1f, viewportH.toFloat() / viewportW.coerceAtLeast(1))
+        val halfFov = kotlin.math.atan(.5f / focal)
+        viewerDist = (viewerRadius * 1.08f / kotlin.math.sin(halfFov)).coerceAtLeast(.3f)
+    }
+
+    fun zoomViewer(scaleFactor: Float) {
+        viewerDist = ViewerZoom.distance(viewerDist, viewerRadius, scaleFactor)
     }
 
     /** 单指旋转：yaw/pitch 增量（弧度）。yaw 增大 = 模型向右转。 */
@@ -174,7 +186,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
      */
     fun panViewer(dxPx: Float, dyPx: Float) {
         if (dxPx == 0f && dyPx == 0f) return
-        val pose = FloatArray(12)
+        val pose = viewerPanPoseBuffer
         computeViewerPose(pose)
         // Row-major R: right=(0,3,6), down=(1,4,7).
         val rx = pose[0]; val ry = pose[3]; val rz = pose[6]
@@ -201,7 +213,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     fun resetViewerView() {
         viewerYaw = 0.9f
         viewerPitch = 0.35f
-        setViewerFrame(viewerTargetX, viewerTargetY, viewerTargetZ, viewerRadius)
+        setViewerFrame(viewerHome[0], viewerHome[1], viewerHome[2], viewerRadius)
     }
 
     /** Keep viewer and reconstruction in the same +Z-up world, with a right-handed camera. */
@@ -383,7 +395,7 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
             drawnAccumulated = 0
             drawnDebug = 0
             drawnMeshTriangles = 0
-            val pose = FloatArray(12)
+            val pose = viewerPoseBuffer
             computeViewerPose(pose)
             // 归一化针孔：fy=1.2（竖直），fx 按视口宽高比缩放，
             // 保证世界系的圆投在屏幕上仍是圆（竖屏不拉伸）。

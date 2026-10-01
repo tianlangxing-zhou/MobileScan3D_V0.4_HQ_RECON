@@ -24,6 +24,7 @@ import android.view.Surface
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan
@@ -51,6 +52,7 @@ class MultiCameraFusionController(
     private val onHint: (String) -> Unit
 ) {
     companion object {
+        private val nativePairLock = Any() // shared across controller generations
         private const val TAG = "MultiCamV11"
         private const val PAIR_PERIOD_NS = 160_000_000L
         private const val TELE_TEXTURE_PERIOD_NS = 1_100_000_000L
@@ -122,6 +124,82 @@ class MultiCameraFusionController(
     private var configuredSize: Size? = null
     private var primaryModel: CameraModel? = null
     private var secondaryModel: CameraModel? = null
+    private var rangeCandidates = emptyList<GeometryCandidate>()
+    private val pairBusy = AtomicBoolean(false)
+    @Volatile private var pairEpoch = 0L
+    @Volatile private var streamsReady = false
+    private var minPairTimestamp = Long.MAX_VALUE
+    private val pairStats = FloatArray(NativeBridge.MULTICAM_STATS_SLOTS)
+    @Volatile private var pairBusyDrops = 0L
+    val secondaryId: String? get() = secondaryModel?.id
+    @Volatile var primaryProjectionMismatch = false
+        private set
+    private var rangePrimaryCrop: Rect? = null
+
+    /** Selection changes only the auxiliary stream: primary/VIO coordinates stay fixed. */
+    fun candidateForRange(range: CameraRangePolicy.Range, distanceMeters: Float): String? {
+        val candidates = rangeCandidates.filter { candidate ->
+            if (!distanceMeters.isFinite() || distanceMeters <= 0f) true else {
+                val c = runCatching { cameraManager.getCameraCharacteristics(candidate.model.id) }.getOrNull()
+                val diopters = c?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                diopters <= 0f || distanceMeters >= .9f / diopters
+            }
+        }
+        return when (range) {
+            CameraRangePolicy.Range.NEAR -> candidates.maxByOrNull { it.model.horizontalFovDeg }
+            CameraRangePolicy.Range.MID -> candidates.maxByOrNull { it.score }
+            CameraRangePolicy.Range.FAR -> candidates.filter { it.model.horizontalFovDeg > 1f }
+                .minByOrNull { it.model.horizontalFovDeg }
+        }?.model?.id
+    }
+
+    fun pausePairs() = synchronized(nativePairLock) {
+        streamsReady = false
+        pairEpoch++
+        latestPrimary = null; latestSecondary = null
+    }
+
+    fun resumePairs() {
+        // Ignore queued buffers from the previous session until its successor reports a timestamp.
+        minPairTimestamp = Long.MAX_VALUE
+        streamsReady = true
+    }
+
+    /** Called on camera thread while capture is stopped. */
+    fun selectSecondary(id: String): Boolean = synchronized(nativePairLock) {
+        val selected = rangeCandidates.firstOrNull { it.model.id == id } ?: return@synchronized false
+        val primary = primaryModel ?: return@synchronized false
+        val size = configuredSize ?: return@synchronized false
+        pausePairs()
+        val secondary = selected.model
+        // Keep primary K; only the changed auxiliary starts from factory calibration.
+        // A HAL that changes the primary crop must stop fusion rather than mix projections.
+        synchronized(physicalResultLock) {
+            rangePrimaryCrop = physicalCaptureStats[primary.id]?.lastCropRect?.let { Rect(it) } ?: rangePrimaryCrop
+        }
+        primaryProjectionMismatch = false
+        secondary.factoryK.copyInto(secondary.k)
+        val ok = runCatching {
+            NativeBridge.nativeMultiCamConfigure(primary.k, secondary.k,
+                primary.poseRotation ?: floatArrayOf(0f,0f,0f,1f),
+                primary.poseTranslation ?: floatArrayOf(0f,0f,0f),
+                secondary.poseRotation ?: floatArrayOf(0f,0f,0f,1f),
+                secondary.poseTranslation ?: floatArrayOf(0f,0f,0f),
+                size.width, size.height, calibratedSync)
+        }.getOrDefault(false)
+        if (!ok) return@synchronized false
+        secondaryModel = secondary
+        baselineMeters = selected.baselineMeters
+        focalRatio = secondary.k[0] / primary.k[0]
+        geometryReady = false
+        runtimeCropApplied = false
+        runtimePrimaryK = null; runtimeSecondaryK = null
+        lastPrimarySampleNs = 0L; lastSecondarySampleNs = 0L
+        synchronized(physicalResultLock) { physicalCaptureStats.clear() }
+        NativeBridge.nativeResetStereoAnchors()
+        status = "range pair ${primary.id} -> ${secondary.id}; recalibrating"
+        true
+    }
     private var relativeRPrimaryFromSecondary: FloatArray? = null
     private var relativeTPrimaryFromSecondary: FloatArray? = null
 
@@ -287,6 +365,7 @@ class MultiCameraFusionController(
                 GeometryCandidate(candidate, b, overlap, score)
             }
 
+        rangeCandidates = geometryCandidates
         val chosen = geometryCandidates.maxByOrNull { it.score }
         if (chosen == null) {
             status = "no physical pair has plausible 4-80mm factory baseline"
@@ -336,7 +415,8 @@ class MultiCameraFusionController(
         factoryGeometryTrusted = false
         geometryReady = false
 
-        val nativeConfigured = runCatching {
+        val nativeConfigured = synchronized(nativePairLock) {
+            runCatching {
             NativeBridge.nativeMultiCamConfigure(
                 primary.k,
                 secondary.k,
@@ -348,8 +428,8 @@ class MultiCameraFusionController(
                 size.height,
                 calibratedSync
             )
-        }.getOrDefault(false)
-
+            }.getOrDefault(false)
+        }
         if (!nativeConfigured) {
             status = "empirical multi-camera bootstrap rejected baseline/intrinsics"
             return false
@@ -464,7 +544,8 @@ class MultiCameraFusionController(
      * Preserve primaryReader so MainActivity can immediately rebuild the original
      * single logical-camera session on the same Surface.
      */
-    fun fallbackToLogical(reason: String) {
+    fun fallbackToLogical(reason: String) = synchronized(nativePairLock) {
+        pausePairs()
         active = false
         geometryReady = false
         scanEnabled = false
@@ -487,7 +568,10 @@ class MultiCameraFusionController(
      * whether the K used by stereo still matches the delivered YUV images.
      */
     fun onCaptureResult(result: TotalCaptureResult) {
-        if (!active) return
+        if (!active || !streamsReady) return
+        if (minPairTimestamp == Long.MAX_VALUE) {
+            minPairTimestamp = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+        }
         physicalResultCallbacks++
 
         val logicalTimestamp =
@@ -510,6 +594,9 @@ class MultiCameraFusionController(
                 physical.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f
             val crop =
                 physical.get(CaptureResult.SCALER_CROP_REGION)
+            if (id == primaryModel?.id && rangePrimaryCrop != null && crop != null && crop != rangePrimaryCrop) {
+                primaryProjectionMismatch = true
+            }
             val distortion =
                 physical.get(CaptureResult.DISTORTION_CORRECTION_MODE) ?: -1
             val zoom =
@@ -581,7 +668,9 @@ class MultiCameraFusionController(
         sessionId: String,
         allowTeleTexture: Boolean
     ) {
-        if (sessionId != currentSessionId) {
+        if (sessionId != currentSessionId) synchronized(nativePairLock) {
+            pairEpoch++
+            latestPrimary = null; latestSecondary = null
             currentSessionId = sessionId
             lastTeleTextureQueuedNs = 0L
             teleTextureRegistered = 0
@@ -675,6 +764,7 @@ class MultiCameraFusionController(
                 }
         )
         sb.appendLine("pairToleranceMs=${pairToleranceNs / 1_000_000f}")
+        sb.appendLine("pairBusyDrops=$pairBusyDrops pairEpoch=$pairEpoch")
         sb.appendLine("analysisSize=${configuredSize?.width ?: -1}x${configuredSize?.height ?: -1}")
         sb.appendLine("primaryFactoryK=${primaryModel?.factoryK?.joinToString(",") ?: "n/a"}")
         sb.appendLine("secondaryFactoryK=${secondaryModel?.factoryK?.joinToString(",") ?: "n/a"}")
@@ -830,7 +920,8 @@ class MultiCameraFusionController(
     }
 
     private fun maybeQueuePrimaryPair(image: Image) {
-        if (!active) return
+        if (!active || !streamsReady || image.timestamp < minPairTimestamp) return
+        if (pairBusy.get()) { pairBusyDrops++; return }
         val ts = image.timestamp
         if (lastPrimarySampleNs != 0L && ts - lastPrimarySampleNs < PAIR_PERIOD_NS) return
         lastPrimarySampleNs = ts
@@ -839,7 +930,8 @@ class MultiCameraFusionController(
     }
 
     private fun maybeQueueSecondaryPair(image: Image) {
-        if (!active) return
+        if (!active || !streamsReady || image.timestamp < minPairTimestamp) return
+        if (pairBusy.get()) { pairBusyDrops++; return }
         val ts = image.timestamp
         if (lastSecondarySampleNs != 0L && ts - lastSecondarySampleNs < PAIR_PERIOD_NS) return
         lastSecondarySampleNs = ts
@@ -851,70 +943,41 @@ class MultiCameraFusionController(
         val p = latestPrimary ?: return
         val s = latestSecondary ?: return
         val delta = p.timestampNs - s.timestampNs
-
-        if (abs(delta) <= pairToleranceNs) {
-            latestPrimary = null
-            latestSecondary = null
-            pairDispatchCount++
-            val size = configuredSize ?: return
-            fusionHandler.post {
-                runCatching {
-                    val goodPair = NativeBridge.nativeMultiCamOnPair(
-                        p.gray,
-                        s.gray,
-                        size.width,
-                        size.height,
-                        p.timestampNs,
-                        s.timestampNs
-                    )
-
-                    // Native empirical calibration owns geometryReady and needs
-                    // multiple consistent synchronized pairs before anchors flow.
-                    val mcStats = FloatArray(NativeBridge.MULTICAM_STATS_SLOTS)
-                    if (NativeBridge.nativeGetMultiCamStats(mcStats) &&
-                        mcStats.size > 24
-                    ) {
-                        geometryReady = mcStats[24] > 0.5f
-                    }
-
-                    // V0.10: submit only after empirical geometry is stable.
-                    // The anchor timestamp is the PRIMARY physical camera timestamp,
-                    // which is also the timestamp used by processImage()/DepthProvider.
-                    if (goodPair && geometryReady && scanEnabled) {
-                        val count = NativeBridge.nativeMultiCamGetAnchors(
-                            stereoAnchorBuffer
-                        ).coerceIn(0, MAX_STEREO_ANCHORS)
-
+        if (abs(delta) > pairToleranceNs) {
+            pairDroppedForTimestamp++
+            if (delta < 0L) latestPrimary = null else latestSecondary = null
+            return
+        }
+        latestPrimary = null; latestSecondary = null
+        val size = configuredSize ?: return
+        // One in-flight pair bounds latency and memory when native matching is slower than capture.
+        if (!pairBusy.compareAndSet(false, true)) { pairBusyDrops++; return }
+        val epoch = pairEpoch
+        val scanSession = currentSessionId
+        val posted = fusionHandler.post {
+            try {
+                synchronized(nativePairLock) {
+                    if (!active || !streamsReady || epoch != pairEpoch) return@synchronized
+                    pairDispatchCount++
+                    val goodPair = NativeBridge.nativeMultiCamOnPair(p.gray, s.gray,
+                        size.width, size.height, p.timestampNs, s.timestampNs)
+                    if (NativeBridge.nativeGetMultiCamStats(pairStats)) geometryReady = pairStats[24] > .5f
+                    if (goodPair && geometryReady && scanEnabled && scanSession == currentSessionId) {
+                        val count = NativeBridge.nativeMultiCamGetAnchors(stereoAnchorBuffer).coerceIn(0, MAX_STEREO_ANCHORS)
                         if (count > 0) {
                             anchorSubmitCalls++
-                            val submitted =
-                                NativeBridge.nativeSubmitStereoAnchors(
-                                    stereoAnchorBuffer,
-                                    count,
-                                    p.timestampNs,
-                                    size.width,
-                                    size.height
-                                )
-                            if (submitted) {
-                                anchorSubmitAnchors += count.toLong()
-                            } else {
-                                anchorSubmitFailures++
-                            }
+                            if (NativeBridge.nativeSubmitStereoAnchors(stereoAnchorBuffer, count,
+                                    p.timestampNs, size.width, size.height)) anchorSubmitAnchors += count
+                            else anchorSubmitFailures++
                         }
                     }
-                }.onFailure {
-                    Log.w(TAG, "native stereo metric-anchor pair failed", it)
-                    anchorSubmitFailures++
                 }
-            }
-        } else {
-            pairDroppedForTimestamp++
-            if (delta < 0L) {
-                latestPrimary = null
-            } else {
-                latestSecondary = null
-            }
+            } catch (error: Throwable) {
+                anchorSubmitFailures++
+                Log.w(TAG, "native stereo pair failed", error)
+            } finally { pairBusy.set(false) }
         }
+        if (!posted) pairBusy.set(false)
     }
 
     private fun maybeQueueTeleTexture(image: Image) {
@@ -1365,6 +1428,10 @@ class MultiCameraFusionController(
             cameraManager.getCameraCharacteristics(id)
         }.getOrNull() ?: return null
 
+        val sizes = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputSizes(ImageFormat.YUV_420_888) ?: return null
+        if (sizes.none { it == output }) return null
+
         val rect = c.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
             ?: c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             ?: return null
@@ -1544,6 +1611,7 @@ class MultiCameraFusionController(
             return
         }
 
+        synchronized(nativePairLock) {
         val updated = runCatching {
             NativeBridge.nativeMultiCamUpdateIntrinsics(pk, sk)
         }.getOrDefault(false)
@@ -1553,6 +1621,8 @@ class MultiCameraFusionController(
             return
         }
 
+        pairEpoch++
+        latestPrimary = null; latestSecondary = null
         pk.copyInto(primary.k)
         sk.copyInto(secondary.k)
         runtimePrimaryK = pk
@@ -1575,6 +1645,7 @@ class MultiCameraFusionController(
             append(" sCrop=").append(sCrop)
         }
         Log.i(TAG, runtimeCropReason)
+        }
     }
 
     private fun factoryBaselineMeters(
@@ -1725,7 +1796,8 @@ class MultiCameraFusionController(
     private fun vectorNorm(v: FloatArray): Float =
         sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
 
-    fun close() {
+    fun close() = synchronized(nativePairLock) {
+        pausePairs()
         active = false
         geometryReady = false
         scanEnabled = false
