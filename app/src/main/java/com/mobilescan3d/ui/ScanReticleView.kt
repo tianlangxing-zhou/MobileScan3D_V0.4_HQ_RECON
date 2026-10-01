@@ -43,12 +43,12 @@ class ScanReticleView @JvmOverloads constructor(
         canvas.drawLine(0f, h / 3f, w, h / 3f, gridPaint)
         canvas.drawLine(0f, h * 2f / 3f, w, h * 2f / 3f, gridPaint)
 
-        // scan frame —— 正方形取景框（用屏幕短边定边长，避免竖屏下被拉成竖长条）
-        val side = minOf(w, h) * 0.42f
-        val frameW = side
+        // scan frame —— 参考稿比例约 1.15:1 略横向；用屏幕短边定边长，竖屏不再被拉长
+        val side = minOf(w, h) * 0.35f
+        val frameW = side * 1.12f
         val frameH = side
         val left = (w - frameW) / 2f
-        val top = (h - frameH) / 2f - dp(20f)
+        val top = (h - frameH) / 2f - dp(6f)
         val right = left + frameW
         val bottom = top + frameH
         val len = dp(26f)

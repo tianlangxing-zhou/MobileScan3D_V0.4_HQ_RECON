@@ -56,7 +56,7 @@
                     android:layout_marginTop="2dp"
                     android:text="@string/version_text"
                     android:textColor="@color/scan_text_secondary"
-                    android:textSize="12sp" />
+                    android:textSize="11sp" />
             </LinearLayout>
 
             <ImageButton
@@ -69,6 +69,15 @@
                 android:contentDescription="设置"
                 android:padding="12dp"
                 android:src="@drawable/ic_settings" />
+
+            <View
+                android:layout_width="8dp"
+                android:layout_height="8dp"
+                android:layout_alignTop="@+id/btnSettings"
+                android:layout_alignEnd="@+id/btnSettings"
+                android:layout_marginTop="5dp"
+                android:layout_marginEnd="5dp"
+                android:background="@drawable/bg_dot_alert"/>
         </RelativeLayout>
 
         <!-- Status card -->
@@ -92,7 +101,7 @@
                 <View
                     android:layout_width="1dp"
                     android:layout_height="42dp"
-                    android:layout_marginHorizontal="10dp"
+                    android:layout_marginHorizontal="6dp"
                     android:background="@color/scan_divider" />
 
                 <LinearLayout
@@ -101,12 +110,25 @@
                     android:layout_weight="1"
                     android:gravity="center"
                     android:orientation="vertical">
-                    <TextView
+                    <LinearLayout
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="距离"
-                        android:textColor="@color/scan_text_secondary"
-                        android:textSize="12sp"/>
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+                        <ImageView
+                            android:layout_width="13dp"
+                            android:layout_height="13dp"
+                            android:contentDescription="距离"
+                            android:src="@drawable/ic_nav"
+                            android:tint="@color/scan_primary"/>
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="4dp"
+                            android:text="距离"
+                            android:textColor="@color/scan_text_secondary"
+                            android:textSize="11sp"/>
+                    </LinearLayout>
                     <TextView
                         android:id="@+id/tvDistance"
                         android:layout_width="wrap_content"
@@ -121,7 +143,7 @@
                 <View
                     android:layout_width="1dp"
                     android:layout_height="42dp"
-                    android:layout_marginHorizontal="10dp"
+                    android:layout_marginHorizontal="6dp"
                     android:background="@color/scan_divider" />
 
                 <LinearLayout
@@ -130,12 +152,25 @@
                     android:layout_weight="1"
                     android:gravity="center"
                     android:orientation="vertical">
-                    <TextView
+                    <LinearLayout
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="自动补光"
-                        android:textColor="@color/scan_text_secondary"
-                        android:textSize="12sp"/>
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+                        <ImageView
+                            android:layout_width="13dp"
+                            android:layout_height="13dp"
+                            android:contentDescription="自动补光"
+                            android:src="@drawable/ic_brightness"
+                            android:tint="@color/scan_primary"/>
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="4dp"
+                            android:text="自动补光"
+                            android:textColor="@color/scan_text_secondary"
+                            android:textSize="11sp"/>
+                    </LinearLayout>
                     <TextView
                         android:id="@+id/tvAutoLight"
                         android:layout_width="wrap_content"
@@ -150,7 +185,7 @@
                 <View
                     android:layout_width="1dp"
                     android:layout_height="42dp"
-                    android:layout_marginHorizontal="10dp"
+                    android:layout_marginHorizontal="6dp"
                     android:background="@color/scan_divider" />
 
                 <LinearLayout
@@ -159,12 +194,25 @@
                     android:layout_weight="1"
                     android:gravity="center"
                     android:orientation="vertical">
-                    <TextView
+                    <LinearLayout
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="镜头"
-                        android:textColor="@color/scan_text_secondary"
-                        android:textSize="12sp"/>
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+                        <ImageView
+                            android:layout_width="13dp"
+                            android:layout_height="13dp"
+                            android:contentDescription="镜头"
+                            android:src="@drawable/ic_viewfinder"
+                            android:tint="@color/scan_primary"/>
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginStart="4dp"
+                            android:text="镜头"
+                            android:textColor="@color/scan_text_secondary"
+                            android:textSize="11sp"/>
+                    </LinearLayout>
                     <TextView
                         android:id="@+id/tvCameraMode"
                         android:layout_width="wrap_content"
@@ -203,6 +251,12 @@
                     android:textColor="@color/scan_success"
                     android:textSize="13sp"
                     android:textStyle="bold"/>
+
+                <View
+                    android:layout_width="1dp"
+                    android:layout_height="14dp"
+                    android:layout_marginStart="10dp"
+                    android:background="@color/scan_divider"/>
 
                 <Space
                     android:layout_width="0dp"
@@ -247,8 +301,8 @@
                 android:id="@+id/tvScanHint"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_gravity="center"
-                android:layout_marginTop="190dp"
+                android:layout_gravity="top|center_horizontal"
+                android:layout_marginTop="230dp"
                 android:text="@string/scan_hint"
                 android:textColor="@color/scan_text_secondary"
                 android:textSize="14sp"/>
@@ -280,6 +334,36 @@
                 android:textColor="@color/scan_text_primary"
                 android:textSize="14sp"
                 android:textStyle="bold"/>
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|start"
+                android:layout_marginStart="4dp"
+                android:layout_marginBottom="8dp"
+                android:background="@drawable/bg_panel"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingHorizontal="16dp"
+                android:paddingVertical="12dp">
+
+                <ImageView
+                    android:layout_width="26dp"
+                    android:layout_height="26dp"
+                    android:contentDescription="点云"
+                    android:src="@drawable/ic_pointcloud"
+                    android:tint="@color/scan_primary"/>
+
+                <TextView
+                    android:id="@+id/hudCompact"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="12dp"
+                    android:lineSpacingExtra="3dp"
+                    android:text="地图 0\n绘制 0\n非米制"
+                    android:textColor="@color/scan_text_secondary"
+                    android:textSize="11sp"/>
+            </LinearLayout>
         </FrameLayout>
 
         <!-- Bottom action bar -->
@@ -292,7 +376,7 @@
             <Button
                 android:id="@+id/btnExport"
                 android:layout_width="0dp"
-                android:layout_height="58dp"
+                android:layout_height="62dp"
                 android:layout_weight="0.8"
                 android:background="@drawable/bg_secondary"
                 android:drawableStart="@drawable/ic_export"
@@ -306,7 +390,7 @@
             <Button
                 android:id="@+id/btnViewModel"
                 android:layout_width="0dp"
-                android:layout_height="58dp"
+                android:layout_height="62dp"
                 android:layout_marginStart="10dp"
                 android:layout_weight="1"
                 android:background="@drawable/bg_secondary"
@@ -321,7 +405,7 @@
             <Button
                 android:id="@+id/btnStartScan"
                 android:layout_width="0dp"
-                android:layout_height="58dp"
+                android:layout_height="62dp"
                 android:layout_marginStart="10dp"
                 android:layout_weight="1.5"
                 android:background="@drawable/bg_primary"

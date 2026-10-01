@@ -5,12 +5,25 @@
     android:layout_weight="1"
     android:gravity="center"
     android:orientation="vertical">
-    <TextView
+    <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="FPS"
-        android:textColor="@color/scan_text_secondary"
-        android:textSize="12sp"/>
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+        <ImageView
+            android:layout_width="13dp"
+            android:layout_height="13dp"
+            android:contentDescription="FPS"
+            android:src="@drawable/ic_pulse"
+            android:tint="@color/scan_primary"/>
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="FPS"
+            android:textColor="@color/scan_text_secondary"
+            android:textSize="12sp"/>
+    </LinearLayout>
     <TextView
         android:id="@+id/tvFps"
         android:layout_width="wrap_content"

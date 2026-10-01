@@ -90,6 +90,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var tvMapCount: TextView
     private lateinit var tvDrawCount: TextView
     private lateinit var tvUnit: TextView
+    private lateinit var hudCompact: TextView
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -751,6 +752,19 @@ private var lastRelocPollMs = 0L
         tvMapCount = findViewById(R.id.tvMapCount)
         tvDrawCount = findViewById(R.id.tvDrawCount)
         tvUnit = findViewById(R.id.tvUnit)
+        hudCompact = findViewById(R.id.hudCompact)
+        // 参考稿：标题 "MobileScan" 白 + "3D" 主蓝
+        val titleTv = findViewById<TextView>(R.id.title)
+        val titleStr = titleTv.text.toString()
+        val i3d = titleStr.indexOf("3D")
+        if (i3d >= 0) {
+            val sp = android.text.SpannableString(titleStr)
+            sp.setSpan(
+                android.text.style.ForegroundColorSpan(getColor(R.color.scan_primary)),
+                i3d, i3d + 2, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+            titleTv.text = sp
+        }
 
         findViewById<android.view.View>(R.id.btnStartScan).setOnClickListener { toggleScan() }
         findViewById<android.view.View>(R.id.btnExport).setOnClickListener { showExportDrawer() }
@@ -4044,6 +4058,15 @@ private var lastRelocPollMs = 0L
         tvDrawCount.text = "绘制: ${renderer.drawnAccumulated}" +
             (if (renderer.drawnDebug > 0) " +${renderer.drawnDebug}" else "")
         tvUnit.text = metricLabel()
+        // 参考稿左下 HUD 卡：图标 + 三行竖排统计
+        hudCompact.text = "地图 $shown\n绘制 ${renderer.drawnAccumulated}" +
+            (if (renderer.drawnDebug > 0) " +${renderer.drawnDebug}" else "") +
+            "\n" + metricLabel()
+        // 参考稿：未扫描且无动态提示时，框下显示静态引导文案
+        if (!scanning && warningBanner.visibility == android.view.View.GONE) {
+            warningBanner.text = getString(R.string.scan_hint)
+            warningBanner.visibility = android.view.View.VISIBLE
+        }
     }
 
     private fun updateStatusBar() {

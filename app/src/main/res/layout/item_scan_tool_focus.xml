@@ -8,18 +8,18 @@
     android:focusable="true"
     android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:paddingHorizontal="12dp">
+    android:paddingHorizontal="10dp">
 
     <ImageView
-        android:layout_width="24dp"
-        android:layout_height="24dp"
+        android:layout_width="22dp"
+        android:layout_height="22dp"
         android:contentDescription="对焦/防抖"
         android:src="@drawable/ic_target"/>
 
     <LinearLayout
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_marginStart="9dp"
+        android:layout_marginStart="8dp"
         android:layout_weight="1"
         android:orientation="vertical">
 
@@ -28,7 +28,7 @@
             android:layout_height="wrap_content"
             android:text="对焦/防抖"
             android:textColor="@color/scan_text_primary"
-            android:textSize="13sp"
+            android:textSize="12sp"
             android:textStyle="bold"/>
         <TextView
                 android:layout_width="wrap_content"
@@ -36,6 +36,14 @@
                 android:layout_marginTop="2dp"
                 android:text="自动"
                 android:textColor="@color/scan_text_secondary"
-                android:textSize="11sp"/>
+                android:textSize="10sp"/>
     </LinearLayout>
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:includeFontPadding="false"
+        android:text="›"
+        android:textColor="@color/scan_text_secondary"
+        android:textSize="16sp"/>
 </LinearLayout>
