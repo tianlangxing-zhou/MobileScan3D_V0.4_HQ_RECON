@@ -63,6 +63,12 @@ struct DepthCalibration {
     // outputInvZSpan = |1/z(d90)-1/z(d10)|，两种模型都以 1/米计。
     float refDepthSpanRel = 0.f;
     float outputInvZSpan = 0.f;
+    // V0.13.35：输出**米制**深度的相对跨度 (p90(ẑ)-p10(ẑ))/p50(ẑ)，ẑ 为
+    // 本帧映射对 base 样本算出的预测深度。这是「映射是否保留场景结构」的
+    // 直接度量 —— vc175 实机（PLK110 22:30 会话）实锤：outputInvZSpan=0.196
+    // 能过 0.15 的旧门（shift~6 时 1/z 绝对值大，小绝对跨度仍是好门），
+    // 但米制 z 只剩 0.171~0.187（16mm 厚的墙），整场景深度结构被摧毁。
+    float outputDepthSpanRel = 0.f;
 
     /**
      * V0.13.4：**输入数值域变更时的显式重参数化**。
@@ -184,6 +190,18 @@ public:
         float firstBuildRelax = 0.5f;
         // 输出逆深度跨度下限（1/米）；首次建立也检查，使用 firstBuildRelax 放宽。
         float minOutputInvZSpan = 0.15f;
+        // ---- V0.13.35 输出米制跨度门 ----
+        //
+        // outputInvZSpan 在 shift 较大时是**弱门**：1/z 的大绝对值让同样小的
+        // 米制结构仍能凑出 0.15 的 1/米跨度（vc175 实锤：shift=5.93、
+        // invZSpan=0.196 过门，z 却只剩 16mm 的跨度 —— 满屏 17cm 平板墙）。
+        // 直接在米制 z 域设门：
+        //   绝对门   ẑ 的 spanRel ≥ minOutputDepthSpanRel（首次建立放宽）
+        //   保持门   ẑ 的 spanRel ≥ outputSpanPreservation × 参考 spanRel
+        // 保持门不放宽：参考跨度本身已被 minRefDepthSpanRel 门住，标定没有
+        // 理由把 VINS 看得到的纵深再摧毁一半以上。
+        float minOutputDepthSpanRel = 0.20f;
+        float outputSpanPreservation = 0.5f;
         // 关掉健康门（用于对照实验 / 回归测试）。
         bool enforceCalibHealthGate = true;
     };

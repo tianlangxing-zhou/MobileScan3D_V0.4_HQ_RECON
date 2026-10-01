@@ -295,6 +295,30 @@ DepthCalibration fitDepthRobust(const std::vector<float>& d,
             out.outputInvZSpan = (za > 1e-6 && zb > 1e-6)
                 ? static_cast<float>(std::fabs(1.0 / za - 1.0 / zb)) : 0.f;
         }
+        // ---- V0.13.35 输出米制跨度 ----
+        // 逐样本用与 toMetric 完全一致的公式算预测 z，再取相对跨度。
+        // 不用 d10/d90 两端点近似：负 scale 或强非线性下两端点不代表分布。
+        {
+            std::vector<float> zp;
+            zp.reserve(base.size());
+            for (const Pair& p : base) {
+                if (out.inverseDepthModel) {
+                    const double v = static_cast<double>(out.scale) * p.x + out.shift;
+                    if (v > 1e-6 && std::isfinite(v)) zp.push_back(static_cast<float>(1.0 / v));
+                } else {
+                    const double v = static_cast<double>(out.scale) * p.x + out.shift;
+                    if (v > 1e-4 && std::isfinite(v)) zp.push_back(static_cast<float>(v));
+                }
+            }
+            if (zp.size() >= 8) {
+                std::sort(zp.begin(), zp.end());
+                const float zp10 = pctOf(zp, 0.10);
+                const float zp50 = pctOf(zp, 0.50);
+                const float zp90 = pctOf(zp, 0.90);
+                out.outputDepthSpanRel =
+                    (zp50 > 1e-4f) ? (zp90 - zp10) / zp50 : 0.f;
+            }
+        }
     }
 
     // 置信度：内点比例 × 残差打分
@@ -386,6 +410,23 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
             lastReject_ = "calibrated depth resolution too flat";
             ++rejectedFrames_;
             return false;
+        }
+        // ---- V0.13.35 输出米制跨度门 ----
+        // 拦「invZSpan 过门但米制 z 已塌成平板」的拟合（vc175 实机 22:30 会话
+        // 的直接根因：首次建立吃进 scale=-0.0003/shift=7.67 的退化映射 →
+        // z 恒为 ~13cm 的墙 → epoch 冻结垃圾 → 满屏拉丝 + 导出碎块）。
+        // 该门同时掐断「负 scale 反向映射」：反向映射在有无纵深结构的场景里
+        // 预测 z 与 VINS 反序，米制跨度必然塌掉。
+        {
+            const float absGate = cfg_.minOutputDepthSpanRel *
+                (calib_.valid ? 1.f : cfg_.firstBuildRelax);
+            const float keepGate =
+                cfg_.outputSpanPreservation * fresh.refDepthSpanRel;
+            if (!(fresh.outputDepthSpanRel >= std::max(absGate, keepGate))) {
+                lastReject_ = "output metric depth span collapsed";
+                ++rejectedFrames_;
+                return false;
+            }
         }
     }
 

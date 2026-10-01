@@ -145,6 +145,8 @@ static bool lastCalibInverse = false;
 // 判定「模型发平」是否源于拟合样本纵深不足。
 static float lastCalibRefSpanRel = 0.f;
 static float lastCalibOutInvZSpan = 0.f;
+// V0.13.35: 标定输出米制深度相对跨度（是否把场景压平的直接度量）。
+static float lastCalibOutZSpanRel = 0.f;
 static uint64_t calibFrames = 0;
 static uint64_t calibRejectFrames = 0;
 // V0.10: exact depth field entering TSDF after calibration.
@@ -1193,6 +1195,7 @@ static void resetDepthCalibration() {
     lastCalibInverse = false;
     lastCalibRefSpanRel = 0.f;
     lastCalibOutInvZSpan = 0.f;
+    lastCalibOutZSpanRel = 0.f;
     calibFrames = 0;
     calibRejectFrames = 0;
     lastFusionDepthCalibrated = false;
@@ -2447,6 +2450,7 @@ static void nativeOnDepthMapImpl(
             c.inverseDepthModel;
         lastCalibRefSpanRel = c.refDepthSpanRel;
         lastCalibOutInvZSpan = c.outputInvZSpan;
+        lastCalibOutZSpanRel = c.outputDepthSpanRel;
     }
     // Calibrated depth is also the input to the metric-threshold target mask.
     // Before calibration, retain appearance tracking but do not classify presence
@@ -2750,7 +2754,7 @@ static void nativeOnDepthMapImpl(
     //  - scanMax/worldPerMeter：扫描范围与 VINS 世界尺度是否自洽
     if ((depthFrames % 30) == 0) {
         LOGI("DepthProbe calib valid=%d scale=%.4f shift=%.4f conf=%.3f samples=%lld "
-             "spanRel=%.3f invZSpan=%.3f acc=%llu rej=%llu reason=%s | "
+             "spanRel=%.3f invZSpan=%.3f zSpanRel=%.3f acc=%llu rej=%llu reason=%s | "
              "fusionDepth min=%.3f max=%.3f mean=%.3f valid=%llu fallback=%llu | "
              "scanMax=%.2f worldPerMeter=%.4f worldScaleUsable=%d | epochA=%d susp=%d",
              lastCalibValid ? 1 : 0,
@@ -2760,6 +2764,7 @@ static void nativeOnDepthMapImpl(
              static_cast<long long>(lastCalibSamples),
              static_cast<double>(lastCalibRefSpanRel),
              static_cast<double>(lastCalibOutInvZSpan),
+             static_cast<double>(lastCalibOutZSpanRel),
              (unsigned long long)calibFrames,
              (unsigned long long)calibRejectFrames,
              depthCalibrator.lastRejectReason() ? depthCalibrator.lastRejectReason() : "",
