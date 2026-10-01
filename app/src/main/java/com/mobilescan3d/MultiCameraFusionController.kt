@@ -132,6 +132,13 @@ class MultiCameraFusionController(
     private val pairStats = FloatArray(NativeBridge.MULTICAM_STATS_SLOTS)
     @Volatile private var pairBusyDrops = 0L
     val secondaryId: String? get() = secondaryModel?.id
+    /**
+     * vc161：可供距离切换的辅助镜头数量。
+     * PLK110 的逻辑相机（Device 0）只暴露 physical 2 与 3，primary=2 ⇒ 候选恒为 1，
+     * 即「距离驱动切换辅摄」在该机型上不再有任何可换目标。把这个事实写进报告，
+     * 避免把「硬件只有一颗辅摄」误判成「策略没触发」。
+     */
+    val selectableAuxCount: Int get() = rangeCandidates.size
     @Volatile var primaryProjectionMismatch = false
         private set
     private var rangePrimaryCrop: Rect? = null
@@ -151,6 +158,31 @@ class MultiCameraFusionController(
             CameraRangePolicy.Range.FAR -> candidates.filter { it.model.horizontalFovDeg > 1f }
                 .minByOrNull { it.model.horizontalFovDeg }
         }?.model?.id
+    }
+
+    /**
+     * vc161：一次性输出「本机可供调配的物理镜头 + 各自最小对焦距离 + 各档位选中结果」。
+     *
+     * 动机（2026-10-01 11:36–11:52 实拍）：镜头调配链只更新 HUD 文本，不留任何日志，
+     * 整个会话 114 次采样、74 次物理镜头连断，却无法回答「到底切没切、为什么没切、
+     * 切了多久」。这里把决策所需的输入固化成一行，供下次实拍直接判读。
+     */
+    fun capabilitySnapshot(): String {
+        val primaryId = primaryModel?.id ?: "?"
+        if (rangeCandidates.isEmpty()) return "primary=$primaryId candidates=none"
+        val sb = StringBuilder("primary=").append(primaryId)
+        for (candidate in rangeCandidates) {
+            val c = runCatching { cameraManager.getCameraCharacteristics(candidate.model.id) }.getOrNull()
+            val diopters = c?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+            val minFocus = if (diopters > 0f) "%.3fm".format(.9f / diopters) else "inf"
+            sb.append(" | id=").append(candidate.model.id)
+                .append(" fov=").append("%.1f".format(candidate.model.horizontalFovDeg))
+                .append(" focal=").append("%.2f".format(candidate.model.focalMm))
+                .append(" minFocus=").append(minFocus)
+                .append(" score=").append("%.2f".format(candidate.score))
+        }
+        sb.append(" | cur=").append(secondaryModel?.id ?: "none")
+        return sb.toString()
     }
 
     fun pausePairs() = synchronized(nativePairLock) {

@@ -17,6 +17,15 @@ class CameraRangePolicy {
     var meters = Float.NaN
         private set
 
+    /**
+     * vc161：把「候选档位是否还在等采样」暴露给日志。
+     * update() 返回 null 有两种完全不同的含义——「已是目标档位/无有效距离」（稳态）
+     * 与「候选未满 3 次采样或 900ms」（等待中）。只看返回值无法区分，实拍时会把
+     * 稳态误读成「策略卡住」。2026-10-01 12:16 自检即出现该歧义。
+     */
+    val pendingRange: Range? get() = pending
+    val pendingSampleCount: Int get() = pendingSamples
+
     fun setMode(value: Mode) { mode = value; pending = null; retryAfter = 0L }
     fun reset() { pending = null; lastObservation = -1L; meters = Float.NaN }
     fun committed(value: Range, nowMs: Long) {

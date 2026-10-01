@@ -5,6 +5,8 @@ import android.util.Log
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import org.tensorflow.lite.DataType
 import java.nio.channels.FileChannel
 
 /**
@@ -29,7 +31,9 @@ class MonoDepthProvider(
     private val interpreter: Interpreter?
 
     private val pre = DepthPreprocessor(inputSize)
-    private val output = Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(1) } } }
+    private val outputBuffer = ByteBuffer.allocateDirect(inputSize * inputSize * 4)
+        .order(ByteOrder.nativeOrder())
+    private val outputFloats = outputBuffer.asFloatBuffer()
     private val timing = DepthPerformance("DepthInferencePerf", "preprocess", "inference", "copy", "total")
     private val depthSmall = FloatArray(inputSize * inputSize)
 
@@ -45,7 +49,24 @@ class MonoDepthProvider(
 
     init {
         interpreter = try {
-            Interpreter(loadModel(assets), Interpreter.Options().apply { setNumThreads(4) })
+            val candidate = Interpreter(loadModel(assets), Interpreter.Options().apply { setNumThreads(4) })
+            try {
+                val input = candidate.getInputTensor(0)
+                val output = candidate.getOutputTensor(0)
+                require(input.dataType() == DataType.FLOAT32 &&
+                    input.shape().contentEquals(intArrayOf(1, inputSize, inputSize, 3))) {
+                    "Expected FLOAT32 NHWC depth input"
+                }
+                require(output.dataType() == DataType.FLOAT32 &&
+                    (output.shape().contentEquals(intArrayOf(1, inputSize, inputSize, 1)) ||
+                     output.shape().contentEquals(intArrayOf(1, inputSize, inputSize)))) {
+                    "Expected one FLOAT32 depth plane"
+                }
+                candidate
+            } catch (t: Throwable) {
+                candidate.close()
+                throw t
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "depth model load failed: ${modelAsset}", t)
             null
@@ -64,19 +85,16 @@ class MonoDepthProvider(
         val started = System.nanoTime()
         pre.fill(y, u, v, width, height, rowStride, uRowStride, uPixelStride)
         val prepared = System.nanoTime()
-        itp.run(pre.tensor, output)
+        outputBuffer.clear()
+        itp.run(pre.tensor, outputBuffer)
         val inferred = System.nanoTime()
 
         // 评审 P0-1 + P0-2：直接取原始模型输出 q，固定 INVERSE_DEPTH 语义，
         // 不做会话级 min/max、不做 [0.4,6] 映射、不上采样到相机分辨率。
         // 分辨率保持 inputSize×inputSize (256×256)，native 侧按深度/相机比
         // 降采样内参 K 完成融合，几何信息基本无损。
-        for (oy in 0 until inputSize) {
-            val base = oy * inputSize
-            for (ox in 0 until inputSize) {
-                depthSmall[base + ox] = output[0][oy][ox][0]
-            }
-        }
+        outputFloats.rewind()
+        outputFloats.get(depthSmall)
 
         val copied = System.nanoTime()
         timing.record((prepared-started)/1_000_000f, (inferred-prepared)/1_000_000f,

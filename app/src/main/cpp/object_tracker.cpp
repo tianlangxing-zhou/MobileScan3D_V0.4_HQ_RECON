@@ -22,8 +22,8 @@ constexpr float kNanoReacquireScore = 0.65f;
 // 重捕获尝试的帧数上限。track() 每帧调一次，约 1.5s @30fps。
 // 用帧数而非时间：掉帧时帧数计数更保守，不会因为卡顿就提前判死。
 constexpr int kReacquireTimeoutFrames = 45;
-// 重捕获期间每帧跑一次 Nano（正常态是每 4 帧）—— 危险态需要更快的节奏。
-constexpr int kReacquireNanoPeriod = 1;
+// 局部重捕获每 3 帧运行一次 Nano，给 5Hz 全画面几何搜索留出预算。
+constexpr int kReacquireNanoPeriod = 3;
 
 // ---------- NanoTrack 自适应节奏 / 纠偏权重 ----------
 // 健康时每 4 帧（约 5Hz @20fps）跑一次省算力；
@@ -143,12 +143,8 @@ void ObjectTracker::setColorFrame(const uint8_t* bgr, int width, int height, int
         return;
     }
     cv::Mat src(height, width, CV_8UC3, const_cast<uint8_t*>(bgr), static_cast<size_t>(stride));
-    cv::Mat owned = src.clone();
-    if (owned.empty()) {
-        return;
-    }
     std::lock_guard<std::mutex> lock(mutex_);
-    colorFrame_ = std::move(owned);
+    src.copyTo(colorFrame_); // same dimensions reuse allocation under tracker lock
     colorFrameValid_ = true;
     colorFrameTs_ = timestamp;
     colorFrameCalls_++;
@@ -432,6 +428,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
         return;
     }
 
+    if (!timestamp || (info_.lastFrameTs && timestamp <= info_.lastFrameTs)) return;
     lastGray_ = owned;
     info_.haveCameraFrame = true;
     info_.frameWidth = width;
@@ -541,7 +538,7 @@ void ObjectTracker::updateFrame(const uint8_t* gray, int width, int height, int 
             p.y += roi.y;
             prevPoints_.push_back(p);
         }
-        prevGray_ = owned.clone();
+        prevGray_ = owned;
         info_.trackedPoints = static_cast<int>(prevPoints_.size());
         info_.inlierRatio = 1.0f;
         info_.confidence = std::min(1.0f, info_.trackedPoints / 80.0f);
@@ -577,17 +574,41 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         return;
     }
 
-    cv::Mat src(height, width, CV_8UC1, const_cast<uint8_t*>(gray), static_cast<size_t>(stride));
-    cv::Mat owned = src.clone();
-    if (owned.empty()) {
-        return;
-    }
-
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!timestamp || timestamp < info_.lastFrameTs) return;
+    cv::Mat owned;
+    if (info_.lastFrameTs == timestamp && lastGray_.cols == width && lastGray_.rows == height)
+        owned = lastGray_;
+    else {
+        cv::Mat src(height,width,CV_8UC1,const_cast<uint8_t*>(gray),size_t(stride));
+        owned = src.clone();
+    }
+    if (owned.empty()) return;
     info_.trackerUpdateCalls++;
 
     if (!enabled_) {
         return;
+    }
+
+    if ((info_.state == TargetState::REACQUIRING || info_.state == TargetState::LOST) &&
+        timestamp > info_.timestamp) {
+        cv::Rect recovered;
+        if (reacquirer_.search(owned, timestamp, recovered) &&
+            adoptNanoBox(recovered, width, height, owned, timestamp, true)) {
+            // Reinitialize local search at the geometrically verified location.
+            nanoNeedInit_ = nanoLoaded_;
+            nanoBoxAge_ = -1;
+            info_.state = TargetState::TRACKING;
+            info_.timestamp = timestamp;
+            info_.presenceValid = true;
+            info_.trackSuccess++;
+            info_.lastEvent = "global identity reacquired (two-exposure geometry)";
+            return;
+        }
+        if (info_.state == TargetState::LOST) {
+            info_.lastEvent = "target lost; bounded global identity search active";
+            return;
+        }
     }
 
     // REACQUIRING：目标短暂出屏后由 NanoTrack 自己找回。
@@ -624,7 +645,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
             // This branch has no Nano score: unavailable identity (-1) cannot
             // be treated as positive evidence, unlike ordinary tracking updates.
             if (lastBox.width >= 16 && lastBox.height >= 16 &&
-                computeIdentityScore(lastBox, owned) >= kIdentityAcceptMin &&
+                computeIdentityScore(lastBox, owned) >= .60f &&
                 adoptNanoBox(lastBox, w, h, owned, timestamp)) {
                 info_.state = TargetState::TRACKING;
                 info_.lastEvent = "reacquired via identity-anchored last-good box";
@@ -811,16 +832,29 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         !std::isfinite(dy) ||
         !std::isfinite(scale) ||
         scale < 0.5f ||
-        scale > 2.0f ||
-        std::abs(dx) > width * 0.5 ||
-        std::abs(dy) > height * 0.5)
+        scale > 2.0f)
     {
         markLost("track: insane affine");
         return;
     }
 
-    trackCx_ += static_cast<float>(dx);
-    trackCy_ += static_cast<float>(dy);
+    const int supported = cv::countNonZero(inliers);
+    if (supported < 10 || supported < int(goodPrev.size() * .55f)) {
+        markLost("track: insufficient affine consensus");
+        return;
+    }
+    const float nextCx = float(a[0]*trackCx_ + a[1]*trackCy_ + a[2]);
+    const float nextCy = float(a[3]*trackCx_ + a[4]*trackCy_ + a[5]);
+    if (!std::isfinite(nextCx) || !std::isfinite(nextCy) ||
+        std::hypot(nextCx-trackCx_, nextCy-trackCy_) > .5f*std::hypot(float(width),float(height))) {
+        markLost("track: implausible center displacement"); return;
+    }
+    trackCx_ = nextCx;
+    trackCy_ = nextCy;
+    // Keep dimensions attached to scale; bounded identity geometry still guards
+    // local failures and Nano remains a slow correction source.
+    trackHalfW_ = std::clamp(trackHalfW_*scale, 8.f, float(width)*.5f);
+    trackHalfH_ = std::clamp(trackHalfH_*scale, 8.f, float(height)*.5f);
 
     const int left = static_cast<int>(std::floor(trackCx_ - trackHalfW_));
     const int top = static_cast<int>(std::floor(trackCy_ - trackHalfH_));
@@ -908,7 +942,7 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
     info_.lastError.clear();
     info_.trackSuccess++;
 
-    prevGray_ = owned.clone();
+    prevGray_ = owned;
     prevPoints_ = inlierNext.empty() ? std::move(goodNext) : std::move(inlierNext);
     info_.prevGrayValid = !prevGray_.empty();
     info_.prevGrayWidth = prevGray_.cols;
@@ -1064,6 +1098,15 @@ void ObjectTracker::track(const uint8_t* gray, int width, int height, int stride
         }
     }
 
+    const cv::Rect corrected = cv::Rect(int(std::floor(trackCx_-trackHalfW_)),
+        int(std::floor(trackCy_-trackHalfH_)), int(std::ceil(2*trackHalfW_)),
+        int(std::ceil(2*trackHalfH_))) & cv::Rect(0,0,width,height);
+    info_.x0 = float(corrected.x)/width; info_.y0 = float(corrected.y)/height;
+    info_.x1 = float(corrected.x+corrected.width)/width;
+    info_.y1 = float(corrected.y+corrected.height)/height;
+    info_.centerXNorm=trackCx_/width;info_.centerYNorm=trackCy_/height;
+    info_.bboxWidthPx=corrected.width;info_.bboxHeightPx=corrected.height;
+
     const bool lowFeatures = goodNext.size() < 35;
     const bool enoughVisible = info_.visibleFraction >= 0.40f;
     const bool cooldownOk = framesSinceLastReseed_ >= 10;
@@ -1214,14 +1257,20 @@ bool ObjectTracker::isTracking() const
 TargetTrackInfo ObjectTracker::info() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return info_;
+    auto result = info_;
+    result.globalSearchReady = reacquirer_.ready();
+    result.globalSearches = reacquirer_.searches;
+    result.globalRecoveries = reacquirer_.recoveries;
+    result.globalInliers = reacquirer_.lastInliers;
+    return result;
 }
 
 cv::Mat ObjectTracker::resolveNanoFrame(const cv::Mat& grayOwned, bool* usedColor) const
 {
     // 优先使用由 YUV420 生成的真实彩色帧：NanoTrack 的外观判别依赖真实颜色，
     // 原来的 GRAY2BGR 只是把灰度复制成三通道，等于放弃了这个能力。
-    if (colorFrameValid_ && !colorFrame_.empty() && colorFrame_.type() == CV_8UC3) {
+    if (colorFrameValid_ && !colorFrame_.empty() && colorFrame_.type() == CV_8UC3 &&
+        colorFrameTs_ == info_.lastFrameTs) {
         if (usedColor) *usedColor = true;
         return colorFrame_;
     }
@@ -1251,6 +1300,7 @@ cv::Rect ObjectTracker::normToRect(float x0, float y0, float x1, float y1, int w
 // ---------------------------------------------------------------- V0.13 identity
 void ObjectTracker::releaseIdentityAnchor()
 {
+    reacquirer_.reset();
     identityTemplate_.release();
     identityReady_ = false;
     identityAspect_ = 1.f;
@@ -1280,6 +1330,7 @@ void ObjectTracker::captureIdentityAnchor(const cv::Mat& gray, const cv::Rect& r
     if (r.width < 16 || r.height < 16) {
         return;
     }
+    reacquirer_.capture(gray, r);
     // 初始框尺寸（**未裁剪**）：bbox growth guard 的比较基准。
     identityHalfWpx_ = static_cast<float>(r.width) * 0.5f;
     identityHalfHpx_ = static_cast<float>(r.height) * 0.5f;
@@ -1485,7 +1536,7 @@ bool ObjectTracker::runNanoUpdate(const cv::Mat& frame, int width, int height, c
 }
 
 bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
-                                 const cv::Mat& grayOwned, uint64_t timestamp)
+                                 const cv::Mat& grayOwned, uint64_t timestamp, bool geometricIdentity)
 {
     if (nanoW <= 0 || nanoH <= 0 || grayOwned.empty() || nanoBox.width <= 0 ||
         nanoBox.height <= 0) {
@@ -1494,6 +1545,8 @@ bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
 
     const int width = grayOwned.cols;
     const int height = grayOwned.rows;
+    if ((info_.state == TargetState::LOST || info_.state == TargetState::REACQUIRING) &&
+        !identityReady_ && !geometricIdentity) return false;
 
     // Nano 框（Nano 输入坐标系）-> 归一化 -> 灰度帧像素坐标
     const float cxNorm =
@@ -1530,7 +1583,9 @@ bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
 
         // idScore < 0 = 无法判定（锚点/搜索窗/出界），**放行**：
         // 拒绝只留给「有明确证据说明不像」的情形，否则目标贴边时会误杀。
-        const bool idOk = (idScore < 0.f) || (idScore >= kIdentityAcceptMin);
+        const bool recovering = info_.state == TargetState::LOST || info_.state == TargetState::REACQUIRING;
+        const bool idOk = geometricIdentity || (idScore >= (recovering ? .60f : kIdentityAcceptMin)) ||
+                          (!recovering && idScore < 0.f);
         // 膨胀/长宽比守卫**不受 -1 影响**：它们是纯几何判据，永远有效。
         const bool sizeOk = scaleFromInitial <= kIdentityMaxBBoxScale;
         const bool aspectOk = aspectDrift <= kIdentityMaxAspectDrift;
@@ -1546,17 +1601,15 @@ bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
         }
     }
 
-    trackCx_ = std::clamp(cxNorm * width, 0.f, static_cast<float>(std::max(0, width - 1)));
-    trackCy_ = std::clamp(cyNorm * height, 0.f, static_cast<float>(std::max(0, height - 1)));
-    trackHalfW_ = candHalfW;
-    trackHalfH_ = candHalfH;
+    const float candidateCx = std::clamp(cxNorm * width, 0.f, static_cast<float>(std::max(0, width - 1)));
+    const float candidateCy = std::clamp(cyNorm * height, 0.f, static_cast<float>(std::max(0, height - 1)));
 
     // 用 Nano 框重新播种 KLT 特征：恢复后仍由 KLT 做精细跟踪，
     // Nano 只在 KLT 失效时兜底，避免长期依赖 CNN 导致漂移。
-    const int left = std::max(0, static_cast<int>(std::floor(trackCx_ - trackHalfW_)));
-    const int top = std::max(0, static_cast<int>(std::floor(trackCy_ - trackHalfH_)));
-    const int right = std::min(width, static_cast<int>(std::ceil(trackCx_ + trackHalfW_)));
-    const int bottom = std::min(height, static_cast<int>(std::ceil(trackCy_ + trackHalfH_)));
+    const int left = std::max(0, static_cast<int>(std::floor(candidateCx - candHalfW)));
+    const int top = std::max(0, static_cast<int>(std::floor(candidateCy - candHalfH)));
+    const int right = std::min(width, static_cast<int>(std::ceil(candidateCx + candHalfW)));
+    const int bottom = std::min(height, static_cast<int>(std::ceil(candidateCy + candHalfH)));
     cv::Rect box(left, top, std::max(1, right - left), std::max(1, bottom - top));
     box &= cv::Rect(0, 0, width, height);
 
@@ -1570,6 +1623,9 @@ bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
         }
     }
 
+    if (pts.size() < kMinKltPoints) return false;
+    trackCx_ = candidateCx; trackCy_ = candidateCy;
+    trackHalfW_ = candHalfW; trackHalfH_ = candHalfH;
     prevPoints_.clear();
     if (pts.size() >= 10) {
         prevPoints_.reserve(pts.size());
@@ -1579,7 +1635,7 @@ bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
             prevPoints_.push_back(p);
         }
     }
-    prevGray_ = grayOwned.clone();
+    prevGray_ = grayOwned;
     havePrev_ = !prevGray_.empty();
     framesSinceLastReseed_ = 0;
     edgeLostFrames_ = 0;
@@ -1610,6 +1666,10 @@ bool ObjectTracker::adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
     info_.confidence = std::clamp(0.5f + 0.5f * lastNanoScore_, 0.f, 1.f);
     info_.lastAffineScale = 1.0f;
     info_.affineScaleEMA = 1.0f;
+    info_.timestamp = timestamp;
+    info_.presenceValid = true;
+    appearanceMismatchFrames_ = 0;
+    clearWeakKlt();
     info_.lastError.clear();
     return true;
 }

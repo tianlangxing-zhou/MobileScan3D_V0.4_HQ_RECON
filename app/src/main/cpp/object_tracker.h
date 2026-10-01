@@ -6,12 +6,15 @@
 #include <string>
 #include <vector>
 
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/video/tracking.hpp>
 
 // 外观跟踪后端接缝（抽象接口 + NanoTrack 适配 + LightTrack-ncnn 骨架）。
 // 放在这里而不是 cpp 里，是因为 ObjectTracker 持有一个 unique_ptr<AppearanceTracker>。
 #include "appearance_tracker.h"
+#include "target_reacquirer.h"
 
 enum class TargetState
 {
@@ -144,6 +147,9 @@ struct TargetTrackInfo
     uint64_t identityRejects = 0;
     float bboxScaleFromInitial = 1.f;
     bool identityAnchorReady = false;
+    bool globalSearchReady = false;
+    uint64_t globalSearches = 0, globalRecoveries = 0;
+    int globalInliers = 0;
     // 外观后端接缝（见 appearance_tracker.h）。当前实际生效的是 nanotrack，
     // lighttrack-ncnn 因未链接 ncnn 而如实回退。
     bool appearanceAvailable = false;
@@ -259,6 +265,7 @@ private:
     uint64_t nanoKltRejects_ = 0;
 
     // ---- V0.13：不可变身份锚点（只在用户框选那一帧写入，之后只读）----
+    TargetReacquirer reacquirer_;
     cv::Mat identityTemplate_;      // 归一化尺寸的灰度外观锚点（固定高度）
     bool identityReady_ = false;
     float identityAspect_ = 1.f;    // 初始框 w/h
@@ -306,7 +313,7 @@ private:
      * 落地方式 —— 所以身份门不会变成新的死锁（V0.7.0.1 的教训）。
      */
     bool adoptNanoBox(const cv::Rect& nanoBox, int nanoW, int nanoH,
-                      const cv::Mat& grayOwned, uint64_t timestamp);
+                      const cv::Mat& grayOwned, uint64_t timestamp, bool geometricIdentity = false);
     void clearWeakKlt();
 
     // ---- V0.13 Immutable Target Identity ----

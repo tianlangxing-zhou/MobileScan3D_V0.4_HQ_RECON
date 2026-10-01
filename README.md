@@ -63,3 +63,7 @@ versionName = 0.7.0-persistent-ar
 
 1. 首次扫描 → 停止导出 → 自动生成 HQ textured GLB + AR cache + 持久地图（提示「跨会话 AR 已保存」）。
 2. 重开 APP，回到原环境，点击「恢复AR」→ 缓慢平移找原扫描区域 → 提示「AR 重定位成功」后模型出现。
+
+## VC161 连续扫描与目标找回
+
+增量更新、修复清单、验证范围与实机步骤见 [README_VC161_ZH.md](README_VC161_ZH.md)。

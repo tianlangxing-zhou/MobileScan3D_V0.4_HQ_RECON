@@ -3,7 +3,8 @@
 #include <memory>
 #include <string>
 
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/video/tracking.hpp>
 
 /**
  * 外观跟踪后端抽象 —— 给「每帧高速层」之外再挂一层「外观纠偏层」留的接缝。

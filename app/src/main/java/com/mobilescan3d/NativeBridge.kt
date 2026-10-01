@@ -3,7 +3,7 @@ object NativeBridge {
     /** Set before starting a scan. Changing it does not erase existing geometry. */
     external fun nativeSetScanMaxDistance(meters: Float)
     /** Pin the exact source pose/RGB while one depth inference is in flight. */
-    external fun nativeRetainDepthFrame(timestampNs: Long)
+    external fun nativeRetainDepthFrame(timestampNs: Long): Boolean
 
     init { System.loadLibrary("mobilescan3d") }
 

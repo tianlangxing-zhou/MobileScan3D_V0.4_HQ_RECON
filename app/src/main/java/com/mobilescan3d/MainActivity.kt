@@ -93,6 +93,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     @Volatile private var cameraRangeSwitching = false
     private val cameraRangeSerial = java.util.concurrent.atomic.AtomicLong(0)
     private var rangeLogicalSurfaces = emptyList<Surface>()
+    // vc161：镜头调配链的可机读证据。改状态立即打，稳定态 5s 心跳；硬下限 1s 防刷屏。
+    private var cameraRangeLogLast = ""
+    private var cameraRangeLogMinGapMs = 0L
+    private var cameraRangeLogHeartbeatMs = 0L
+    @Volatile private var cameraRangeSwitchStartedMs = 0L
     private var rangeHqActive = false
     private var rangeTimeout: Runnable? = null
     private var lastDepthScaleSampleNs = 0L
@@ -2154,6 +2159,8 @@ private var lastRelocPollMs = 0L
         sb.appendLine("Scan settings: maxDistanceMeters=$scanMaxDistanceMeters autoFillLight=$autoFillLight torchRequested=$torchRequested torchAvailable=$torchAvailable torchFailed=$torchFailed")
         sb.appendLine("Depth worker: busy=${depthBusy.get()} errors=$depthErrors lastError=$depthLastError lastCompletedElapsedMs=$depthCompletedMs")
         sb.appendLine("ThermalGuard: thermalStatus=$thermalStatus depthMinIntervalMs=${thermalDepthMinIntervalMs()} meshIntervalScale=${thermalMeshIntervalScale()} liveMeshLastBuildMs=$liveMeshLastBuildMs")
+        sb.appendLine("CameraRange: status=$cameraRangeStatus mode=${cameraRangePolicy.mode.label} range=${cameraRangePolicy.range.label} aux=${multiCam?.secondaryId} selectableAux=${multiCam?.selectableAuxCount ?: -1}")
+        sb.appendLine("CameraRange caps: ${multiCam?.capabilitySnapshot() ?: "unavailable"}")
         sb.appendLine("MobileScan3D 配置反馈报告")
         sb.appendLine("时间戳: ${System.currentTimeMillis()}")
         sb.appendLine()
@@ -2612,7 +2619,12 @@ private var lastRelocPollMs = 0L
         if (!depthBusy.compareAndSet(false, true)) return
         val generation = depthGeneration
         try {
-            NativeBridge.nativeRetainDepthFrame(t)
+            if (!NativeBridge.nativeRetainDepthFrame(t)) {
+                // No source pose => no possible fusion. Retry on the next camera
+                // exposure without occupying the expensive inference worker.
+                depthBusy.set(false)
+                return
+            }
             val accepted = handler.post {
                 try {
                     // Queued work may belong to a scan that has already stopped.
@@ -2752,7 +2764,21 @@ private var lastRelocPollMs = 0L
         captureState = "IDLE"
         depthScaleEstimator.reset()
         lastDepthScaleSampleNs = 0L
-        cameraHandler?.post { cameraRangePolicy.reset() }
+        cameraHandler?.post {
+            cameraRangePolicy.reset()
+            val rangeCam = multiCam
+            logCameraRange(
+                "scan-start capabilities: ${rangeCam?.capabilitySnapshot() ?: "multiCam=null"}",
+                force = true
+            )
+            if (rangeCam != null && rangeCam.active && rangeCam.selectableAuxCount < 2) {
+                logCameraRange(
+                    "note: only ${rangeCam.selectableAuxCount} selectable auxiliary lens -> " +
+                        "distance-driven switching cannot change the aux id on this device",
+                    force = true
+                )
+            }
+        }
         if (::hqCapture.isInitialized) {
             hqCapture.beginScan(sessionId)
             // 状态机由 HqCaptureController 持有，这里只做镜像
@@ -4181,29 +4207,71 @@ private var lastRelocPollMs = 0L
             }.show()
     }
 
+    /**
+     * vc161：镜头调配链的日志出口。
+     *
+     * 上一轮实拍（10-01 11:36–11:52）里 `updateCameraRange` 只写 HUD，结果整场没有任何
+     * 一行能证明「距离是否有效 / 档位是否被提交 / 每颗镜头是否被尝试过 / 切换耗时」。
+     * 这里按「状态变化立即打 + 稳定态 5s 心跳 + 硬下限 1s」的节流输出，绝不逐帧打。
+     */
+    private fun logCameraRange(message: String, force: Boolean = false) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val changed = message != cameraRangeLogLast
+        if (!force && !(changed && now >= cameraRangeLogMinGapMs) && now < cameraRangeLogHeartbeatMs) return
+        cameraRangeLogLast = message
+        cameraRangeLogMinGapMs = now + 1_000L
+        cameraRangeLogHeartbeatMs = now + 5_000L
+        android.util.Log.i("CameraRange", message)
+    }
+
     private fun updateCameraRange(distance: Float, source: Int) {
         if (!resumed || cameraRangeSwitching) return
         val mc = multiCam
-        if (mc?.active != true) { cameraRangeStatus = "单摄回退 · 无可调配物理镜头"; return }
-        if (mc.primaryProjectionMismatch) return
+        if (mc?.active != true) {
+            cameraRangeStatus = "单摄回退 · 无可调配物理镜头"
+            logCameraRange("fallback: multi-camera inactive, no reconfigurable lens")
+            return
+        }
+        if (mc.primaryProjectionMismatch) {
+            logCameraRange("hold: primary projection mismatch")
+            return
+        }
         val now = android.os.SystemClock.elapsedRealtime()
         val desired = cameraRangePolicy.update(distance, source > 0, now)
         val observation = if (source > 0 && distance.isFinite() && distance > 0f)
             "%.2fm%s".format(distance, if (source == 2) "" else "（估计）") else "等待有效深度"
         cameraRangeStatus = "${cameraRangePolicy.mode.label}/${cameraRangePolicy.range.label} · $observation · 辅摄${mc.secondaryId}"
-        if (desired == null || modelOperationBusy || openingCamera || modelViewerActive) return
-        if (::hqCapture.isInitialized && !hqCapture.canChangeFillLight()) return
+        if (desired == null || modelOperationBusy || openingCamera || modelViewerActive) {
+            logCameraRange(
+                "hold ${cameraRangePolicy.mode.label}/${cameraRangePolicy.range.label} $observation " +
+                    "aux=${mc.secondaryId} reason=" +
+                    (if (desired == null)
+                        "policy-hold pending=${cameraRangePolicy.pendingRange?.label ?: "none"}" +
+                            "/${cameraRangePolicy.pendingSampleCount}"
+                    else "gate(modelBusy=$modelOperationBusy open=$openingCamera viewer=$modelViewerActive)")
+            )
+            return
+        }
+        if (::hqCapture.isInitialized && !hqCapture.canChangeFillLight()) {
+            logCameraRange("hold ${desired.label} $observation reason=fill-light-busy")
+            return
+        }
         val nextId = mc.candidateForRange(desired, distance)
         if (nextId == null) {
             cameraRangeStatus = "${desired.label}距无可用辅助镜头 · 保留当前摄像头"
             cameraRangePolicy.failed(now)
+            logCameraRange("no-lens ${desired.label} $observation: keep aux=${mc.secondaryId}")
             return
         }
         if (nextId == mc.secondaryId) {
             cameraRangePolicy.committed(desired, now)
             cameraRangeStatus = "${cameraRangePolicy.mode.label}/${desired.label} · $observation · 辅摄$nextId（共用）"
+            logCameraRange(
+                "steady ${cameraRangePolicy.mode.label}/${desired.label} $observation aux=$nextId(shared)"
+            )
             return
         }
+        logCameraRange("switch aux ${mc.secondaryId} -> $nextId for ${desired.label} $observation")
         reconfigureAuxiliaryCamera(mc, nextId, desired)
     }
 
@@ -4218,6 +4286,7 @@ private var lastRelocPollMs = 0L
         if (logical.isEmpty()) return
         cameraRangeSwitching = true
         cameraRangeStatus = "切换${desired.label}距辅助镜头…"
+        cameraRangeSwitchStartedMs = android.os.SystemClock.elapsedRealtime()
         mc.pausePairs()
         runCatching { previousSession.stopRepeating() }
         runCatching { previousSession.abortCaptures() }
@@ -4233,9 +4302,22 @@ private var lastRelocPollMs = 0L
                 if (!current()) return
                 rangeTimeout?.let { handler.removeCallbacks(it) }
                 cameraRangePolicy.failed(android.os.SystemClock.elapsedRealtime())
-                if (!rollback) { start(previousId, true); return }
+                if (!rollback) {
+                    logCameraRange(
+                        "switch ACCEPT-FAIL id=$id -> rollback aux=$previousId after " +
+                            "${android.os.SystemClock.elapsedRealtime() - cameraRangeSwitchStartedMs}ms",
+                        force = true
+                    )
+                    start(previousId, true)
+                    return
+                }
                 cameraRangeSwitching = false
                 cameraRangeStatus = "切换失败，已保留模型；正在恢复相机"
+                logCameraRange(
+                    "switch FAILED id=$id rollback-failed after " +
+                        "${android.os.SystemClock.elapsedRealtime() - cameraRangeSwitchStartedMs}ms",
+                    force = true
+                )
                 runOnUiThread {
                     if (!resumed || multiCam !== mc || cameraDevice !== camera) return@runOnUiThread
                     if (scanning) stopScan()
@@ -4257,6 +4339,11 @@ private var lastRelocPollMs = 0L
                     if (!rollback) cameraRangePolicy.committed(desired, android.os.SystemClock.elapsedRealtime())
                     cameraRangeStatus = if (rollback) "HAL 拒绝切换 · 已恢复辅摄$previousId"
                         else "${cameraRangePolicy.mode.label}/${desired.label} · 辅摄$id · 重新标定双目"
+                    logCameraRange(
+                        (if (rollback) "switch rolled-back to aux=$id" else "switch OK aux=$id for ${desired.label}") +
+                            " in ${android.os.SystemClock.elapsedRealtime() - cameraRangeSwitchStartedMs}ms",
+                        force = true
+                    )
                     applyCaptureSettings()
                     if (!rollback && cameraRangePolicy.mode != CameraRangePolicy.Mode.AUTO) {
                         handler.post { if (current()) updateCameraRange(Float.NaN, 0) }

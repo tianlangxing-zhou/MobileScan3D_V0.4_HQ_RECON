@@ -1,20 +1,20 @@
 package com.mobilescan3d.depth
 
-/**
- * YUV_420_888 -> 模型输入张量的预处理。
- *
- * 从原来的 DepthProvider 里原样抽出来，**算法一字未改**（YUV->RGB 的定点系数、
- * ImageNet 均值方差、最近邻重采样），只是不再和 TFLite 解释器耦合在一起：
- * 换模型尺度、加硬件深度、或者在标定里复用它，都不需要动推理代码。
- *
- * 注意 u/v 平面是 **整段 stride 拷贝**（见 MainActivity.extractPlane），所以必须
- * 用 uRowStride / uPixelStride 定位，不能假设 uv 是紧凑排列的。
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+/** YUV420 -> fixed ImageNet normalization; nearest sampling and NHWC layout
+ * remain identical to VC160, while contiguous storage removes nested JNI copies.
+ * U/V use Camera2's shared chroma row/pixel stride; callers copy whole planes.
  */
 class DepthPreprocessor(val inputSize: Int = 256) {
 
-    /** 形状 [1][inputSize][inputSize][3]，直接喂给 TFLite。 */
-    val tensor: Array<Array<Array<FloatArray>>> =
-        Array(1) { Array(inputSize) { Array(inputSize) { FloatArray(3) } } }
+    init { require(inputSize in 1..2048) }
+    /** Contiguous native-order FLOAT32 NHWC input, reused by the depth worker. */
+    val tensor: ByteBuffer = ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4)
+        .order(ByteOrder.nativeOrder())
+    private val sourceX = IntArray(inputSize)
+    private var sourceWidth = 0
 
     fun fill(
         y: ByteArray,
@@ -26,11 +26,20 @@ class DepthPreprocessor(val inputSize: Int = 256) {
         uRowStride: Int,
         uPixelStride: Int
     ) {
+        require(width > 0 && height > 0 && rowStride >= width && uRowStride > 0 && uPixelStride > 0)
+        val yLast = (height - 1L) * rowStride + width - 1L
+        val uvLast = ((height - 1L) / 2) * uRowStride + ((width - 1L) / 2) * uPixelStride
+        require(yLast < y.size && uvLast < u.size && uvLast < v.size) { "Truncated YUV planes" }
         val n = inputSize
+        if (sourceWidth != width) {
+            for (x in 0 until n) sourceX[x] = (x.toLong() * width / n).toInt()
+            sourceWidth = width
+        }
+        tensor.clear()
         for (oy in 0 until n) {
             val sy = oy * height / n
             for (ox in 0 until n) {
-                val sx = ox * width / n
+                val sx = sourceX[ox]
                 val yi = sy * rowStride + sx
                 val uvIdx = (sy / 2) * uRowStride + (sx / 2) * uPixelStride
 
@@ -45,11 +54,12 @@ class DepthPreprocessor(val inputSize: Int = 256) {
                 val g = ((298 * c - 100 * d - 208 * e + 128) shr 8).coerceIn(0, 255)
                 val b = ((298 * c + 516 * d + 128) shr 8).coerceIn(0, 255)
 
-                tensor[0][oy][ox][0] = (r - MEAN[0]) / STD[0]
-                tensor[0][oy][ox][1] = (g - MEAN[1]) / STD[1]
-                tensor[0][oy][ox][2] = (b - MEAN[2]) / STD[2]
+                tensor.putFloat((r - MEAN[0]) / STD[0])
+                tensor.putFloat((g - MEAN[1]) / STD[1])
+                tensor.putFloat((b - MEAN[2]) / STD[2])
             }
         }
+        tensor.rewind()
     }
 
     companion object {

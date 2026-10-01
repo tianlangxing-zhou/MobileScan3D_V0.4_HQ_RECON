@@ -31,6 +31,7 @@
 #include "depth_calib.h"
 #include "camera_distance.h"
 #include "depth_confidence.h"
+#include "depth_refinement.h"
 #include "color_contours.h"
 #include "fusion_guard.h"
 #include "depth_geometry.h"
@@ -404,7 +405,7 @@ static uint64_t retainMissNoPose = 0;
 static uint64_t retainMissMismatch = 0;
 static uint64_t retainMissBadTs = 0;
 
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeRetainDepthFrame(JNIEnv*, jobject, jlong ts) {
     std::lock_guard<std::mutex> lk(gStateMutex);
     haveRetainedDepthSnap = false;
@@ -416,7 +417,7 @@ Java_com_mobilescan3d_NativeBridge_nativeRetainDepthFrame(JNIEnv*, jobject, jlon
     const uint64_t want = ts > 0 ? static_cast<uint64_t>(ts) : 0u;
     if (want == 0) {
         ++retainMissBadTs;
-        return;
+        return JNI_FALSE;
     }
     // 从后往前找同时间戳的那一帧，而不是只看最新一帧。
     for (auto it = snaps.rbegin(); it != snaps.rend(); ++it) {
@@ -429,13 +430,14 @@ Java_com_mobilescan3d_NativeBridge_nativeRetainDepthFrame(JNIEnv*, jobject, jlon
             LOGI("Unable to pin depth snapshot: %s", error.what());
             ++retainMissMismatch;
         }
-        return;
+        return haveRetainedDepthSnap ? JNI_TRUE : JNI_FALSE;
     }
     if (!vinsPoseOk) {
         ++retainMissNoPose;   // 该帧没有可用位姿，storeSnap 根本没存
     } else {
         ++retainMissMismatch; // 有位姿，但快照已滑出 60 帧窗口 / 时间戳对不上
     }
+    return JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1593,17 +1595,28 @@ static void nativeOnCameraFrameImpl(
         JNIEnv* e,
         jbyteArray y, jbyteArray u, jbyteArray v,
         jint w, jint h, jint rs, jint urs, jint ups, jlong frameTs, jlong vinsTs) {
+    static std::mutex cameraCallbackMutex;
+    std::lock_guard<std::mutex> cameraCallbackLock(cameraCallbackMutex);
+    if (!y || !u || !v || w <= 0 || h <= 0 || w > 8192 || h > 8192 ||
+        rs < w || urs <= 0 || ups <= 0 || frameTs <= 0 || vinsTs <= 0) return;
+    const int64_t yRequired = int64_t(h-1)*rs + w;
+    const int64_t uvRequired = int64_t((h-1)/2)*urs + int64_t((w-1)/2)*ups + 1;
+    if (yRequired > e->GetArrayLength(y) || uvRequired > e->GetArrayLength(u) ||
+        uvRequired > e->GetArrayLength(v)) return;
     jsize un = e->GetArrayLength(u);
     std::vector<uint8_t> ubuf((size_t)un);
     e->GetByteArrayRegion(u, 0, un, reinterpret_cast<jbyte*>(ubuf.data()));
+    if (e->ExceptionCheck()) return;
 
     jsize vn = e->GetArrayLength(v);
     std::vector<uint8_t> vbuf((size_t)vn);
     e->GetByteArrayRegion(v, 0, vn, reinterpret_cast<jbyte*>(vbuf.data()));
+    if (e->ExceptionCheck()) return;
 
     jsize n = e->GetArrayLength(y);
     std::vector<uint8_t> ybuf((size_t)n);
     e->GetByteArrayRegion(y, 0, n, reinterpret_cast<jbyte*>(ybuf.data()));
+    if (e->ExceptionCheck()) return;
 
     const uint8_t* yy = ybuf.data();
     const uint8_t* uu = ubuf.data();
@@ -1737,6 +1750,19 @@ static void nativeOnCameraFrameImpl(
             const int th = std::max(16, static_cast<int>(std::lround(h * tScale)));
             gTrackerGray.resize(static_cast<size_t>(tw) * static_cast<size_t>(th));
             downscaleGray(yy, w, h, rs, gTrackerGray.data(), tw, th);
+            // Current-exposure color, before Nano initialization/update. Reuse
+            // storage and cap at 320 px; stale color must never correct fresh KLT.
+            constexpr int kColorMaxDim = 320;
+            const double cScale = std::min(1.0, double(kColorMaxDim) / std::max(w, h));
+            const int cw = std::max(16, int(std::lround(w * cScale)));
+            const int ch = std::max(16, int(std::lround(h * cScale)));
+            static std::vector<uint8_t> color;
+            color.resize(size_t(cw) * ch * 3);
+            downscaleYuvToBgr(yy, uu, vv, w, h, rs, urs, ups,
+                              ubuf.size(), vbuf.size(), color.data(), cw, ch);
+            tracker->setColorFrame(color.data(), cw, ch, cw * 3,
+                                   static_cast<uint64_t>(frameTs));
+
             tracker->updateFrame(gTrackerGray.data(), tw, th, tw,
                                  static_cast<uint64_t>(frameTs));
             tracker->track(gTrackerGray.data(), tw, th, tw,
@@ -1753,23 +1779,6 @@ static void nativeOnCameraFrameImpl(
                                     static_cast<int>(tracker->nanoUpdateCalls()));
             }
 
-            // 每 5 帧喂一张由 YUV420 直接生成的真实彩色缩略图给 NanoTrack。
-            // 原实现把灰度复制成三通道（COLOR_GRAY2BGR），NanoTrack 的外观
-            // 判别能力实际上被浪费了；这里让它拿到真正的 RGB 信息。
-            if (++gTrackerColorFrameCounter % 5ULL == 0ULL) {
-                constexpr int kColorMaxDim = 640;
-                const double cScale = std::min(
-                    1.0, static_cast<double>(kColorMaxDim) /
-                             static_cast<double>(std::max(1, std::max(w, h))));
-                const int cw = std::max(16, static_cast<int>(std::lround(w * cScale)));
-                const int ch = std::max(16, static_cast<int>(std::lround(h * cScale)));
-                std::vector<uint8_t> color((size_t)cw * (size_t)ch * 3u);
-                downscaleYuvToBgr(yy, uu, vv, w, h, rs, urs, ups,
-                                  ubuf.size(), vbuf.size(),
-                                  color.data(), cw, ch);
-                tracker->setColorFrame(color.data(), cw, ch, cw * 3,
-                                       static_cast<uint64_t>(frameTs));
-            }
         } catch (const cv::Exception& ex) {
             __android_log_print(ANDROID_LOG_ERROR, "MobileScan3D-Target", "OpenCV tracker exception: %s", ex.what());
         } catch (const std::exception& ex) {
@@ -1918,9 +1927,13 @@ static void nativeOnCameraFrameImpl(
                     haveFirstReject = true;
                 }
                 vinsLostAfterInit = true;
-                snaps.clear();
-                renderPoseHistory.clear();
-                haveRetainedDepthSnap = false;
+                // A missing CURRENT pose does not invalidate an earlier accepted
+                // exposure still in inference. A real VINS world reset does.
+                if (poseOk || vinsWorldDiscontinuous()) {
+                    snaps.clear();
+                    renderPoseHistory.clear();
+                    haveRetainedDepthSnap = false;
+                }
             }
             vinsPoseOk = false;
             vinsRejectReason = vinsWorldDiscontinuous() ? "world_reset_restart_required" : "no_time_aligned_pose";
@@ -2099,6 +2112,10 @@ static void nativeOnDepthMapImpl(
         if (e->ExceptionCheck()) return;
     }
 
+    static std::vector<float> refinedDepth;
+    depth_refinement::spatial(d.data(), w, h, representation == 1, refinedDepth);
+    d.swap(refinedDepth);
+
     // Fetch timestamp-aligned sparse observations before taking gStateMutex.
     // Every calibrator read/write below is protected against reset/UI diagnostics.
     float frameSamples[kMaxCalibSamples * 3];
@@ -2210,11 +2227,9 @@ static void nativeOnDepthMapImpl(
                     static_cast<int>(
                         nv * static_cast<float>(h))));
 
-            const float dv =
-                d[static_cast<size_t>(py) * w + px];
-            if (!std::isfinite(dv)) {
-                continue;
-            }
+            float dv = 0.f;
+            if (!depth_refinement::calibrationSample(d.data(), w, h, px, py,
+                                                     representation == 1, dv)) continue;
 
             dPairs.push_back(dv);
             zPairs.push_back(vz);
@@ -4082,6 +4097,10 @@ Java_com_mobilescan3d_NativeBridge_nativeGetTargetDiagnostics(JNIEnv* env, jobje
       << "colorFrameValid=" << (i.colorFrameValid ? "true" : "false") << "\n"
       << "colorFrameSize=" << i.colorFrameWidth << "x" << i.colorFrameHeight << "\n"
       << "colorFrameCalls=" << i.colorFrameCalls << "\n"
+      << "globalSearchReady=" << i.globalSearchReady << "\n"
+      << "globalSearches=" << i.globalSearches << "\n"
+      << "globalRecoveries=" << i.globalRecoveries << "\n"
+      << "globalInliers=" << i.globalInliers << "\n"
       << "depthP10=" << i.depthP10 << "\n"
       << "depthMedian=" << i.medianDepth << "\n"
       << "depthP90=" << i.depthP90 << "\n"
