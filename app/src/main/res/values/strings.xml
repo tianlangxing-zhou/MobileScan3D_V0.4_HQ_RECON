@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MobileScan 3D</string>
+    <string name="version_text">v0.13.30-epoch-reanchor</string>
+    <string name="fps">FPS</string>
+    <string name="distance">距离</string>
+    <string name="auto_light">自动补光</string>
+    <string name="camera">镜头</string>
+    <string name="depth">深度</string>
+    <string name="valid">有效</string>
+    <string name="auto">自动</string>
+    <string name="on">开</string>
+    <string name="map_count">地图: 0</string>
+    <string name="draw_count">绘制: 0</string>
+    <string name="non_metric">非米制</string>
+    <string name="object_lock">物体锁定</string>
+    <string name="unlocked">未锁定</string>
+    <string name="focus_stabilization">对焦/防抖</string>
+    <string name="placement">摆放</string>
+    <string name="realtime">实时</string>
+    <string name="enabled">开启</string>
+    <string name="restore_ar">恢复AR</string>
+    <string name="scan_hint">将物体置于框内开始扫描</string>
+    <string name="export">导出</string>
+    <string name="view_model">查看模型</string>
+    <string name="start_scan">开始扫描</string>
+    <string name="stop_scan">停止扫描</string>
+</resources>

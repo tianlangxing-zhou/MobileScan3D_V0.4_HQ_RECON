@@ -75,10 +75,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var renderer: PointCloudRenderer
 
     private lateinit var primaryButton: android.widget.Button
+    private lateinit var headerTitle: TextView
     private lateinit var headerStatus: TextView
     private lateinit var warningBanner: TextView
     private lateinit var statusBarText: TextView
     private lateinit var hudText: TextView
+    private lateinit var settingsButton: android.widget.Button
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -269,7 +271,7 @@ private var lastRelocPollMs = 0L
     /** Preview 当前帧的时间戳（SurfaceTexture.getTimestamp），AR 用它反查那一刻的 pose */
     @Volatile private var previewTimestampNs = 0L
     /** AR 图层切换按钮 */
-    private var arLayerButton: android.widget.TextView? = null
+    private var arLayerButton: android.widget.Button? = null
     /** AR 绘制模式，见 PointCloudRenderer.DRAW_* */
     @Volatile private var arDrawMode = PointCloudRenderer.DRAW_LIVE
 
@@ -329,7 +331,7 @@ private var lastRelocPollMs = 0L
      */
     @Volatile private var placeModeActive = false
     /** 摆放模式按钮（进入/退出共用，文字随状态切换） */
-    private var placeButton: android.widget.TextView? = null
+    private var placeButton: android.widget.Button? = null
     /** 模型包围盒中心（模型坐标系），摆放时用它把模型「中心对齐锚点」。 */
     private val placeCenter = FloatArray(3)
     /** 锚点：当前世界坐标下模型中心要放到的位置。 */
@@ -609,18 +611,16 @@ private var lastRelocPollMs = 0L
         autoFillLight = scanPrefs.getBoolean("auto_fill_light", true)
         scanVoxelProfile = scanPrefs.getInt("voxel_profile", 0).coerceIn(0, 2)
 
-        // —— 换皮：使用 UI 替换包提供的 XML 布局，保留全部扫描/融合/导出核心逻辑 ——
-        setContentView(R.layout.activity_mobile_scan)
-        val container = findViewById<android.widget.FrameLayout>(R.id.cameraPreviewContainer)
+        val root = android.widget.FrameLayout(this)
         val density = resources.displayMetrics.density
         fun dp(value: Int) = (value * density + .5f).toInt()
 
         texture = TextureView(this)
-        container.addView(texture, ViewGroup.LayoutParams(-1, -1))
+        root.addView(texture, ViewGroup.LayoutParams(-1, -1))
         targetOverlay = TargetLockOverlay(this)
         targetOverlay.isClickable = false
         targetOverlay.isFocusable = false
-        container.addView(targetOverlay, ViewGroup.LayoutParams(-1, -1))
+        root.addView(targetOverlay, ViewGroup.LayoutParams(-1, -1))
         texture.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
             if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) {
                 configureTransform(right - left, bottom - top)
@@ -632,6 +632,7 @@ private var lastRelocPollMs = 0L
                 android.view.MotionEvent.ACTION_DOWN -> {
                     downX = event.x
                     downY = event.y
+                    // 物体锁定打开时才进入「可能拖框」状态；否则维持原来的点按对焦。
                     if (objectLockEnabled) {
                         dragSelecting = true
                         dragStartX = event.x
@@ -641,6 +642,8 @@ private var lastRelocPollMs = 0L
                 }
                 android.view.MotionEvent.ACTION_MOVE -> {
                     if (dragSelecting) {
+                        // 实时反馈：让用户看到自己框的是哪一块。
+                        // 只在超过最小拖拽距离后才显示，避免点按时闪一下黄框。
                         val dx = event.x - dragStartX
                         val dy = event.y - dragStartY
                         if (dx * dx + dy * dy >=
@@ -664,9 +667,11 @@ private var lastRelocPollMs = 0L
                     if (event.actionMasked == android.view.MotionEvent.ACTION_UP &&
                         wasDrag &&
                         dx * dx + dy * dy >= dragSelectMinPx() * dragSelectMinPx()) {
+                        // 拖动 -> 精确框选
                         selectTargetRect(downX, downY, event.x, event.y)
                     } else if (event.actionMasked == android.view.MotionEvent.ACTION_UP &&
                         dx * dx + dy * dy < dragSelectMinPx() * dragSelectMinPx()) {
+                        // 轻点 -> 快速自动框
                         if (objectLockEnabled) {
                             selectTarget(event.x, event.y)
                         } else {
@@ -687,27 +692,53 @@ private var lastRelocPollMs = 0L
             renderer = PointCloudRenderer()
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+            // Camera preview is a TextureView in the window; the translucent
+            // GL surface must stay above it (media-overlay is for SurfaceViews).
             setZOrderOnTop(true)
             isClickable = false
             isFocusable = false
         }
+        // V0.13.3 模型查看器手势。glView 平时不吃触摸（isClickable=false，
+        // 事件穿透到 TextureView 走点选目标/对焦）；进入查看模式时置
+        // clickable，手势在这里处理：
+        //   - 按下后立刻拖动 -> 旋转（yaw/pitch）
+        //   - 按住不动 300ms 后再拖 -> 平移（物体跟手）
         glView.setOnTouchListener { _, event ->
             if (modelViewerActive) {
                 handleModelViewerTouch(event)
                 return@setOnTouchListener true
             }
+            // V0.13.4 P1：自由摆放模式的手势（左右=旋转，上下=缩放）。
             if (placeModeActive) {
                 handlePlacementTouch(event)
                 return@setOnTouchListener true
             }
             false
         }
-        container.addView(glView, android.widget.FrameLayout.LayoutParams(
+        root.addView(glView, android.widget.FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         ))
 
-        // 目标离屏提示（原 hudText 区域保留：常驻文案而非 Toast）
+        hudText = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 11f
+            setBackgroundColor(android.graphics.Color.argb(120, 0, 0, 0))
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            maxLines = 8
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            text = "点云 0 点 · 非米制"
+            setOnClickListener { toggleHud() }
+        }
+        root.addView(hudText, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.START
+        ).apply { leftMargin = 12; topMargin = (135 * density).toInt() })
+
+        // 目标离屏提示。刻意做成**常驻**文案而不是 Toast：
+        // 目标整块滑出画面时 bbox 退化成空矩形，连红框都画不出来，
+        // 用 Toast 一闪而过就等于「什么都没发生」。
         targetWarningText = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
             textSize = 15f
@@ -718,25 +749,148 @@ private var lastRelocPollMs = 0L
             gravity = Gravity.CENTER
             visibility = android.view.View.GONE
         }
+        root.addView(targetWarningText, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER
+        ))
 
-        // —— 新 UI（activity_mobile_scan.xml）控件绑定 ——
-        // 复用既有状态字段，使其指向新布局 TextView，updateHeader/updateStatusBar/toggleHud 无需改动：
-        //   headerStatus->tvFps, warningBanner->tvDepth, statusBarText->tvUnit, hudText->tvDrawCount
-        primaryButton = findViewById(R.id.btnStartScan)
-        modelViewerButton = findViewById(R.id.btnViewModel)
-        placeButton = findViewById(R.id.toolPlacementLabel)
-        arLayerButton = findViewById(R.id.toolRealtimeLabel)
-        headerStatus = findViewById(R.id.tvFps)
-        warningBanner = findViewById(R.id.tvDepth)
-        statusBarText = findViewById(R.id.tvUnit)
-        hudText = findViewById(R.id.tvDrawCount)
+        statusBarText = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 12f
+            setBackgroundColor(android.graphics.Color.argb(110, 0, 0, 0))
+            setPadding(dp(12), dp(4), dp(12), dp(4))
+            text = "--:-- · -- · --%"
+        }
+        root.addView(statusBarText, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP
+        ))
 
-        findViewById<android.view.View>(R.id.btnStartScan).setOnClickListener { toggleScan() }
-        findViewById<android.view.View>(R.id.btnExport).setOnClickListener { showExportDrawer() }
-        findViewById<android.view.View>(R.id.btnViewModel).setOnClickListener { toggleModelViewer() }
-        findViewById<android.view.View>(R.id.btnSettings).setOnClickListener { showSettingsMenu() }
-        findViewById<android.view.View>(R.id.toolCamera).setOnClickListener { showCameraRangeDialog() }
-        findViewById<android.view.View>(R.id.toolLock).setOnClickListener {
+        settingsButton = android.widget.Button(this).apply {
+            text = "设置"
+            textSize = 12f
+            contentDescription = "打开设置"
+            minWidth = dp(48)
+            minimumWidth = dp(48)
+            minHeight = dp(48)
+            minimumHeight = dp(48)
+            setPadding(dp(4), 0, dp(4), 0)
+            setTextColor(android.graphics.Color.WHITE)
+            setBackgroundColor(android.graphics.Color.argb(80, 0, 0, 0))
+            setOnClickListener { showSettingsMenu() }
+        }
+        root.addView(settingsButton, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END
+        ).apply { topMargin = (28 * density).toInt(); rightMargin = 8 })
+
+        val header = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setBackgroundColor(android.graphics.Color.argb(120, 0, 0, 0))
+            setPadding(dp(12), dp(8), dp(64), dp(8))
+        }
+        headerTitle = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 14f
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            text = "MobileScan3D ${BuildConfig.VERSION_NAME}"
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        headerStatus = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 13f
+            text = "FPS -- · 空闲"
+        }
+        warningBanner = TextView(this).apply {
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 13f
+            setBackgroundColor(android.graphics.Color.argb(220, 200, 30, 30))
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            text = "定位失锁：位姿不可用于拼接"
+            visibility = android.view.View.GONE
+        }
+        header.addView(headerTitle)
+        header.addView(headerStatus)
+        header.addView(warningBanner)
+        root.addView(header, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP
+        ).apply { topMargin = (28 * density).toInt() })
+
+        val bottom = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(android.graphics.Color.argb(160, 0, 0, 0))
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+        primaryButton = android.widget.Button(this).apply {
+            text = "开始扫描"
+            setTextColor(android.graphics.Color.WHITE)
+            setBackgroundColor(android.graphics.Color.argb(230, 0, 122, 255))
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setOnClickListener { toggleScan() }
+        }
+        val exportButton = android.widget.Button(this).apply {
+            text = "导出"
+            setTextColor(android.graphics.Color.WHITE)
+            setBackgroundColor(android.graphics.Color.argb(120, 255, 255, 255))
+            setOnClickListener { showExportDrawer() }
+        }
+        modelViewerButton = android.widget.Button(this).apply {
+            text = "查看模型"
+            setTextColor(android.graphics.Color.WHITE)
+            setBackgroundColor(android.graphics.Color.argb(200, 88, 86, 214))
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setOnClickListener { toggleModelViewer() }
+            setOnLongClickListener {
+                if (modelViewerActive) {
+                    glView.queueEvent { renderer.resetViewerView() }
+                    glView.requestRender()
+                    true
+                } else false
+            }
+        }
+        bottom.addView(exportButton, android.widget.LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
+        bottom.addView(modelViewerButton, android.widget.LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
+        bottom.addView(primaryButton, android.widget.LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
+        root.addView(bottom, android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM
+        ))
+
+        val toolbar = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(android.graphics.Color.argb(90, 0, 0, 0))
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        fun toolButton(text: String, onClick: () -> Unit): android.widget.Button =
+            android.widget.Button(this).apply {
+                this.text = text
+                setTextColor(android.graphics.Color.WHITE)
+                setBackgroundColor(android.graphics.Color.argb(80, 255, 255, 255))
+                textSize = 12f
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+                minWidth = 0
+                minimumWidth = 0
+                minHeight = dp(48)
+                minimumHeight = dp(48)
+                maxLines = 2
+                contentDescription = text
+                setOnClickListener { onClick() }
+            }
+        toolbar.addView(toolButton("镜头") { showCameraRangeDialog() },
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
+        toolbar.addView(toolButton("物体锁定") {
             objectLockEnabled = !objectLockEnabled
             NativeBridge.nativeSetObjectLockEnabled(objectLockEnabled)
             if (objectLockEnabled) {
@@ -750,19 +904,83 @@ private var lastRelocPollMs = 0L
                 targetWarningText.visibility = android.view.View.GONE
             }
             toast(if (objectLockEnabled) "点击需要扫描的物体" else "已退出物体锁定")
+        },
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
+        toolbar.addView(toolButton("对焦/防抖") { showFocusStabDialog() },
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
+        // AR 图层切换：默认只画「当前帧 target depth 调试层」。
+        // 先用它证明 VINS pose / 光轴 / 内参 / 竖屏旋转 / TextureView 裁剪 /
+        // 时间戳同步 这一整条 AR 坐标链是对的，再切到累计点云；
+        // 那时若累计点仍然散，问题就只剩 depth scale / 精度 / fusion。
+        placeButton = toolButton("摆放") { togglePlacement() }
+        toolbar.addView(placeButton,
+            android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(4) })
+        arLayerButton = toolButton(arDrawModeLabel()) { cycleArLayer() }
+        toolbar.addView(arLayerButton,
+            android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(4) })
+        toolbar.addView(
+            toolButton("恢复AR") {
+                restoreLatestPersistentAr()
+            },
+            android.widget.LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        // Constrain the tools to the measured free space; short phones and large
+        // fonts can scroll without covering the bottom scan controls.
+        val toolScroll = android.widget.ScrollView(this).apply {
+            isFillViewport = false
+            addView(toolbar, ViewGroup.LayoutParams(-1, -2))
         }
-        findViewById<android.view.View>(R.id.toolFocus).setOnClickListener { showFocusStabDialog() }
-        findViewById<android.view.View>(R.id.toolPlacement).setOnClickListener { togglePlacement() }
-        findViewById<android.view.View>(R.id.toolRealtime).setOnClickListener { cycleArLayer() }
-        findViewById<android.view.View>(R.id.toolRestoreAr).setOnClickListener { restoreLatestPersistentAr() }
-
-        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(container) { view, insets ->
+        root.addView(toolScroll, android.widget.FrameLayout.LayoutParams(
+            dp(104), dp(240), Gravity.TOP or Gravity.END
+        ).apply { marginEnd = dp(8) })
+        for (button in listOfNotNull(exportButton, modelViewerButton, primaryButton)) {
+            button.minWidth = 0
+            button.minimumWidth = 0
+            button.minHeight = dp(48)
+            button.minimumHeight = dp(48)
+            button.textSize = 14f
+            button.maxLines = 2
+            button.setPadding(dp(4), dp(8), dp(4), dp(8))
+        }
+        settingsButton.bringToFront()
+        setContentView(root)
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
             val safe = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars() or
                 androidx.core.view.WindowInsetsCompat.Type.displayCutout())
             view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
             insets
         }
-        androidx.core.view.ViewCompat.requestApplyInsets(container)
+        androidx.core.view.ViewCompat.requestApplyInsets(root)
+        root.viewTreeObserver.addOnGlobalLayoutListener {
+            fun position(view: android.view.View, top: Int, height: Int? = null, width: Int? = null) {
+                val lp = view.layoutParams as android.widget.FrameLayout.LayoutParams
+                if (lp.topMargin != top || (height != null && lp.height != height) ||
+                    (width != null && lp.width != width)) {
+                    lp.topMargin = top
+                    height?.let { lp.height = it }
+                    width?.let { lp.width = it }
+                    view.layoutParams = lp
+                }
+            }
+            position(header, statusBarText.height)
+            position(settingsButton, statusBarText.height, width = dp(48))
+            val contentTop = statusBarText.height + header.height + dp(8)
+            val available = (root.height - root.paddingTop - root.paddingBottom -
+                contentTop - bottom.height - dp(8)).coerceAtLeast(0)
+            position(toolScroll, contentTop, available)
+            position(hudText, contentTop, width = (root.width - root.paddingLeft -
+                root.paddingRight - dp(132)).coerceAtLeast(dp(80)))
+            hudText.maxHeight = available
+        }
 
         // vc159 ThermalGuard：订阅系统热状态，用于在设备发烫时自动降载。
         // OnThermalStatusChangedListener / currentThermalStatus 需要 API 29，
@@ -4358,7 +4576,7 @@ private var lastRelocPollMs = 0L
     }
 
     private fun showSettingsMenu() {
-        android.widget.PopupMenu(this, findViewById(R.id.btnSettings)!!).apply {
+        android.widget.PopupMenu(this, settingsButton).apply {
             menu.add("相机参数")
             menu.add("重建档位")
             menu.add("扫描距离与补光")

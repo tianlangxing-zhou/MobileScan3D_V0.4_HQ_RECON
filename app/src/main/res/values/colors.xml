@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="scan_bg">#06090E</color>
+    <color name="scan_panel">#D9161D27</color>
+    <color name="scan_panel_stroke">#354154</color>
+    <color name="scan_tool">#E31A212C</color>
+    <color name="scan_tool_active">#CC0B3558</color>
+    <color name="scan_primary">#1689FF</color>
+    <color name="scan_primary_2">#0B70EA</color>
+    <color name="scan_text_primary">#F7F9FC</color>
+    <color name="scan_text_secondary">#A8B2C1</color>
+    <color name="scan_divider">#334153</color>
+    <color name="scan_success">#25E6A6</color>
+</resources>
