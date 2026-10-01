@@ -1,0 +1,45 @@
+{
+  "baseline": "MobileScan3D_core_src_vc155_round234_20261001.zip",
+  "files": [
+    {
+      "path": "README_FUSION_REFINEMENT_ZH.md",
+      "before_sha256": null,
+      "after_sha256": "6293a578387a59da2254b3d04d58c00dd8b847aac8dbbcd9e147f61bdd606df8"
+    },
+    {
+      "path": "app/src/main/cpp/depth_calib.cpp",
+      "before_sha256": "e7a6615b6142e092ee5cf580f0c67c5c71ca5fbe781e1e0a4190aedb2e76156c",
+      "after_sha256": "6b6c048c777bd61a3d83310a0aa5ba4be9409927968528b0bb962ab01595aab7"
+    },
+    {
+      "path": "app/src/main/cpp/surfel_engine.cpp",
+      "before_sha256": "d86d5f6ea85958bb93ad041da2c486557d93c50493cd2e9f0f8b96c192dc3f3c",
+      "after_sha256": "3c0d4474d877aea9b4f1929617b08e768c85c596586b9250908f70bd7b088d8a"
+    },
+    {
+      "path": "app/src/main/cpp/surfel_engine.h",
+      "before_sha256": "865195ed1f4c7fe87c570c3a7516d636d46e495aace2889ca5ada63a2634f6cc",
+      "after_sha256": "e86d9ed8d4a62733061f750e9b9d80bb375f86cf018bffffa1e57359385954c8"
+    },
+    {
+      "path": "app/src/main/cpp/tsdf_engine.cpp",
+      "before_sha256": "c4b81b39e4b82d94b4bcdf891444a84fe17767512d8175bc876bc276c779ce91",
+      "after_sha256": "7c11320f0ea8da134336f143cc6f6fb3022ba9b6524cfaa572b528ef7104473f"
+    },
+    {
+      "path": "tools/review_tests/fusion_refinement_regression.cpp",
+      "before_sha256": null,
+      "after_sha256": "3274a6ec24bc7f1a0894ebb7a268f8554c7b3866e604d354377819c5ce23b216"
+    },
+    {
+      "path": "tools/review_tests/run_fusion_refinement.py",
+      "before_sha256": null,
+      "after_sha256": "280e70389b200bbaad0cf815e976b7f9c01e52fcd35b2ecb90e27435b8bc3016"
+    },
+    {
+      "path": "tools/review_tests/verify_fusion_refinement_overlay.py",
+      "before_sha256": null,
+      "after_sha256": "0bff61462a5176556b42cf16ccd5d93a30b6f65a7e1afa2fbd605df49d6decbb"
+    }
+  ]
+}

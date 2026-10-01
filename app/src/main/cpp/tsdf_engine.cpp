@@ -191,6 +191,10 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
     // unordered_map rehash preserves element pointers. Cache the last block,
     // including a failed lookup at capacity, across adjacent ray samples.
     // Local lifetime keeps reset()/a later integration from using stale pointers.
+    // A ray traverses several blocks and the next pixel usually revisits them.
+    // Keep a bounded, allocation-free second-level cache for those transitions.
+    struct BlockCacheEntry { int x=0,y=0,z=0; TsdfBlock* block=nullptr; bool valid=false; };
+    BlockCacheEntry blockCache[64]{};
     TsdfBlock* cachedBlock = nullptr;
     int cachedX = 0, cachedY = 0, cachedZ = 0;
     bool haveCachedBlock = false;
@@ -290,7 +294,12 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                 const int by = vy >> kTsdfBlockShift;
                 const int bz = vz >> kTsdfBlockShift;
                 if (!haveCachedBlock || bx != cachedX || by != cachedY || bz != cachedZ) {
-                    cachedBlock = blockFor(bx, by, bz, true);
+                    const size_t slot = BlockHash{}(BlockKey{bx, by, bz}) & 63u;
+                    auto& entry = blockCache[slot];
+                    if (!entry.valid || entry.x!=bx || entry.y!=by || entry.z!=bz) {
+                        entry = {bx, by, bz, blockFor(bx, by, bz, true), true};
+                    }
+                    cachedBlock = entry.block;
                     cachedX = bx; cachedY = by; cachedZ = bz;
                     haveCachedBlock = true;
                 }

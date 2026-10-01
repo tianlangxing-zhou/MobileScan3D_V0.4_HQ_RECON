@@ -293,14 +293,19 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
     // 超量时均匀抽稀，保证调用耗时可控
     std::vector<float> dd, zz;
     const size_t n = std::min(d.size(), z.size());
-    const size_t step = (n > static_cast<size_t>(cfg_.maxSamples))
-                            ? (1 + (n - 1) / static_cast<size_t>(cfg_.maxSamples))
-                            : 1;
-    dd.reserve(n / step + 2);
-    zz.reserve(n / step + 2);
-    for (size_t i = 0; i < n; i += step) {
-        dd.push_back(d[i]);
-        zz.push_back(z[i]);
+    const size_t count = std::min(n, static_cast<size_t>(cfg_.maxSamples));
+    dd.reserve(count);
+    zz.reserve(count);
+    // Exactly fill the sample budget even just above its boundary (513/512).
+    // Quotient/remainder stepping is floor(j*n/count), without j*n overflow.
+    const size_t stride = n / count, remainder = n % count;
+    size_t index = 0, phase = 0;
+    for (size_t j = 0; j < count; ++j) {
+        dd.push_back(d[index]);
+        zz.push_back(z[index]);
+        index += stride;
+        phase += remainder;
+        if (phase >= count) { ++index; phase -= count; }
     }
 
     const DepthCalibration fresh =

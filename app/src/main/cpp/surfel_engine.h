@@ -28,6 +28,8 @@ struct Surfel {
     float sx, sy, sz;
     float qx, qy, qz, qw;
     uint8_t r, g, b, opacity;
+    // Fractional color survives repeated fusion; only rendering quantizes to bytes.
+    float red=0, green=0, blue=0, fusionWeight=0;
     uint16_t hits;
     uint8_t state;
     float nx=0, ny=0, nz=0;
@@ -94,6 +96,7 @@ private:
     size_t reclaimed_=0, reactivated_=0;
     std::vector<Surfel> g_;
     std::unordered_map<Key, size_t, Hash> index_;
+    size_t confirmed_ = 0; // hits >= 2
     size_t stable_ = 0;
     size_t merged_ = 0;
 };

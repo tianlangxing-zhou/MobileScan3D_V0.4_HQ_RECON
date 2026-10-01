@@ -8,7 +8,7 @@ void SurfelEngine::reset() {
     sampler_.reset(); coarseIndex_.clear(); frame_=0; reclaimed_=reactivated_=0;
     g_.clear();
     index_.clear();
-    stable_ = 0;
+    confirmed_ = stable_ = 0;
     merged_ = 0;
 }
 
@@ -58,6 +58,7 @@ void SurfelEngine::ingestPoint(
     a.r = r;
     a.g = g;
     a.b = b;
+    a.red = r; a.green = g; a.blue = b; a.fusionWeight = confidence;
     a.opacity = (uint8_t)(confidence * 255.f);
     a.hits = 1;
     a.state = 0;
@@ -73,6 +74,8 @@ size_t SurfelEngine::confirmedCount(int minHits) const {
     if (minHits <= 1) {
         return g_.size();
     }
+    if (minHits == 2) return confirmed_;
+    if (minHits == 3) return stable_;
     const uint16_t need = static_cast<uint16_t>(minHits > 65535 ? 65535 : minHits);
     size_t n = 0;
     for (const Surfel& a : g_) {
@@ -89,30 +92,24 @@ size_t SurfelEngine::copyPoints(float* out, size_t maxPoints, int minHits) const
     }
     const uint16_t need = static_cast<uint16_t>(std::clamp(minHits, 1, 65535));
 
-    // 先数一遍「满足 minHits 的点」，再按它算采样步长。
-    // 旧实现直接对 g_ 全体均匀抽样并全部画出来，于是未验证点也进了渲染 ——
-    // 实机统计 600000 总点里 stable 只有 28，屏幕自然是一层噪声。
-    size_t enabled = 0;
-    for (const Surfel& a : g_) {
-        if (a.hits >= need) {
-            enabled++;
-        }
-    }
+    const size_t enabled = confirmedCount(need);
     if (enabled == 0) {
         return 0;
     }
 
-    const size_t step =
-        enabled > maxPoints ? (enabled + maxPoints - 1) / maxPoints : 1;
-    size_t seen = 0;
+    const size_t target = std::min(enabled, maxPoints);
+    size_t phase = enabled - target;
     size_t written = 0;
     for (size_t i = 0; i < g_.size() && written < maxPoints; ++i) {
         const Surfel& a = g_[i];
         if (a.hits < need) {
             continue;
         }
-        const bool take = (seen % step) == 0;
-        seen++;
+        // Bresenham-style sampling fills the budget exactly, without a divide
+        // per point or the old near-2x undersampling just above maxPoints.
+        phase += target;
+        const bool take = phase >= enabled;
+        if (take) phase -= enabled;
         if (!take) {
             continue;
         }
@@ -172,11 +169,23 @@ void SurfelEngine::centroid(float* x, float* y, float* z) const {
 }
 
 void SurfelEngine::updatePoint(Surfel& a,float x,float y,float z,uint8_t r,uint8_t g,uint8_t b,float confidence,bool countHit) {
-    const float w=std::min(.5f,confidence), iw=1.f/(1.f+w);
-    a.px=(a.px+x*w)*iw;a.py=(a.py+y*w)*iw;a.pz=(a.pz+z*w)*iw;
-    a.r=uint8_t((a.r+r*w)*iw);a.g=uint8_t((a.g+g*w)*iw);a.b=uint8_t((a.b+b*w)*iw);
+    const float w=std::clamp(confidence,0.f,1.f);
+    const float sum=a.fusionWeight+w;
+    const double alpha=sum>0 ? double(w)/sum : 0;
+    // Double intermediates keep a convex update inside the original fine cell.
+    a.px=float(double(a.px)+(double(x)-a.px)*alpha);
+    a.py=float(double(a.py)+(double(y)-a.py)*alpha);
+    a.pz=float(double(a.pz)+(double(z)-a.pz)*alpha);
+    a.red+=float((double(r)-a.red)*alpha);
+    a.green+=float((double(g)-a.green)*alpha);
+    a.blue+=float((double(b)-a.blue)*alpha);
+    a.r=uint8_t(std::clamp(std::lround(a.red),0L,255L));
+    a.g=uint8_t(std::clamp(std::lround(a.green),0L,255L));
+    a.b=uint8_t(std::clamp(std::lround(a.blue),0L,255L));
+    // Bounded history still adapts to real changes after the map becomes stable.
+    a.fusionWeight=std::min(sum,32.f);
     a.opacity=uint8_t(std::clamp(confidence,0.f,1.f)*255);
-    if(countHit && a.hits<65535) ++a.hits;
+    if(countHit && a.hits<65535) { if(a.hits==1) ++confirmed_; ++a.hits; }
     if(a.hits>=3 && a.state<2){a.state=2;++stable_;}
     ++merged_;
 }
@@ -192,14 +201,15 @@ SurfelEngine::Key SurfelEngine::keyFor(const Surfel& a) const {
 void SurfelEngine::erasePoint(size_t i) {
     const Surfel old=g_[i];
     (old.coarse?coarseIndex_:index_).erase(keyFor(old));
+    if(old.hits>=2)--confirmed_;
     if(old.state>=2)--stable_;
     if(i!=g_.size()-1){g_[i]=g_.back();(g_[i].coarse?coarseIndex_:index_)[keyFor(g_[i])]=i;}
     g_.pop_back();
 }
 void SurfelEngine::rebuildIndex() {
     // Swap releases old hash nodes/buckets after compaction, unlike clear alone.
-    decltype(index_) fine,coarse;stable_=0;
-    for(size_t i=0;i<g_.size();++i){auto& a=g_[i];(a.coarse?coarse:fine)[keyFor(a)]=i;if(a.state>=2)++stable_;}
+    decltype(index_) fine,coarse;confirmed_=stable_=0;
+    for(size_t i=0;i<g_.size();++i){auto& a=g_[i];(a.coarse?coarse:fine)[keyFor(a)]=i;if(a.hits>=2)++confirmed_;if(a.state>=2)++stable_;}
     index_.swap(fine);coarseIndex_.swap(coarse);
 }
 void SurfelEngine::ingestAdaptivePoint(float x,float y,float z,uint8_t r,uint8_t g,uint8_t b,
@@ -215,6 +225,7 @@ void SurfelEngine::ingestAdaptivePoint(float x,float y,float z,uint8_t r,uint8_t
         if(geo.protectedDetail || dot<.996f || error>.002f) {
             // Keep a representative while restoring fine cells from fresh observations.
             Surfel old=a;erasePoint(coarse->second);old.coarse=false;old.hits=1;old.state=0;
+            old.fusionWeight=std::max(.05f,old.opacity/255.f);
             old.protectedUntil=frame_+32;old.detail=true;old.sx=old.sy=old.sz=.008f;
             index_[keyFor(old)]=g_.size();g_.push_back(old);++reactivated_;
         } else {
@@ -252,7 +263,7 @@ void SurfelEngine::endFrame() {
         q.valid=q.valid && !a.coarse && !a.detail && a.hits>=6 && frame_>=a.protectedUntil &&
             frame_-a.lastFrame<=32 && (a.nx*ref.nx+a.ny*ref.ny+a.nz*ref.nz)>.996f &&
             std::fabs((a.px-ref.px)*ref.nx+(a.py-ref.py)*ref.ny+(a.pz-ref.pz)*ref.nz)<.002f;
-        ++q.count;q.x+=a.px;q.y+=a.py;q.z+=a.pz;q.r+=a.r;q.g+=a.g;q.b+=a.b;
+        ++q.count;q.x+=a.px;q.y+=a.py;q.z+=a.pz;q.r+=a.red;q.g+=a.green;q.b+=a.blue;
     }
     size_t removed=0;
     for(const auto& kv:groups)if(kv.second.valid&&kv.second.count>=3)removed+=kv.second.count-1;
@@ -265,7 +276,8 @@ void SurfelEngine::endFrame() {
         if(q.valid && q.count>=3) {
             if(i!=q.first)continue;
             a.px=float(q.x/q.count);a.py=float(q.y/q.count);a.pz=float(q.z/q.count);
-            a.r=uint8_t(q.r/q.count);a.g=uint8_t(q.g/q.count);a.b=uint8_t(q.b/q.count);
+            a.red=float(q.r/q.count);a.green=float(q.g/q.count);a.blue=float(q.b/q.count);
+            a.r=uint8_t(std::lround(a.red));a.g=uint8_t(std::lround(a.green));a.b=uint8_t(std::lround(a.blue));
             a.coarse=true;a.sx=a.sy=a.sz=.016f;
         }
         compact.push_back(a);
