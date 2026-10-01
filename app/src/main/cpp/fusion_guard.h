@@ -6,6 +6,12 @@
 #include <cstdint>
 #include <vector>
 
+// V0.13.22：视角门限。相对位移 / 转角超过它就判定「已不是同一个观察位置」，
+// 该参考帧不再参与重复壳一致性检查 —— 否则移动扫描会与旧 anchor 永远对不上、
+// 每一帧都被整帧否决，网格再也长不出来（详见 accept() 内注释）。
+static constexpr float kGuardMaxTranslateM = 0.15f;   // 15 cm
+static constexpr float kGuardMaxAngleDeg = 20.f;      // 20 deg
+
 // Accepted-keyframe consistency, not pose estimation. Fixed first anchor plus
 // three spatially spaced recent anchors prevents a rejected frame from becoming
 // its own reference and keeps the original surface testable on a return visit.
@@ -39,6 +45,22 @@ public:
                 for(int k=0;k<3;++k)relativeT[i]+=R[k*3+i]*(ref.t[k]-t[k]);
                 for(int j=0;j<3;++j){relativeR[i*3+j]=0;
                     for(int k=0;k<3;++k)relativeR[i*3+j]+=R[k*3+i]*ref.R[k*3+j];}
+            }
+            // V0.13.22：视角差异过大时，这个 ref 不可能构成「重复壳」判据。
+            // 原实现只要任一 ref 的重叠一致率 < 0.60 就整帧拒绝；用户移动摄像头后
+            // 与旧 anchor 的重叠本就稀疏、单目深度噪声又大，于是每一帧都被拒 ->
+            // 再也长不出新几何（真机实测网格冻结在 verts=4257 长达 2min21s）。
+            // 位移 >15cm 或转角 >20° 时跳过该 ref，只在「回到接近的旧视角」时
+            // 才真正执行重复壳一致性检查。全部 ref 都被跳过 => 循环空转返回 true
+            // （新区域放行），这正是移动扫描该有的行为。
+            {
+                float tr = relativeR[0]+relativeR[4]+relativeR[8];
+                float cosA = (tr-1.f)*0.5f;
+                cosA = cosA<-1.f?-1.f:(cosA>1.f?1.f:cosA);
+                const float angleDeg = std::acos(cosA)*57.2957795f;
+                const float dx=relativeT[0],dy=relativeT[1],dz=relativeT[2];
+                const float distM = std::sqrt(dx*dx+dy*dy+dz*dz);
+                if(distM>kGuardMaxTranslateM || angleDeg>kGuardMaxAngleDeg)continue;
             }
             int tested=0,agree=0;
             temporalConsistencyMask(ref.depth.data(),depth,w,h,K[0],K[1],K[2],K[3],

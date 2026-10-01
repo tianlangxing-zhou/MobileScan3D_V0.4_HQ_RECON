@@ -260,6 +260,43 @@ DepthCalibration fitDepthRobust(const std::vector<float>& d,
     out.samples = static_cast<int>(base.size());
     out.rejected = static_cast<int>(base.size()) - out.inliers;
 
+    // ---- V0.13.25 标定健康度诊断 ----
+    // 用 base（全部有效配对样本）算两个退化指标，供 update() 门控与日志使用。
+    {
+        std::vector<float> zs;
+        std::vector<float> ds;
+        zs.reserve(base.size());
+        ds.reserve(base.size());
+        for (const Pair& p : base) {
+            zs.push_back(p.y);
+            ds.push_back(p.x);
+        }
+        std::sort(zs.begin(), zs.end());
+        std::sort(ds.begin(), ds.end());
+        auto pctOf = [](const std::vector<float>& v, double q) -> float {
+            if (v.empty()) return 0.f;
+            size_t i = static_cast<size_t>(q * static_cast<double>(v.size() - 1));
+            if (i >= v.size()) i = v.size() - 1;
+            return v[i];
+        };
+        const float z10 = pctOf(zs, 0.10);
+        const float z50 = pctOf(zs, 0.50);
+        const float z90 = pctOf(zs, 0.90);
+        const float d10 = pctOf(ds, 0.10);
+        const float d90 = pctOf(ds, 0.90);
+        out.refDepthSpanRel = (z50 > 1e-4f) ? (z90 - z10) / z50 : 0.f;
+        // Compare the same 1/metre unit for linear and inverse models.
+        // For z=a*d+b, |a|*delta(d) is metres, not inverse metres.
+        if (out.inverseDepthModel) {
+            out.outputInvZSpan = std::fabs(out.scale) * (d90 - d10);
+        } else {
+            const double za = static_cast<double>(out.scale) * d10 + out.shift;
+            const double zb = static_cast<double>(out.scale) * d90 + out.shift;
+            out.outputInvZSpan = (za > 1e-6 && zb > 1e-6)
+                ? static_cast<float>(std::fabs(1.0 / za - 1.0 / zb)) : 0.f;
+        }
+    }
+
     // 置信度：内点比例 × 残差打分
     const float inlierRatio = static_cast<float>(out.inliers) / static_cast<float>(base.size());
     const float residualScore = 1.f / (1.f + 8.f * out.medianRelativeResidual);
@@ -326,6 +363,32 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
         return false;
     }
 
+    // ---- V0.13.25 标定健康门 ----
+    // 参考深度没有纵深结构时，1/z = scale*d + shift 的因变量几乎不变，最小二乘
+    // 只能给出 scale~0，深度对输入完全失去敏感性 —— 整场景被压成一块平板
+    // （z ≈ 1/shift）。实测 vc164：近距离时 VINS 参考 z 仅 0.106~0.141m
+    // （相对纵深 0.30），拟合出 scale=1e-4，fusionDepth 宽仅 1cm。
+    //
+    // 首次建立时用放宽阈值兜底（避免冷启动完全拿不到标定而退回原始深度）；
+    // 已有标定时严格门控，防止好标定被退化样本经 EMA 慢慢带偏。
+    if (cfg_.enforceCalibHealthGate) {
+        const float spanGate = calib_.valid
+            ? cfg_.minRefDepthSpanRel
+            : cfg_.minRefDepthSpanRel * cfg_.firstBuildRelax;
+        if (!(fresh.refDepthSpanRel >= spanGate)) {
+            lastReject_ = "reference depth span too narrow";
+            ++rejectedFrames_;
+            return false;
+        }
+        const float outputGate = cfg_.minOutputInvZSpan *
+            (calib_.valid ? 1.f : cfg_.firstBuildRelax);
+        if (!(fresh.outputInvZSpan >= outputGate)) {
+            lastReject_ = "calibrated depth resolution too flat";
+            ++rejectedFrames_;
+            return false;
+        }
+    }
+
     if (!calib_.valid) {
         // 首次接受：直接采用
         calib_ = fresh;
@@ -354,6 +417,8 @@ bool DepthCalibrator::update(const std::vector<float>& d, const std::vector<floa
         calib_.inliers = fresh.inliers;
         calib_.rejected = fresh.rejected;
         calib_.medianRelativeResidual = fresh.medianRelativeResidual;
+        calib_.refDepthSpanRel = fresh.refDepthSpanRel;
+        calib_.outputInvZSpan = fresh.outputInvZSpan;
         calib_.samples += fresh.samples;
     }
     calib_.valid = true;

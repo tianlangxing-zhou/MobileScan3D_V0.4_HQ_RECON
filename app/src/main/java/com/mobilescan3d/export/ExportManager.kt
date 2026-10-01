@@ -114,9 +114,11 @@ class ExportManager(context: Context) {
     }
 
     fun exportPlyAsync(sessionId: String, onDone: (PlyResult) -> Unit) {
+        val generation = meshGeneration.get()
         io.execute {
+            if (generation != meshGeneration.get()) return@execute
             val result = exportPly(sessionId)
-            main.post { onDone(result) }
+            main.post { if (generation == meshGeneration.get()) onDone(result) }
         }
     }
 
@@ -254,7 +256,13 @@ class ExportManager(context: Context) {
         val shapeMode = shape.coerceIn(0, 3)
         val suffix = arrayOf("", "_planar", "_cuboid", "_cube")[shapeMode]
         val exportId = sessionId + suffix
+        val generation = meshGeneration.get()
         io.execute {
+            fun checkGeneration() {
+                if (generation != meshGeneration.get()) {
+                    throw java.util.concurrent.CancellationException("Scan session ended")
+                }
+            }
             val file = File(outputDir, "scan_$exportId.glb")
             val staging = File(outputDir, "scan_$exportId.pending.glb")
             var verts = 0
@@ -265,11 +273,13 @@ class ExportManager(context: Context) {
             var msg = ""
             var shapeReport = ""
             try {
+                checkGeneration()
                 staging.delete()
                 lastMesh = null
                 // Never reuse an earlier bake when this export falls back to vertex color.
                 NativeBridge.nativeClearTexturedArAsset()
                 ok = NativeBridge.nativeBuildMeshWithShape(q, shapeMode)
+                checkGeneration()
                 shapeReport = if (shapeMode > 0) NativeBridge.nativeGetHardSurfaceReport() else ""
                 if (ok) {
                     val mesh = pullMesh()
@@ -293,6 +303,9 @@ class ExportManager(context: Context) {
                         Log.w(TAG, "nativeBakeTexturedGlb failed", t)
                         false
                     }
+                    // JNI work is not interrupted by shutdownNow(). Do not let
+                    // a late bake fall back to/export another session's mesh.
+                    checkGeneration()
                     // 纹理失败不能连几何一起判废 —— 退回 V0.5 的 vertex color GLB。
                     ok = textured ||
                         try {
@@ -313,6 +326,7 @@ class ExportManager(context: Context) {
                         "registeredKeyframes=0 说明扫描时未采到关键帧（VINS 未初始化或 burst 全失败）；" +
                         ">0 说明关键帧已登记但烘焙未产出可用视角。")
                 }
+                checkGeneration()
                 ok = ok && staging.isFile && staging.length() > 0L && staging.renameTo(file)
                 if (ok && textured) {
                     val baked = NativeBridge.nativeGetTexturedArAssetStats()
@@ -365,6 +379,8 @@ class ExportManager(context: Context) {
                         Log.w(TAG, "write bakeDiag.json failed", t)
                     }
                 }
+            } catch (_: java.util.concurrent.CancellationException) {
+                return@execute
             } catch (t: Throwable) {
                 Log.e(TAG, "buildAndExportGlb failed", t)
                 ok = false
@@ -383,7 +399,7 @@ class ExportManager(context: Context) {
                 textured = ok && textured,
                 persistenceMessage = persistenceMessage
             )
-            main.post { onDone(res) }
+            main.post { if (generation == meshGeneration.get()) onDone(res) }
         }
     }
 

@@ -51,6 +51,19 @@ struct DepthCalibration {
     bool inverseDepthModel = false;
     bool valid = false;
 
+    // ---- V0.13.25 标定健康度诊断 ----
+    //
+    // 「模型发平、整场景像一块平板」的根因不是网络输出坏，而是**拟合样本的
+    // 纵深不足**：VINS 稀疏三角化点全部落在很薄的一层深度里时，
+    //   1/z = scale*d + shift
+    // 的因变量 1/z 几乎没有变化，最小二乘只能给出 scale~0 —— 深度对输入 d
+    // 完全不敏感，整个场景被钉死在 z = 1/shift 附近。
+    //
+    // refDepthSpanRel  = (p90(z)-p10(z)) / p50(z)  —— 参考深度的相对纵深
+    // outputInvZSpan = |1/z(d90)-1/z(d10)|，两种模型都以 1/米计。
+    float refDepthSpanRel = 0.f;
+    float outputInvZSpan = 0.f;
+
     /**
      * V0.13.4：**输入数值域变更时的显式重参数化**。
      *
@@ -158,6 +171,21 @@ public:
         float maxJumpRatio = 3.0f;           // 新旧 scale 比超过此值视为野值
         bool allowInverseDepth = true;
         bool forceInverseDepth = false;
+
+        // ---- V0.13.25 标定健康门 ----
+        //
+        // 参考深度相对纵深下限 (p90(z)-p10(z))/p50(z)。
+        // 低于此值说明这一帧的 VINS 参考点没有纵深结构，拟合出的 scale
+        // 必然接近 0（场景会被压平）。此时**拒绝该帧**，保持上一版标定。
+        //
+        // 首次建立（calib_ 尚无效）时用 minRefDepthSpanRel * firstBuildRelax
+        // 作为兜底，避免一开始完全拿不到标定而退回未标定的原始深度。
+        float minRefDepthSpanRel = 0.30f;
+        float firstBuildRelax = 0.5f;
+        // 输出逆深度跨度下限（1/米）；首次建立也检查，使用 firstBuildRelax 放宽。
+        float minOutputInvZSpan = 0.15f;
+        // 关掉健康门（用于对照实验 / 回归测试）。
+        bool enforceCalibHealthGate = true;
     };
 
     void reset();

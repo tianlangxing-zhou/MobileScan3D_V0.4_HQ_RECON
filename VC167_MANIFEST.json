@@ -1,0 +1,69 @@
+{
+  "versionCode": 167,
+  "versionName": "0.13.27-review",
+  "repository": "https://github.com/tianlangxing-zhou/MobileScan3D_V0.4_HQ_RECON",
+  "baseCommit": "b1e080dbeeb1d0a57236311d42ba47d13c90e536",
+  "algorithmBase": "MobileScan3D_algo_src_vc166_0.13.26_20261001.zip",
+  "files": [
+    {
+      "path": "README_VC167_REPLACE_ZH.md",
+      "sha256": "42c15e734d24879edd3006e206272f604ae79729e248c27bb737a9149522614a",
+      "bytes": 9745
+    },
+    {
+      "path": "app/build.gradle.kts",
+      "sha256": "28cfa24d3ae3df0ebbd9c3ed6748d87f1a8d2157dde70ae7bb4761f5eb39e1f6",
+      "bytes": 3417
+    },
+    {
+      "path": "app/src/main/cpp/depth_calib.cpp",
+      "sha256": "302f1efbd079df68aa0153875628962097b3260bbc9e20e2b9fc7e117fb26be5",
+      "bytes": 19733
+    },
+    {
+      "path": "app/src/main/cpp/depth_calib.h",
+      "sha256": "7a287e15dfc1337b114a1511ceb3d4a976d72a989c48775a2e0643759ce2886b",
+      "bytes": 13335
+    },
+    {
+      "path": "app/src/main/cpp/fusion_guard.h",
+      "sha256": "7ea1f76cfd572a754f025b12c2af3c68308b5f65593467940c9bb0358bf9538e",
+      "bytes": 5498
+    },
+    {
+      "path": "app/src/main/cpp/native_engine.cpp",
+      "sha256": "a1c32e22996305ffc6ca9f61940964294ea67e1e988e6a9b07751f02b9536f9e",
+      "bytes": 240156
+    },
+    {
+      "path": "app/src/main/cpp/scan_policy.h",
+      "sha256": "91766b76effdadbd385e90a1f5dd260833c26d2026da29b124a8ba318ededa79",
+      "bytes": 1877
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/MainActivity.kt",
+      "sha256": "512f976990676c9719889babe253a772e82c60b1defc7ef687758b66127a07a9",
+      "bytes": 241315
+    },
+    {
+      "path": "app/src/main/java/com/mobilescan3d/export/ExportManager.kt",
+      "sha256": "930624e61194eb1aa823f64624bdb82df3772db86edc3dc55de6b94faf3ec017",
+      "bytes": 19463
+    },
+    {
+      "path": "tools/review_tests/run_vc167.py",
+      "sha256": "b0b01def9ec4aa8f380be3af8435b4032470090a3d3e45941ec31ed2b13c89ca",
+      "bytes": 697
+    },
+    {
+      "path": "tools/review_tests/vc167_regression.cpp",
+      "sha256": "8c5878805ed61dfcaf2e320b3a5c6553a0edc39fdbd9530303e508b823004b90",
+      "bytes": 2633
+    },
+    {
+      "path": "tools/review_tests/verify_vc167_overlay.py",
+      "sha256": "ee92b3c242af7a98d8aecea16e50268fd4c934fbcb65a83bd3bde20578651c50",
+      "bytes": 682
+    }
+  ]
+}

@@ -5,6 +5,11 @@
 #include "depth_calib.h"
 
 namespace scan_policy {
+// Cached calibration validity is not a new observation. During warmup only
+// accepted fits count; an active epoch can also use independent current evidence.
+inline bool hasCurrentCalibrationEvidence(bool updated, bool active, bool frozenGood) {
+    return updated || (active && frozenGood);
+}
 // Euclidean camera-to-surface distance, not optical-axis Z or world origin.
 inline bool inRange(float z, float rayX, float rayY, float maxMeters,
                     float worldPerMeter = 1.f) {

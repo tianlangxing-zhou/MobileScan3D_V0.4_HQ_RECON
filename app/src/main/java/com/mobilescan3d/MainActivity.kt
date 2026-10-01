@@ -467,7 +467,9 @@ private var lastRelocPollMs = 0L
     private var fpsLastNs = 0L
     private var hudExpanded = false
     private var hudShownPoints = 0f
-    private var modeLabel = "连续单帧点云"
+    private var scanVoxelProfile = 0
+    private var systemInitialized = false
+    private var imuRegistered = false
     private var objectLockEnabled = false
     private lateinit var targetOverlay: TargetLockOverlay
     /** 目标接近边缘 / 已离开画面的**持续**提示（不是 Toast，Toast 一闪就没了） */
@@ -602,13 +604,16 @@ private var lastRelocPollMs = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
         val scanPrefs = getSharedPreferences("scan_settings", Context.MODE_PRIVATE)
         val savedDistance = scanPrefs.getFloat("max_distance_m", 1f)
         scanMaxDistanceMeters = if (savedDistance.isFinite()) savedDistance.coerceIn(.2f, 5f) else 1f
         autoFillLight = scanPrefs.getBoolean("auto_fill_light", true)
+        scanVoxelProfile = scanPrefs.getInt("voxel_profile", 0).coerceIn(0, 2)
 
         val root = android.widget.FrameLayout(this)
         val density = resources.displayMetrics.density
+        fun dp(value: Int) = (value * density + .5f).toInt()
 
         texture = TextureView(this)
         root.addView(texture, ViewGroup.LayoutParams(-1, -1))
@@ -664,7 +669,8 @@ private var lastRelocPollMs = 0L
                         dx * dx + dy * dy >= dragSelectMinPx() * dragSelectMinPx()) {
                         // 拖动 -> 精确框选
                         selectTargetRect(downX, downY, event.x, event.y)
-                    } else if (dx * dx + dy * dy < 48f * 48f) {
+                    } else if (event.actionMasked == android.view.MotionEvent.ACTION_UP &&
+                        dx * dx + dy * dy < dragSelectMinPx() * dragSelectMinPx()) {
                         // 轻点 -> 快速自动框
                         if (objectLockEnabled) {
                             selectTarget(event.x, event.y)
@@ -686,6 +692,8 @@ private var lastRelocPollMs = 0L
             renderer = PointCloudRenderer()
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+            // Camera preview is a TextureView in the window; the translucent
+            // GL surface must stay above it (media-overlay is for SurfaceViews).
             setZOrderOnTop(true)
             isClickable = false
             isFocusable = false
@@ -716,7 +724,9 @@ private var lastRelocPollMs = 0L
             setTextColor(android.graphics.Color.WHITE)
             textSize = 11f
             setBackgroundColor(android.graphics.Color.argb(120, 0, 0, 0))
-            setPadding(10, 6, 10, 6)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            maxLines = 8
+            ellipsize = android.text.TextUtils.TruncateAt.END
             text = "点云 0 点 · 非米制"
             setOnClickListener { toggleHud() }
         }
@@ -749,7 +759,7 @@ private var lastRelocPollMs = 0L
             setTextColor(android.graphics.Color.WHITE)
             textSize = 12f
             setBackgroundColor(android.graphics.Color.argb(110, 0, 0, 0))
-            setPadding(16, 6, 16, 6)
+            setPadding(dp(12), dp(4), dp(12), dp(4))
             text = "--:-- · -- · --%"
         }
         root.addView(statusBarText, android.widget.FrameLayout.LayoutParams(
@@ -759,7 +769,14 @@ private var lastRelocPollMs = 0L
         ))
 
         settingsButton = android.widget.Button(this).apply {
-            text = "⚙️"
+            text = "设置"
+            textSize = 12f
+            contentDescription = "打开设置"
+            minWidth = dp(48)
+            minimumWidth = dp(48)
+            minHeight = dp(48)
+            minimumHeight = dp(48)
+            setPadding(dp(4), 0, dp(4), 0)
             setTextColor(android.graphics.Color.WHITE)
             setBackgroundColor(android.graphics.Color.argb(80, 0, 0, 0))
             setOnClickListener { showSettingsMenu() }
@@ -773,13 +790,15 @@ private var lastRelocPollMs = 0L
         val header = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setBackgroundColor(android.graphics.Color.argb(120, 0, 0, 0))
-            setPadding(16, 8, 16, 8)
+            setPadding(dp(12), dp(8), dp(64), dp(8))
         }
         headerTitle = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
             textSize = 14f
             setTypeface(null, android.graphics.Typeface.BOLD)
-            text = "MobileScan3D ${BuildConfig.VERSION_NAME} · $buildGitSha"
+            text = "MobileScan3D ${BuildConfig.VERSION_NAME}"
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
         }
         headerStatus = TextView(this).apply {
             setTextColor(android.graphics.Color.WHITE)
@@ -790,7 +809,7 @@ private var lastRelocPollMs = 0L
             setTextColor(android.graphics.Color.WHITE)
             textSize = 13f
             setBackgroundColor(android.graphics.Color.argb(220, 200, 30, 30))
-            setPadding(12, 8, 12, 8)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
             text = "定位失锁：位姿不可用于拼接"
             visibility = android.view.View.GONE
         }
@@ -807,13 +826,13 @@ private var lastRelocPollMs = 0L
             orientation = android.widget.LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(android.graphics.Color.argb(160, 0, 0, 0))
-            setPadding(12, 10, 12, 14)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
         }
         primaryButton = android.widget.Button(this).apply {
-            text = "实验扫描（非测量）"
+            text = "开始扫描"
             setTextColor(android.graphics.Color.WHITE)
             setBackgroundColor(android.graphics.Color.argb(230, 0, 122, 255))
-            setPadding(20, 12, 20, 12)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
             setOnClickListener { toggleScan() }
         }
         val exportButton = android.widget.Button(this).apply {
@@ -826,7 +845,7 @@ private var lastRelocPollMs = 0L
             text = "查看模型"
             setTextColor(android.graphics.Color.WHITE)
             setBackgroundColor(android.graphics.Color.argb(200, 88, 86, 214))
-            setPadding(20, 12, 20, 12)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
             setOnClickListener { toggleModelViewer() }
             setOnLongClickListener {
                 if (modelViewerActive) {
@@ -837,9 +856,9 @@ private var lastRelocPollMs = 0L
             }
         }
         bottom.addView(exportButton, android.widget.LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = 8 })
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
         bottom.addView(modelViewerButton, android.widget.LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = 8 })
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) })
         bottom.addView(primaryButton, android.widget.LinearLayout.LayoutParams(
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
         root.addView(bottom, android.widget.FrameLayout.LayoutParams(
@@ -852,7 +871,7 @@ private var lastRelocPollMs = 0L
             orientation = android.widget.LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setBackgroundColor(android.graphics.Color.argb(90, 0, 0, 0))
-            setPadding(6, 8, 6, 8)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
         }
         fun toolButton(text: String, onClick: () -> Unit): android.widget.Button =
             android.widget.Button(this).apply {
@@ -860,11 +879,17 @@ private var lastRelocPollMs = 0L
                 setTextColor(android.graphics.Color.WHITE)
                 setBackgroundColor(android.graphics.Color.argb(80, 255, 255, 255))
                 textSize = 12f
-                setPadding(8, 6, 8, 6)
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+                minWidth = 0
+                minimumWidth = 0
+                minHeight = dp(48)
+                minimumHeight = dp(48)
+                maxLines = 2
+                contentDescription = text
                 setOnClickListener { onClick() }
             }
         toolbar.addView(toolButton("镜头") { showCameraRangeDialog() },
-            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
         toolbar.addView(toolButton("物体锁定") {
             objectLockEnabled = !objectLockEnabled
             NativeBridge.nativeSetObjectLockEnabled(objectLockEnabled)
@@ -880,9 +905,9 @@ private var lastRelocPollMs = 0L
             }
             toast(if (objectLockEnabled) "点击需要扫描的物体" else "已退出物体锁定")
         },
-            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
         toolbar.addView(toolButton("对焦/防抖") { showFocusStabDialog() },
-            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 6 })
+            android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
         // AR 图层切换：默认只画「当前帧 target depth 调试层」。
         // 先用它证明 VINS pose / 光轴 / 内参 / 竖屏旋转 / TextureView 裁剪 /
         // 时间戳同步 这一整条 AR 坐标链是对的，再切到累计点云；
@@ -892,13 +917,13 @@ private var lastRelocPollMs = 0L
             android.widget.LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = 6 })
+            ).apply { bottomMargin = dp(4) })
         arLayerButton = toolButton(arDrawModeLabel()) { cycleArLayer() }
         toolbar.addView(arLayerButton,
             android.widget.LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = 6 })
+            ).apply { bottomMargin = dp(4) })
         toolbar.addView(
             toolButton("恢复AR") {
                 restoreLatestPersistentAr()
@@ -908,14 +933,54 @@ private var lastRelocPollMs = 0L
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         )
-        root.addView(toolbar, android.widget.FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER_VERTICAL or Gravity.END
-        ).apply { rightMargin = 8 })
-
+        // Constrain the tools to the measured free space; short phones and large
+        // fonts can scroll without covering the bottom scan controls.
+        val toolScroll = android.widget.ScrollView(this).apply {
+            isFillViewport = false
+            addView(toolbar, ViewGroup.LayoutParams(-1, -2))
+        }
+        root.addView(toolScroll, android.widget.FrameLayout.LayoutParams(
+            dp(104), dp(240), Gravity.TOP or Gravity.END
+        ).apply { marginEnd = dp(8) })
+        for (button in listOfNotNull(exportButton, modelViewerButton, primaryButton)) {
+            button.minWidth = 0
+            button.minimumWidth = 0
+            button.minHeight = dp(48)
+            button.minimumHeight = dp(48)
+            button.textSize = 14f
+            button.maxLines = 2
+            button.setPadding(dp(4), dp(8), dp(4), dp(8))
+        }
         settingsButton.bringToFront()
         setContentView(root)
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val safe = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars() or
+                androidx.core.view.WindowInsetsCompat.Type.displayCutout())
+            view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
+            insets
+        }
+        androidx.core.view.ViewCompat.requestApplyInsets(root)
+        root.viewTreeObserver.addOnGlobalLayoutListener {
+            fun position(view: android.view.View, top: Int, height: Int? = null, width: Int? = null) {
+                val lp = view.layoutParams as android.widget.FrameLayout.LayoutParams
+                if (lp.topMargin != top || (height != null && lp.height != height) ||
+                    (width != null && lp.width != width)) {
+                    lp.topMargin = top
+                    height?.let { lp.height = it }
+                    width?.let { lp.width = it }
+                    view.layoutParams = lp
+                }
+            }
+            position(header, statusBarText.height)
+            position(settingsButton, statusBarText.height, width = dp(48))
+            val contentTop = statusBarText.height + header.height + dp(8)
+            val available = (root.height - root.paddingTop - root.paddingBottom -
+                contentTop - bottom.height - dp(8)).coerceAtLeast(0)
+            position(toolScroll, contentTop, available)
+            position(hudText, contentTop, width = (root.width - root.paddingLeft -
+                root.paddingRight - dp(132)).coerceAtLeast(dp(80)))
+            hudText.maxHeight = available
+        }
 
         // vc159 ThermalGuard：订阅系统热状态，用于在设备发烫时自动降载。
         // OnThermalStatusChangedListener / currentThermalStatus 需要 API 29，
@@ -984,12 +1049,37 @@ private var lastRelocPollMs = 0L
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 100 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startSystem()
+        if (requestCode == 100) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                primaryButton.text = "开始扫描"
+                startSystem()
+            } else {
+                primaryButton.text = "启用相机"
+                headerStatus.text = "需要相机权限；点击启用相机后可扫描"
+            }
         }
     }
 
+    private fun ensureSystemReady(): Boolean {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            android.app.AlertDialog.Builder(this).setTitle("需要相机权限")
+                .setMessage("扫描需要相机画面。可重新授权，或在系统设置中开启相机权限。")
+                .setPositiveButton("授权") { _, _ ->
+                    requestPermissions(arrayOf(Manifest.permission.CAMERA), 100)
+                }
+                .setNeutralButton("系统设置") { _, _ ->
+                    startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        android.net.Uri.parse("package:$packageName")))
+                }
+                .setNegativeButton("取消", null).show()
+            return false
+        }
+        if (!systemInitialized) startSystem()
+        return systemInitialized
+    }
+
     private fun startSystem() {
+        if (systemInitialized || isDestroyed) return
         cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val allCameraIds = cameraManager.cameraIdList.toList()
         val rearCameraIds = allCameraIds.filter { cameraId ->
@@ -997,6 +1087,11 @@ private var lastRelocPollMs = 0L
                 .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
         }
         cameraIds = rearCameraIds.ifEmpty { allCameraIds }
+        if (cameraIds.isEmpty()) {
+            headerStatus.text = "没有可用摄像头"
+            toast("没有可用摄像头，无法扫描")
+            return
+        }
         currentCameraId = cameraIds.firstOrNull { cameraId ->
             val ch = cameraManager.getCameraCharacteristics(cameraId)
             ch.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
@@ -1018,7 +1113,8 @@ private var lastRelocPollMs = 0L
         exportManager = ExportManager(this)
         depthThread = HandlerThread("DepthInference").also { it.start() }
         depthHandler = Handler(depthThread!!.looper)
-        registerImu()
+        systemInitialized = true
+        if (resumed) registerImu()
 
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: android.graphics.SurfaceTexture, w: Int, h: Int) {
@@ -1103,6 +1199,11 @@ private var lastRelocPollMs = 0L
     }
 
     private fun registerImu() {
+        if (imuRegistered || !systemInitialized) return
+        imuRegistered = true
+        hasAcc = false
+        hasGyr = false
+        lastImuOutNs = 0L
         val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         val acc = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         val sensorHandler = Handler(sensorThread!!.looper)
@@ -1112,6 +1213,7 @@ private var lastRelocPollMs = 0L
     }
 
     private fun openCamera() {
+        if (!resumed || isDestroyed || !systemInitialized) return
         if (cameraDevice != null) return
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             return
@@ -1182,7 +1284,9 @@ private var lastRelocPollMs = 0L
             // 重开相机（onResume）不应重置重建状态——nativeCreate 会清空点云/TSDF，
             // 息屏回来一次就把已积累的扫描全部丢掉。只在首次建会话时创建。
             if (!sessionCreated) {
-                NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
+                check(NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)) {
+                    "原生重建引擎初始化失败"
+                }
                 sessionCreated = true
             }
 
@@ -1283,6 +1387,7 @@ private var lastRelocPollMs = 0L
                         }
 
                         fun startLegacySessionWithHq() {
+                            if (abandonedOpen || cameraDevice !== camera || !resumed) return
                             camera.createCaptureSession(
                                 primarySurfaces,
                                 object : CameraCaptureSession.StateCallback() {
@@ -1296,6 +1401,7 @@ private var lastRelocPollMs = 0L
                                         session: CameraCaptureSession
                                     ) {
                                         runCatching { session.close() }
+                                        if (abandonedOpen || cameraDevice !== camera || !resumed) return
                                         hqCapture.detachSurfaces()
                                         camera.createCaptureSession(
                                             baseSurfaces,
@@ -1323,6 +1429,7 @@ private var lastRelocPollMs = 0L
                         val mc = multiCam
                         if (mc != null && mc.active) {
                             fun startDualWithoutHq() {
+                                if (abandonedOpen || cameraDevice !== camera || !resumed) return
                                 val startedNoHq = mc.createPhysicalSession(
                                     camera,
                                     listOf(previewSurface!!),
@@ -1338,6 +1445,7 @@ private var lastRelocPollMs = 0L
                                             session: CameraCaptureSession
                                         ) {
                                             runCatching { session.close() }
+                                            if (abandonedOpen || cameraDevice !== camera || !resumed) return
                                             mc.fallbackToLogical(
                                                 "HAL rejected dual physical without HQ"
                                             )
@@ -2708,6 +2816,7 @@ private var lastRelocPollMs = 0L
     }
 
     private fun startScan() {
+        if (!ensureSystemReady()) return
         if (modelOperationBusy) {
             toast("模型正在生成或恢复，请稍候")
             return
@@ -2791,7 +2900,18 @@ private var lastRelocPollMs = 0L
             synchronized(depthSessionLock) {
             if (isDestroyed || !scanning || startToken != scanSessionToken) return@post
             NativeBridge.nativeDestroy()
-            NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)
+            if (!NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)) {
+                sessionCreated = false
+                runOnUiThread {
+                    if (startToken == scanSessionToken) {
+                        scanning = false
+                        primaryButton.text = "开始扫描"
+                        if (::hqCapture.isInitialized) hqCapture.endScan()
+                        toast("重建引擎初始化失败，请重新开始")
+                    }
+                }
+                return@post
+            }
             // 体素边长与块预算：评审 P1-2 改为按档位切换。物体扫描默认
             // OBJECT_HQ（目标 4mm / 场景 8mm），比 V0.13.3 的 0.012/0.004
             // 更细（场景 ×1.5 分辨率，面数约 ×2.25）；块预算保持一致
@@ -2799,7 +2919,7 @@ private var lastRelocPollMs = 0L
             // 截断距离 = voxel×4（tsdf_engine 固定系数），目标侧 16mm，
             // 立体深度噪声典型 5~15mm，尚在容忍带内。
             // 注意：nativeCreate 已 reset TSDF，这里在复位后设置档位才有效。
-            NativeBridge.nativeSetVoxelProfile(0)
+            NativeBridge.nativeSetVoxelProfile(scanVoxelProfile)
             NativeBridge.nativeSetScanMaxDistance(scanMaxDistanceMeters)
             NativeBridge.nativeSetDepthCalibrationEnabled(true)
             if (objectLockEnabled) {
@@ -2816,7 +2936,7 @@ private var lastRelocPollMs = 0L
                 NativeBridge.nativeSetPersistentMapCaptureEnabled(true)
             } catch (_: Throwable) {
             }
-            scanNativeReady = true
+            scanNativeReady = scanning && resumed && startToken == scanSessionToken
             }
         }
         // V0.12: 扫描期默认进 LIVE 图层 —— 半透明网格 + 累计 surfel(hits>=1)
@@ -2827,7 +2947,7 @@ private var lastRelocPollMs = 0L
         liveMeshBuildBusy = false
         liveMeshBlockedNotice = false
         applyScanArLayer(true)
-        primaryButton.text = "停止实验扫描"
+        primaryButton.text = "停止扫描"
         updateHeader()
     }
 
@@ -2863,6 +2983,7 @@ private var lastRelocPollMs = 0L
     }
 
     private fun stopScan() {
+        val hadReadyScan = scanNativeReady
         scanning = false
         cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
         multiCam?.updateScanState(false, sessionId, false)
@@ -2876,7 +2997,7 @@ private var lastRelocPollMs = 0L
         } catch (_: Throwable) {
         }
         synchronized(depthSessionLock) { depthGeneration++ }
-        arMeshViewing = true
+        arMeshViewing = hadReadyScan
         aeLock = false
         awbLock = false
         captureState = "IDLE"
@@ -2886,7 +3007,11 @@ private var lastRelocPollMs = 0L
         applyCaptureSettings()
         // V0.12: 停扫后回到「网格」档（不透明 + 真实顶点色）做几何验收。
         applyScanArLayer(false)
-        primaryButton.text = "实验扫描（非测量）"
+        primaryButton.text = "开始扫描"
+        if (!hadReadyScan) {
+            toast("扫描尚未就绪，本次未导出模型")
+            return
+        }
         exportModel()
         // 会话结束顺手产出真正的 AR 模型：带索引三角面 + 逐顶点法线 + 逐顶点
         // 颜色的 GLB。构建在 ExportManager 的后台线程上，构建期间 native 会
@@ -3018,6 +3143,7 @@ private var lastRelocPollMs = 0L
 
     /** 「查看模型」按钮入口：切换进出查看模式。 */
     private fun toggleModelViewer() {
+        if (!ensureSystemReady()) return
         if (modelViewerActive) {
             exitModelViewer()
             return
@@ -3700,6 +3826,7 @@ private var lastRelocPollMs = 0L
 // --------------------------------------------------------- V0.7 persistent AR
 
     private fun restoreLatestPersistentAr() {
+        if (!ensureSystemReady()) return
         if (scanning || modelOperationBusy) {
             toast("请先停止扫描，并等待当前模型操作完成")
             return
@@ -4408,6 +4535,7 @@ private var lastRelocPollMs = 0L
     }
 
     private fun showCameraParams() {
+        if (!ensureSystemReady()) return
         val container = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(16, 8, 16, 8)
@@ -4442,7 +4570,7 @@ private var lastRelocPollMs = 0L
         }
         android.app.AlertDialog.Builder(this)
             .setTitle("相机参数")
-            .setView(container)
+            .setView(android.widget.ScrollView(this).apply { addView(container) })
             .setPositiveButton("关闭", null)
             .show()
     }
@@ -4450,12 +4578,12 @@ private var lastRelocPollMs = 0L
     private fun showSettingsMenu() {
         android.widget.PopupMenu(this, settingsButton).apply {
             menu.add("相机参数")
-            menu.add("模式选择")
+            menu.add("重建档位")
             menu.add("扫描距离与补光")
             setOnMenuItemClickListener { item ->
                 when (item.title.toString()) {
                     "相机参数" -> showCameraParams()
-                    "模式选择" -> showModeDialog()
+                    "重建档位" -> showModeDialog()
                     "扫描距离与补光" -> showScanSettings()
                 }
                 true
@@ -4495,7 +4623,7 @@ private var lastRelocPollMs = 0L
         panel.addView(TextView(this).apply {
             text = "仅在设定距离内采集点云和模型，默认 1 米。单目距离依赖定位和深度标定，并非测距仪。补光开启后保持至停扫或退到后台，避免反复闪烁；无闪光灯的镜头无法补光。"
         })
-        android.app.AlertDialog.Builder(this).setTitle("扫描距离与补光").setView(panel)
+        android.app.AlertDialog.Builder(this).setTitle("扫描距离与补光").setView(android.widget.ScrollView(this).apply { addView(panel) })
             .setNegativeButton("取消", null)
             .setPositiveButton("保存") { _, _ ->
                 scanMaxDistanceMeters = .2f + slider.progress / 10f
@@ -4548,6 +4676,7 @@ private var lastRelocPollMs = 0L
     }
 
     private fun showExportDrawer() {
+        if (!ensureSystemReady()) return
         android.app.AlertDialog.Builder(this)
             .setTitle("导出")
             .setItems(
@@ -4589,20 +4718,21 @@ private var lastRelocPollMs = 0L
     }
 
     private fun showModeDialog() {
-        val desc = "连续单帧点云：非米制，深度为相对尺度，点云仅做实时预览，不进行多帧拼接。\n\n" +
-            "旧版多帧拼接：尝试按位姿累积多帧，实验性，可能产生漂移。"
+        if (scanning || modelOperationBusy) {
+            toast("请先停止扫描并等待模型操作完成；档位用于下一次扫描")
+            return
+        }
+        val labels = arrayOf("物体精细 · 4mm 目标体素", "物体快速 · 8mm 目标体素", "房间 · 20mm 场景体素")
         android.app.AlertDialog.Builder(this)
-            .setTitle("模式选择")
-            .setMessage(desc)
-            .setPositiveButton("连续单帧点云") { _, _ ->
-                modeLabel = "连续单帧点云"
-                NativeBridge.nativeSetMode(0)
+            .setTitle("重建档位（体素设置，非测量精度）")
+            .setSingleChoiceItems(labels, scanVoxelProfile) { dialog, which ->
+                scanVoxelProfile = which
+                getSharedPreferences("scan_settings", Context.MODE_PRIVATE).edit()
+                    .putInt("voxel_profile", which).apply()
+                toast("下次扫描使用：${labels[which]}")
+                dialog.dismiss()
             }
-            .setNegativeButton("旧版多帧拼接") { _, _ ->
-                modeLabel = "旧版多帧拼接"
-                NativeBridge.nativeSetMode(1)
-            }
-            .setNeutralButton("取消", null)
+            .setNegativeButton("取消", null)
             .show()
     }
 
@@ -4628,6 +4758,7 @@ private var lastRelocPollMs = 0L
     }
 
     override fun onSensorChanged(e: SensorEvent) {
+        if (!resumed || !((scanning && scanNativeReady) || arMeshViewing)) return
         when (e.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> {
                 remapDeviceToCamera(e.values[0], e.values[1], e.values[2], lastImu, 0)
@@ -4691,7 +4822,14 @@ private var lastRelocPollMs = 0L
     }
 
     override fun onPause() {
+        // A closed camera is a discontinuity, not a pause in a continuous VIO scan.
+        // Finalize the current scan so resume cannot silently fuse across the gap.
+        if (scanning) stopScan()
         resumed = false
+        if (::sensorManager.isInitialized && imuRegistered) {
+            sensorManager.unregisterListener(this)
+            imuRegistered = false
+        }
         cancelViewerLongPress()
         viewerMultiTouch = false
         synchronized(depthSessionLock) { depthGeneration++ }
@@ -4704,6 +4842,10 @@ private var lastRelocPollMs = 0L
         super.onResume()
         resumed = true
         glView.onResume()
+        if (!systemInitialized && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            startSystem()
+        }
+        if (systemInitialized) registerImu()
         if (::cameraManager.isInitialized && texture.isAvailable && cameraDevice == null && !openingCamera) {
             openCamera()
         }
