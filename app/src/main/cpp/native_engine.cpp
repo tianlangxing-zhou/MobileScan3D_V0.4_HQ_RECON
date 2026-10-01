@@ -2508,8 +2508,18 @@ static void nativeOnDepthMapImpl(
                 ++epochOpens;
             }
         } else if (!calibratedNow || !liveOk ||
-                   !scan_policy::hasCurrentCalibrationEvidence(
-                       calibrationUpdatedThisFrame, epochActive, frozenEvidenceGood)) {
+                   // V0.13.28 修复：`hasCurrentCalibrationEvidence` 的「本帧必须刚拟合成功」
+                   // 语义**只对已开启的 epoch 有意义**（防止用陈旧缓存为冻结参数背书）。
+                   // 冷启动阶段要求「连续 kEpochStableFrames 帧**每帧**都有新拟合」是不可满足的：
+                   // 标定只在通过健康门时才更新（实测 acc=22 / rej=57，接受率 ~28%，且两次成功
+                   // 拟合之间常隔 20s+），8 连击概率 ~1e-5 ⇒ epoch 永不开启 ⇒
+                   // epochFusionDepth 恒空 ⇒ 几何一个体素都写不进去（真机表现：地图 0 · 绘制 0、
+                   // nativeBuildMesh verts=0 tris=0 "no triangles extracted"）。
+                   // 冷启动期恢复 vc166 语义（标定器可用 + 参考点稳定即可），epoch 开启后的
+                   // 严格证据要求保持不变。
+                   (epochActive &&
+                    !scan_policy::hasCurrentCalibrationEvidence(
+                        calibrationUpdatedThisFrame, epochActive, frozenEvidenceGood))) {
             // 标定**短暂**不可用：epoch 生效期间**继续用冻结参数融合**（下面是
             // `if (epochActive)` 生成 epochFusionDepth，仍然有效）。单帧拟合失败
             // 很常见（纹理弱 / 运动模糊），一失败就停融合会让点云频繁断流，
