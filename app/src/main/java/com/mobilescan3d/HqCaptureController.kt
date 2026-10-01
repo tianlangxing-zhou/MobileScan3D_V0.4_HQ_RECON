@@ -549,6 +549,18 @@ class HqCaptureController(
 
     fun canChangeFillLight(): Boolean = !burstInFlight && !processingInFlight
 
+    /**
+     * V0.13.20：采集是否「在途」（burst 拍摄中，或拍完的融合/落盘还没结束）。
+     *
+     * 供主线程的实时网格重建（[MainActivity.maybeRefreshLiveMesh]）避让使用。
+     * 原因（真机数据）：`nativeBuildMesh` 在 native 侧持全局 `gStateMutex` 完成整段
+     * 构建（Marching Tetrahedra + 清理 + QEM），实测随体素场增长从 86ms 涨到 1186ms；
+     * 这段持锁期内相机帧回调被阻塞 → VINS 位姿历史出现空洞 → burst 帧按其
+     * SENSOR_TIMESTAMP 连 500ms 宽容窗口都取不到位姿，纹理关键帧被静默丢弃
+     * （实拍 18 组里丢了 5 组）。采集窗口内让出重建即可避免这一类丢失。
+     */
+    fun captureBusy(): Boolean = burstInFlight || processingInFlight
+
 
     private var jpegReader: ImageReader? = null
     private var rawReader: ImageReader? = null

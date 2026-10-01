@@ -309,6 +309,22 @@ private var lastRelocPollMs = 0L
      * 「模型在长」——而点云是每帧刷新的，画面并不会显得僵。
      */
     private val liveMeshRefreshPeriodMs = 5_000L
+    /**
+     * V0.13.20：实时网格重建的自适应退避上限。
+     *
+     * 真机数据（vc156 实拍 3 分钟）：`nativeBuildMesh` 在 native 侧持全局锁完成
+     * 整段构建，耗时随体素场覆盖增长从 86ms 涨到 1186ms，且每 5s 触发一次；
+     * 持锁期内相机帧回调被阻塞（实测 `nativeOnCameraFrame` 峰值 1165.7ms，
+     * 与构建耗时逐一对应），VINS 位姿历史出现空洞 → AR 卡顿 + HQ 纹理关键帧被丢。
+     *
+     * 因此按「上一次构建越慢、下一次间隔越长」退避，把固定 5s 节拍改成
+     * `clamp(上次构建耗时 × 15, 5s, 30s)`：构建 1186ms 时退到约 17.8s，
+     * 便宜的构建（<333ms）仍保持 5s。这是治标——根治需要把全局锁只覆盖
+     * 「Marching Tetrahedra 提取」这一段，把清理/QEM 挪到锁外。
+     */
+    private val liveMeshRefreshPeriodMaxMs = 30_000L
+    /** 上一次实时网格构建在 native 侧的实际耗时（ms），用于自适应退避。 */
+    @Volatile private var liveMeshLastBuildMs = 0L
     /** Fusion Epoch 诊断槽缓冲（HUD / 报告用，走 UI 线程）。 */
     private val fusionEpochBuf = FloatArray(NativeBridge.FUSION_EPOCH_STATS_SLOTS)
     /**
@@ -3351,8 +3367,17 @@ private var lastRelocPollMs = 0L
             !::glView.isInitialized
         ) return
 
+        // V0.13.20：采集在途时让出重建。构建会持 native 全局锁（实测 86ms→1186ms），
+        // 落在采集窗口内会丢相机帧 → VINS 位姿历史空洞 → burst 帧取不到位姿，
+        // 纹理关键帧被静默丢弃。宁可这一段少几次网格刷新，也不能丢纹理。
+        if (::hqCapture.isInitialized && hqCapture.captureBusy()) return
+
         val now = android.os.SystemClock.elapsedRealtime()
-        if (now - lastLiveMeshRefreshMs < liveMeshRefreshPeriodMs) return
+        // V0.13.20 自适应退避：上一次构建越慢，下一次间隔越长（5s..30s）。
+        // 固定的 5s 节拍在大体素场下会变成「每 5s 冻结相机 ~1s」。
+        val interval = (liveMeshLastBuildMs * 15L)
+            .coerceIn(liveMeshRefreshPeriodMs, liveMeshRefreshPeriodMaxMs)
+        if (now - lastLiveMeshRefreshMs < interval) return
 
         // 不要按相机帧率去碰 native 状态，只在网格节拍上问一次。
         if (!fusionEpochActive()) {
@@ -3385,6 +3410,15 @@ private var lastRelocPollMs = 0L
                         glView.requestRender()
                     }
                 } finally {
+                    // 回填 native 实际构建耗时（meshStats 槽 12 = totalMs），
+                    // 供下一次自适应退避使用。
+                    liveMeshLastBuildMs = try {
+                        exportManager.meshStats()
+                            .getOrNull(NativeBridge.MESH_STATS_INDEX_TOTAL_MS)
+                            ?.toLong()?.coerceAtLeast(0L) ?: liveMeshLastBuildMs
+                    } catch (_: Throwable) {
+                        liveMeshLastBuildMs
+                    }
                     liveMeshBuildBusy = false
                 }
             }
