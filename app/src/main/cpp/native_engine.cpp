@@ -40,6 +40,7 @@
 #include "target_mask_temporal.h"
 #include "stereo_anchor_bridge.h"
 #include "mesh/mesh_engine.h"
+#include "mesh/mesh_registration.h"
 #include "mesh/hard_surface.h"
 #include "export/gltf_exporter.h"
 #include "v06/mesh_postprocess.h"
@@ -457,6 +458,16 @@ static double firstRejectTd = 0.0;
 static uint64_t vinsFrames = 0;
 static uint64_t depthFrames = 0;
 static double lastVinsMs = 0.0;
+
+// ---------------------------------------------------------------- Round 7 device calibration profile
+// These values are configured by Kotlin before nativeCreate(). They persist across
+// nativeDestroy() so a camera/session restart can reuse the same device profile.
+static float gConfiguredRic[9] = {1.f,0.f,0.f, 0.f,1.f,0.f, 0.f,0.f,1.f};
+static float gConfiguredTic[3] = {0.f,0.f,0.f};
+static double gConfiguredTd = 0.0;
+static int gConfiguredEstimateExtrinsicMode = 0;
+static int gConfiguredEstimateTd = 1;
+static uint64_t gCalibrationProfileSerial = 0;
 
 static uint64_t targetGeneration = 0;
 
@@ -1606,8 +1617,13 @@ static jboolean nativeCreateImpl(jint w, jint h, jfloat fx, jfloat fy, jfloat cx
     vk = (r == VK_SUCCESS || r == VK_INCOMPLETE);
     LOGI("V0.4 native create Vulkan=%d", vk);
 
-    float ric[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    float tic[3] = {0, 0, 0};
+    float ric[9];
+    float tic[3];
+    std::copy(gConfiguredRic, gConfiguredRic + 9, ric);
+    std::copy(gConfiguredTic, gConfiguredTic + 3, tic);
+    const double initialTd = gConfiguredTd;
+    const int estimateExtrinsicMode = gConfiguredEstimateExtrinsicMode;
+    const int estimateTd = gConfiguredEstimateTd;
     const float vScale = 640.f / (float)std::max(w, h);
     gVinsW = std::max(1, (int)(w * vScale));
     gVinsH = std::max(1, (int)(h * vScale));
@@ -1615,8 +1631,85 @@ static jboolean nativeCreateImpl(jint w, jint h, jfloat fx, jfloat fy, jfloat cx
     const float vFy = fy * vScale;
     const float vCx = cx * vScale;
     const float vCy = cy * vScale;
-    vinsInit(vFx, vFy, vCx, vCy, gVinsW, gVinsH, ric, tic, 0.1f, 0.001f, 0.001f, 0.0001f);
+    vinsInit(
+        vFx, vFy, vCx, vCy, gVinsW, gVinsH, ric, tic,
+        0.1f, 0.001f, 0.001f, 0.0001f,
+        initialTd, estimateExtrinsicMode, estimateTd);
     return JNI_TRUE;
+}
+
+/** Round 7: configure camera<->IMU calibration used by the NEXT nativeCreate(). */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSetVinsCalibrationProfile(
+        JNIEnv* env, jobject,
+        jfloatArray ricArray, jfloatArray ticArray,
+        jfloat tdSeconds, jboolean estimateExtrinsic, jboolean estimateTd) {
+    if (!ricArray || !ticArray ||
+        env->GetArrayLength(ricArray) < 9 || env->GetArrayLength(ticArray) < 3 ||
+        !std::isfinite(tdSeconds) || std::abs(tdSeconds) > 0.150f) {
+        return JNI_FALSE;
+    }
+    float r[9]{};
+    float t[3]{};
+    env->GetFloatArrayRegion(ricArray, 0, 9, r);
+    env->GetFloatArrayRegion(ticArray, 0, 3, t);
+    if (env->ExceptionCheck()) return JNI_FALSE;
+
+    // Reject obviously invalid matrices. A small non-orthogonality is tolerated
+    // because profiles imported from calibration tools are rounded text values.
+    auto rowDot = [&](int a, int b) {
+        return r[a*3+0]*r[b*3+0] + r[a*3+1]*r[b*3+1] + r[a*3+2]*r[b*3+2];
+    };
+    const float n0 = rowDot(0,0), n1 = rowDot(1,1), n2 = rowDot(2,2);
+    const float det =
+        r[0]*(r[4]*r[8]-r[5]*r[7]) -
+        r[1]*(r[3]*r[8]-r[5]*r[6]) +
+        r[2]*(r[3]*r[7]-r[4]*r[6]);
+    if (!std::isfinite(det) || det < 0.75f || det > 1.25f ||
+        std::abs(n0-1.f) > 0.20f || std::abs(n1-1.f) > 0.20f ||
+        std::abs(n2-1.f) > 0.20f ||
+        std::abs(rowDot(0,1)) > 0.20f ||
+        std::abs(rowDot(0,2)) > 0.20f ||
+        std::abs(rowDot(1,2)) > 0.20f) {
+        return JNI_FALSE;
+    }
+    const float tNorm = std::sqrt(t[0]*t[0] + t[1]*t[1] + t[2]*t[2]);
+    if (!std::isfinite(tNorm) || tNorm > 0.50f) return JNI_FALSE;
+
+    std::lock_guard<std::mutex> lk(gStateMutex);
+    std::copy(r, r + 9, gConfiguredRic);
+    std::copy(t, t + 3, gConfiguredTic);
+    gConfiguredTd = static_cast<double>(tdSeconds);
+    gConfiguredEstimateExtrinsicMode = estimateExtrinsic == JNI_TRUE ? 2 : 0;
+    gConfiguredEstimateTd = estimateTd == JNI_TRUE ? 1 : 0;
+    ++gCalibrationProfileSerial;
+    return JNI_TRUE;
+}
+
+/**
+ * Round 7 fixed-width VINS health protocol.
+ * 0 init, 1 velocity, 2 accBias, 3 gyroBias, 4 gravity, 5 trackedFeatures,
+ * 6 lastImuDtSec, 7 estimatedTdSec, 8..16 RIC, 17..19 TIC.
+ */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetVinsHealth(
+        JNIEnv* env, jobject, jfloatArray out) {
+    if (!out || env->GetArrayLength(out) < 20) return 0;
+    VinsHealth h;
+    if (!vinsGetHealth(&h)) return 0;
+    jfloat v[20]{};
+    v[0] = h.initialized ? 1.f : 0.f;
+    v[1] = h.velocity;
+    v[2] = h.accBias;
+    v[3] = h.gyroBias;
+    v[4] = h.gravity;
+    v[5] = static_cast<float>(h.trackedFeatures);
+    v[6] = static_cast<float>(h.lastImuDt);
+    v[7] = static_cast<float>(h.timeOffset);
+    for (int i = 0; i < 9; ++i) v[8+i] = h.ric[i];
+    for (int i = 0; i < 3; ++i) v[17+i] = h.tic[i];
+    env->SetFloatArrayRegion(out, 0, 20, v);
+    return 20;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -5330,6 +5423,95 @@ Java_com_mobilescan3d_NativeBridge_nativeGetMeshIndices(JNIEnv* e, jobject,
     }
     e->SetIntArrayRegion(out, 0, (jsize)n, buf.data());
     return (jint)n;
+}
+
+/**
+ * Round 8 cumulative multi-segment registration.
+ * referenceVertices use the normal Kotlin interleaved layout (9 float/vertex).
+ * Current native mesh is the moving segment. Successful registration replaces
+ * meshEngine's export mesh with the cumulative merged mesh.
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeAlignCurrentMeshToReference(
+        JNIEnv* env, jobject,
+        jfloatArray referenceVertices, jint referenceVertexCount,
+        jintArray referenceIndices, jint referenceIndexCount,
+        jint preferredYawDeg,
+        jfloatArray outStats, jfloatArray outTransform) {
+    if (!referenceVertices || !referenceIndices || !outStats || !outTransform ||
+        referenceVertexCount <= 0 || referenceIndexCount < 3 ||
+        env->GetArrayLength(referenceVertices) < referenceVertexCount * MESH_VERTEX_FLOATS ||
+        env->GetArrayLength(referenceIndices) < referenceIndexCount ||
+        env->GetArrayLength(outStats) < 10 || env->GetArrayLength(outTransform) < 16) {
+        return JNI_FALSE;
+    }
+
+    std::vector<jfloat> vr(static_cast<std::size_t>(referenceVertexCount) * MESH_VERTEX_FLOATS);
+    std::vector<jint> ir(static_cast<std::size_t>(referenceIndexCount));
+    env->GetFloatArrayRegion(referenceVertices, 0, static_cast<jsize>(vr.size()), vr.data());
+    env->GetIntArrayRegion(referenceIndices, 0, referenceIndexCount, ir.data());
+    if (env->ExceptionCheck()) return JNI_FALSE;
+
+    Mesh reference;
+    reference.positions.resize(static_cast<std::size_t>(referenceVertexCount) * 3);
+    reference.normals.resize(static_cast<std::size_t>(referenceVertexCount) * 3);
+    reference.colors.resize(static_cast<std::size_t>(referenceVertexCount) * 3);
+    for (int i = 0; i < referenceVertexCount; ++i) {
+        const float* v = vr.data() + static_cast<std::size_t>(i) * MESH_VERTEX_FLOATS;
+        for (int k = 0; k < 3; ++k) {
+            reference.positions[static_cast<std::size_t>(i)*3+k] = v[k];
+            reference.normals[static_cast<std::size_t>(i)*3+k] = v[3+k];
+            reference.colors[static_cast<std::size_t>(i)*3+k] = v[6+k];
+        }
+    }
+    reference.indices.resize(static_cast<std::size_t>(referenceIndexCount));
+    for (int i = 0; i < referenceIndexCount; ++i) {
+        const int idx = ir[static_cast<std::size_t>(i)];
+        if (idx < 0 || idx >= referenceVertexCount) return JNI_FALSE;
+        reference.indices[static_cast<std::size_t>(i)] = static_cast<std::uint32_t>(idx);
+    }
+
+    Mesh moving;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        moving = meshEngine.mesh();
+    }
+    if (moving.triangleCount() < 100) return JNI_FALSE;
+
+    Mesh merged;
+    std::array<float,16> T{};
+    MeshRegistrationStats stats;
+    const bool ok = alignAndMergeMeshes(
+        reference, moving, &merged, &T, &stats,
+        preferredYawDeg >= 0 ? static_cast<int>(preferredYawDeg) : -1);
+
+    jfloat stat[10] = {
+        ok ? 1.f : 0.f,
+        stats.rmseMeters,
+        stats.overlap,
+        static_cast<float>(stats.inliers),
+        static_cast<float>(stats.iterations),
+        static_cast<float>(stats.yawHypothesisDeg),
+        static_cast<float>(stats.referenceVertices),
+        static_cast<float>(stats.movingVertices),
+        static_cast<float>(stats.outputVertices),
+        static_cast<float>(stats.outputTriangles)
+    };
+    env->SetFloatArrayRegion(outStats, 0, 10, stat);
+    env->SetFloatArrayRegion(outTransform, 0, 16, T.data());
+    if (!ok) return JNI_FALSE;
+
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        meshEngine.replaceExportMesh(std::move(merged));
+        meshStats.outVertices = meshEngine.mesh().vertexCount();
+        meshStats.outTriangles = meshEngine.mesh().triangleCount();
+        meshStats.ok = true;
+        meshStats.note = "R8 cumulative ICP merge";
+        meshDirty = false;
+        ++meshBuilds;
+    }
+    return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT void JNICALL

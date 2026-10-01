@@ -216,6 +216,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     /** PLY / GLB 导出与网格构建（构建在后台线程，绝不占 UI 线程）。 */
     private lateinit var exportManager: ExportManager
+    /** Round 8 cumulative multi-session mesh base. */
+    private lateinit var segmentStore: com.mobilescan3d.multiscan.ScanSegmentStore
+    @Volatile private var multiSegmentMergedActive = false
+    @Volatile private var segmentMergeBusy = false
+    private var latestQualityReport: java.io.File? = null
 
     // Main-thread guard spans reconstruction, texture baking, and package saving.
     private var modelOperationBusy = false
@@ -927,6 +932,8 @@ private var lastRelocPollMs = 0L
             glView.requestRender()
         }
         findViewById<android.view.View>(R.id.btnViewerExport).setOnClickListener { showExportDrawer() }
+        findViewById<android.view.View>(R.id.btnViewerReport).setOnClickListener { showScanQualityReport() }
+        findViewById<android.view.View>(R.id.btnViewerSegment).setOnClickListener { showSegmentMergeDialog() }
         findViewById<android.view.View>(R.id.btnViewerHelp).setOnClickListener { showViewerHelp() }
         viewerModeTexture.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_TEXTURE) }
         viewerModeSolid.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_SOLID) }
@@ -1120,6 +1127,7 @@ private var lastRelocPollMs = 0L
             this, assets, preferHardware = false, probe = depthProbe
         )
         exportManager = ExportManager(this)
+        segmentStore = com.mobilescan3d.multiscan.ScanSegmentStore(this)
         depthThread = HandlerThread("DepthInference").also { it.start() }
         depthHandler = Handler(depthThread!!.looper)
         systemInitialized = true
@@ -1293,6 +1301,7 @@ private var lastRelocPollMs = 0L
             // 重开相机（onResume）不应重置重建状态——nativeCreate 会清空点云/TSDF，
             // 息屏回来一次就把已积累的扫描全部丢掉。只在首次建会话时创建。
             if (!sessionCreated) {
+                applyDeviceCalibrationProfileToNative()
                 check(NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)) {
                     "原生重建引擎初始化失败"
                 }
@@ -3043,6 +3052,9 @@ private var lastRelocPollMs = 0L
         lastMeshSummary = "n/a"
         renderer.clearMesh()
         renderer.clearTexturedMesh()
+        multiSegmentMergedActive = false
+        viewerBaseMesh = null
+        viewerSurfaceVertices = null
         // V0.6：新一轮扫描要清掉上一轮的 HQ 纹理关键帧登记表，否则会把
         // 上一场拍的照片烘到这一场的网格上（native 侧 nativeCreate 另有兜底）。
         try {
@@ -3085,6 +3097,7 @@ private var lastRelocPollMs = 0L
             synchronized(depthSessionLock) {
             if (isDestroyed || !scanning || startToken != scanSessionToken) return@post
             NativeBridge.nativeDestroy()
+            applyDeviceCalibrationProfileToNative()
             if (!NativeBridge.nativeCreate(nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy)) {
                 sessionCreated = false
                 runOnUiThread {
@@ -3211,6 +3224,7 @@ private var lastRelocPollMs = 0L
         cameraHandler?.post {
             val loaded = synchronized(depthSessionLock) {
                 NativeBridge.nativeDestroy()
+                applyDeviceCalibrationProfileToNative()
                 val created = NativeBridge.nativeCreate(
                     nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy
                 )
@@ -3617,6 +3631,10 @@ private var lastRelocPollMs = 0L
      */
     private fun exportModel() {
         if (!::exportManager.isInitialized) return
+        if (multiSegmentMergedActive) {
+            toast("累计分段模型不能导出为当前单会话 PLY；请导出 GLB")
+            return
+        }
         val exportSession = sessionId
         val token = scanSessionToken
         exportManager.exportPlyAsync(exportSession) { r ->
@@ -3640,10 +3658,50 @@ private var lastRelocPollMs = 0L
      */
     private fun buildMeshAndExport(sessionId: String, quality: Int, shape: Int = 0) {
         if (!::exportManager.isInitialized) return
-        if (scanning || modelOperationBusy) {
+        if (scanning || modelOperationBusy || segmentMergeBusy) {
             toast("请先停止扫描，并等待当前模型操作完成")
             return
         }
+
+        // Round 8 cumulative meshes already live in meshEngine. Rebuilding from the
+        // current TSDF here would silently discard every earlier segment. Export the
+        // merged native mesh as-is instead. Cross-session photo texture projection is
+        // intentionally not fabricated because older keyframes are not in this VINS frame.
+        if (multiSegmentMergedActive) {
+            if (shape != 0) {
+                toast("分段拼接模型暂不支持长方体/正方体拟合；请先导出累计 GLB")
+                return
+            }
+            modelOperationBusy = true
+            toast("正在导出累计分段 GLB…")
+            try {
+                exportManager.exportCurrentMeshGlbAsync(sessionId + "_segments") { r ->
+                    modelOperationBusy = false
+                    if (isDestroyed) return@exportCurrentMeshGlbAsync
+                    val mesh = exportManager.lastMesh
+                    if (r.ok && mesh != null) {
+                        renderer.clearTexturedMesh()
+                        renderer.setMesh(mesh.vertices, mesh.indices)
+                        viewerBaseMesh = mesh
+                        lastModelFile = r.file
+                        lastGlbFilename = r.file.name
+                        lastGlbTriangles = r.triangles
+                        lastGlbBytes = r.fileBytes
+                        lastMeshSummary =
+                            "${r.triangles} 面 / ${r.vertices} 顶点 · ${r.fileBytes / 1024} KB · 多段累计(vertex color)"
+                        generateQualityReportSilently()
+                        glView.requestRender()
+                    }
+                    r.persistenceMessage?.let { toast(it) }
+                    toast(r.message)
+                }
+            } catch (t: Throwable) {
+                modelOperationBusy = false
+                toast("累计模型导出异常：${t.javaClass.simpleName}")
+            }
+            return
+        }
+
         modelOperationBusy = true
         val label = meshQualityLabel(quality)
         toast("正在重建网格（$label），请稍候…")
@@ -3668,6 +3726,7 @@ private var lastRelocPollMs = 0L
                     lastMeshSummary =
                         "${r.triangles} 面 / ${r.vertices} 顶点 · ${r.fileBytes / 1024} KB · $label" +
                             textureNote(r.textured)
+                    generateQualityReportSilently()
                     // V0.5：网格一出来就自动切到「网格」图层 —— 用户刚拍完就直接
                     // 看到结果，不必自己去翻图层按钮。
                     arMeshViewing = true
@@ -3824,6 +3883,10 @@ private var lastRelocPollMs = 0L
 
     private fun setViewerPresentation(style: Int) {
         if (!modelViewerActive) return
+        if (style == PointCloudRenderer.VIEWER_STYLE_SURFACE && multiSegmentMergedActive) {
+            toast("累计拼接模型来自多个独立 TSDF；观测热力只对单会话网格有定义")
+            return
+        }
         val base = viewerBaseMesh
         if (base != null) {
             if (style == PointCloudRenderer.VIEWER_STYLE_SURFACE && viewerSurfaceVertices != null) {
@@ -3878,7 +3941,11 @@ private var lastRelocPollMs = 0L
             } catch (_: Throwable) {
                 null
             }
-            val observationWeights = try {
+            val observationWeights = if (multiSegmentMergedActive) {
+                // Earlier segments no longer share the current TSDF volume, so a
+                // per-vertex TSDF heatmap would be physically misleading.
+                FloatArray(0)
+            } else try {
                 exportManager.meshObservationWeights(mesh.vertexCount)
             } catch (_: Throwable) {
                 FloatArray(0)
@@ -5843,7 +5910,9 @@ private var lastRelocPollMs = 0L
                     "双指捏合：缩放\n" +
                     "双指一起拖动：平移\n\n" +
                     "顶部可切换纹理 / 实体 / 线框 / 缺口 / 表面观测。\n" +
-                    "“缺口”模式中的红线是真实拓扑开放边，不是估算热力图。\n\n" +
+                    "“缺口”模式中的红线是真实拓扑开放边，不是估算热力图。\n" +
+                    "“观测”来自单次扫描 TSDF 权重；分段累计模型会自动禁用该热力。\n\n" +
+                    "右侧“诊断”生成结构化质量报告；“分段”可建立基准并自动 ICP 拼接。\n" +
                     "右侧“重置”可回到自动构图；“AR摆放”会退出独立查看器，" +
                     "把模型放回真实相机画面。"
             )
@@ -5870,14 +5939,389 @@ private var lastRelocPollMs = 0L
         updateHeader()
     }
 
+    private fun applyDeviceCalibrationProfileToNative(): Boolean {
+        return com.mobilescan3d.calibration.DeviceCalibrationManager.applyToNative(applicationContext)
+    }
+
+    private fun currentVinsHealth(): FloatArray? {
+        val out = FloatArray(NativeBridge.VINS_HEALTH_SLOTS)
+        val n = runCatching { NativeBridge.nativeGetVinsHealth(out) }.getOrDefault(0)
+        return if (n == out.size) out else null
+    }
+
+    private fun showCalibrationCenter() {
+        if (scanning || modelOperationBusy) {
+            toast("请先停止扫描并等待模型操作完成")
+            return
+        }
+        val manager = com.mobilescan3d.calibration.DeviceCalibrationManager
+        val profile = manager.load(this)
+        val health = currentVinsHealth()
+        val healthText = if (health == null) {
+            "当前 VINS：暂无可读状态（开始过一次定位后可采纳时延/外参）"
+        } else {
+            val init = health[NativeBridge.VINS_HEALTH_INITIALIZED] >= 0.5f
+            val tdMs = health[NativeBridge.VINS_HEALTH_TIME_OFFSET] * 1000f
+            val features = health[NativeBridge.VINS_HEALTH_FEATURES].toInt()
+            val gb = health[NativeBridge.VINS_HEALTH_GYRO_BIAS]
+            "当前 VINS：${if (init) "已初始化" else "未初始化"} · 特征 $features · " +
+                "td ${"%.2f".format(tdMs)}ms · gyroBias ${"%.4f".format(gb)}"
+        }
+        val message = manager.pretty(profile) + "\n\n" + healthText +
+            "\n\n说明：外参实验模式会让 VINS 在下一次会话中自行估计相机-IMU旋转；" +
+            "只有完成充分旋转激励并稳定初始化后，才建议采纳当前 VINS 外参。"
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("设备标定中心 · Round 7")
+            .setMessage(message)
+            .setItems(
+                arrayOf(
+                    "编辑 / 导入标定 JSON",
+                    "采纳当前 VINS 时间偏移",
+                    "采纳当前 VINS 外参 + 时间偏移",
+                    if (profile.estimateExtrinsic) "关闭实验外参自标定" else "开启实验外参自标定",
+                    if (profile.estimateTimeOffset) "冻结当前时间偏移" else "开启在线时间偏移估计",
+                    "重置为默认（RIC=I / TIC=0）"
+                )
+            ) { _, which ->
+                when (which) {
+                    0 -> showCalibrationJsonEditor()
+                    1 -> {
+                        val h = currentVinsHealth()
+                        if (h == null) toast("当前没有 VINS 健康数据")
+                        else manager.withCurrentTimeOffset(this, h)
+                            .onSuccess {
+                                applyDeviceCalibrationProfileToNative()
+                                toast("已保存当前时延；下次重建会话生效")
+                            }
+                            .onFailure { toast("保存失败：${it.message}") }
+                    }
+                    2 -> {
+                        val h = currentVinsHealth()
+                        if (h == null) toast("当前没有 VINS 健康数据")
+                        else manager.withCurrentVinsEstimate(this, h)
+                            .onSuccess {
+                                applyDeviceCalibrationProfileToNative()
+                                toast("已采纳当前 VINS 外参/时延；下次重建会话生效")
+                            }
+                            .onFailure { toast("不能采纳：${it.message}") }
+                    }
+                    3 -> {
+                        manager.save(this, profile.copy(
+                            estimateExtrinsic = !profile.estimateExtrinsic,
+                            source = if (!profile.estimateExtrinsic) "experimental-online-extrinsic" else profile.source
+                        )).onSuccess {
+                            applyDeviceCalibrationProfileToNative()
+                            toast(if (it.estimateExtrinsic) "已开启：下一会话请做充分旋转激励" else "已关闭实验外参估计")
+                        }.onFailure { toast("保存失败：${it.message}") }
+                    }
+                    4 -> {
+                        manager.save(this, profile.copy(
+                            estimateTimeOffset = !profile.estimateTimeOffset,
+                            source = profile.source
+                        )).onSuccess {
+                            applyDeviceCalibrationProfileToNative()
+                            toast(if (it.estimateTimeOffset) "已开启在线时延估计" else "已冻结时延种子")
+                        }.onFailure { toast("保存失败：${it.message}") }
+                    }
+                    5 -> {
+                        manager.reset(this)
+                        applyDeviceCalibrationProfileToNative()
+                        toast("已恢复默认标定；下次重建会话生效")
+                    }
+                }
+            }
+            .setPositiveButton("关闭", null)
+            .show()
+    }
+
+    private fun showCalibrationJsonEditor() {
+        val manager = com.mobilescan3d.calibration.DeviceCalibrationManager
+        val edit = android.widget.EditText(this).apply {
+            setText(manager.load(this@MainActivity).toJson().toString(2))
+            setTextIsSelectable(true)
+            minLines = 12
+            maxLines = 20
+            setHorizontallyScrolling(false)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            // 注意：onCreate 里的局部 fun dp() 在此作用域不可见，直接按 density 换算
+            val editorDensity = resources.displayMetrics.density
+            setPadding(
+                (12 * editorDensity + .5f).toInt(), (10 * editorDensity + .5f).toInt(),
+                (12 * editorDensity + .5f).toInt(), (10 * editorDensity + .5f).toInt()
+            )
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("标定 JSON")
+            .setMessage("支持从 Kalibr/离线标定流程换算后粘贴 RIC/TIC/时延。单位：TIC=米，timeOffsetSeconds=秒。")
+            .setView(android.widget.ScrollView(this).apply { addView(edit) })
+            .setNegativeButton("取消", null)
+            .setPositiveButton("验证并保存") { _, _ ->
+                manager.parse(edit.text.toString())
+                    .fold(
+                        onSuccess = { parsed ->
+                            manager.save(this, parsed.copy(source = "imported-json"))
+                                .onSuccess {
+                                    applyDeviceCalibrationProfileToNative()
+                                    toast("标定 JSON 已保存；下次重建会话生效")
+                                }
+                                .onFailure { toast("保存失败：${it.message}") }
+                        },
+                        onFailure = { toast("标定 JSON 无效：${it.message}") }
+                    )
+            }
+            .show()
+    }
+
+    private fun buildQualitySnapshot(): com.mobilescan3d.diagnostics.ScanQualityReporter.UiSnapshot =
+        com.mobilescan3d.diagnostics.ScanQualityReporter.UiSnapshot(
+            captureSufficiency = lastScanSufficiency,
+            viewpointCoverage = lastViewpointCoveragePercent,
+            surfaceCoverage = if (multiSegmentMergedActive) 0 else lastSurfaceCoveragePercent,
+            surfaceRobust = if (multiSegmentMergedActive) 0 else lastSurfaceRobustPercent,
+            geometryQuality = lastGeometryQualityPercent,
+            textureQuality = lastTextureQualityPercent,
+            angularSpeedDps = scanAngularSpeedDps,
+            latestDistanceMeters = latestScanDistanceMeters,
+            cumulativeMesh = multiSegmentMergedActive,
+            cumulativeSegments = segmentStore.info()?.segmentCount ?: 1
+        )
+
+    /** Round 7: every successful model build gets a silent machine-readable report. */
+    private fun generateQualityReportSilently() {
+        if (!::exportManager.isInitialized || scanning) return
+        val sid = sessionId.ifBlank { "scan" }
+        val snapshot = buildQualitySnapshot()
+        kotlin.concurrent.thread(name = "ScanQualityAuto", isDaemon = true) {
+            runCatching {
+                com.mobilescan3d.diagnostics.ScanQualityReporter.generate(
+                    applicationContext, exportManager, sid, snapshot
+                )
+            }.onSuccess { latestQualityReport = it.json }
+        }
+    }
+
+    private fun showScanQualityReport() {
+        if (!::exportManager.isInitialized) return
+        if (scanning || modelOperationBusy || segmentMergeBusy) {
+            toast("请先停止扫描并等待当前模型操作完成")
+            return
+        }
+        modelOperationBusy = true
+        val sid = sessionId.ifBlank { "scan" }
+        val snapshot = buildQualitySnapshot()
+        kotlin.concurrent.thread(name = "ScanQualityReport", isDaemon = true) {
+            val result = runCatching {
+                com.mobilescan3d.diagnostics.ScanQualityReporter.generate(
+                    applicationContext, exportManager, sid, snapshot
+                )
+            }
+            runOnUiThread {
+                modelOperationBusy = false
+                result.onSuccess { r ->
+                    latestQualityReport = r.json
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("扫描诊断 · ${r.summary}")
+                        .setMessage(
+                            "已生成结构化质量证据：\n${r.json.absolutePath}\n\n" +
+                                "同时生成易读文本：\n${r.text.absolutePath}\n\n" +
+                                "报告会把 VINS、深度标定、融合 epoch、真实表面观测、" +
+                                "Mesh 拓扑和纹理统计放在同一时间点，便于对比不同扫描。"
+                        )
+                        .setPositiveButton("关闭", null)
+                        .show()
+                }.onFailure { toast("质量报告生成失败：${it.message}") }
+            }
+        }
+    }
+
+    private fun saveSegmentBaseAsync(
+        mesh: com.mobilescan3d.export.ExportManager.MeshData,
+        sid: String,
+        count: Int,
+        successMessage: String
+    ) {
+        if (segmentMergeBusy || modelOperationBusy) return
+        segmentMergeBusy = true
+        modelOperationBusy = true
+        kotlin.concurrent.thread(name = "SegmentBaseSave", isDaemon = true) {
+            val ok = segmentStore.save(mesh, sid, count)
+            runOnUiThread {
+                segmentMergeBusy = false
+                modelOperationBusy = false
+                toast(if (ok) successMessage else "保存拼接基准失败")
+            }
+        }
+    }
+
+    private fun showSegmentMergeDialog() {
+        if (!modelViewerActive || segmentMergeBusy || modelOperationBusy) {
+            toast("请先进入稳定的 3D 模型查看状态")
+            return
+        }
+        val current = viewerBaseMesh ?: exportManager.lastMesh
+        if (current == null || current.triangleCount <= 0) {
+            toast("当前没有可拼接的网格")
+            return
+        }
+        val info = segmentStore.info()
+        if (info == null) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("分段扫描 · 建立基准")
+                .setMessage(
+                    "把当前 ${current.triangleCount} 面模型保存为第 1 段。\n\n" +
+                        "之后开始新的扫描会话，在 3D 查看器再次点“分段拼接”，" +
+                        "系统会围绕重力轴搜索初始方向并用 ICP 对齐。"
+                )
+                .setNegativeButton("取消", null)
+                .setPositiveButton("保存为基准") { _, _ ->
+                    saveSegmentBaseAsync(current, sessionId, 1, "已保存第 1 段拼接基准")
+                }
+                .show()
+            return
+        }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("分段拼接 · 已有 ${info.segmentCount} 段")
+            .setMessage(
+                "基准：${info.triangleCount} 面 / ${info.vertexCount} 顶点\n" +
+                    "当前：${current.triangleCount} 面 / ${current.vertexCount} 顶点\n\n" +
+                    "自动拼接会拒绝低重叠或高残差结果，不会为了“看起来连上”而强行合并。"
+            )
+            .setItems(arrayOf(
+                "自动对齐并合并当前段",
+                "手动方向辅助 + ICP…",
+                "用当前模型覆盖拼接基准",
+                "清除拼接基准"
+            )) { _, which ->
+                when (which) {
+                    0 -> mergeCurrentSegmentIntoBase()
+                    1 -> showManualSegmentYawDialog()
+                    2 -> {
+                        multiSegmentMergedActive = false
+                        saveSegmentBaseAsync(current, sessionId, 1, "已用当前模型覆盖基准")
+                    }
+                    3 -> {
+                        segmentStore.clear()
+                        multiSegmentMergedActive = false
+                        toast("已清除分段拼接基准")
+                    }
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun showManualSegmentYawDialog() {
+        val yaws = intArrayOf(0, 45, 90, 135, 180, 225, 270, 315)
+        val labels = yaws.map { "约 ${it}°" }.toTypedArray()
+        android.app.AlertDialog.Builder(this)
+            .setTitle("手动方向辅助")
+            .setMessage(
+                "选择“当前段相对基准”的大致重力轴旋转。这里只提供初值，" +
+                    "随后仍会用完整刚体 ICP 自动优化旋转和平移。"
+            )
+            .setItems(labels) { _, which -> mergeCurrentSegmentIntoBase(yaws[which]) }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun mergeCurrentSegmentIntoBase(preferredYawDeg: Int = -1) {
+        val base = segmentStore.load() ?: run {
+            toast("拼接基准读取失败")
+            return
+        }
+        if (segmentMergeBusy || modelOperationBusy) return
+        segmentMergeBusy = true
+        modelOperationBusy = true
+        tvViewerStats.text = if (preferredYawDeg >= 0) {
+            "ICP 对齐 · 手动方向约 ${preferredYawDeg}°…"
+        } else {
+            "正在做多段 ICP 自动对齐…"
+        }
+        val stats = FloatArray(10)
+        val transform = FloatArray(16)
+        kotlin.concurrent.thread(name = "MultiScanICP", isDaemon = true) {
+            val ok = runCatching {
+                NativeBridge.nativeAlignCurrentMeshToReference(
+                    base.mesh.vertices, base.mesh.vertexCount,
+                    base.mesh.indices, base.mesh.indexCount,
+                    preferredYawDeg,
+                    stats, transform
+                )
+            }.getOrDefault(false)
+            val merged = if (ok) exportManager.refreshCurrentMesh() else null
+            val nextCount = base.info.segmentCount + 1
+            val persisted = if (merged != null) {
+                segmentStore.save(merged, "${base.info.sessionId}+${sessionId}", nextCount)
+            } else false
+            runOnUiThread {
+                segmentMergeBusy = false
+                modelOperationBusy = false
+                if (!ok || merged == null) {
+                    val rmseMm = stats.getOrElse(1) { 0f } * 1000f
+                    val overlap = stats.getOrElse(2) { 0f } * 100f
+                    tvViewerStats.text = "拼接未通过质量门"
+                    android.app.AlertDialog.Builder(this)
+                        .setTitle("自动拼接未通过")
+                        .setMessage(
+                            "重叠率：${"%.1f".format(overlap)}%\n" +
+                                "RMSE：${"%.1f".format(rmseMm)} mm\n\n" +
+                                "建议下一段至少保留 30% 左右的共同表面，并从上一段已扫描区域开始。"
+                        )
+                        .setPositiveButton("知道了", null)
+                        .show()
+                    return@runOnUiThread
+                }
+
+                multiSegmentMergedActive = true
+                viewerBaseMesh = merged
+                viewerSurfaceVertices = null
+                renderer.clearTexturedMesh()
+                renderer.setMesh(merged.vertices, merged.indices)
+                renderer.setViewerBoundaryEdges(null)
+                renderer.setViewerStyle(PointCloudRenderer.VIEWER_STYLE_SOLID)
+                updateViewerModeUi(PointCloudRenderer.VIEWER_STYLE_SOLID)
+                analyzeViewerMesh(merged)
+                glView.requestRender()
+
+                val rmseMm = stats[1] * 1000f
+                val overlap = stats[2] * 100f
+                val yaw = stats[5].toInt()
+                tvViewerStats.text = "$nextCount 段累计 · ${merged.triangleCount} 面 · ICP ${"%.1f".format(rmseMm)}mm"
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("分段拼接完成")
+                    .setMessage(
+                        "累计段数：$nextCount\n" +
+                            "有效重叠：${"%.1f".format(overlap)}%\n" +
+                            "对齐 RMSE：${"%.1f".format(rmseMm)} mm\n" +
+                            "初始重力轴角度假设：${yaw}°\n\n" +
+                            if (persisted) {
+                                "已把结果更新为新的累计基准，可继续扫描下一段。"
+                            } else {
+                                "本次内存合并成功，但累计基准写盘失败；请先导出当前 GLB。"
+                            }
+                    )
+                    .setPositiveButton("关闭", null)
+                    .show()
+            }
+        }
+    }
+
     private fun showSettingsMenu() {
         android.widget.PopupMenu(this, findViewById(R.id.btnSettings)!!).apply {
             menu.add("相机参数")
+            menu.add("设备标定中心")
+            menu.add("扫描质量诊断")
             menu.add("重建档位")
             menu.add("扫描距离与补光")
             setOnMenuItemClickListener { item ->
                 when (item.title.toString()) {
                     "相机参数" -> showCameraParams()
+                    "设备标定中心" -> showCalibrationCenter()
+                    "扫描质量诊断" -> showScanQualityReport()
                     "重建档位" -> showModeDialog()
                     "扫描距离与补光" -> showScanSettings()
                 }

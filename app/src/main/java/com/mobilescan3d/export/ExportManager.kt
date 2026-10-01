@@ -204,6 +204,13 @@ class ExportManager(context: Context) {
         }
     }
 
+    /** Round 8: adopt the mesh currently held by native (e.g. after ICP merge). */
+    fun refreshCurrentMesh(): MeshData? {
+        val mesh = pullMesh()
+        synchronized(meshCacheLock) { lastMesh = mesh }
+        return mesh
+    }
+
     /**
      * Round 6: pull actual TSDF observation strength for the currently built mesh.
      * Values are accumulated TSDF confidence weights, not camera-view estimates.
@@ -258,6 +265,60 @@ class ExportManager(context: Context) {
     }
 
     // ------------------------------------------------------------------ GLB
+
+    /**
+     * Round 8: export the current native mesh WITHOUT rebuilding from the current
+     * TSDF. Required for cumulative multi-session meshes, because rebuilding would
+     * silently throw away already aligned earlier segments.
+     *
+     * Merged sessions currently export vertex-color GLB. Cross-session texture
+     * rebaking needs all source keyframes in one coordinate frame and is deliberately
+     * not faked here.
+     */
+    fun exportCurrentMeshGlbAsync(sessionId: String, onDone: (GlbResult) -> Unit) {
+        val generation = meshGeneration.get()
+        io.execute {
+            val file = File(outputDir, "scan_${sessionId}_merged.glb")
+            val staging = File(outputDir, "scan_${sessionId}_merged.pending.glb")
+            var ok = false
+            var mesh: MeshData? = null
+            var message = ""
+            try {
+                if (generation != meshGeneration.get()) return@execute
+                staging.delete()
+                mesh = pullMesh()
+                ok = mesh != null && mesh!!.triangleCount > 0 &&
+                    NativeBridge.nativeExportGlb(staging.absolutePath)
+                if (generation != meshGeneration.get()) return@execute
+                ok = ok && staging.isFile && staging.length() > 0L && staging.renameTo(file)
+                if (ok) {
+                    synchronized(meshCacheLock) { lastMesh = mesh }
+                    message = "分段拼接 GLB 已导出：${file.absolutePath}"
+                } else {
+                    message = "分段拼接 GLB 导出失败"
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "exportCurrentMeshGlbAsync failed", t)
+                ok = false
+                message = "分段拼接导出异常：${t.message ?: t.javaClass.simpleName}"
+            } finally {
+                staging.delete()
+            }
+            val m = mesh
+            val result = GlbResult(
+                ok = ok,
+                file = file,
+                vertices = m?.vertexCount ?: 0,
+                triangles = m?.triangleCount ?: 0,
+                fileBytes = if (ok && file.isFile) file.length() else 0L,
+                quality = NativeBridge.MESH_QUALITY_HQ,
+                message = message,
+                textured = false,
+                persistenceMessage = "分段模型使用 vertex color；未伪造跨会话纹理重投影"
+            )
+            main.post { if (generation == meshGeneration.get()) onDone(result) }
+        }
+    }
 
     /**
      * 后台构建网格并导出 GLB。回调在主线程。

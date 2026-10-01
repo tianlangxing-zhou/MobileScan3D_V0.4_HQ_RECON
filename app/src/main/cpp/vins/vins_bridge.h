@@ -30,7 +30,10 @@ void vinsInit(
     float accN,
     float accW,
     float gyrN,
-    float gyrW);
+    float gyrW,
+    double initialTd = 0.0,
+    int estimateExtrinsicMode = 0,
+    int estimateTimeOffset = 1);
 
 void vinsInputImu(double t, double ax, double ay, double az, double gx, double gy, double gz);
 

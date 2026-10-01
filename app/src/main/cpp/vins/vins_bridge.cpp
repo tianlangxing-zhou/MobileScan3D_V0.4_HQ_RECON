@@ -193,7 +193,10 @@ void vinsInit(
         float accN,
         float accW,
         float gyrN,
-        float gyrW) {
+        float gyrW,
+        double initialTd,
+        int estimateExtrinsicMode,
+        int estimateTimeOffset) {
     setImageSize((double)h, (double)w);
     g_vinsImageW = (int)w;
     g_vinsImageH = (int)h;
@@ -224,8 +227,12 @@ void vinsInit(
     // 重复初始化（如重开相机/二次扫描）时清掉滑窗与预积分的残留状态，
     // 否则旧内参/旧时刻的滑窗会与新会话混跑。clearState 后必须重新 setParameter。
     g_estimator.clearState();
-    setExtrinsicEstimateMode(0);
-    setTemporalParams(0.0, 1, 0, 0.0);
+    setExtrinsicEstimateMode(std::clamp(estimateExtrinsicMode, 0, 2));
+    setTemporalParams(
+        std::clamp(initialTd, -0.150, 0.150),
+        estimateTimeOffset != 0 ? 1 : 0,
+        0,
+        0.0);
     g_estimator.setParameter();
     g_estimatorTime = -1.0;
     g_lastEstimatorAcc.setZero();

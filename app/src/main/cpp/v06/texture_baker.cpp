@@ -105,6 +105,9 @@ struct LoadedFrame {
     float depthScaleX = 1.0f;
     float depthScaleY = 1.0f;
     float luminanceGain = 1.0f;
+    // Round 7: robust per-channel color normalization (B,G,R). Luminance and
+    // chroma are handled separately so mixed AWB states do not create seams.
+    cv::Vec3f colorGain = cv::Vec3f(1.0f, 1.0f, 1.0f);
 };
 
 Vec3 cameraPosition(const TextureKeyframe& k) {
@@ -208,6 +211,33 @@ float approximateMedianLuma(const cv::Mat& bgr) {
         if (acc >= target) return static_cast<float>(i);
     }
     return 128.0f;
+}
+
+
+cv::Vec3f approximateChannelMedian(const cv::Mat& bgr) {
+    if (bgr.empty()) return cv::Vec3f(128,128,128);
+    std::array<std::array<int,256>,3> hist{};
+    int total = 0;
+    const int stepX = std::max(1, bgr.cols / 128);
+    const int stepY = std::max(1, bgr.rows / 96);
+    for (int y = 0; y < bgr.rows; y += stepY) {
+        const auto* row = bgr.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < bgr.cols; x += stepX) {
+            const cv::Vec3b p = row[x];
+            ++hist[0][p[0]]; ++hist[1][p[1]]; ++hist[2][p[2]];
+            ++total;
+        }
+    }
+    const int target = std::max(1, total / 2);
+    cv::Vec3f out(128,128,128);
+    for (int ch = 0; ch < 3; ++ch) {
+        int acc = 0;
+        for (int i = 0; i < 256; ++i) {
+            acc += hist[ch][i];
+            if (acc >= target) { out[ch] = static_cast<float>(i); break; }
+        }
+    }
+    return out;
 }
 
 void rasterizeDepth(
@@ -566,6 +596,8 @@ bool TextureBaker::bake(
     frames.reserve(selected.size());
     std::vector<float> medians;
     medians.reserve(selected.size());
+    std::vector<cv::Vec3f> channelMedians;
+    channelMedians.reserve(selected.size());
 
     for (const auto& k : selected) {
         cv::Mat img =
@@ -627,6 +659,7 @@ bool TextureBaker::bake(
 
         const float med = approximateMedianLuma(f.bgr);
         medians.push_back(med);
+        channelMedians.push_back(approximateChannelMedian(f.bgr));
 
         rasterizeDepth(
             mesh,
@@ -652,11 +685,34 @@ bool TextureBaker::bake(
         const float target =
             std::max(20.0f, *mid);
 
+        std::array<float,3> channelTarget{128.f,128.f,128.f};
+        if (channelMedians.size() == frames.size()) {
+            for (int ch = 0; ch < 3; ++ch) {
+                std::vector<float> c;
+                c.reserve(channelMedians.size());
+                for (const auto& m : channelMedians) c.push_back(m[ch]);
+                auto cmid = c.begin() + c.size()/2u;
+                std::nth_element(c.begin(), cmid, c.end());
+                channelTarget[ch] = std::max(16.0f, *cmid);
+            }
+        }
+
         for (std::size_t i = 0; i < frames.size(); ++i) {
-            const float med =
-                std::max(8.0f, medians[i]);
+            const float med = std::max(8.0f, medians[i]);
             frames[i].luminanceGain =
-                std::clamp(target / med, 0.70f, 1.35f);
+                std::clamp(target / med, 0.72f, 1.32f);
+            if (i < channelMedians.size()) {
+                cv::Vec3f g(1,1,1);
+                for (int ch = 0; ch < 3; ++ch) {
+                    g[ch] = std::clamp(
+                        channelTarget[ch] / std::max(12.0f, channelMedians[i][ch]),
+                        0.84f, 1.19f);
+                }
+                // Remove overall brightness from per-channel normalization;
+                // luminanceGain already owns exposure. This leaves AWB/chroma only.
+                const float mean = std::max(0.1f, (g[0]+g[1]+g[2]) / 3.0f);
+                frames[i].colorGain = g * (1.0f / mean);
+            }
         }
     }
 
@@ -789,6 +845,10 @@ bool TextureBaker::bake(
 
                 cv::Vec3f sum(0,0,0);
                 float weightSum = 0.0f;
+                cv::Vec3f bestSample(0,0,0);
+                float bestWeight = -1.0f;
+                float minLuma = std::numeric_limits<float>::infinity();
+                float maxLuma = -std::numeric_limits<float>::infinity();
 
                 for (const auto& item : scored) {
                     const LoadedFrame& f =
@@ -821,9 +881,17 @@ bool TextureBaker::bake(
                     // The triangle-level score also captures projected detail.
                     weight *= std::max(0.01f, item.first);
 
-                    cv::Vec3f sample =
-                        bilinearBgr(f.bgr, u, v);
-                    sample *= f.luminanceGain;
+                    cv::Vec3f sample = bilinearBgr(f.bgr, u, v);
+                    for (int ch = 0; ch < 3; ++ch) {
+                        sample[ch] *= f.luminanceGain * f.colorGain[ch];
+                    }
+                    const float lum = 0.114f*sample[0] + 0.587f*sample[1] + 0.299f*sample[2];
+                    minLuma = std::min(minLuma, lum);
+                    maxLuma = std::max(maxLuma, lum);
+                    if (weight > bestWeight) {
+                        bestWeight = weight;
+                        bestSample = sample;
+                    }
 
                     sum += sample * weight;
                     weightSum += weight;
@@ -833,11 +901,17 @@ bool TextureBaker::bake(
                     weightSum > 1e-8f;
 
                 if (haveHqSample) {
-                    sum *= 1.0f / weightSum;
+                    // When supposedly matching views still disagree strongly,
+                    // averaging creates a visible ghost seam. Prefer the strongest
+                    // view instead; otherwise blend normally.
+                    const bool unstableBlend =
+                        std::isfinite(minLuma) && std::isfinite(maxLuma) &&
+                        (maxLuma - minLuma) > 52.0f;
+                    cv::Vec3f resolved = unstableBlend ? bestSample : (sum * (1.0f / weightSum));
                     dst[x] = cv::Vec3b(
-                        cv::saturate_cast<std::uint8_t>(sum[0]),
-                        cv::saturate_cast<std::uint8_t>(sum[1]),
-                        cv::saturate_cast<std::uint8_t>(sum[2]));
+                        cv::saturate_cast<std::uint8_t>(resolved[0]),
+                        cv::saturate_cast<std::uint8_t>(resolved[1]),
+                        cv::saturate_cast<std::uint8_t>(resolved[2]));
                 } else {
                     // Never leave a chart interior black. When no camera sees
                     // this texel reliably, bake the already-fused vertex color.

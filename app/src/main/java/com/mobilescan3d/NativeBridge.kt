@@ -36,6 +36,19 @@ object NativeBridge {
     const val SCAN_UI_STABLE = 6
     const val SCAN_UI_TARGET_ONLY = 7
 
+    /** Round 7 fixed-width VINS/device-calibration health protocol. */
+    const val VINS_HEALTH_SLOTS = 20
+    const val VINS_HEALTH_INITIALIZED = 0
+    const val VINS_HEALTH_VELOCITY = 1
+    const val VINS_HEALTH_ACC_BIAS = 2
+    const val VINS_HEALTH_GYRO_BIAS = 3
+    const val VINS_HEALTH_GRAVITY = 4
+    const val VINS_HEALTH_FEATURES = 5
+    const val VINS_HEALTH_IMU_DT = 6
+    const val VINS_HEALTH_TIME_OFFSET = 7
+    const val VINS_HEALTH_RIC_START = 8
+    const val VINS_HEALTH_TIC_START = 17
+
     /**
      * 14 -> 16：新增 PresenceGate 结论与外观后端状态。
      *
@@ -286,6 +299,13 @@ object NativeBridge {
     const val MESH_STATS_INDEX_BUILDS = 13
     const val MESH_STATS_INDEX_VOXEL_SIZE_UM = 14
 
+    /** Round 7 calibration profile. Applied by the next nativeCreate(). */
+    external fun nativeSetVinsCalibrationProfile(
+        ric: FloatArray, tic: FloatArray, timeOffsetSeconds: Float,
+        estimateExtrinsic: Boolean, estimateTimeOffset: Boolean
+    ): Boolean
+    external fun nativeGetVinsHealth(out: FloatArray): Int
+
     external fun nativeCreate(w:Int,h:Int,fx:Float,fy:Float,cx:Float,cy:Float):Boolean
     external fun nativeDestroy()
     external fun nativeOnImu(t:Long,ax:Float,ay:Float,az:Float,gx:Float,gy:Float,gz:Float)
@@ -503,6 +523,18 @@ object NativeBridge {
 
     /** 拉索引（三角形，每 3 个一组）。返回实际写入的索引数。 */
     external fun nativeGetMeshIndices(out: IntArray, maxIndices: Int): Int
+
+    /**
+     * Round 8: align the current native mesh to a persisted reference segment and
+     * replace the current export mesh with the cumulative merge.
+     * stats[10] = ok, rmse, overlap, inliers, iterations, yawDeg, refV, movV, outV, outTri.
+     */
+    external fun nativeAlignCurrentMeshToReference(
+        referenceVertices: FloatArray, referenceVertexCount: Int,
+        referenceIndices: IntArray, referenceIndexCount: Int,
+        preferredYawDeg: Int,
+        outStats: FloatArray, outTransform: FloatArray
+    ): Boolean
 
     /** Round 6: actual TSDF observation strength for final mesh vertices. */
     external fun nativeGetMeshObservationWeights(out: FloatArray, maxVertices: Int): Int

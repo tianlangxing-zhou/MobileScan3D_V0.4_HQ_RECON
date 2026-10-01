@@ -1233,6 +1233,35 @@
                     android:textStyle="bold" />
             </LinearLayout>
 
+            <LinearLayout
+                android:id="@+id/btnViewerReport"
+                android:layout_width="match_parent"
+                android:layout_height="62dp"
+                android:layout_marginBottom="2dp"
+                android:background="@drawable/bg_tool_item"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <ImageView
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:contentDescription="扫描诊断"
+                    android:src="@drawable/ic_pointcloud" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:includeFontPadding="false"
+                    android:text="诊断"
+                    android:textColor="@color/scan_text_primary"
+                    android:textSize="9.5sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
             <include
                 android:id="@+id/toolPlacement"
                 layout="@layout/item_scan_tool_placement" />
@@ -1240,6 +1269,35 @@
             <include
                 android:id="@+id/toolRestoreAr"
                 layout="@layout/item_scan_tool_restore" />
+
+            <LinearLayout
+                android:id="@+id/btnViewerSegment"
+                android:layout_width="match_parent"
+                android:layout_height="62dp"
+                android:layout_marginBottom="2dp"
+                android:background="@drawable/bg_tool_active"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <ImageView
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:contentDescription="分段拼接"
+                    android:src="@drawable/ic_cube" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:includeFontPadding="false"
+                    android:text="分段拼接"
+                    android:textColor="@color/scan_primary"
+                    android:textSize="8.8sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
 
             <LinearLayout
                 android:id="@+id/btnViewerExport"
