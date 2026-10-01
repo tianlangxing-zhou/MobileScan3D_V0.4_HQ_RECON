@@ -34,7 +34,7 @@ struct Surfel {
     uint8_t state;
     float nx=0, ny=0, nz=0;
     uint32_t lastFrame=0, protectedUntil=0;
-    bool detail=true, coarse=false;
+    bool detail=true, coarse=false, colorBoundary=false;
 };
 
 class SurfelEngine {

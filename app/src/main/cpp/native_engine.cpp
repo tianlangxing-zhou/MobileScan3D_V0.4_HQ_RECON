@@ -30,6 +30,8 @@
 #include "target_mask_engine.h"
 #include "depth_calib.h"
 #include "depth_confidence.h"
+#include "color_contours.h"
+#include "fusion_guard.h"
 #include "depth_geometry.h"
 #include "scan_policy.h"
 #include "stereo_anchor_bridge.h"
@@ -264,6 +266,9 @@ static float rawDepthSampleMedian(const float* d, int w, int h) {
 
 // 时序一致性：上一帧深度按相对位姿重投影到当前帧，比较逐像素一致性，
 // 不一致就压低这一帧的融合权重（消「毛刺 / 浮点 / 重影」）。
+static FusionGuard fusionGuard;
+static ColorContours colorContours;
+static uint64_t lastConsumedDepthTs=0, duplicateDepthRejects=0;
 static std::vector<float> lastFusedDepth;
 static float lastFuseR[9] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f};
 static float lastFuseT[3] = {0.f, 0.f, 0.f};
@@ -654,7 +659,7 @@ static constexpr float kObjMin = 0.30f;             // 远离物体点最低保�
  */
 static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& s,
                              float confidence, bool haveObj, float objCx, float objCy,
-                             const float* pixelWeight = nullptr) {
+                             const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
         return;
     }
@@ -663,9 +668,11 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
     g.beginFrame();
     const float diag = std::sqrt(static_cast<float>(w * w + h * h));
+    for(int pass=0;pass<(contourPriority?2:1);++pass)
     for (int y = 0; y < h; ++y) {
         const int yy = std::min(s.h - 1, y * s.h / h);
         for (int x = 0; x < w; ++x) {
+            if(contourPriority && bool(contourPriority[size_t(y)*w+x])!=(pass==0))continue;
             const int xx = std::min(s.w - 1, x * s.w / w);
             float z = depth[(size_t)y * w + x];
             if (!(z > 0.08f && z < 8.f)) {
@@ -705,7 +712,10 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
             float Xw, Yw, Zw;
             rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
             size_t o = ((size_t)yy * s.w + xx) * 3;
-            const auto geometry = adaptive::geometry(depth,w,h,x,y,dFx,dFy,dCx,dCy,s.R);
+            auto geometry = adaptive::geometry(depth,w,h,x,y,dFx,dFy,dCx,dCy,s.R);
+            if(contourPriority && contourPriority[size_t(y)*w+x]) {
+                geometry.protectedDetail=true;geometry.colorBoundary=true;
+            }
             g.ingestAdaptivePoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2], c, geometry, x, y);
         }
     }
@@ -722,7 +732,7 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
  * @param pixelWeight 可选逐像素可信度（长度 w*h，[0,1]），nullptr 表示整帧同权。
  */
 static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence,
-                      const float* pixelWeight = nullptr) {
+                      const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
         return;
     }
@@ -732,7 +742,7 @@ static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, floa
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
                         dFx, dFy, dCx, dCy, s.R, s.t, confidence,
-                        1.f, 0.f, pixelWeight, true);
+                        1.f, 0.f, pixelWeight, true, contourPriority);
     // 注意：场景 surfel（g）的喂入已**解耦**到 feedSceneSurfels()，
     // 与 TSDF 共用融合门控；暂停时保留已有几何，不再喂不可信观测。
 }
@@ -1049,6 +1059,8 @@ static void resetDepthCalibration() {
     lastFusionDepthMean = 0.f;
     lastFusionDepthValid = 0;
     lastFusionDepthConversionFallback = 0;
+    fusionGuard.reset(); colorContours.reset();
+    lastConsumedDepthTs=duplicateDepthRejects=0;
     lastFusedDepth.clear();
     haveLastFusePose = false;
     lastFuseCalibrated = false;
@@ -1153,7 +1165,7 @@ static float currentTargetDepthScale() {
  */
 static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s,
                             const cv::Mat& maskIn, float confidence,
-                            const float* pixelWeight = nullptr) {
+                            const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || maskIn.empty()) {
         return;
     }
@@ -1190,13 +1202,15 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
     filterScanRange(masked, w, h, dFx, dFy, dCx, dCy);
     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
                               dFx, dFy, dCx, dCy, s.R, s.t, confidence,
-                              1.f, 0.f, pixelWeight, true);
+                              1.f, 0.f, pixelWeight, true, contourPriority);
 
     targetG.beginFrame();
+    for(int pass=0;pass<(contourPriority?2:1);++pass)
     for (int y = 0; y < h; ++y) {
         const int yy = std::min(s.h - 1, y * s.h / h);
         const uint8_t* mRow = mask.ptr<uint8_t>(y);
         for (int x = 0; x < w; ++x) {
+            if(contourPriority && bool(contourPriority[size_t(y)*w+x])!=(pass==0))continue;
             const int xx = std::min(s.w - 1, x * s.w / w);
             if (!mRow[x]) {
                 continue;
@@ -1218,7 +1232,10 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
             float Xw, Yw, Zw;
             rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
             const size_t o = (static_cast<size_t>(yy) * s.w + xx) * 3;
-            const auto geometry = adaptive::geometry(masked.data(),w,h,x,y,dFx,dFy,dCx,dCy,s.R);
+            auto geometry = adaptive::geometry(masked.data(),w,h,x,y,dFx,dFy,dCx,dCy,s.R);
+            if(contourPriority && contourPriority[size_t(y)*w+x]) {
+                geometry.protectedDetail=true;geometry.colorBoundary=true;
+            }
             targetG.ingestAdaptivePoint(Xw, Yw, Zw, s.rgb[o], s.rgb[o + 1], s.rgb[o + 2],
                                        confidence * wP, geometry, x, y);
         }
@@ -2064,6 +2081,8 @@ static void nativeOnDepthMapImpl(
     }
 
     if (!match || match->targetGeneration != targetGeneration) return;
+    if(t<=0 || static_cast<uint64_t>(t)<=lastConsumedDepthTs){++duplicateDepthRejects;return;}
+    lastConsumedDepthTs=static_cast<uint64_t>(t);
 
     // V0.9: raw model depth retained briefly for exact-timestamp stereo pairing.
     mobilescan3d::stereo_anchor::onDepthFrame(
@@ -2579,9 +2598,10 @@ static void nativeOnDepthMapImpl(
         const auto temporalK = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
         const bool sameK = temporalK.fx == lastFuseK[0] && temporalK.fy == lastFuseK[1] &&
                            temporalK.cx == lastFuseK[2] && temporalK.cy == lastFuseK[3];
-        if (haveLastFusePose && lastFuseCalibrated == calibratedNow &&
+        const bool metricDepth = epochActive && calibEnabledEff;
+        if (haveLastFusePose && lastFuseCalibrated == metricDepth &&
             lastFusedDepth.size() == (size_t)w * h && lastFuseW == w && lastFuseH == h && sameK &&
-            static_cast<uint64_t>(t) > lastFuseTs && static_cast<uint64_t>(t) - lastFuseTs < 1'500'000'000ULL) {
+            static_cast<uint64_t>(t) > lastFuseTs) {
             // Pc_cur = Rcur^T * Rprev * Pc_prev + Rcur^T * (tprev - tcur)
             float Rrel[9];
             float trel[3];
@@ -2613,7 +2633,7 @@ static void nativeOnDepthMapImpl(
             temporalMaskValid = true;
             lastTemporalRatio = mTested < 16 ? 1.f : float(mAgree)/mTested;
             ++temporalChecks;
-            if (lastTemporalRatio < 0.35f && mTested > w*h/4) {
+            if (lastTemporalRatio < 0.60f && mTested >= std::max(32,w*h/64)) {
                 ++temporalRejects;
                 temporalAccepted = false;
             }
@@ -2670,16 +2690,30 @@ static void nativeOnDepthMapImpl(
             fusionRanged = gRangedFusion.data();
         }
 
+        // Reference checks do not expire after a pause. Only accepted, actually
+        // integrated samples are retained; reject a second shell on return visits.
+        const float guardK[4]={temporalK.fx,temporalK.fy,temporalK.cx,temporalK.cy};
+        bool modelAccepted=true;
+        if(fusionRanged)modelAccepted=fusionGuard.accept(fusionRanged,w,h,guardK,match->R,match->t,
+                                                        static_cast<uint64_t>(t));
+        if(!modelAccepted) {
+            fusionDepth=nullptr;fusionRanged=nullptr;
+        }
+        colorContours.reset();
+        if(fusionRanged)colorContours.build(match->rgb.data(),match->w,match->h,
+                                            fusionRanged,w,h,pixelWeight);
+        const uint8_t* contourPriority=colorContours.priorityPixels ? colorContours.band.data() : nullptr;
+
         if (fusionRanged != nullptr) {
             const auto tFuse = std::chrono::steady_clock::now();
             // 全场景地图
-            fuseDepth(fusionRanged, w, h, *match, conf, pixelWeight);
+            fuseDepth(fusionRanged, w, h, *match, conf, pixelWeight, contourPriority);
 
             // 目标专用模型：**只有 presenceOk、mask 有效、且 mask 时序稳定
             // 才允许融合**。这是「墙/天花板/桌子进不了目标点云」的落地点；
             // V0.13 又加了一道 —— mask 单帧整块跳变的那一帧也不进。
             if (haveTi && presenceOk && maskOk && maskTemporalOk) {
-                fuseTargetDepth(fusionRanged, w, h, *match, targetMaskMat, conf, pixelWeight);
+                fuseTargetDepth(fusionRanged, w, h, *match, targetMaskMat, conf, pixelWeight, contourPriority);
             }
             gPerf[kPerfFuse].push(perfMsSince(tFuse));
             fusionFusedFrames++;
@@ -2692,31 +2726,13 @@ static void nativeOnDepthMapImpl(
             }
         }
 
-        // 点云（场景 surfel g）与 TSDF 融合**解耦**：融合只在 epoch 稳定时写几何，
-        // 但点云显示必须连续——epoch 挂起(漂移/换视角)时用已标定的 zEpoch 持续喂，
-        // 消除 V0.13.19 重新耦合导致的"点云冻结 / 换视角不生成 / 不连续"。
-        // 仅用 zEpoch 喂**可视化点云**；TSDF 融合仍走 fusionDepth 门控，不会在 mesh 堆第二层壳
-        // （V0.13.19 担心的风险只针对融合写入，不针对点云显示层）。
-        const float* surfelDepth = fusionDepth;
-        if (!surfelDepth && epochActive && calibEnabledEff && !zEpoch.empty()) {
-            surfelDepth = zEpoch.data();
-        }
-        if (surfelDepth != nullptr) {
-            // 与融合同源时直接共用上面那份过滤结果；只有走 zEpoch 兜底路径
-            // （epoch 挂起时点云仍要连续）才需要单独过滤一份。
-            const float* surfelRanged = nullptr;
-            if (surfelDepth == fusionDepth && fusionRanged != nullptr) {
-                surfelRanged = fusionRanged;
-            } else {
-                const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
-                gRangedSurfel.assign(surfelDepth, surfelDepth + static_cast<size_t>(w) * h);
-                filterScanRange(gRangedSurfel, w, h, dk.fx, dk.fy, dk.cx, dk.cy);
-                surfelRanged = gRangedSurfel.data();
-            }
-            const auto tSurfel = std::chrono::steady_clock::now();
-            feedSceneSurfels(surfelRanged, w, h, *match, conf,
-                             (haveTi && maskOk), targetMaskStats.centerX, targetMaskStats.centerY,
-                             pixelWeight);
+        // Accumulated preview obeys exactly the same acceptance as the mesh.
+        // The camera-space target debug layer above remains the live-only view.
+        if(fusionRanged) {
+            const auto tSurfel=std::chrono::steady_clock::now();
+            feedSceneSurfels(fusionRanged,w,h,*match,conf,
+                            (haveTi && maskOk),targetMaskStats.centerX,targetMaskStats.centerY,
+                            pixelWeight,contourPriority);
             gPerf[kPerfSurfel].push(perfMsSince(tSurfel));
         }
 
@@ -2728,7 +2744,9 @@ static void nativeOnDepthMapImpl(
                 kStereoAnchorMaxAgeNs,
                 2);
 
+        bool stereoGeometryChanged=false;
         for (const auto& batch : stereoWorldBatches) {
+            if(!temporalAccepted || !modelAccepted)continue;
             int64_t stereoPoseDiffNs = -1;
             const FrameSnap* stereoSnap =
                 findStereoAnchorSnap(
@@ -2750,6 +2768,7 @@ static void nativeOnDepthMapImpl(
                     nullptr,
                     &scenePasses);
 
+            stereoGeometryChanged=stereoGeometryChanged || sceneAccepted>0;
             mobilescan3d::stereo_anchor::noteSceneTsdf(
                 static_cast<int>(batch.anchors.size()),
                 sceneAccepted,
@@ -2794,7 +2813,11 @@ static void nativeOnDepthMapImpl(
 
         // Retain an accepted reference, never an uncalibrated/rejected observation.
         if (fusionDepth != nullptr) {
-            lastFusedDepth.assign(depthForFusion, depthForFusion + (size_t)w * h);
+            lastFusedDepth.assign(fusionRanged, fusionRanged + (size_t)w * h);
+            for(size_t i=0;i<lastFusedDepth.size();++i)
+                if(pixelWeight && pixelWeight[i]<=0)lastFusedDepth[i]=0;
+            fusionGuard.commit(fusionRanged,w,h,guardK,match->R,match->t,
+                               static_cast<uint64_t>(t),pixelWeight);
             for (int i = 0; i < 9; ++i) {
                 lastFuseR[i] = match->R[i];
             }
@@ -2802,15 +2825,14 @@ static void nativeOnDepthMapImpl(
                 lastFuseT[i] = match->t[i];
             }
             haveLastFusePose = true;
-            lastFuseCalibrated = calibratedNow;
+            lastFuseCalibrated = metricDepth;
             lastFuseW = w; lastFuseH = h; lastFuseTs = static_cast<uint64_t>(t);
             lastFuseK[0] = temporalK.fx; lastFuseK[1] = temporalK.fy;
             lastFuseK[2] = temporalK.cx; lastFuseK[3] = temporalK.cy;
         }
 
         // 体素场变了 -> 网格变脏
-        meshDirty = true;
-        meshDirtyMarks++;
+        if(fusionRanged || stereoGeometryChanged){meshDirty = true; ++meshDirtyMarks;}
     }
 
     if (!targetDebugEnabled) {
@@ -3397,6 +3419,11 @@ Java_com_mobilescan3d_NativeBridge_nativeGetStats(JNIEnv* e, jobject) {
       << "Tracking frames: " << vio.frames() << "  features: " << vio.features() << "\n"
       << "VINS: " << (vinsInitialized() ? "nonlinear initialized" : "initializing")
       << "  poseSource: " << (vinsPoseOk ? "camera_at_exposure" : "unavailable") << "\n"
+      << "Fusion guard: refs=" << fusionGuard.references() << " checks=" << fusionGuard.checks
+      << " rejected=" << fusionGuard.rejected << " tested=" << fusionGuard.lastTested
+      << " ratio=" << fusionGuard.lastRatio << " duplicateDepth=" << duplicateDepthRejects << "\n"
+      << "Color contours: linePixels=" << colorContours.contourPixels
+      << " priorityPixels=" << colorContours.priorityPixels << "\n"
       << "World continuity: " << (vinsWorldDiscontinuous() ? "RESET: export then restart scan" : "ok") << "\n"
       << "VINS raw q: (" << vinsQ[0] << ", " << vinsQ[1] << ", " << vinsQ[2] << ", " << vinsQ[3] << ")\n"
       << "VINS raw t: (" << vinsT[0] << ", " << vinsT[1] << ", " << vinsT[2] << ")\n"

@@ -1,0 +1,76 @@
+{
+  "baseline": "MobileScan3D_core_src_vc157_livemeshfix_20261001.zip",
+  "upstream_commit": "23d070f30b2eab51929bd391d5071dfc1cb71bae",
+  "files": [
+    {
+      "path": "README_VC158_CONTOUR_GUARD_ZH.md",
+      "before_sha256": null,
+      "after_sha256": "ad074be198ed2e8a93044380065dd1f92852f9602b1a84a0b9f3f1cb1f8081d4"
+    },
+    {
+      "path": "app/build.gradle.kts",
+      "before_sha256": "0db5506ae468d56d8776a0433fc42f6023f1efdba4a556d5e347bf2ddd30b70a",
+      "after_sha256": "5390a3380d49d33dcb94d63847a9a9b10d21342dc34ca46e4e682586abbd8a2e"
+    },
+    {
+      "path": "app/src/main/cpp/adaptive_sampling.h",
+      "before_sha256": "69bfa66ecfbd367e38ea42b3364cc76f6e880d342420c3dbb223d14110f3f3dc",
+      "after_sha256": "7d98785878d4e33ffb366aa32e4788416880e72dd7ef214f27d863605833aa44"
+    },
+    {
+      "path": "app/src/main/cpp/color_contours.h",
+      "before_sha256": null,
+      "after_sha256": "16cbbc0a9825a7ba3bca3385faaa1bda0cca523718398c592ea5c5e50df577b4"
+    },
+    {
+      "path": "app/src/main/cpp/fusion_guard.h",
+      "before_sha256": null,
+      "after_sha256": "bcb740fe6494defbbad4f11ec0fb4899439fd451de65c265194479eccb134b1b"
+    },
+    {
+      "path": "app/src/main/cpp/native_engine.cpp",
+      "before_sha256": "c7fc066b0bb637968fc10acdaafdf0f7d2df11d31d6ac87ba875e1520af67cff",
+      "after_sha256": "2b0b7bb74eab2782dbb74d02d82fdb8f3e1cd3db216bd4c69ce4ca1c73a19d7b"
+    },
+    {
+      "path": "app/src/main/cpp/surfel_engine.cpp",
+      "before_sha256": "3c0d4474d877aea9b4f1929617b08e768c85c596586b9250908f70bd7b088d8a",
+      "after_sha256": "2b61547d20214de183a6fee7de4dbc80d82cb5a188177bcf7f069f339882bb69"
+    },
+    {
+      "path": "app/src/main/cpp/surfel_engine.h",
+      "before_sha256": "e86d9ed8d4a62733061f750e9b9d80bb375f86cf018bffffa1e57359385954c8",
+      "after_sha256": "8e3c57b1f15879d20b8b9c7919d485a37fd8a261f87120235e02deceefa7bbe5"
+    },
+    {
+      "path": "app/src/main/cpp/tsdf_engine.cpp",
+      "before_sha256": "7c11320f0ea8da134336f143cc6f6fb3022ba9b6524cfaa572b528ef7104473f",
+      "after_sha256": "7c8f533b1d9bbe6d3fdc9ef304acc94c4ec023dcaf0e3db086d55c7d73507adf"
+    },
+    {
+      "path": "app/src/main/cpp/tsdf_engine.h",
+      "before_sha256": "30c3bb539cc2dc592822764daeb2aaa4a3b317a9ca8cb5628c38c078c55b3370",
+      "after_sha256": "345aadadf0400a1ad99882eba30da440f0db6e26e0dbc313c0e47672477dc01e"
+    },
+    {
+      "path": "tools/review_tests/contour_guard_benchmark.cpp",
+      "before_sha256": null,
+      "after_sha256": "ef985c41fec96f6f43d4b5341a6457bf429b94c2b9e84a2dc23dfa64e13e1fbd"
+    },
+    {
+      "path": "tools/review_tests/contour_guard_regression.cpp",
+      "before_sha256": null,
+      "after_sha256": "3e1691080af0eaf325ad9d258c2fe769f6ddb35e61aecd3fff2aaf656cbcb91e"
+    },
+    {
+      "path": "tools/review_tests/run_contour_guard.py",
+      "before_sha256": null,
+      "after_sha256": "af9b4c153365e127a949a4d9cfc075f3284ef1942a66fb6f3e13d9901796dca4"
+    },
+    {
+      "path": "tools/review_tests/verify_vc158_overlay.py",
+      "before_sha256": null,
+      "after_sha256": "2ddbc7ecf69fa0cecf76ce067341fe10adae88bc922c20fdac2ac24a66588ad7"
+    }
+  ]
+}

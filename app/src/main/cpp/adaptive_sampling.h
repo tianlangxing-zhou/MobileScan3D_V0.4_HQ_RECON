@@ -1,6 +1,6 @@
 #pragma once
 // Round 4: conservative geometry classification and bounded world-space history.
-// No RGB edges, confidence inflation, or removal of the final TSDF geometry.
+// Color contours can protect sampling detail; never inflate depth confidence.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -13,6 +13,7 @@ namespace adaptive {
 struct Geometry {
     float nx=0, ny=0, nz=0; // world normal, oriented consistently toward camera +Z
     bool protectedDetail=true;
+    bool colorBoundary=false;
 };
 inline Geometry classify(const float* d, int w, int h, int x, int y,
                          float fx, float fy, const float* R,

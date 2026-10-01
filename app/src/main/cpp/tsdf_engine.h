@@ -121,7 +121,8 @@ public:
                         float fx, float fy, float cx, float cy,
                         const float R[9], const float t[3], float confidence,
                         float depthScale = 1.f, float depthShift = 0.f,
-                        const float* pixelWeight = nullptr, bool adaptiveSampling = false);
+                        const float* pixelWeight = nullptr, bool adaptiveSampling = false,
+                        const uint8_t* contourPriority = nullptr);
 
     const adaptive::Stats& adaptiveStats() const { return adaptive_.stats(); }
     size_t adaptiveCells() const { return adaptive_.cells(); }

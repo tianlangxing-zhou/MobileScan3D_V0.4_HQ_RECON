@@ -23,6 +23,7 @@ import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.PowerManager
 import android.os.HandlerThread
 import android.view.Gravity
 import android.view.Surface
@@ -139,6 +140,23 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     // V0.5：会话世代号。停止/重开扫描时自增，用来丢弃「晚到达」的深度推理
     // 结果 —— 否则上一轮会话的深度会喂进已经被 reset 的 TSDF。
     @Volatile private var depthGeneration = 0L
+
+    /**
+     * vc159 ThermalGuard：系统热状态驱动的**自适应降载**。
+     *
+     * 实拍数据（vc157，OnePlus 15，08:43–09:11）：
+     *  - 相机 30fps + VINS(OpenCV) + GPU 渲染持续满载；
+     *  - 单目深度模型 `depth_model.tflite` **66MB**，XNNPACK **CPU** 推理
+     *    单帧 p50 ≈ 265–386 ms（且随拍摄单调恶化），串行跑 ≈ 常驻占满约一个核；
+     *  - `nativeBuildMesh` 的 `rawTris` 无上限增长到 82 万，构建 5–11 s。
+     *  结果是 20 分钟就把 8 个核顶到 ~100 ℃、GPU 75–79 ℃、电池 47.7 ℃，
+     *  系统落到 **Thermal Status 3(SEVERE)** 并开始降频。
+     *
+     * 本机制**只在设备已经变热时**下调本 App 自己的重活频率（深度推理间隔、
+     * 网格重建间隔），凉下来自动恢复 —— 冷机时不回调、零影响。
+     */
+    @Volatile private var thermalStatus: Int = PowerManager.THERMAL_STATUS_NONE
+    private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
 
     private var captureSize: android.util.Size? = null
     private var previewSize: android.util.Size? = null
@@ -843,6 +861,34 @@ private var lastRelocPollMs = 0L
 
         settingsButton.bringToFront()
         setContentView(root)
+
+        // vc159 ThermalGuard：订阅系统热状态，用于在设备发烫时自动降载。
+        // OnThermalStatusChangedListener / currentThermalStatus 需要 API 29，
+        // 低版本静默跳过（thermalStatus 维持 NONE，等价于「不做任何降载」）。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                if (pm != null) {
+                    thermalStatus = pm.currentThermalStatus
+                    android.util.Log.i(
+                        "ThermalGuard",
+                        "initial thermal status = $thermalStatus " +
+                            "(depthMin=${thermalDepthMinIntervalMs()}ms meshScale=${thermalMeshIntervalScale()})"
+                    )
+                    val listener = PowerManager.OnThermalStatusChangedListener { st ->
+                        thermalStatus = st
+                        android.util.Log.i(
+                            "ThermalGuard",
+                            "thermal status -> $st (depthMin=${thermalDepthMinIntervalMs()}ms)"
+                        )
+                    }
+                    thermalListener = listener
+                    pm.addThermalStatusListener(mainExecutor, listener)
+                }
+            } catch (t: Throwable) {
+                android.util.Log.w("ThermalGuard", "thermal listener unavailable", t)
+            }
+        }
 
         // V0.12: 默认进「实时」图层 —— 半透明网格 + 累计 surfel(hits>=1)
         // + 当前帧 target depth 点。native 的逐帧取点开关必须跟着打开，
@@ -2051,6 +2097,7 @@ private var lastRelocPollMs = 0L
         val sb = StringBuilder()
         sb.appendLine("Scan settings: maxDistanceMeters=$scanMaxDistanceMeters autoFillLight=$autoFillLight torchRequested=$torchRequested torchAvailable=$torchAvailable torchFailed=$torchFailed")
         sb.appendLine("Depth worker: busy=${depthBusy.get()} errors=$depthErrors lastError=$depthLastError lastCompletedElapsedMs=$depthCompletedMs")
+        sb.appendLine("ThermalGuard: thermalStatus=$thermalStatus depthMinIntervalMs=${thermalDepthMinIntervalMs()} meshIntervalScale=${thermalMeshIntervalScale()} liveMeshLastBuildMs=$liveMeshLastBuildMs")
         sb.appendLine("MobileScan3D 配置反馈报告")
         sb.appendLine("时间戳: ${System.currentTimeMillis()}")
         sb.appendLine()
@@ -2492,6 +2539,12 @@ private var lastRelocPollMs = 0L
      */
     private fun scheduleDepth(y: ByteArray, u: ByteArray, v: ByteArray, w: Int, h: Int, rowStride: Int, uRowStride: Int, uPixelStride: Int, t: Long) {
         val handler = depthHandler ?: return
+        // vc159 ThermalGuard：设备发烫时拉开两次深度推理之间的最小间隔，把
+        // 66MB 模型的 CPU 占空比从 ~100% 降到 30~40%。冷机时 minInterval=0，
+        // 完全不影响原有节奏。（这里先于 CAS 判定，避免占用 depthBusy。）
+        val minInterval = thermalDepthMinIntervalMs()
+        if (minInterval > 0L && depthCompletedMs != 0L &&
+            android.os.SystemClock.elapsedRealtime() - depthCompletedMs < minInterval) return
         if (!depthBusy.compareAndSet(false, true)) return
         val generation = depthGeneration
         try {
@@ -3375,8 +3428,11 @@ private var lastRelocPollMs = 0L
         val now = android.os.SystemClock.elapsedRealtime()
         // V0.13.20 自适应退避：上一次构建越慢，下一次间隔越长（5s..30s）。
         // 固定的 5s 节拍在大体素场下会变成「每 5s 冻结相机 ~1s」。
-        val interval = (liveMeshLastBuildMs * 15L)
-            .coerceIn(liveMeshRefreshPeriodMs, liveMeshRefreshPeriodMaxMs)
+        // vc159 ThermalGuard：发烫时再乘一个热状态系数（×1/×2/×4），封顶 60s，
+        // 减少「全核 QEM 满载 + 冻结相机」的次数。
+        val interval = ((liveMeshLastBuildMs * 15L)
+            .coerceIn(liveMeshRefreshPeriodMs, liveMeshRefreshPeriodMaxMs) *
+            thermalMeshIntervalScale()).coerceAtMost(60_000L)
         if (now - lastLiveMeshRefreshMs < interval) return
 
         // 不要按相机帧率去碰 native 状态，只在网格节拍上问一次。
@@ -3694,11 +3750,58 @@ private var lastRelocPollMs = 0L
         return out.absolutePath
     }
 
+    /**
+     * vc159 ThermalGuard：按当前系统热状态给出「两次深度推理之间的最小间隔」。
+     *
+     * 66MB 单目模型在 XNNPACK CPU 上单帧约 265–386ms，连续跑等于常驻占满约一个核。
+     *  - NONE / LIGHT：0ms，不干预（保持原生节奏）；
+     *  - MODERATE：450ms，占空比约 40%；
+     *  - SEVERE 及以上：800ms，占空比约 30%，优先给 SoC 降温。
+     * 深度帧被跳过是安全的：相机会继续送帧，下一帧到达时照常提交。
+     */
+    private fun thermalDepthMinIntervalMs(): Long = when {
+        thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> 800L
+        thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> 450L
+        else -> 0L
+    }
+
+    /**
+     * vc159 ThermalGuard：热状态下把实时网格重建间隔进一步拉长。
+     *
+     * `nativeBuildMesh` 的 rawTris 随 TSDF 覆盖无上限增长（实拍见到 82 万），
+     * 构建本身是全核 QEM 简化、持全局锁 5–11s。发烫时把重建节拍再放宽，
+     * 减少「全核满载 + 冻结相机」的次数。
+     */
+    private fun thermalMeshIntervalScale(): Long = when {
+        thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> 4L
+        thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> 2L
+        else -> 1L
+    }
+
+    /**
+     * 统一的 Toast 出口（vc159 起带限流）。
+     *
+     * 实拍日志里系统侧出现过 **386 次** `Toast already killed. pkg=com.mobilescan3d`，
+     * 说明有调用点在高频路径上反复弹同一句提示，既刷屏又白耗电。这里做两档限流：
+     *  - 相同内容 1.5s 内只弹一次；
+     *  - 任意内容 400ms 内最多弹一次。
+     */
     private fun toast(msg: String) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(toastLock) {
+            if (msg == lastToastMsg && now - lastToastMs < 1_500L) return
+            if (now - lastToastMs < 400L) return
+            lastToastMsg = msg
+            lastToastMs = now
+        }
         runOnUiThread {
             android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
         }
     }
+
+    @Volatile private var lastToastMs = 0L
+    @Volatile private var lastToastMsg = ""
+    private val toastLock = Any()
 
     /**
      * 深度尺度采样：raw 目标深度 ↔ VINS 三角化深度的比例失配。
@@ -4311,6 +4414,17 @@ private var lastRelocPollMs = 0L
         // 权限被拒路径下 startSystem 未执行，sensorManager 可能未初始化，直接访问会崩溃
         if (::sensorManager.isInitialized) {
             sensorManager.unregisterListener(this)
+        }
+        // vc159 ThermalGuard：注销热状态监听。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                thermalListener?.let { l ->
+                    (getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                        ?.removeThermalStatusListener(l)
+                }
+            } catch (_: Throwable) {
+            }
+            thermalListener = null
         }
         synchronized(depthSessionLock) { NativeBridge.nativeDestroy() }
         sessionCreated = false

@@ -165,7 +165,7 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
                                 float fx, float fy, float cx, float cy,
                                 const float R[9], const float t[3], float confidence,
                                 float depthScale, float depthShift,
-                                const float* pixelWeight, bool adaptiveSampling) {
+                                const float* pixelWeight, bool adaptiveSampling, const uint8_t* contourPriority) {
     if (!depth || w < 4 || h < 4 || !R || !t) {
         return;
     }
@@ -199,10 +199,12 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
     int cachedX = 0, cachedY = 0, cachedZ = 0;
     bool haveCachedBlock = false;
 
+    for (int pass=0; pass<(contourPriority?2:1); ++pass)
     for (int y = 0; y < h; y += step) {
         const float* drow = depth + static_cast<size_t>(y) * w;
         const float* wrow = pixelWeight ? pixelWeight + static_cast<size_t>(y) * w : nullptr;
         for (int x = 0; x < w; x += step) {
+            if(contourPriority && bool(contourPriority[size_t(y)*w+x])!=(pass==0))continue;
             const float raw = drow[x];
             if (!std::isfinite(raw) || raw <= 0.f) {
                 continue;
@@ -226,7 +228,8 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
             const float yn = (static_cast<float>(y) - cy) * invFy;
 
             if (adaptiveSampling) {
-                const auto geo = adaptive::geometry(depth,w,h,x,y,fx,fy,cx,cy,R,depthScale,depthShift);
+                auto geo = adaptive::geometry(depth,w,h,x,y,fx,fy,cx,cy,R,depthScale,depthShift);
+                if(contourPriority && contourPriority[size_t(y)*w+x])geo.protectedDetail=true;
                 const float xc=xn*z, yc=yn*z;
                 const float wx=R[0]*xc+R[1]*yc+R[2]*z+t[0];
                 const float wy=R[3]*xc+R[4]*yc+R[5]*z+t[1];

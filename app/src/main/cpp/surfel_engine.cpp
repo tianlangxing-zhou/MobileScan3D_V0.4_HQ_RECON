@@ -98,29 +98,27 @@ size_t SurfelEngine::copyPoints(float* out, size_t maxPoints, int minHits) const
     }
 
     const size_t target = std::min(enabled, maxPoints);
-    size_t phase = enabled - target;
-    size_t written = 0;
-    for (size_t i = 0; i < g_.size() && written < maxPoints; ++i) {
-        const Surfel& a = g_[i];
-        if (a.hits < need) {
-            continue;
+    size_t edges=0;
+    if(enabled>target)for(const auto& a:g_)if(a.hits>=need && a.colorBoundary)++edges;
+    // Reserve up to half the display budget for measured contour points; retain
+    // surface coverage, and redistribute unused capacity to either partition.
+    const size_t edgeTarget=edges ? std::max(std::min(edges,(target+1)/2),
+                                             target-std::min(enabled-edges,target)) : 0;
+    size_t written=0;
+    for(int pass=0;pass<(edges?2:1);++pass) {
+        const bool edgePass=edges && pass==0;
+        const size_t population=edges ? (edgePass?edges:enabled-edges) : enabled;
+        const size_t budget=edges ? (edgePass?edgeTarget:target-edgeTarget) : target;
+        if(!budget)continue;
+        size_t phase=population-budget;
+        for(const auto& a:g_) {
+            if(a.hits<need || (edges && a.colorBoundary!=edgePass))continue;
+            phase+=budget;if(phase<population)continue;phase-=population;
+            float* p=out+written*6;
+            p[0]=a.px;p[1]=a.py;p[2]=a.pz;
+            p[3]=a.r/255.f;p[4]=a.g/255.f;p[5]=a.b/255.f;
+            ++written;
         }
-        // Bresenham-style sampling fills the budget exactly, without a divide
-        // per point or the old near-2x undersampling just above maxPoints.
-        phase += target;
-        const bool take = phase >= enabled;
-        if (take) phase -= enabled;
-        if (!take) {
-            continue;
-        }
-        float* p = out + written * 6;
-        p[0] = a.px;
-        p[1] = a.py;
-        p[2] = a.pz;
-        p[3] = a.r / 255.0f;
-        p[4] = a.g / 255.0f;
-        p[5] = a.b / 255.0f;
-        written++;
     }
     return written;
 }
@@ -249,6 +247,8 @@ void SurfelEngine::ingestAdaptivePoint(float x,float y,float z,uint8_t r,uint8_t
     Surfel& a=g_[it->second];
     const float dot=a.nx*geo.nx+a.ny*geo.ny+a.nz*geo.nz;
     if(geo.protectedDetail || confidence<.12f || (!fresh && dot<.996f)) a.protectedUntil=frame_+32;
+    // Interior pixels later in the same frame must not erase an edge vote.
+    a.colorBoundary=geo.colorBoundary || (a.lastFrame==frame_ && a.colorBoundary);
     a.detail=geo.protectedDetail;a.nx=geo.nx;a.ny=geo.ny;a.nz=geo.nz;a.lastFrame=frame_;
 }
 void SurfelEngine::endFrame() {
