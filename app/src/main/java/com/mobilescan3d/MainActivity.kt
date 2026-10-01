@@ -91,6 +91,57 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var tvDrawCount: TextView
     private lateinit var tvUnit: TextView
     private lateinit var hudCompact: TextView
+    private lateinit var pauseButton: android.widget.Button
+    private lateinit var scanReticleView: com.mobilescan3d.ui.ScanReticleView
+    private lateinit var scanProgressView: android.widget.ProgressBar
+    private lateinit var tvScanProgressPercent: TextView
+    private lateinit var tvMotionState: TextView
+    private lateinit var tvDistanceState: TextView
+    private lateinit var tvTrackingState: TextView
+    private lateinit var tvScanStateBadge: TextView
+    private lateinit var mainScanUi: android.view.View
+    private lateinit var viewpointCoverageView: com.mobilescan3d.ui.ViewpointCoverageView
+    private lateinit var scanReviewOverlay: android.view.View
+    private lateinit var reviewContinueButton: android.widget.Button
+    private lateinit var reviewGenerateButton: android.widget.Button
+    private lateinit var reviewDiscardButton: android.widget.Button
+    private lateinit var tvReviewTopHint: TextView
+    private lateinit var tvReviewScore: TextView
+    private lateinit var tvReviewRecommendation: TextView
+    private lateinit var tvReviewMissing: TextView
+    private lateinit var reviewProgressCapture: android.widget.ProgressBar
+    private lateinit var reviewProgressViewpoint: android.widget.ProgressBar
+    private lateinit var reviewProgressGeometry: android.widget.ProgressBar
+    private lateinit var reviewProgressTexture: android.widget.ProgressBar
+    private lateinit var tvReviewCapture: TextView
+    private lateinit var tvReviewViewpoint: TextView
+    private lateinit var tvReviewGeometry: TextView
+    private lateinit var tvReviewTexture: TextView
+
+    // Round 3: scan-review + spatial viewpoint-coverage state.
+    @Volatile private var scanReviewActive = false
+    private var reviewInterrupted = false
+    private val viewpointCoverage = FloatArray(14) // 12 orbit + top + bottom
+    private val coveragePose = FloatArray(NativeBridge.RENDER_POSE_SLOTS)
+    private val coverageAnchorWorld = FloatArray(3)
+    private var coverageAnchorValid = false
+    private var coverageCurrentSector = -1
+    private var coverageCurrentElevationDeg = 0f
+    private var coverageLastSampleMs = 0L
+    private var lastViewpointCoveragePercent = 0
+    private var lastGeometryQualityPercent = 0
+    private var lastTextureQualityPercent = 0
+    private var lastCoverageGuidance = ""
+
+    // Round 2 scanner UX state. These are presentation-layer signals only;
+    // they do not alter reconstruction math or calibration.
+    @Volatile private var scanPaused = false
+    @Volatile private var scanAngularSpeedDps = 0f
+    @Volatile private var latestScanDistanceMeters = 0f
+    @Volatile private var latestScanDistanceMs = 0L
+    @Volatile private var targetMedianDepthMeters = 0f
+    private var lastScanSufficiency = 0
+    private val scanUiMetrics = FloatArray(NativeBridge.SCAN_UI_METRICS_SLOTS)
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -730,6 +781,18 @@ private var lastRelocPollMs = 0L
             gravity = Gravity.CENTER
             visibility = android.view.View.GONE
         }
+        container.addView(
+            targetWarningText,
+            android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            ).apply {
+                topMargin = dp(178)
+                marginStart = dp(18)
+                marginEnd = dp(18)
+            }
+        )
 
         // —— 新 UI（activity_mobile_scan.xml）控件绑定（100% 替换包设计还原）——
         // 包设计把状态拆为结构化单项：tvFps/tvDistance/tvAutoLight/tvCameraMode +
@@ -753,6 +816,32 @@ private var lastRelocPollMs = 0L
         tvDrawCount = findViewById(R.id.tvDrawCount)
         tvUnit = findViewById(R.id.tvUnit)
         hudCompact = findViewById(R.id.hudCompact)
+        pauseButton = findViewById(R.id.btnPauseScan)
+        scanReticleView = findViewById(R.id.scanReticle)
+        scanProgressView = findViewById(R.id.scanProgress)
+        tvScanProgressPercent = findViewById(R.id.tvScanProgressPercent)
+        tvMotionState = findViewById(R.id.tvMotionState)
+        tvDistanceState = findViewById(R.id.tvDistanceState)
+        tvTrackingState = findViewById(R.id.tvTrackingState)
+        tvScanStateBadge = findViewById(R.id.tvScanStateBadge)
+        mainScanUi = findViewById(R.id.mainScanUi)
+        viewpointCoverageView = findViewById(R.id.viewpointCoverage)
+        scanReviewOverlay = findViewById(R.id.scanReviewOverlay)
+        reviewContinueButton = findViewById(R.id.btnReviewContinue)
+        reviewGenerateButton = findViewById(R.id.btnReviewGenerate)
+        reviewDiscardButton = findViewById(R.id.btnReviewDiscard)
+        tvReviewTopHint = findViewById(R.id.tvReviewTopHint)
+        tvReviewScore = findViewById(R.id.tvReviewScore)
+        tvReviewRecommendation = findViewById(R.id.tvReviewRecommendation)
+        tvReviewMissing = findViewById(R.id.tvReviewMissing)
+        reviewProgressCapture = findViewById(R.id.reviewProgressCapture)
+        reviewProgressViewpoint = findViewById(R.id.reviewProgressViewpoint)
+        reviewProgressGeometry = findViewById(R.id.reviewProgressGeometry)
+        reviewProgressTexture = findViewById(R.id.reviewProgressTexture)
+        tvReviewCapture = findViewById(R.id.tvReviewCapture)
+        tvReviewViewpoint = findViewById(R.id.tvReviewViewpoint)
+        tvReviewGeometry = findViewById(R.id.tvReviewGeometry)
+        tvReviewTexture = findViewById(R.id.tvReviewTexture)
         // 参考稿：标题 "MobileScan" 白 + "3D" 主蓝
         val titleTv = findViewById<TextView>(R.id.title)
         val titleStr = titleTv.text.toString()
@@ -766,7 +855,11 @@ private var lastRelocPollMs = 0L
             titleTv.text = sp
         }
 
-        findViewById<android.view.View>(R.id.btnStartScan).setOnClickListener { toggleScan() }
+        findViewById<android.view.View>(R.id.btnStartScan).setOnClickListener { handlePrimaryScanAction() }
+        findViewById<android.view.View>(R.id.btnPauseScan).setOnClickListener { togglePauseScan() }
+        reviewContinueButton.setOnClickListener { resumeFromScanReview() }
+        reviewGenerateButton.setOnClickListener { finalizeFromScanReview() }
+        reviewDiscardButton.setOnClickListener { confirmDiscardScan() }
         findViewById<android.view.View>(R.id.btnExport).setOnClickListener { showExportDrawer() }
         findViewById<android.view.View>(R.id.btnViewModel).setOnClickListener { toggleModelViewer() }
         findViewById<android.view.View>(R.id.btnSettings).setOnClickListener { showSettingsMenu() }
@@ -1819,6 +1912,10 @@ private var lastRelocPollMs = 0L
         targetState = state
         targetConfidence = out.getOrElse(5) { 0f }
         targetTrackedPoints = out.getOrElse(8) { 0f }.toInt()
+        val targetMedian = out.getOrElse(6) { 0f }
+        if (targetMedian.isFinite() && targetMedian > 0f) {
+            targetMedianDepthMeters = targetMedian
+        }
         val visibleFraction =
             out.getOrElse(NativeBridge.TARGET_STATE_INDEX_VISIBLE_FRACTION) { 1f }
         val centerX = out.getOrElse(NativeBridge.TARGET_STATE_INDEX_CENTER_X) { 0.5f }
@@ -2633,7 +2730,60 @@ private var lastRelocPollMs = 0L
     }
 
     private fun toggleScan() {
-        if (scanning) stopScan() else startScan()
+        handlePrimaryScanAction()
+    }
+
+    /**
+     * The primary action means "start" while idle and "finish" while a scan
+     * session exists. Pause/resume is a separate reversible action.
+     */
+    private fun handlePrimaryScanAction() {
+        if (scanning || scanPaused) enterScanReview() else startScan()
+    }
+
+    private fun togglePauseScan() {
+        when {
+            scanning -> pauseScan()
+            scanPaused -> resumeScan()
+        }
+    }
+
+    private fun pauseScan() {
+        if (!scanning || !sessionCreated) return
+        scanning = false
+        scanPaused = true
+        scanNativeReady = false
+
+        // Reject any depth job already in flight. Keep VINS alive through the
+        // AR-view path so the world pose does not freeze while the user pauses.
+        synchronized(depthSessionLock) { depthGeneration++ }
+        arMeshViewing = true
+        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
+        multiCam?.updateScanState(false, sessionId, false)
+
+        pauseButton.text = "继续"
+        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_play_circle, 0, 0, 0)
+        primaryButton.text = "完成扫描"
+        warningBanner.text = "扫描已暂停 · 调整位置后点“继续”，或直接完成本次扫描"
+        warningBanner.visibility = android.view.View.VISIBLE
+        updateHeader()
+    }
+
+    private fun resumeScan() {
+        if (!scanPaused || !sessionCreated || !resumed) return
+        scanPaused = false
+        scanning = true
+        synchronized(depthSessionLock) { depthGeneration++ }
+        depthCompletedMs = android.os.SystemClock.elapsedRealtime()
+        scanNativeReady = true
+        arMeshViewing = false
+        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
+        applyScanArLayer(true)
+
+        pauseButton.text = "暂停"
+        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_pause_circle, 0, 0, 0)
+        primaryButton.text = "完成扫描"
+        updateHeader()
     }
 
     private fun startScan() {
@@ -2647,6 +2797,25 @@ private var lastRelocPollMs = 0L
             return
         }
         scanning = true
+        scanPaused = false
+        lastScanSufficiency = 0
+        latestScanDistanceMeters = 0f
+        latestScanDistanceMs = 0L
+        targetMedianDepthMeters = 0f
+        scanAngularSpeedDps = 0f
+        scanReviewActive = false
+        reviewInterrupted = false
+        viewpointCoverage.fill(0f)
+        coverageAnchorValid = false
+        coverageCurrentSector = -1
+        coverageCurrentElevationDeg = 0f
+        coverageLastSampleMs = 0L
+        lastViewpointCoveragePercent = 0
+        lastGeometryQualityPercent = 0
+        lastTextureQualityPercent = 0
+        lastCoverageGuidance = ""
+        if (::viewpointCoverageView.isInitialized) viewpointCoverageView.clearCoverage()
+        showScanReview(false)
         depthCompletedMs = android.os.SystemClock.elapsedRealtime()
         depthErrors = 0
         depthLastError = ""
@@ -2726,7 +2895,9 @@ private var lastRelocPollMs = 0L
                 runOnUiThread {
                     if (startToken == scanSessionToken) {
                         scanning = false
+                        scanPaused = false
                         primaryButton.text = "开始扫描"
+                        pauseButton.visibility = android.view.View.GONE
                         if (::hqCapture.isInitialized) hqCapture.endScan()
                         toast("重建引擎初始化失败，请重新开始")
                     }
@@ -2768,7 +2939,10 @@ private var lastRelocPollMs = 0L
         liveMeshBuildBusy = false
         liveMeshBlockedNotice = false
         applyScanArLayer(true)
-        primaryButton.text = "停止扫描"
+        primaryButton.text = "完成扫描"
+        pauseButton.visibility = android.view.View.VISIBLE
+        pauseButton.text = "暂停"
+        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_pause_circle, 0, 0, 0)
         updateHeader()
     }
 
@@ -2803,9 +2977,238 @@ private var lastRelocPollMs = 0L
         if (::glView.isInitialized) glView.requestRender()
     }
 
-    private fun stopScan() {
-        val hadReadyScan = scanNativeReady
+    /**
+     * Round 3 review gate.
+     *
+     * "完成扫描" no longer immediately commits/export the session. It freezes
+     * fusion, keeps the native reconstruction in memory, builds a preview mesh,
+     * and lets the user either supplement missing views or commit the model.
+     */
+    private fun enterScanReview() {
+        if (!sessionCreated) {
+            toast("扫描仍在初始化，请稍候再检查")
+            return
+        }
+        if (!(scanning || scanPaused)) return
+
         scanning = false
+        scanPaused = false
+        scanReviewActive = true
+        scanNativeReady = false
+        reviewInterrupted = false
+        synchronized(depthSessionLock) { depthGeneration++ }
+        arMeshViewing = true
+        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
+        multiCam?.updateScanState(false, sessionId, false)
+
+        // Review should show the reconstructed geometry, not the live translucent
+        // accumulation layer. The native session itself remains intact.
+        applyScanArLayer(false)
+        showScanReview(true)
+        updateReviewUi()
+        buildReviewPreviewMesh()
+    }
+
+    private fun resumeFromScanReview() {
+        if (!scanReviewActive || !sessionCreated) return
+        if (reviewInterrupted) {
+            toast("应用曾离开前台，定位连续性已中断；请生成当前模型或放弃本次扫描")
+            return
+        }
+
+        scanReviewActive = false
+        scanning = true
+        scanPaused = false
+        synchronized(depthSessionLock) { depthGeneration++ }
+        depthCompletedMs = android.os.SystemClock.elapsedRealtime()
+        scanNativeReady = resumed
+        arMeshViewing = false
+        showScanReview(false)
+        applyScanArLayer(true)
+        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
+
+        primaryButton.text = "完成扫描"
+        pauseButton.visibility = android.view.View.VISIBLE
+        pauseButton.text = "暂停"
+        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_pause_circle, 0, 0, 0)
+        updateHeader()
+    }
+
+    private fun finalizeFromScanReview() {
+        if (!scanReviewActive || !sessionCreated) return
+        reviewContinueButton.isEnabled = false
+        reviewGenerateButton.isEnabled = false
+        reviewDiscardButton.isEnabled = false
+        tvReviewTopHint.text = "正在生成最终模型…"
+        stopScan()
+    }
+
+    private fun confirmDiscardScan() {
+        if (!scanReviewActive) return
+        android.app.AlertDialog.Builder(this)
+            .setTitle("放弃本次扫描？")
+            .setMessage("当前未生成的扫描数据会被清空。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("放弃") { _, _ -> discardReviewedScan() }
+            .show()
+    }
+
+    private fun discardReviewedScan() {
+        scanSessionToken++
+        scanning = false
+        scanPaused = false
+        scanReviewActive = false
+        scanNativeReady = false
+        arMeshViewing = false
+        sessionCreated = false
+        synchronized(depthSessionLock) { depthGeneration++ }
+        multiCam?.updateScanState(false, sessionId, false)
+        if (::hqCapture.isInitialized) hqCapture.endScan()
+        try {
+            NativeBridge.nativeSetPersistentMapCaptureEnabled(false)
+        } catch (_: Throwable) {
+        }
+        cameraHandler?.post {
+            synchronized(depthSessionLock) {
+                try {
+                    NativeBridge.nativeDestroy()
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        if (::exportManager.isInitialized) exportManager.resetMesh()
+        renderer.clearMesh()
+        renderer.clearTexturedMesh()
+        glView.requestRender()
+        showScanReview(false)
+        lastScanSufficiency = 0
+        lastViewpointCoveragePercent = 0
+        viewpointCoverage.fill(0f)
+        viewpointCoverageView.clearCoverage()
+        primaryButton.text = "开始扫描"
+        pauseButton.visibility = android.view.View.GONE
+        tvScanStateBadge.text = "待扫描"
+        toast("已放弃本次扫描")
+    }
+
+    private fun showScanReview(show: Boolean) {
+        if (!::scanReviewOverlay.isInitialized) return
+        scanReviewOverlay.visibility =
+            if (show) android.view.View.VISIBLE else android.view.View.GONE
+        if (::mainScanUi.isInitialized) {
+            mainScanUi.visibility =
+                if (show) android.view.View.GONE else android.view.View.VISIBLE
+        }
+        if (::scanReticleView.isInitialized) {
+            scanReticleView.visibility =
+                if (show) android.view.View.GONE else android.view.View.VISIBLE
+        }
+        if (::targetOverlay.isInitialized) {
+            targetOverlay.visibility =
+                if (show) android.view.View.GONE else android.view.View.VISIBLE
+        }
+        if (::targetWarningText.isInitialized) {
+            targetWarningText.visibility = android.view.View.GONE
+        }
+        if (show) {
+            reviewContinueButton.isEnabled = !reviewInterrupted
+            reviewGenerateButton.isEnabled = true
+            reviewDiscardButton.isEnabled = true
+        }
+    }
+
+    private fun buildReviewPreviewMesh() {
+        if (!::exportManager.isInitialized) return
+        val token = scanSessionToken
+        tvReviewTopHint.text = "正在生成检查用网格…"
+        try {
+            exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
+                if (isDestroyed || token != scanSessionToken || !scanReviewActive) return@buildMeshAsync
+                if (mesh != null && mesh.triangleCount > 0) {
+                    renderer.clearTexturedMesh()
+                    renderer.setMesh(mesh.vertices, mesh.indices)
+                    arMeshViewing = true
+                    arDrawMode = PointCloudRenderer.DRAW_MESH
+                    renderer.drawMode = arDrawMode
+                    renderer.setMeshAlpha(viewMeshAlpha)
+                    glView.requestRender()
+                    tvReviewTopHint.text = "旋转手机观察模型缺口，再决定补扫或生成"
+                } else {
+                    tvReviewTopHint.text = "网格信息不足，建议继续补扫"
+                }
+                updateReviewUi()
+            }
+        } catch (t: Throwable) {
+            tvReviewTopHint.text = "预览网格生成失败，可继续补扫后重试"
+        }
+    }
+
+    private fun updateReviewUi() {
+        if (!::scanReviewOverlay.isInitialized) return
+        val capture = lastScanSufficiency.coerceIn(0, 100)
+        val viewpoint = lastViewpointCoveragePercent.coerceIn(0, 100)
+        val geometry = lastGeometryQualityPercent.coerceIn(0, 100)
+        val textureQ = lastTextureQualityPercent.coerceIn(0, 100)
+        val overall = (
+            capture * 0.34f +
+                viewpoint * 0.30f +
+                geometry * 0.22f +
+                textureQ * 0.14f
+            ).toInt().coerceIn(0, 100)
+
+        tvReviewScore.text = "$overall"
+        tvReviewScore.setTextColor(
+            getColor(
+                when {
+                    overall >= 80 -> R.color.scan_success
+                    overall >= 58 -> R.color.scan_warning
+                    else -> R.color.scan_danger
+                }
+            )
+        )
+        val recommendation = when {
+            overall >= 80 && viewpoint >= 70 -> "可生成"
+            overall >= 58 -> "建议补扫"
+            else -> "继续扫描"
+        }
+        tvReviewRecommendation.text = recommendation
+        tvReviewRecommendation.setTextColor(
+            getColor(
+                when (recommendation) {
+                    "可生成" -> R.color.scan_success
+                    "建议补扫" -> R.color.scan_warning
+                    else -> R.color.scan_danger
+                }
+            )
+        )
+
+        reviewProgressCapture.progress = capture
+        reviewProgressViewpoint.progress = viewpoint
+        reviewProgressGeometry.progress = geometry
+        reviewProgressTexture.progress = textureQ
+        tvReviewCapture.text = "$capture%"
+        tvReviewViewpoint.text = "$viewpoint%"
+        tvReviewGeometry.text = "$geometry%"
+        tvReviewTexture.text = "$textureQ%"
+        tvReviewMissing.text = reviewMissingViewsText()
+
+        reviewContinueButton.isEnabled = !reviewInterrupted
+        if (reviewInterrupted) {
+            reviewContinueButton.alpha = 0.45f
+            tvReviewMissing.text = tvReviewMissing.text.toString() +
+                "\n定位连续性已中断：不能继续补扫，但可以生成当前模型。"
+        } else {
+            reviewContinueButton.alpha = 1f
+        }
+    }
+
+    private fun stopScan() {
+        val hadReadyScan = scanNativeReady || (scanPaused && sessionCreated) ||
+            (scanReviewActive && sessionCreated)
+        scanning = false
+        scanPaused = false
+        scanReviewActive = false
+        showScanReview(false)
         cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
         multiCam?.updateScanState(false, sessionId, false)
         // V0.5：停扫后不再派发深度推理 / TSDF 融合（见 processImage 的
@@ -2829,6 +3232,9 @@ private var lastRelocPollMs = 0L
         // V0.12: 停扫后回到「网格」档（不透明 + 真实顶点色）做几何验收。
         applyScanArLayer(false)
         primaryButton.text = "开始扫描"
+        pauseButton.visibility = android.view.View.GONE
+        pauseButton.text = "暂停"
+        pauseButton.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_pause_circle, 0, 0, 0)
         if (!hadReadyScan) {
             toast("扫描尚未就绪，本次未导出模型")
             return
@@ -3065,7 +3471,7 @@ private var lastRelocPollMs = 0L
         val v = if (visible) android.view.View.VISIBLE else android.view.View.GONE
         listOf(
             R.id.statusCard, R.id.toolRail, R.id.scanReticle, R.id.tvZoom,
-            R.id.hudCard, R.id.btnExport, R.id.btnStartScan
+            R.id.hudCard, R.id.viewpointCoverage, R.id.btnExport, R.id.btnStartScan
         ).forEach { findViewById<android.view.View>(it).visibility = v }
     }
 
@@ -4055,7 +4461,16 @@ private var lastRelocPollMs = 0L
         }
         // V0.13.31：替换包状态卡拆解写入（100% 设计还原，结构化单项）
         tvFps.text = "%.1f".format(fps)
-        tvDistance.text = "≤%.1fm".format(scanMaxDistanceMeters)
+        val uiNow = android.os.SystemClock.elapsedRealtime()
+        val freshDistance = if (latestScanDistanceMs > 0L &&
+            uiNow - latestScanDistanceMs < 2_500L &&
+            latestScanDistanceMeters.isFinite() &&
+            latestScanDistanceMeters > 0f) latestScanDistanceMeters else 0f
+        tvDistance.text = if ((scanning || scanPaused) && freshDistance > 0f) {
+            "%.2fm".format(freshDistance)
+        } else {
+            "≤%.1fm".format(scanMaxDistanceMeters)
+        }
         tvAutoLight.text = when {
             torchFailed -> "故障"
             torchRequested || autoFillLight -> "开"
@@ -4070,13 +4485,361 @@ private var lastRelocPollMs = 0L
             (if (renderer.drawnDebug > 0) " +${renderer.drawnDebug}" else "")
         tvUnit.text = metricLabel()
         // 参考稿左下 HUD 卡：图标 + 三行竖排统计
-        hudCompact.text = "地图 $shown\n绘制 ${renderer.drawnAccumulated}" +
+        hudCompact.text = "地图 $shown · 绘制 ${renderer.drawnAccumulated}" +
             (if (renderer.drawnDebug > 0) " +${renderer.drawnDebug}" else "") +
-            "\n" + metricLabel()
-        // 参考稿：未扫描且无动态提示时，框下显示静态引导文案
-        if (!scanning && warningBanner.visibility == android.view.View.GONE) {
+            " · " + metricLabel()
+
+        updateScanExperienceUi(vinsOk)
+
+        // A healthy scan should still tell the user what to do next. Warnings
+        // stay higher priority; native keyframe guidance fills the quiet state.
+        if (scanPaused) {
+            warningBanner.text = "扫描已暂停 · 调整位置后点“继续”，或直接完成本次扫描"
+            warningBanner.visibility = android.view.View.VISIBLE
+        } else if (scanning && warningBanner.visibility == android.view.View.GONE) {
+            val nativeGuidance = runCatching { NativeBridge.nativeGetGuidance() }.getOrDefault("")
+            val guidance = when {
+                nativeGuidance.contains("模糊") ||
+                    nativeGuidance.contains("曝光") ||
+                    nativeGuidance.contains("放慢") ||
+                    nativeGuidance.contains("跟踪") -> nativeGuidance
+                lastCoverageGuidance.isNotBlank() -> lastCoverageGuidance
+                else -> nativeGuidance
+            }
+            if (guidance.isNotBlank()) {
+                warningBanner.text = guidance
+                warningBanner.visibility = android.view.View.VISIBLE
+            }
+        } else if (!scanning && !scanPaused && warningBanner.visibility == android.view.View.GONE) {
             warningBanner.text = getString(R.string.scan_hint)
             warningBanner.visibility = android.view.View.VISIBLE
+        }
+        updateScanHintAppearance(vinsOk)
+    }
+
+    /**
+     * "采集充分度" is a monotonic capture-quality proxy, not a claim that the
+     * object's geometric surface coverage has been measured exactly.
+     *
+     * It combines accepted viewpoints (keyframes), repeatedly observed geometry
+     * (confirmed/stable points), and current image quality. The signal is used
+     * only for UX guidance and never for reconstruction decisions.
+     */
+    private fun updateScanExperienceUi(vinsOk: Boolean) {
+        val metricCount = runCatching {
+            NativeBridge.nativeGetScanUiMetrics(scanUiMetrics)
+        }.getOrDefault(0)
+
+        if ((scanning || scanPaused) && metricCount == scanUiMetrics.size) {
+            val keyframes = scanUiMetrics[NativeBridge.SCAN_UI_KEYFRAMES].coerceAtLeast(0f)
+            val sharpness = scanUiMetrics[NativeBridge.SCAN_UI_SHARPNESS].coerceIn(0f, 1f)
+            val exposure = scanUiMetrics[NativeBridge.SCAN_UI_EXPOSURE].coerceIn(0f, 1f)
+            val confirmed = scanUiMetrics[NativeBridge.SCAN_UI_CONFIRMED].coerceAtLeast(0f)
+            val stable = scanUiMetrics[NativeBridge.SCAN_UI_STABLE].coerceAtLeast(0f)
+
+            val keyframeScore = ((keyframes - 2f) / 26f).coerceIn(0f, 1f)
+            val pointScore = (
+                kotlin.math.ln(1.0 + confirmed.toDouble()) /
+                    kotlin.math.ln(1.0 + 6000.0)
+                ).toFloat().coerceIn(0f, 1f)
+            val stableRatio = if (confirmed > 0f) (stable / confirmed).coerceIn(0f, 1f) else 0f
+            val imageQuality = (sharpness * 0.58f + exposure * 0.42f).coerceIn(0f, 1f)
+            lastGeometryQualityPercent = (
+                (stableRatio * 0.72f + pointScore * 0.28f) * 100f
+                ).toInt().coerceIn(0, 100)
+            lastTextureQualityPercent = (imageQuality * 100f).toInt().coerceIn(0, 100)
+            updateViewpointCoverage(vinsOk, imageQuality)
+
+            val score = (
+                keyframeScore * 0.52f +
+                    pointScore * 0.28f +
+                    stableRatio * 0.12f +
+                    imageQuality * 0.08f
+                )
+            val percent = (score * 100f).toInt().coerceIn(0, 96)
+            lastScanSufficiency = kotlin.math.max(lastScanSufficiency, percent)
+        }
+
+        if (metricCount != scanUiMetrics.size) {
+            updateViewpointCoverage(vinsOk, 0.55f)
+        }
+
+        scanProgressView.progress = lastScanSufficiency
+        tvScanProgressPercent.text = "$lastScanSufficiency%"
+        tvScanProgressPercent.setTextColor(
+            getColor(if (lastScanSufficiency >= 82) R.color.scan_success else R.color.scan_primary)
+        )
+
+        val guidance = if (scanning) {
+            runCatching { NativeBridge.nativeGetGuidance() }.getOrDefault("")
+        } else ""
+
+        val motionTooFast =
+            scanAngularSpeedDps > 72f ||
+                guidance.contains("放慢") ||
+                guidance.contains("模糊")
+        val motionTooSlow =
+            scanning && guidance.contains("变化太小")
+
+        tvMotionState.text = when {
+            scanPaused -> "移动：已暂停"
+            !scanning -> "移动：待开始"
+            motionTooFast -> "移动：过快 · 请放慢"
+            motionTooSlow -> "移动：视角变化不足"
+            else -> "移动：合适"
+        }
+        tvMotionState.setTextColor(
+            getColor(
+                when {
+                    motionTooFast -> R.color.scan_warning
+                    motionTooSlow -> R.color.scan_warning
+                    scanning -> R.color.scan_success
+                    else -> R.color.scan_text_secondary
+                }
+            )
+        )
+
+        val now = android.os.SystemClock.elapsedRealtime()
+        val distance = when {
+            objectLockEnabled && targetMedianDepthMeters.isFinite() && targetMedianDepthMeters > 0f ->
+                targetMedianDepthMeters
+            latestScanDistanceMs > 0L && now - latestScanDistanceMs < 2_500L ->
+                latestScanDistanceMeters
+            else -> 0f
+        }
+        val distanceTooFar = distance > 0f && distance > scanMaxDistanceMeters
+        val distanceTooNear = distance > 0f && distance < 0.18f
+        tvDistanceState.text = when {
+            scanPaused && distance > 0f -> "距离：%.2fm · 已暂停".format(distance)
+            distanceTooFar -> "距离：%.2fm · 过远".format(distance)
+            distanceTooNear -> "距离：%.2fm · 过近".format(distance)
+            distance > 0f -> "距离：%.2fm · 合适".format(distance)
+            else -> "距离：≤%.1fm · 等待测距".format(scanMaxDistanceMeters)
+        }
+        tvDistanceState.setTextColor(
+            getColor(
+                when {
+                    distanceTooFar || distanceTooNear -> R.color.scan_warning
+                    distance > 0f && (scanning || scanPaused) -> R.color.scan_success
+                    else -> R.color.scan_text_secondary
+                }
+            )
+        )
+
+        val everInit = runCatching { NativeBridge.nativeVinsEverInitialized() }.getOrDefault(false)
+        val trackingWarning = (scanning || scanPaused) && !vinsOk && everInit
+        tvTrackingState.text = when {
+            scanPaused && vinsOk -> "定位：保持"
+            !(scanning || scanPaused) -> "定位：待开始"
+            vinsOk -> "定位：稳定"
+            everInit -> "定位：失锁 · 回到已扫区域"
+            else -> "定位：初始化中"
+        }
+        tvTrackingState.setTextColor(
+            getColor(
+                when {
+                    trackingWarning -> R.color.scan_danger
+                    vinsOk && (scanning || scanPaused) -> R.color.scan_success
+                    else -> R.color.scan_text_secondary
+                }
+            )
+        )
+
+        tvScanStateBadge.text = when {
+            modelOperationBusy -> "模型处理中"
+            scanReviewActive -> "扫描检查"
+            scanPaused -> "已暂停"
+            scanning && !vinsOk -> "定位中"
+            scanning -> "扫描中"
+            lastScanSufficiency > 0 && sessionCreated -> "已完成"
+            else -> "待扫描"
+        }
+        tvScanStateBadge.setTextColor(
+            getColor(
+                when {
+                    scanReviewActive -> R.color.scan_primary
+                    scanPaused -> R.color.scan_text_secondary
+                    scanning && !vinsOk -> R.color.scan_warning
+                    scanning -> R.color.scan_success
+                    lastScanSufficiency > 0 && sessionCreated -> R.color.scan_primary
+                    else -> R.color.scan_text_secondary
+                }
+            )
+        )
+
+        val reticleWarning = trackingWarning || motionTooFast || distanceTooFar || distanceTooNear
+        scanReticleView.setScanUiState(
+            lastScanSufficiency / 100f,
+            scanning,
+            scanPaused,
+            reticleWarning
+        )
+    }
+
+    /**
+     * Builds an approximate orbit heat map from the existing VINS render pose.
+     *
+     * Anchor initialization:
+     *   camera position + camera forward * measured target/range distance.
+     * Once initialized, the anchor stays fixed for this scan so the orbit bins
+     * remain stable even if range estimates fluctuate.
+     *
+     * This is a viewpoint-coverage signal. It does not claim exact surface-area
+     * coverage, which would require per-surface visibility/observation counts.
+     */
+    private fun updateViewpointCoverage(vinsOk: Boolean, sampleQuality: Float) {
+        if (!::viewpointCoverageView.isInitialized) return
+        if (!scanning || !vinsOk) {
+            viewpointCoverageView.setCoverage(
+                viewpointCoverage, coverageCurrentSector, lastViewpointCoveragePercent
+            )
+            return
+        }
+
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (coverageLastSampleMs != 0L && now - coverageLastSampleMs < 450L) return
+        coverageLastSampleMs = now
+
+        val poseOk = try {
+            NativeBridge.nativeGetRenderPose(coveragePose)
+        } catch (_: Throwable) {
+            false
+        }
+        if (!poseOk) return
+
+        val camX = coveragePose[9]
+        val camY = coveragePose[10]
+        val camZ = coveragePose[11]
+        if (!camX.isFinite() || !camY.isFinite() || !camZ.isFinite()) return
+
+        if (!coverageAnchorValid) {
+            val freshRange = if (
+                latestScanDistanceMs > 0L &&
+                now - latestScanDistanceMs < 2_500L &&
+                latestScanDistanceMeters.isFinite() &&
+                latestScanDistanceMeters > 0.12f
+            ) latestScanDistanceMeters else 0f
+            val d = when {
+                objectLockEnabled &&
+                    targetMedianDepthMeters.isFinite() &&
+                    targetMedianDepthMeters > 0.12f -> targetMedianDepthMeters
+                freshRange > 0f -> freshRange
+                else -> (scanMaxDistanceMeters * 0.72f).coerceIn(0.35f, 1.20f)
+            }
+
+            // Renderer pose convention already used by placement code:
+            // forward is the third column of R.
+            val fx = coveragePose[2]
+            val fy = coveragePose[5]
+            val fz = coveragePose[8]
+            coverageAnchorWorld[0] = camX + fx * d
+            coverageAnchorWorld[1] = camY + fy * d
+            coverageAnchorWorld[2] = camZ + fz * d
+            coverageAnchorValid = true
+        }
+
+        val dx = camX - coverageAnchorWorld[0]
+        val dy = camY - coverageAnchorWorld[1]
+        val dz = camZ - coverageAnchorWorld[2]
+        val horizontal = kotlin.math.sqrt(dx * dx + dy * dy)
+        val radius = kotlin.math.sqrt(horizontal * horizontal + dz * dz)
+        if (!radius.isFinite() || radius < 0.12f) return
+
+        var azimuth = kotlin.math.atan2(dy, dx)
+        if (azimuth < 0f) azimuth += (Math.PI * 2.0).toFloat()
+        val sector = (
+            azimuth / ((Math.PI * 2.0 / 12.0).toFloat())
+            ).toInt().coerceIn(0, 11)
+        val elevationDeg = Math.toDegrees(kotlin.math.atan2(dz, horizontal).toDouble()).toFloat()
+        coverageCurrentSector = sector
+        coverageCurrentElevationDeg = elevationDeg
+
+        // Quality-aware accumulation: one weak glance should not turn a sector green.
+        val quality = sampleQuality.coerceIn(0f, 1f)
+        val gain = (0.11f + 0.18f * quality).coerceIn(0.10f, 0.30f)
+        viewpointCoverage[sector] = (viewpointCoverage[sector] + gain).coerceAtMost(1f)
+        if (elevationDeg > 18f) {
+            viewpointCoverage[12] = (viewpointCoverage[12] + gain * 0.86f).coerceAtMost(1f)
+        }
+        if (elevationDeg < -14f) {
+            viewpointCoverage[13] = (viewpointCoverage[13] + gain * 0.86f).coerceAtMost(1f)
+        }
+
+        val sideAverage = viewpointCoverage.sliceArray(0 until 12).average().toFloat()
+        val weighted = sideAverage * 0.82f +
+            viewpointCoverage[12] * 0.10f +
+            viewpointCoverage[13] * 0.08f
+        lastViewpointCoveragePercent =
+            (weighted * 100f).toInt().coerceIn(0, 100)
+        lastCoverageGuidance = computeCoverageGuidance()
+        viewpointCoverageView.setCoverage(
+            viewpointCoverage, coverageCurrentSector, lastViewpointCoveragePercent
+        )
+    }
+
+    private fun computeCoverageGuidance(): String {
+        val sideMissing = (0 until 12).count { viewpointCoverage[it] < 0.38f }
+        val topMissing = viewpointCoverage[12] < 0.34f
+        val bottomMissing = viewpointCoverage[13] < 0.30f
+        return when {
+            lastViewpointCoveragePercent >= 82 ->
+                "视角覆盖已经较完整，可点“完成扫描”检查模型"
+            sideMissing <= 3 && topMissing ->
+                "抬高手机，补扫物体顶部视角"
+            sideMissing <= 2 && bottomMissing ->
+                "降低手机，补扫底部和遮挡边缘"
+            sideMissing > 0 ->
+                "继续环绕物体 · 还有 $sideMissing 个侧面视角不足"
+            topMissing ->
+                "抬高手机，补扫顶部视角"
+            bottomMissing ->
+                "降低手机，补扫底部视角"
+            else ->
+                "覆盖良好，保持稳定完成最后一圈"
+        }
+    }
+
+    private fun reviewMissingViewsText(): String {
+        val sideMissing = (0 until 12).count { viewpointCoverage[it] < 0.38f }
+        val notes = ArrayList<String>()
+        if (sideMissing > 0) notes.add("侧面仍有 $sideMissing 个视角采集不足")
+        if (viewpointCoverage[12] < 0.34f) notes.add("顶部视角不足")
+        if (viewpointCoverage[13] < 0.30f) notes.add("底部/遮挡边缘不足")
+        if (lastGeometryQualityPercent < 55) notes.add("几何重复观测偏少")
+        if (lastTextureQualityPercent < 55) notes.add("纹理画质偏弱")
+        return if (notes.isEmpty()) {
+            "未发现明显的视角短板；仍建议观察预览网格是否存在真实缺口。"
+        } else {
+            notes.joinToString(" · ")
+        }
+    }
+
+    private fun updateScanHintAppearance(vinsOk: Boolean) {
+        val text = warningBanner.text?.toString().orEmpty()
+        val severe =
+            text.contains("失败") ||
+                text.contains("不可用") ||
+                text.contains("失锁") ||
+                text.contains("延迟") ||
+                text.contains("不稳定") ||
+                text.contains("过快")
+        when {
+            scanPaused -> {
+                warningBanner.setBackgroundResource(R.drawable.bg_hint_paused)
+                warningBanner.setTextColor(getColor(R.color.scan_text_primary))
+            }
+            scanning && (!vinsOk || severe) -> {
+                warningBanner.setBackgroundResource(R.drawable.bg_hint_warning)
+                warningBanner.setTextColor(getColor(R.color.scan_warning))
+            }
+            scanning && text.contains("覆盖良好") -> {
+                warningBanner.setBackgroundResource(R.drawable.bg_hint_success)
+                warningBanner.setTextColor(getColor(R.color.scan_success))
+            }
+            else -> {
+                warningBanner.setBackgroundResource(R.drawable.bg_hint)
+                warningBanner.setTextColor(getColor(R.color.scan_text_primary))
+            }
         }
     }
 
@@ -4221,6 +4984,10 @@ private var lastRelocPollMs = 0L
             return
         }
         val now = android.os.SystemClock.elapsedRealtime()
+        if (source > 0 && distance.isFinite() && distance > 0f) {
+            latestScanDistanceMeters = distance
+            latestScanDistanceMs = now
+        }
         val desired = cameraRangePolicy.update(distance, source > 0, now)
         val observation = if (source > 0 && distance.isFinite() && distance > 0f)
             "%.2fm%s".format(distance, if (source == 2) "" else "（估计）") else "等待有效深度"
@@ -4624,6 +5391,12 @@ private var lastRelocPollMs = 0L
                 return
             }
             Sensor.TYPE_GYROSCOPE -> {
+                val omegaDps = kotlin.math.sqrt(
+                    e.values[0] * e.values[0] +
+                        e.values[1] * e.values[1] +
+                        e.values[2] * e.values[2]
+                ) * 57.29578f
+                scanAngularSpeedDps += (omegaDps - scanAngularSpeedDps) * 0.18f
                 remapDeviceToCamera(e.values[0], e.values[1], e.values[2], lastImu, 3)
                 lastGyrNs = e.timestamp
                 hasGyr = true
@@ -4680,8 +5453,13 @@ private var lastRelocPollMs = 0L
 
     override fun onPause() {
         // A closed camera is a discontinuity, not a pause in a continuous VIO scan.
-        // Finalize the current scan so resume cannot silently fuse across the gap.
+        // Finalize an active scan. A review session may remain reviewable, but
+        // supplement scanning is disabled after this discontinuity.
         if (scanning) stopScan()
+        if (scanReviewActive) {
+            reviewInterrupted = true
+            if (::reviewContinueButton.isInitialized) reviewContinueButton.isEnabled = false
+        }
         resumed = false
         if (::sensorManager.isInitialized && imuRegistered) {
             sensorManager.unregisterListener(this)
@@ -4699,6 +5477,10 @@ private var lastRelocPollMs = 0L
         super.onResume()
         resumed = true
         glView.onResume()
+        if (scanReviewActive) {
+            showScanReview(true)
+            updateReviewUi()
+        }
         if (!systemInitialized && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startSystem()
         }
@@ -4752,16 +5534,34 @@ private var lastRelocPollMs = 0L
         /** 手指拖框时的实时选框（view 像素）。null = 不显示（点按也会清掉）。 */
         var dragRect: android.graphics.RectF? = null
 
-        private val paint = android.graphics.Paint().apply {
+        private val density = resources.displayMetrics.density
+        private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
             style = android.graphics.Paint.Style.STROKE
-            strokeWidth = 3f * resources.displayMetrics.density
+            strokeWidth = 2.4f * density
+            strokeCap = android.graphics.Paint.Cap.ROUND
             color = android.graphics.Color.GREEN
         }
 
-        private val dragPaint = android.graphics.Paint().apply {
+        private val shadePaint = android.graphics.Paint().apply {
+            style = android.graphics.Paint.Style.FILL
+            color = android.graphics.Color.argb(88, 0, 4, 10)
+        }
+
+        private val dragPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
             style = android.graphics.Paint.Style.STROKE
-            strokeWidth = 2f * resources.displayMetrics.density
+            strokeWidth = 2f * density
             color = android.graphics.Color.YELLOW
+        }
+
+        private val labelBgPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            style = android.graphics.Paint.Style.FILL
+            color = android.graphics.Color.argb(220, 8, 18, 27)
+        }
+
+        private val labelTextPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            textSize = 11f * resources.displayMetrics.scaledDensity
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
 
         override fun onDraw(canvas: android.graphics.Canvas) {
@@ -4771,30 +5571,21 @@ private var lastRelocPollMs = 0L
             val s = state
             if (s.visible) {
                 paint.color = when {
-                    s.state == NativeBridge.TARGET_STATE_LOST ->
-                        android.graphics.Color.RED
-                    s.state == NativeBridge.TARGET_STATE_REACQUIRING ->
-                        android.graphics.Color.rgb(255, 160, 0)
-                    // V0.12: 与常驻提示的两级阈值对齐（<0.30 红 / <0.65 黄）。
-                    // 框的颜色是最快被余光捕捉到的信号，不能和文字说两套话。
                     s.state == NativeBridge.TARGET_STATE_TRACKING &&
-                        s.visibleFraction < 0.30f ->
-                        android.graphics.Color.RED
+                        (!s.presenceValid || s.visibleFraction < 0.30f) ->
+                        android.graphics.Color.rgb(255, 93, 115)
                     s.state == NativeBridge.TARGET_STATE_TRACKING &&
                         s.visibleFraction < 0.65f ->
-                        android.graphics.Color.YELLOW
+                        android.graphics.Color.rgb(255, 184, 77)
                     s.confidence < 0.5f ->
-                        android.graphics.Color.YELLOW
+                        android.graphics.Color.rgb(255, 184, 77)
+                    s.state == NativeBridge.TARGET_STATE_ARMED ||
+                        s.state == NativeBridge.TARGET_STATE_ACQUIRING ->
+                        android.graphics.Color.rgb(42, 168, 255)
                     else ->
-                        android.graphics.Color.GREEN
+                        android.graphics.Color.rgb(35, 232, 162)
                 }
 
-                // bbox 是**相机归一化**坐标，canvas 是 **view** 坐标系。
-                // 两者之间隔着 sensorOrientation 90° + SurfaceTexture transform
-                // + TextureView center crop，直接 `x0 * width` 是错的。
-                // 这里复用 Renderer 那套已验证的 cameraToView：四个角都映射，
-                // 再取轴对齐包围盒 —— 旋转/翻转/裁剪全部被这套变换吸收，
-                // 画框处不需要知道任何屏幕方向细节。
                 val p0 = cameraNormToView(s.x0, s.y0)
                 val p1 = cameraNormToView(s.x1, s.y0)
                 val p2 = cameraNormToView(s.x1, s.y1)
@@ -4805,10 +5596,46 @@ private var lastRelocPollMs = 0L
                 val right = maxOf(p0.x, p1.x, p2.x, p3.x) * w
                 val top = minOf(p0.y, p1.y, p2.y, p3.y) * h
                 val bottom = maxOf(p0.y, p1.y, p2.y, p3.y) * h
-                // 目标整块出界时 bbox 退化成 0x0，此时不画框，
-                // 由常驻的 targetWarningText 负责提示。
+
                 if (right - left >= 2f && bottom - top >= 2f) {
-                    canvas.drawRect(left, top, right, bottom, paint)
+                    // Target isolation: the subject remains visually clear while
+                    // surrounding clutter is de-emphasized.
+                    canvas.drawRect(0f, 0f, w, top.coerceAtLeast(0f), shadePaint)
+                    canvas.drawRect(0f, bottom.coerceAtMost(h), w, h, shadePaint)
+                    canvas.drawRect(0f, top.coerceAtLeast(0f), left.coerceAtLeast(0f), bottom.coerceAtMost(h), shadePaint)
+                    canvas.drawRect(right.coerceAtMost(w), top.coerceAtLeast(0f), w, bottom.coerceAtMost(h), shadePaint)
+
+                    drawBracket(canvas, left, top, right, bottom, paint)
+
+                    val stateLabel = when (s.state) {
+                        NativeBridge.TARGET_STATE_TRACKING -> "目标锁定"
+                        NativeBridge.TARGET_STATE_ACQUIRING -> "正在识别"
+                        else -> "选择目标"
+                    }
+                    val conf = (s.confidence.coerceIn(0f, 1f) * 100f).toInt()
+                    val depth = if (s.medianDepth.isFinite() && s.medianDepth > 0f)
+                        " · %.2fm".format(s.medianDepth) else ""
+                    val label = if (s.state == NativeBridge.TARGET_STATE_TRACKING)
+                        "$stateLabel · $conf%$depth" else stateLabel
+                    val padX = 8f * density
+                    val padY = 6f * density
+                    val textW = labelTextPaint.measureText(label)
+                    val labelH = labelTextPaint.textSize + padY * 1.4f
+                    val labelLeft = left.coerceIn(6f * density, (w - textW - padX * 2f - 6f * density).coerceAtLeast(6f * density))
+                    val labelTop = (top - labelH - 7f * density).coerceAtLeast(8f * density)
+                    val rect = android.graphics.RectF(
+                        labelLeft, labelTop,
+                        labelLeft + textW + padX * 2f,
+                        labelTop + labelH
+                    )
+                    canvas.drawRoundRect(rect, 9f * density, 9f * density, labelBgPaint)
+                    labelTextPaint.color = paint.color
+                    canvas.drawText(
+                        label,
+                        labelLeft + padX,
+                        labelTop + labelH - padY * 0.75f,
+                        labelTextPaint
+                    )
                 }
             }
 
@@ -4817,6 +5644,26 @@ private var lastRelocPollMs = 0L
                     canvas.drawRect(r, dragPaint)
                 }
             }
+        }
+
+        private fun drawBracket(
+            canvas: android.graphics.Canvas,
+            left: Float,
+            top: Float,
+            right: Float,
+            bottom: Float,
+            p: android.graphics.Paint
+        ) {
+            val maxLen = 28f * density
+            val len = minOf(maxLen, (right - left) * 0.24f, (bottom - top) * 0.24f)
+            canvas.drawLine(left, top, left + len, top, p)
+            canvas.drawLine(left, top, left, top + len, p)
+            canvas.drawLine(right - len, top, right, top, p)
+            canvas.drawLine(right, top, right, top + len, p)
+            canvas.drawLine(left, bottom - len, left, bottom, p)
+            canvas.drawLine(left, bottom, left + len, bottom, p)
+            canvas.drawLine(right, bottom - len, right, bottom, p)
+            canvas.drawLine(right - len, bottom, right, bottom, p)
         }
     }
 }

@@ -175,6 +175,16 @@ static constexpr int kEpochResumeFrames = 6;
 static constexpr float kEpochCatastrophicRatio = 0.75f;
 /** V0.13：极端失效判据 2（必须持续这么多帧才算真的塌了，不是抖动）。 */
 static constexpr int kEpochCatastrophicFrames = 30;
+/**
+ * V0.13.34：灾难暂停的限时自动恢复（10s）。
+ * 实机证据（PLK110 vc172 扫描）：live 标定是场景相关噪声（spanRel 0.35~0.74、
+ * scale 0.0006↔0.0023 乱跳），用它对比冻结映射产生的「漂移」绝大多数是假漂移；
+ * 旧实现的 20% 挂起 / 10% 恢复滞回死区让 susp 一旦置位就再也解不开
+ * （FusionDiag depthFrames=60 fused=2 gated=57）。灾难门保留三重条件
+ * （>75% 且连续 10 帧且无冻结证据），误报率低；即便如此，暂停超过 10s
+ * 仍强制恢复 —— 冻结链路自洽，停写只会得到半截扫描。
+ */
+static constexpr int64_t kEpochCatastrophicMaxSuspendNs = 10'000'000'000LL;
 // V0.13.30：live 标定器 EMA 平滑（漂移检测的鲁棒参考）+ 稳定性门。
 // VC171: only fresh accepted fits update this diagnostic. Recovery also needs
 // current geometric evidence; EMA convergence cannot authorize a scale change.
@@ -216,6 +226,9 @@ static int epochCatastrophicStreak = 0;
 static uint64_t epochSuspendEvents = 0;
 static uint64_t epochCatastrophicRebuilds = 0;
 static uint64_t fusionSuspendedFrames = 0;
+// V0.13.34：灾难暂停的计时锚点与限时恢复计数（见 kEpochCatastrophicMaxSuspendNs）。
+static int64_t epochSuspendedSinceNs = 0;
+static uint64_t epochCatastrophicTimeoutResumes = 0;
 // V0.13.30：epoch 漂移检测用的 live 标定器 EMA（消除单帧噪声误判永久 susp）。
 static float epochLiveEmaScale = 1.f;
 static float epochLiveEmaShift = 0.f;
@@ -276,6 +289,8 @@ static void resetFusionEpoch() {
     epochSuspendEvents = 0;
     epochCatastrophicRebuilds = 0;
     fusionSuspendedFrames = 0;
+    epochSuspendedSinceNs = 0;
+    epochCatastrophicTimeoutResumes = 0;
     epochLiveEmaScale = 1.f;
     epochLiveEmaShift = 0.f;
     epochLiveEmaInvDepth = false;
@@ -555,6 +570,8 @@ static std::deque<RenderPoseSample> renderPoseHistory;
 static constexpr size_t kRenderPoseHistoryMax = 120;
 // Bound exposure mismatch; never substitute a half-second-old view.
 static constexpr int64_t kRenderPoseMaxAgeNs = 80'000'000LL; // 80ms
+// V0.13.34：strict 查询 miss 后「最新样本兜底」的次数（诊断，日志节流回显）。
+static uint64_t renderPoseBoundedFallbacks = 0;
 
 // ------------------------------------------------- 当前帧 target depth 调试层
 /**
@@ -2541,36 +2558,24 @@ static void nativeOnDepthMapImpl(
             epochBadStreak = epochSuspendStreak = epochCatastrophicStreak = 0;
             epochResumeStreak = 0;
         } else if (!calibratedNow || !liveOk) {
-            // V0.13.32：epoch 生效后融合用的是**冻结尺度**（epochCalib.toMetric，
-            // 见下方 epochFusionDepth），根本不依赖 live 标定。因此「本帧没有新拟合」
-            // （calibrationUpdatedThisFrame=false，标定接受率仅 ~10-28%）不该被当作
-            // 「标定失效」去累加 badStreak —— 那会误触发 suspend 且 hasCurrentCalibrationEvidence
-            // 的 frozenGood 分支（需 20 对 + 80% 吻合）在低质量数据下几乎恒 false，
-            // 导致 badStreak 无法清零、susp 永久挂起、点云停止生长（实测 depthFrames=60
-            // fused=1~3 gated=56~118、driftRejects=0）。标定失效只认「标定器不可用 /
-            // live 参考无效」；尺度漂移仍由下方 EMA 漂移监控（kEpochDriftSuspendRatio）把关。
-            // 标定**短暂**不可用：epoch 生效期间**继续用冻结参数融合**（下面是
-            // `if (epochActive)` 生成 epochFusionDepth，仍然有效）。单帧拟合失败
-            // 很常见（纹理弱 / 运动模糊），一失败就停融合会让点云频繁断流，
-            // 比「标定略旧几帧」更影响体验。
+            // V0.13.34：标定失效**只作诊断计数，不再暂停写几何**。
             //
-            // 只有**连续** kEpochCalibLossFrames 帧都拿不到可用标定，才判定这个
-            // epoch 暂时无法证明尺度一致 —— 暂停新增，保留当前模型。
+            // 实机证据（PLK110 vc172 扫描 20:46~20:53）：depthCalibrator.usable()=1
+            // 但 susp=1、badStreak=9~41、driftRejects=0，FusionDiag depthFrames=60
+            // fused=2 gated=57。本分支由 liveOk（对固定 epochRefRaw 求值）触发 ——
+            // live 拟合换工作域后对该 raw 点求不出正值，这是 live 的属性，不是
+            // epoch 的属性。而 epoch 融合深度走 epochCalib 冻结参数（见下方
+            // epochFusionDepth），与 live 标定器的可用性**完全无关**；用 live 状态
+            // 去停冻结链路既无必要，又因恢复滞回（10%~20%）死区永远解不开 ——
+            // 点云停长、旧模型跟着位姿转，用户看到「模型与物体错位/穿帮」。
+            //
+            // 保留 badStreak 计数作为「live 标定失效持续帧数」诊断量
+            // （EpochProbe 回显）；真正的写入门只剩下方灾难级条件。
             ++epochBadStreak;
             epochResumeStreak = 0;
             if (!epochActive) {
                 epochStableStreak = 0;
                 haveEpochPrevZ = false;
-            } else if (epochBadStreak >= kEpochCalibLossFrames) {
-                // V0.13 Sticky：标定连续失效**只暂停新融合，绝不清几何**。
-                // 现有体素场是用这个 epoch 的冻结参数建的，它是自洽的；
-                // 因为「这几帧拟合不出来」就把整棵几何抹掉，等于每几秒
-                // 抹一次屏幕 —— 那正是 V0.12「屏幕上永远只有残片」的成因。
-                if (!epochSuspended) {
-                    epochSuspended = true;
-                    ++epochSuspendEvents;
-                }
-                epochSuspendStreak = epochBadStreak;
             }
         } else if (!epochActive) {
             // 还没开 epoch：要求连续 kEpochStableFrames 帧稳定（相邻帧之间
@@ -2603,9 +2608,12 @@ static void nativeOnDepthMapImpl(
             }
         } else {
             // Monitor the frozen/live mapping disagreement at the SAME raw value.
-            // Sustained disagreement suspends writes, without changing map scale.
-            // V0.13.30：漂移参考改用 EMA 平滑后的 live（见 epochLiveEma*），
-            // 消除单帧拟合噪声导致的假漂移。
+            // V0.13.34：分歧本身**不再暂停写几何**（降级为诊断），只有灾难级
+            // 分歧（>75% 且连续 kEpochDriftSuspendFrames 帧 且稀疏证据不支持冻结）
+            // 才暂停 —— 那是「标定模型翻转 / 真尺度崩坏」的形态，冻结参数自身
+            // 不可信，暂停是合理的。普通的 20%~75% 分歧来自 live 拟合的场景
+            // 相关性（实测 scale 0.0006↔0.0023、z 中位数 0.36~0.53m），冻结
+            // 几何自洽，继续用冻结尺度写不会产生尺度接缝。
             const float zFrozen = epochCalib.toMetric(epochRefRaw, 0.f);
             DepthCalibration emaLive;
             emaLive.scale = epochLiveEmaScale;
@@ -2619,32 +2627,26 @@ static void nativeOnDepthMapImpl(
                 epochLastDriftRel = std::fabs(zLiveAtRef - zFrozen) / zFrozen;
             }
             if (bothOk && epochLastDriftRel > kEpochDriftSuspendRatio) {
+                // 诊断计数：保留原「漂移超标帧数」语义（EpochProbe 回显），
+                // 但不再累加 suspendStreak / 不再置 susp。
                 ++epochDriftRejects;
+            }
+            const bool catastrophic =
+                bothOk && epochLastDriftRel > kEpochCatastrophicRatio && !frozenEvidenceGood;
+            if (catastrophic) {
                 ++epochBadStreak;
                 ++epochSuspendStreak;
                 epochResumeStreak = 0;
-                // V0.13 Sticky：连续 kEpochDriftSuspendFrames 帧漂移超标
-                // -> **暂停新融合**。不清几何、不开新 epoch。
                 if (!epochSuspended && epochSuspendStreak >= kEpochDriftSuspendFrames) {
                     epochSuspended = true;
+                    epochSuspendedSinceNs = static_cast<int64_t>(t);
                     ++epochSuspendEvents;
                 }
-                // Keep extreme disagreement as a bounded diagnostic only.
-                // A different fit is not proof that the old geometry should be erased.
-                if (epochLastDriftRel > kEpochCatastrophicRatio && !frozenEvidenceGood) {
-                    ++epochCatastrophicStreak;
-                } else {
-                    epochCatastrophicStreak = 0;
-                }
-                // Even prolonged fit disagreement cannot justify erasing a scan.
-                // Keep the frozen mapping and geometry; resume only on evidence.
-                epochCatastrophicStreak = std::min(epochCatastrophicStreak, kEpochCatastrophicFrames);
+                // Even prolonged disagreement cannot justify erasing a scan.
+                epochCatastrophicStreak = std::min(epochCatastrophicStreak + 1,
+                                                   kEpochCatastrophicFrames);
             } else if (bothOk && epochLastDriftRel <= kEpochDriftResumeRatio) {
-                // V0.13.32：恢复判据改为「EMA 平滑后的 live 与 frozen 漂移回落到
-                // 恢复门限内」（滞回，低于 suspend 的 20%）。原实现要求
-                // `calibrationUpdatedThisFrame && mappingsAgree(瞬时 live)`：标定接受率
-                // 仅 ~10-28%（实测 acc=2 rej=20），且瞬时 live 噪声大，导致漂移早已
-                // 回落到 1.5% 也永远走不到恢复 → susp 永久挂起 → 点云停止生长。
+                // 漂移回落到恢复门限内：清计数、按 kEpochResumeFrames 解除暂停。
                 // 恢复后 epochCalib 不变，新几何仍用冻结尺度，不会产生尺度接缝。
                 epochBadStreak = 0;
                 epochSuspendStreak = 0;
@@ -2657,7 +2659,22 @@ static void nativeOnDepthMapImpl(
                     }
                 }
             } else {
+                // 10%~20% 恢复带与 20%~75% 分歧带：既往不咎 —— 既不累加也不暂停。
+                // V0.13.32 的死区滞回正是 susp 永久挂起（点云停长）的根因。
+                epochBadStreak = 0;
+                epochSuspendStreak = 0;
                 epochResumeStreak = 0;
+            }
+            // 灾难暂停的限时自动恢复：见 kEpochCatastrophicMaxSuspendNs 注释。
+            // 冻结链路自洽，停写只会得到半截扫描；三重条件的灾难门误报率低，
+            // 但万一它被一个持续 40%+ 的噪声带顶住，10s 后强制恢复。
+            if (epochSuspended && epochSuspendedSinceNs > 0 &&
+                static_cast<int64_t>(t) - epochSuspendedSinceNs >
+                    kEpochCatastrophicMaxSuspendNs) {
+                epochSuspended = false;
+                epochResumeStreak = 0;
+                epochBadStreak = epochSuspendStreak = epochCatastrophicStreak = 0;
+                ++epochCatastrophicTimeoutResumes;
             }
             // Do not change epochCalib while old geometry is retained. A stable
             // new fit alone cannot align already fused points to the new mapping.
@@ -2767,7 +2784,8 @@ static void nativeOnDepthMapImpl(
              "| frozen scale=%.4f shift=%.4f inv=%d refRaw=%.4f refZ=%.4f frozenN=%d frozenConf=%.3f "
              "| live scale=%.4f shift=%.4f conf=%.3f samples=%d inv=%d "
              "| norm A=%.5f B=%.5f reparms=%llu lastScaleRel=%.4f changesWhileEpoch=%llu "
-             "| liveEma scale=%.4f shift=%.4f var=%.6f relVar=%.4f stable=%d reanchors=%llu",
+             "| liveEma scale=%.4f shift=%.4f var=%.6f relVar=%.4f stable=%d reanchors=%llu "
+             "| catTimeoutResumes=%llu (V0.13.34: drift>=20% only counts diagnostics; suspend only on catastrophic)",
              (int)epochActive, (int)epochSuspended,
              (unsigned long long)epochOpens, (unsigned long long)epochIndex,
              (unsigned long long)epochSuspendEvents, (unsigned long long)fusionSuspendedFrames,
@@ -2792,7 +2810,8 @@ static void nativeOnDepthMapImpl(
              (int)(epochLiveEmaInit && (epochLiveEmaScale * epochLiveEmaScale > 1e-12f)
                        ? epochLiveEmaVar / (epochLiveEmaScale * epochLiveEmaScale) < kEpochLiveVarSuspendRel
                        : 0),
-             (unsigned long long)epochReanchors);
+             (unsigned long long)epochReanchors,
+             (unsigned long long)epochCatastrophicTimeoutResumes);
 
         float st[mobilescan3d::stereo_anchor::kStatsSlots];
         mobilescan3d::stereo_anchor::fillStats(st);
@@ -4083,6 +4102,37 @@ Java_com_mobilescan3d_NativeBridge_nativeGetGuidance(JNIEnv* e, jobject) {
     return e->NewStringUTF(kf.guidance().c_str());
 }
 
+
+// Round 2: compact scanner telemetry for the live UI.
+// Keep this protocol intentionally small; nativeGetStats() is a diagnostic report,
+// not something the UI should parse every second.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetScanUiMetrics(
+        JNIEnv* e, jobject, jfloatArray out) {
+    static constexpr int kSlots = 8;
+    if (!out || e->GetArrayLength(out) < kSlots) return 0;
+
+    jfloat values[kSlots] = {};
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        const AiQuality q = ai.q();
+        const bool targetOnly = targetLockEverArmed;
+        const size_t confirmed = targetOnly ? targetG.confirmedCount(2) : g.confirmedCount(2);
+        const size_t stable = targetOnly ? targetG.confirmedCount(3) : g.confirmedCount(3);
+
+        values[0] = static_cast<jfloat>(kf.size());
+        values[1] = static_cast<jfloat>(kf.overlap());
+        values[2] = q.sharpness;
+        values[3] = q.exposure;
+        values[4] = static_cast<jfloat>(vio.features());
+        values[5] = static_cast<jfloat>(confirmed);
+        values[6] = static_cast<jfloat>(stable);
+        values[7] = targetOnly ? 1.0f : 0.0f;
+    }
+    e->SetFloatArrayRegion(out, 0, kSlots, values);
+    return kSlots;
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_mobilescan3d_NativeBridge_nativeGetGaussians(JNIEnv* e, jobject,
                                                       jfloatArray out, jint maxPoints,
@@ -4562,6 +4612,79 @@ Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAt(JNIEnv* env, jobject,
     pose[10] = savedT[1];
     pose[11] = savedT[2];
     env->SetFloatArrayRegion(out, 0, 12, pose);
+    return JNI_TRUE;
+}
+
+/**
+ * V0.13.34：AR 渲染专用「带兜底」位姿查询。
+ *
+ * 严格窗口（80ms 内插值查询）失败、但历史里最新样本足够新（|newest.ts - ts|
+ * ≤ newestAgeNs，传 0 用默认 150ms）时，退回最新样本而不是整帧不画。
+ *
+ * 实机（PLK110 vc172 扫描）：热身后仍有 ~12.6% 帧查不到（ArPoseProbe
+ * latest=12.4%~13%），快速转动时恰恰是这些帧最需要画 —— 整帧不画表现为
+ * 「点云/网格闪烁、不连续」。150ms 内的位姿滞后在常规扫描运动（<60°/s）
+ * 下误差 ≤9°，比「模型消失」更可接受。世界跳变 / 历史为空仍然拒绝
+ * （与 strict 版一致）；strict 命中时与 nativeGetRenderPoseAt 结果完全相同。
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetRenderPoseAtBounded(JNIEnv* env, jobject,
+                                                                jlong timestampNs,
+                                                                jlong newestAgeNs,
+                                                                jfloatArray out) {
+    if (out == nullptr || env->GetArrayLength(out) < 12) {
+        return JNI_FALSE;
+    }
+    if (newestAgeNs <= 0) {
+        newestAgeNs = 150'000'000LL;
+    }
+    float pose[12];
+    bool bounded = false;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        if (vinsWorldDiscontinuous() || renderPoseHistory.empty()) {
+            return JNI_FALSE;
+        }
+        const bool strictHit = timestampNs > 0 && vinsPoseOk &&
+            scan_pose::lookup(renderPoseHistory,
+                              static_cast<uint64_t>(timestampNs),
+                              kRenderPoseMaxAgeNs, pose);
+        if (!strictHit) {
+            // 兜底：不要求 vinsPoseOk（step 门拒绝帧正是最需要兜底的帧），
+            // 只要求最新样本离请求时间戳足够近。
+            const RenderPoseSample& newest = renderPoseHistory.back();
+            int64_t age = static_cast<int64_t>(newest.ts) - timestampNs;
+            if (age < 0) age = -age;
+            if (timestampNs <= 0 || age > newestAgeNs) {
+                return JNI_FALSE;
+            }
+            for (int i = 0; i < 9; ++i) pose[i] = newest.R[i];
+            pose[9] = newest.t[0];
+            pose[10] = newest.t[1];
+            pose[11] = newest.t[2];
+            bounded = true;
+        }
+    }
+    // V0.7 saved-world transform（与 strict 版一致）。
+    float savedR[9];
+    float savedT[3];
+    if (!gPersistentRelocalizer.transformPose(
+            pose, pose + 9, savedR, savedT)) {
+        return JNI_FALSE;
+    }
+    for (int i = 0; i < 9; ++i) pose[i] = savedR[i];
+    pose[9] = savedT[0];
+    pose[10] = savedT[1];
+    pose[11] = savedT[2];
+    env->SetFloatArrayRegion(out, 0, 12, pose);
+    if (bounded) {
+        ++renderPoseBoundedFallbacks;
+        if ((renderPoseBoundedFallbacks % 180) == 1) {
+            LOGI("RenderPoseBounded fallbacks=%llu (strict miss -> newest within %lldms)",
+                 (unsigned long long)renderPoseBoundedFallbacks,
+                 (long long)(newestAgeNs / 1'000'000LL));
+        }
+    }
     return JNI_TRUE;
 }
 

@@ -97,6 +97,8 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
     private var arPoseStatsTotal = 0
     private var arPoseStatsFromTs = 0
     private var arPoseStatsLatest = 0
+    // V0.13.34：strict miss 后走「最新样本兜底」的帧数（150ms 内）。
+    private var arPoseStatsBounded = 0
 
     /** 绘制模式：见 DRAW_* 常量 */
     @Volatile var drawMode = DRAW_LIVE
@@ -447,13 +449,26 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
 
         // Query the pose of this preview exposure. Missing tracking hides the AR
         // overlay but keeps the world model; never draw with a stale latest pose.
+        // V0.13.34：strict miss 时改走「最新样本兜底」（150ms 内）—— 实机
+        // 热身后仍有 ~12.6% 帧 strict miss，整帧不画表现为「点云闪烁/不连续」，
+        // 快速转动时恰恰是这些帧最需要画。兜底仍拒绝世界跳变/空历史。
         val ts = previewTimestampNs
         var ok = false
+        var bounded = false
         if (ts > 0L) {
             ok = try {
                 NativeBridge.nativeGetRenderPoseAt(ts, poseBuf)
             } catch (t: Throwable) {
                 false
+            }
+            if (!ok) {
+                ok = try {
+                    bounded = true
+                    NativeBridge.nativeGetRenderPoseAtBounded(ts, 0L, poseBuf)
+                } catch (t: Throwable) {
+                    false
+                }
+                if (!ok) bounded = false
             }
         }
         poseFromTimestamp = ok
@@ -461,14 +476,18 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         // 若长期 false，说明累计模型/网格用「此刻最新 pose」渲染，手机
         // 一转动模型就会漂 —— 这正是「AR 模型不跟随物体固定」的根因之一。
         arPoseStatsTotal++
+        if (ok && bounded) arPoseStatsBounded++
         if (ok) arPoseStatsFromTs++ else arPoseStatsLatest++
         if (arPoseStatsTotal % 90 == 0) {
-            val pct = 100f * arPoseStatsFromTs / arPoseStatsTotal
+            val pct = 100f * (arPoseStatsFromTs - arPoseStatsBounded) / arPoseStatsTotal
             android.util.Log.i(
                 "ArPoseProbe",
                 String.format(
-                    "fromTs=%.1f%% latest=%.1f%% total=%d",
-                    pct, 100f - pct, arPoseStatsTotal
+                    "fromTs=%.1f%% bounded=%.1f%% latest=%.1f%% total=%d",
+                    pct,
+                    100f * arPoseStatsBounded / arPoseStatsTotal,
+                    100f - pct - 100f * arPoseStatsBounded / arPoseStatsTotal,
+                    arPoseStatsTotal
                 )
             )
         }

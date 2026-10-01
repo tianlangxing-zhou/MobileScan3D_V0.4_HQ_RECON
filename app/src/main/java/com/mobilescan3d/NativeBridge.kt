@@ -20,6 +20,23 @@ object NativeBridge {
      */
     const val DEPTH_DIAGNOSTIC_SLOTS = 7
     /**
+     * Round 2 scanner UI telemetry. This is deliberately a small fixed-width
+     * protocol so the UI never has to parse nativeGetStats().
+     *
+     * 0 keyframes, 1 viewpointNovelty, 2 sharpness, 3 exposure,
+     * 4 trackedFeatures, 5 confirmedPoints, 6 stablePoints, 7 targetOnly.
+     */
+    const val SCAN_UI_METRICS_SLOTS = 8
+    const val SCAN_UI_KEYFRAMES = 0
+    const val SCAN_UI_NOVELTY = 1
+    const val SCAN_UI_SHARPNESS = 2
+    const val SCAN_UI_EXPOSURE = 3
+    const val SCAN_UI_FEATURES = 4
+    const val SCAN_UI_CONFIRMED = 5
+    const val SCAN_UI_STABLE = 6
+    const val SCAN_UI_TARGET_ONLY = 7
+
+    /**
      * 14 -> 16：新增 PresenceGate 结论与外观后端状态。
      *
      *   0  state            1  x0        2  y0        3  x1        4  y1
@@ -281,6 +298,7 @@ object NativeBridge {
     external fun nativeSetMode(m:Int)
     external fun nativeGetStats():String
     external fun nativeGetGuidance():String
+    external fun nativeGetScanUiMetrics(out: FloatArray): Int
     external fun nativeGetGaussians(out: FloatArray, maxPoints: Int, minHits: Int): Int
     external fun nativeGetTargetDepthDebug(out: FloatArray, maxPoints: Int): Int
     external fun nativeSetTargetDebugEnabled(enabled: Boolean)
@@ -323,6 +341,21 @@ object NativeBridge {
      * 一转起来点云就漂。时间戳超出 80ms 会返回 false，调用方应回退。
      */
     external fun nativeGetRenderPoseAt(timestampNs: Long, out: FloatArray): Boolean
+
+    /**
+     * V0.13.34：AR 渲染专用「带兜底」版 [nativeGetRenderPoseAt]。
+     *
+     * strict 80ms 窗口查不到时，若位姿历史里最新样本距请求时间戳
+     * ≤ newestAgeNs（传 0 用默认 150ms），退回最新样本而不是整帧不画。
+     * 实机热身后仍有 ~12.6% 帧 strict miss，快速转动时整帧不画表现为
+     * 「点云/网格闪烁」；150ms 内的滞后误差远小于「模型消失」的观感损失。
+     * 世界跳变 / 历史为空仍返回 false（与 strict 版一致）。
+     */
+    external fun nativeGetRenderPoseAtBounded(
+        timestampNs: Long,
+        newestAgeNs: Long,
+        out: FloatArray
+    ): Boolean
 
     /**
      * V0.13.2：[nativeGetRenderPoseAt] 的关键帧专用宽松版。

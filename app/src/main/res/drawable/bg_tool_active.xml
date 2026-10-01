@@ -1,6 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<shape xmlns:android="http://schemas.android.com/apk/res/android">
-    <solid android:color="@color/scan_tool_active"/>
-    <stroke android:width="1.5dp" android:color="@color/scan_primary"/>
-    <corners android:radius="16dp"/>
-</shape>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true">
+        <shape>
+            <solid android:color="#E1124C78" />
+            <stroke android:width="1.5dp" android:color="@color/scan_cyan" />
+            <corners android:radius="11dp" />
+        </shape>
+    </item>
+    <item>
+        <shape>
+            <gradient
+                android:angle="0"
+                android:startColor="#C60A3150"
+                android:endColor="#D510466E" />
+            <stroke android:width="1.5dp" android:color="@color/scan_primary" />
+            <corners android:radius="11dp" />
+        </shape>
+    </item>
+</selector>

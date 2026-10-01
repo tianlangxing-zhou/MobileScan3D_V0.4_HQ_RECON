@@ -1,36 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="0dp"
-    android:layout_height="wrap_content"
+    android:layout_height="match_parent"
     android:layout_weight="1"
     android:gravity="center"
     android:orientation="vertical">
+
     <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:gravity="center_vertical"
         android:orientation="horizontal">
+
         <ImageView
             android:layout_width="13dp"
             android:layout_height="13dp"
             android:contentDescription="FPS"
             android:src="@drawable/ic_pulse"
-            android:tint="@color/scan_primary"/>
+            android:tint="@color/scan_primary" />
+
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginStart="4dp"
+            android:includeFontPadding="false"
             android:text="FPS"
             android:textColor="@color/scan_text_secondary"
-            android:textSize="12sp"/>
+            android:textSize="10sp" />
     </LinearLayout>
+
     <TextView
         android:id="@+id/tvFps"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_marginTop="3dp"
+        android:layout_marginTop="4dp"
+        android:includeFontPadding="false"
         android:text="29.8"
         android:textColor="@color/scan_text_primary"
-        android:textSize="18sp"
-        android:textStyle="bold"/>
+        android:textSize="16sp"
+        android:textStyle="bold" />
 </LinearLayout>
