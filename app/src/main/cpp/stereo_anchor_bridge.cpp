@@ -40,6 +40,14 @@ struct DepthFrame {
     std::vector<float> depth;
 };
 
+// V0.13.29: one accepted (pred, metric) pair used by updateWorldScale. Kept as
+// a rolling window so sparse stereo anchors (often <1 valid pair per batch) can
+// still accumulate enough samples to pass kScaleMinSamples across frames.
+struct RatioSample {
+    float pred = 0.f;
+    float metric = 0.f;
+};
+
 struct Diagnostics {
     std::uint64_t submittedBatches = 0;
     std::uint64_t submittedAnchors = 0;
@@ -108,6 +116,10 @@ std::deque<AnchorBatch> gGeometry;
 Diagnostics gDiag;
 std::uint64_t gResetSerial = 0;
 
+// V0.13.29: rolling window of recent accepted (pred, metric) pairs; see RatioSample.
+std::deque<RatioSample> gRecentRatios;
+constexpr std::size_t kRatioWindow = 48;
+
 float median(std::vector<float> values) {
     if (values.empty()) return 0.f;
     const std::size_t mid = values.size() / 2;
@@ -166,6 +178,42 @@ void trimQueuesLocked() {
     }
 }
 
+float sampleDepthFinite(const std::vector<float>& depth,
+                         int width,
+                         int height,
+                         int px,
+                         int py) {
+    if (px >= 0 && px < width && py >= 0 && py < height &&
+        std::isfinite(depth[static_cast<std::size_t>(py) * width + px])) {
+        return depth[static_cast<std::size_t>(py) * width + px];
+    }
+    // V0.13.29: dilate to the nearest finite depth within a small radius so that
+    // sparse stereo anchors whose exact pixel the monocular network left
+    // non-finite (holes / edges) can still be paired. Anchors are sparse texture
+    // points; the immediate neighborhood is almost always the same surface, so a
+    // 2px dilation recovers far more usable pairs without crossing surfaces.
+    constexpr int kRadius = 2;
+    float best = std::numeric_limits<float>::quiet_NaN();
+    int bestD2 = (kRadius + 1) * (kRadius + 1);
+    for (int dy = -kRadius; dy <= kRadius; ++dy) {
+        const int yy = py + dy;
+        if (yy < 0 || yy >= height) continue;
+        for (int dx = -kRadius; dx <= kRadius; ++dx) {
+            const int xx = px + dx;
+            if (xx < 0 || xx >= width) continue;
+            const float dv =
+                depth[static_cast<std::size_t>(yy) * width + xx];
+            if (!std::isfinite(dv)) continue;
+            const int d2 = dx * dx + dy * dy;
+            if (d2 < bestD2) {
+                bestD2 = d2;
+                best = dv;
+            }
+        }
+    }
+    return best;
+}
+
 bool buildCalibrationBatchLocked(
         const AnchorBatch& anchors,
         const DepthFrame& depth,
@@ -199,8 +247,8 @@ bool buildCalibrationBatchLocked(
             static_cast<int>(std::lround(a.v * static_cast<float>(depth.height - 1))),
             0,
             depth.height - 1);
-        const float raw = depth.depth[
-            static_cast<std::size_t>(py) * depth.width + px];
+        const float raw = sampleDepthFinite(
+            depth.depth, depth.width, depth.height, px, py);
 
         if (!std::isfinite(raw)) continue;
 
@@ -287,6 +335,7 @@ void reset() {
     gDepthFrames.clear();
     gReadyCalibration.clear();
     gGeometry.clear();
+    gRecentRatios.clear();
     gDiag = Diagnostics{};
     gDiag.resetSerial = ++gResetSerial;
 }
@@ -327,7 +376,18 @@ bool updateWorldScale(
         const CalibrationBatch& batch) {
     std::lock_guard<std::mutex> lock(gMutex);
 
-    if (!current.valid || current.confidence < 0.20f) {
+    // V0.13.29: bootstrap from a *finite, previously-fitted* calibrator model
+    // instead of full `valid`. The monocular calibrator frequently fails the
+    // V0.13.25 health gate in real scans (acc≈28%), yet its scale/shift stay
+    // finite and roughly right. World-scale estimation is itself a robust median
+    // over many frames with its own outlier rejection (medRel / kScaleMaxJumpRatio
+    // / stability frames), so a warming-up calibrator suffices to bootstrap. This
+    // removes the previous deadlock where world scale waited forever for
+    // calibrator `valid` while stereo (the only metric reference) could not help
+    // the calibrator until world scale existed.
+    if (current.samples <= 0 ||
+        !std::isfinite(current.scale) ||
+        !std::isfinite(current.shift)) {
         gDiag.scaleRejectedFrames++;
         gDiag.scaleRejectedNoBaseCalib++;
         gDiag.scaleGoodStreak = 0;
@@ -341,36 +401,49 @@ bool updateWorldScale(
         batch.metricDepth.size(),
         batch.quality.size()});
 
-    std::vector<float> ratios;
-    std::vector<float> denseRel;
-    ratios.reserve(n);
-    denseRel.reserve(n);
-
+    // Collect this batch's accepted (pred, metric) pairs into the rolling window.
+    // pred mirrors DepthCalibration::toMetric but gates on a finite model rather
+    // than `valid`, so a warming-up calibrator can still drive the estimate.
     for (std::size_t i = 0; i < n; ++i) {
         if (batch.quality[i] < 0.35f) continue;
         const float metric = batch.metricDepth[i];
         if (!(metric > 0.12f) || !std::isfinite(metric)) continue;
-
-        const float pred = current.toMetric(batch.rawDepth[i], 0.f);
+        const float raw = batch.rawDepth[i];
+        if (!std::isfinite(raw)) continue;
+        const double v = static_cast<double>(current.scale) * raw +
+                         static_cast<double>(current.shift);
+        const float pred = current.inverseDepthModel
+            ? (v > 1e-6 ? static_cast<float>(1.0 / v) : 0.f)
+            : (v > 1e-4 && std::isfinite(v) ? static_cast<float>(v) : 0.f);
         if (!(pred > 0.05f) || !std::isfinite(pred)) continue;
-
         const float ratio = pred / metric;
         if (!std::isfinite(ratio) || ratio < kScaleMin || ratio > kScaleMax) {
             continue;
         }
-        ratios.push_back(ratio);
+        RatioSample s;
+        s.pred = pred;
+        s.metric = metric;
+        gRecentRatios.push_back(s);
+    }
+    while (gRecentRatios.size() > kRatioWindow) {
+        gRecentRatios.pop_front();
     }
 
-    if (ratios.size() < static_cast<std::size_t>(kScaleMinSamples)) {
+    if (gRecentRatios.size() < static_cast<std::size_t>(kScaleMinSamples)) {
         gDiag.scaleRejectedFrames++;
         gDiag.scaleRejectedFewSamples++;
-        gDiag.lastScaleSamples = static_cast<int>(ratios.size());
+        gDiag.lastScaleSamples = static_cast<int>(gRecentRatios.size());
         gDiag.scaleGoodStreak = 0;
         gDiag.scaleBadStreak++;
         if (gDiag.scaleBadStreak >= 2) gDiag.worldScaleStable = false;
         return false;
     }
 
+    std::vector<float> ratios;
+    ratios.reserve(gRecentRatios.size());
+    for (const RatioSample& s : gRecentRatios) {
+        ratios.push_back(s.pred / s.metric);
+    }
     const float frameScale = median(ratios);
     std::vector<float> rel;
     rel.reserve(ratios.size());
@@ -379,25 +452,20 @@ bool updateWorldScale(
     }
     const float medRel = median(rel);
 
-    // Independent "dense vs stereo after one robust scale" metric.
-    for (std::size_t i = 0; i < n; ++i) {
-        if (batch.quality[i] < 0.35f) continue;
-        const float metric = batch.metricDepth[i];
-        const float pred = current.toMetric(batch.rawDepth[i], 0.f);
-        if (!(metric > 0.12f) || !(pred > 0.05f) ||
-            !std::isfinite(metric) || !std::isfinite(pred)) {
-            continue;
-        }
-        const float target = metric * frameScale;
+    // Independent "dense vs stereo after one robust scale" metric, over the window.
+    std::vector<float> denseRel;
+    denseRel.reserve(gRecentRatios.size());
+    for (const RatioSample& s : gRecentRatios) {
+        const float target = s.metric * frameScale;
         denseRel.push_back(
-            std::fabs(pred - target) / std::max(0.05f, pred));
+            std::fabs(s.pred - target) / std::max(0.05f, s.pred));
     }
     const float denseStereoRel = median(denseRel);
 
     gDiag.lastFrameScale = frameScale;
     gDiag.lastScaleMedianRel = medRel;
     gDiag.lastDenseStereoMedianRel = denseStereoRel;
-    gDiag.lastScaleSamples = static_cast<int>(ratios.size());
+    gDiag.lastScaleSamples = static_cast<int>(gRecentRatios.size());
 
     if (!std::isfinite(frameScale) ||
         frameScale < kScaleMin ||
@@ -436,6 +504,9 @@ bool updateWorldScale(
     }
 
     gDiag.scaleAcceptedFrames++;
+    // V0.13.29: accept advances the GOOD streak and resets the BAD one; once
+    // scaleGoodStreak reaches kScaleStableFrames with medRel/denseStereoRel within
+    // tolerance, worldScaleStable latches true and scanWorldPerMeter leaves 1.0.
     gDiag.scaleBadStreak = 0;
     gDiag.scaleGoodStreak++;
     gDiag.worldScaleStable =

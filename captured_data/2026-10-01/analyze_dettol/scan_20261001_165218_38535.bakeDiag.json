@@ -1,0 +1,32 @@
+{
+  "sessionId": "20261001_165218_38535",
+  "shapeMode": 0,
+  "shapeReport": "",
+  "ts": 1790844789811,
+  "textured": false,
+  "vertices": 57638,
+  "triangles": 99999,
+  "fileBytes": 2815040,
+  "message": "网格已导出（vertex color；纹理烘焙未生效）：\/storage\/emulated\/0\/Android\/data\/com.mobilescan3d\/files\/scan_20261001_165218_38535.glb",
+  "registeredKeyframes": 0,
+  "loadedKeyframes": 0,
+  "usedKeyframes": 0,
+  "atlasW": 0,
+  "atlasH": 0,
+  "texturedTriangles": 0,
+  "fallbackTriangles": 0,
+  "coveragePercent": 0,
+  "usedXatlas": false,
+  "meshCleanupStats": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ]
+}

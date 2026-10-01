@@ -171,6 +171,12 @@ static constexpr int kEpochResumeFrames = 6;
 static constexpr float kEpochCatastrophicRatio = 0.75f;
 /** V0.13：极端失效判据 2（必须持续这么多帧才算真的塌了，不是抖动）。 */
 static constexpr int kEpochCatastrophicFrames = 30;
+// V0.13.30：live 标定器 EMA 平滑（漂移检测的鲁棒参考）+ 稳定性门。
+// 瞬时 live 因低接受率（~28%）+ 场景相关拟合而噪声大，直接比 frozen 会被
+// 误判为永久漂移 -> susp=1 再也解不开。EMA 平滑后对比才稳；只有 live 帧间
+// 离散度足够小（稳定）才认作「真实漂移」，否则视为噪声不挂起、不重锚。
+static constexpr float kEpochLiveEmaNew = 0.15f;        // EMA 新观测权重
+static constexpr float kEpochLiveVarSuspendRel = 0.05f; // 相对方差门限（stddev<~22% 才认作稳定）
 static bool epochActive = false;
 static DepthCalibration epochCalib{};
 static float epochRefRaw = 0.f;
@@ -207,6 +213,13 @@ static int epochCatastrophicStreak = 0;
 static uint64_t epochSuspendEvents = 0;
 static uint64_t epochCatastrophicRebuilds = 0;
 static uint64_t fusionSuspendedFrames = 0;
+// V0.13.30：epoch 漂移检测用的 live 标定器 EMA（消除单帧噪声误判永久 susp）。
+static float epochLiveEmaScale = 1.f;
+static float epochLiveEmaShift = 0.f;
+static bool  epochLiveEmaInvDepth = false;
+static bool  epochLiveEmaInit = false;
+static float epochLiveEmaVar = 0.f;   // (instant - ema)^2 的 EMA，用于稳定性判据
+static uint64_t epochReanchors = 0;   // 重锚次数（诊断：永久 susp 是否被解除）
 
 // ============================================================================
 //  V0.13.4 深度数值域（归一化映射）追踪
@@ -258,6 +271,12 @@ static void resetFusionEpoch() {
     epochSuspendEvents = 0;
     epochCatastrophicRebuilds = 0;
     fusionSuspendedFrames = 0;
+    epochLiveEmaScale = 1.f;
+    epochLiveEmaShift = 0.f;
+    epochLiveEmaInvDepth = false;
+    epochLiveEmaInit = false;
+    epochLiveEmaVar = 0.f;
+    epochReanchors = 0;
 }
 
 /**
@@ -2496,6 +2515,26 @@ static void nativeOnDepthMapImpl(
         const float zLiveNow = calibratedNow ? liveCal.toMetric(epochRefRaw, 0.f) : 0.f;
         const bool liveOk = std::isfinite(zLiveNow) && zLiveNow > 0.f;
 
+        // V0.13.30：维护 live 标定器的 EMA，作为漂移检测的鲁棒参考。
+        // 瞬时 live 因低接受率（~28%）+ 场景相关拟合而噪声大，直接比 frozen
+        // 会被误判为永久漂移 -> susp=1 再也解不开。EMA 平滑后对比才稳。
+        if (calibratedNow && liveCal.valid &&
+            std::isfinite(liveCal.scale) && std::isfinite(liveCal.shift)) {
+            if (!epochLiveEmaInit) {
+                epochLiveEmaScale = liveCal.scale;
+                epochLiveEmaShift = liveCal.shift;
+                epochLiveEmaInvDepth = liveCal.inverseDepthModel;
+                epochLiveEmaVar = 0.f;
+                epochLiveEmaInit = true;
+            } else {
+                epochLiveEmaScale += kEpochLiveEmaNew * (liveCal.scale - epochLiveEmaScale);
+                epochLiveEmaShift += kEpochLiveEmaNew * (liveCal.shift - epochLiveEmaShift);
+                epochLiveEmaInvDepth = liveCal.inverseDepthModel;
+                const float dev = liveCal.scale - epochLiveEmaScale;
+                epochLiveEmaVar = 0.9f * epochLiveEmaVar + 0.1f * dev * dev;
+            }
+        }
+
         if (!calibEnabledEff) {
             // 退路：整条标定链被关掉时，退回「融合 raw depth」的旧行为。
             // 否则「关掉标定」会静默变成「永远不融合」—— 比标定不准更糟。
@@ -2574,10 +2613,23 @@ static void nativeOnDepthMapImpl(
         } else {
             // Monitor the frozen/live mapping disagreement at the SAME raw value.
             // Sustained disagreement suspends writes, without changing map scale.
+            // V0.13.30：漂移参考改用 EMA 平滑后的 live（见 epochLiveEma*），
+            // 消除单帧拟合噪声导致的假漂移。
             const float zFrozen = epochCalib.toMetric(epochRefRaw, 0.f);
-            const float zLiveAtRef = liveCal.toMetric(epochRefRaw, 0.f);
+            DepthCalibration emaLive;
+            emaLive.scale = epochLiveEmaScale;
+            emaLive.shift = epochLiveEmaShift;
+            emaLive.inverseDepthModel = epochLiveEmaInvDepth;
+            emaLive.valid = epochLiveEmaInit;
+            const float zLiveAtRef = emaLive.toMetric(epochRefRaw, 0.f);
             const bool bothOk = std::isfinite(zFrozen) && zFrozen > 0.f &&
                                 std::isfinite(zLiveAtRef) && zLiveAtRef > 0.f;
+            // 稳定性判据：live 标定器帧间离散度足够小才认作「真实漂移」，
+            // 否则视为噪声（不挂起、不重锚）。
+            const float liveRelVar = (epochLiveEmaScale * epochLiveEmaScale > 1e-12f)
+                                         ? epochLiveEmaVar / (epochLiveEmaScale * epochLiveEmaScale)
+                                         : 1e9f;
+            const bool liveStable = epochLiveEmaInit && liveRelVar < kEpochLiveVarSuspendRel;
             if (bothOk) {
                 epochLastDriftRel = std::fabs(zLiveAtRef - zFrozen) / zFrozen;
             }
@@ -2614,6 +2666,30 @@ static void nativeOnDepthMapImpl(
                         epochResumeStreak = 0;
                     }
                 }
+            }
+            // V0.13.30 重锚（re-anchor）：持续且稳定的背离 = 真实尺度已落到新值，
+            // 采用平滑后的 live 标定继续融合，避免永久 susp=1 让几何停止生长。
+            // 仅在 live 已收敛稳定（liveStable）时才重锚，否则只是噪声不动作。
+            if (epochSuspended && epochSuspendStreak >= kEpochDriftSuspendFrames &&
+                liveStable && epochLiveEmaInit &&
+                std::isfinite(epochLiveEmaScale) && std::isfinite(epochLiveEmaShift)) {
+                epochCalib.scale = epochLiveEmaScale;
+                epochCalib.shift = epochLiveEmaShift;
+                epochCalib.inverseDepthModel = epochLiveEmaInvDepth;
+                epochCalib.valid = true;
+                epochCalib.confidence = liveCal.confidence;
+                epochCalib.samples = liveCal.samples;
+                epochRefRaw = rawDepthSampleMedian(d.data(), w, h);
+                epochRefZ = epochCalib.toMetric(epochRefRaw, 0.f);
+                epochSuspended = false;
+                epochSuspendStreak = 0;
+                epochBadStreak = 0;
+                epochResumeStreak = 0;
+                epochCatastrophicStreak = 0;
+                epochLastDriftRel = 0.f;
+                epochLiveEmaVar = 0.f;
+                ++epochIndex;
+                ++epochReanchors;
             }
         }
     }
@@ -2715,7 +2791,8 @@ static void nativeOnDepthMapImpl(
              "driftRejects=%llu lastDriftRel=%.4f frozenRecoveries=%llu stableStreak=%d badStreak=%d suspendStreak=%d "
              "| frozen scale=%.4f shift=%.4f inv=%d refRaw=%.4f refZ=%.4f frozenN=%d frozenConf=%.3f "
              "| live scale=%.4f shift=%.4f conf=%.3f samples=%d inv=%d "
-             "| norm A=%.5f B=%.5f reparms=%llu lastScaleRel=%.4f changesWhileEpoch=%llu",
+             "| norm A=%.5f B=%.5f reparms=%llu lastScaleRel=%.4f changesWhileEpoch=%llu "
+             "| liveEma scale=%.4f shift=%.4f var=%.6f relVar=%.4f stable=%d reanchors=%llu",
              (int)epochActive, (int)epochSuspended,
              (unsigned long long)epochOpens, (unsigned long long)epochIndex,
              (unsigned long long)epochSuspendEvents, (unsigned long long)fusionSuspendedFrames,
@@ -2731,7 +2808,16 @@ static void nativeOnDepthMapImpl(
              static_cast<double>(gDepthNormA), static_cast<double>(gDepthNormB),
              (unsigned long long)gDepthNormReparams,
              static_cast<double>(gDepthNormLastScaleRel),
-             (unsigned long long)gDepthNormChangesWhileEpoch);
+             (unsigned long long)gDepthNormChangesWhileEpoch,
+             static_cast<double>(epochLiveEmaScale), static_cast<double>(epochLiveEmaShift),
+             static_cast<double>(epochLiveEmaVar),
+             static_cast<double>((epochLiveEmaScale * epochLiveEmaScale > 1e-12f)
+                                     ? epochLiveEmaVar / (epochLiveEmaScale * epochLiveEmaScale)
+                                     : 1e9f),
+             (int)(epochLiveEmaInit && (epochLiveEmaScale * epochLiveEmaScale > 1e-12f)
+                       ? epochLiveEmaVar / (epochLiveEmaScale * epochLiveEmaScale) < kEpochLiveVarSuspendRel
+                       : 0),
+             (unsigned long long)epochReanchors);
 
         float st[mobilescan3d::stereo_anchor::kStatsSlots];
         mobilescan3d::stereo_anchor::fillStats(st);
