@@ -166,6 +166,7 @@ static constexpr int kEpochStableFrames = 8;
 static constexpr int kEpochCalibLossFrames = 5;
 static constexpr float kEpochRebuildRatio = 0.08f;
 static constexpr float kEpochDriftSuspendRatio = 0.20f;  // V0.13.19.4：暂停新融合的漂移门限（独立于开启稳定性门槛 8%）
+static constexpr float kEpochDriftResumeRatio = 0.10f;   // V0.13.32：恢复门限（滞回，低于 suspend 的 20%，避免边界抖动）
 /** V0.13：连续多少帧漂移超标 -> 暂停新融合（几何保持不动）。 */
 static constexpr int kEpochDriftSuspendFrames = 10;
 /** V0.13：漂移连续恢复正常多少帧 -> 解除暂停。 */
@@ -2642,10 +2643,13 @@ static void nativeOnDepthMapImpl(
                 // Even prolonged fit disagreement cannot justify erasing a scan.
                 // Keep the frozen mapping and geometry; resume only on evidence.
                 epochCatastrophicStreak = std::min(epochCatastrophicStreak, kEpochCatastrophicFrames);
-            } else if (bothOk && calibrationUpdatedThisFrame &&
-                       scan_policy::mappingsAgree(epochCalib, liveCal, d.data(), w*h,
-                                                  kEpochRebuildRatio)) {
-                // 漂移回到门限内：连续 kEpochResumeFrames 帧正常就解除暂停。
+            } else if (bothOk && epochLastDriftRel <= kEpochDriftResumeRatio) {
+                // V0.13.32：恢复判据改为「EMA 平滑后的 live 与 frozen 漂移回落到
+                // 恢复门限内」（滞回，低于 suspend 的 20%）。原实现要求
+                // `calibrationUpdatedThisFrame && mappingsAgree(瞬时 live)`：标定接受率
+                // 仅 ~10-28%（实测 acc=2 rej=20），且瞬时 live 噪声大，导致漂移早已
+                // 回落到 1.5% 也永远走不到恢复 → susp 永久挂起 → 点云停止生长。
+                // 恢复后 epochCalib 不变，新几何仍用冻结尺度，不会产生尺度接缝。
                 epochBadStreak = 0;
                 epochSuspendStreak = 0;
                 epochCatastrophicStreak = 0;
