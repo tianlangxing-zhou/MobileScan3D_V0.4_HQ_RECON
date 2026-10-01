@@ -2785,7 +2785,7 @@ static void nativeOnDepthMapImpl(
              "| live scale=%.4f shift=%.4f conf=%.3f samples=%d inv=%d "
              "| norm A=%.5f B=%.5f reparms=%llu lastScaleRel=%.4f changesWhileEpoch=%llu "
              "| liveEma scale=%.4f shift=%.4f var=%.6f relVar=%.4f stable=%d reanchors=%llu "
-             "| catTimeoutResumes=%llu (V0.13.34: drift>=20% only counts diagnostics; suspend only on catastrophic)",
+             "| catTimeoutResumes=%llu (V0.13.34: drift over 20pc only counts diagnostics; suspend only on catastrophic)",
              (int)epochActive, (int)epochSuspended,
              (unsigned long long)epochOpens, (unsigned long long)epochIndex,
              (unsigned long long)epochSuspendEvents, (unsigned long long)fusionSuspendedFrames,
