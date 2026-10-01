@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="64dp"
+    android:layout_height="66dp"
     android:layout_marginBottom="2dp"
     android:background="@drawable/bg_tool_item"
     android:clickable="true"
@@ -11,30 +11,28 @@
     android:orientation="vertical">
 
     <ImageView
-        android:layout_width="20dp"
-        android:layout_height="20dp"
-        android:contentDescription="镜头"
-        android:src="@drawable/ic_camera" />
+        android:layout_width="21dp"
+        android:layout_height="21dp"
+        android:contentDescription="重建模式"
+        android:src="@drawable/ic_cube" />
 
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
         android:includeFontPadding="false"
-        android:text="镜头"
+        android:text="模式"
         android:textColor="@color/scan_text_primary"
         android:textSize="9.5sp"
         android:textStyle="bold" />
 
     <TextView
-        android:id="@+id/toolCameraLabel"
+        android:id="@+id/toolModeLabel"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="2dp"
-        android:ellipsize="end"
         android:includeFontPadding="false"
-        android:maxLines="1"
-        android:text="自动"
+        android:text="精细物体"
         android:textColor="@color/scan_text_muted"
-        android:textSize="8.3sp" />
+        android:textSize="8.2sp" />
 </LinearLayout>

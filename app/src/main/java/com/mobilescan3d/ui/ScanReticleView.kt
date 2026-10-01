@@ -85,10 +85,10 @@ class ScanReticleView @JvmOverloads constructor(
         val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
 
-        val centerX = w * 0.46f
-        val centerY = h * 0.50f
-        val frameW = w * 0.50f
-        val frameH = frameW * 1.12f
+        val centerX = w * 0.50f
+        val centerY = h * 0.47f
+        val frameW = w * 0.38f
+        val frameH = frameW * 1.35f
         val left = centerX - frameW / 2f
         val top = centerY - frameH / 2f
         val right = centerX + frameW / 2f

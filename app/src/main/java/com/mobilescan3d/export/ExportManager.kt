@@ -204,6 +204,23 @@ class ExportManager(context: Context) {
         }
     }
 
+    /**
+     * Round 6: pull actual TSDF observation strength for the currently built mesh.
+     * Values are accumulated TSDF confidence weights, not camera-view estimates.
+     */
+    fun meshObservationWeights(vertexCount: Int): FloatArray {
+        if (vertexCount <= 0) return FloatArray(0)
+        return try {
+            val out = FloatArray(vertexCount)
+            val got = NativeBridge.nativeGetMeshObservationWeights(out, vertexCount)
+            if (got <= 0) FloatArray(0)
+            else if (got == out.size) out else out.copyOf(got)
+        } catch (t: Throwable) {
+            Log.w(TAG, "meshObservationWeights failed", t)
+            FloatArray(0)
+        }
+    }
+
     /** 网格统计（16 槽，下标含义见 [NativeBridge]）。失败返回空数组。 */
     fun meshStats(): IntArray = try {
         NativeBridge.nativeGetMeshStats()

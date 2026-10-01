@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <array>
+#include <limits>
 
 // ============================================================================
 //  定点量化辅助
@@ -72,6 +74,159 @@ void TsdfEngine::setVoxelSize(float meters) {
 void TsdfEngine::setTruncation(float meters) {
     if (!std::isfinite(meters) || meters < 1e-4f) return;
     trunc_ = std::min(meters, 1.0f);
+}
+
+
+// ============================================================================
+//  Round 6 recovery snapshot
+// ============================================================================
+
+namespace {
+constexpr std::array<char, 8> kTsdfCheckpointMagic = {'M','S','3','D','T','S','6','\0'};
+constexpr std::uint32_t kTsdfCheckpointVersion = 1u;
+
+template <typename T>
+bool writePod(std::ofstream& out, const T& v) {
+    out.write(reinterpret_cast<const char*>(&v), sizeof(T));
+    return static_cast<bool>(out);
+}
+
+template <typename T>
+bool readPod(std::ifstream& in, T* v) {
+    in.read(reinterpret_cast<char*>(v), sizeof(T));
+    return static_cast<bool>(in);
+}
+}
+
+bool TsdfEngine::saveCheckpoint(const std::string& path) const {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+
+    out.write(kTsdfCheckpointMagic.data(), kTsdfCheckpointMagic.size());
+    if (!writePod(out, kTsdfCheckpointVersion)) return false;
+
+    const std::uint32_t blockSize = kTsdfBlockSize;
+    const std::uint32_t voxelBytes = sizeof(TsdfVoxel);
+    const std::uint64_t blockCount = static_cast<std::uint64_t>(blocks_.size());
+    const std::uint64_t maxBlocks = static_cast<std::uint64_t>(maxBlocks_);
+    const std::int32_t pixelStep = pixelStep_;
+
+    if (!writePod(out, blockSize) ||
+        !writePod(out, voxelBytes) ||
+        !writePod(out, voxel_) ||
+        !writePod(out, trunc_) ||
+        !writePod(out, maxBlocks) ||
+        !writePod(out, pixelStep) ||
+        !writePod(out, blockCount)) {
+        return false;
+    }
+
+    for (const auto& kv : blocks_) {
+        if (!writePod(out, kv.first.x) ||
+            !writePod(out, kv.first.y) ||
+            !writePod(out, kv.first.z)) {
+            return false;
+        }
+        out.write(
+            reinterpret_cast<const char*>(kv.second.voxels),
+            sizeof(kv.second.voxels));
+        if (!out) return false;
+    }
+    out.flush();
+    return static_cast<bool>(out);
+}
+
+bool TsdfEngine::loadCheckpoint(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+
+    std::array<char, 8> magic{};
+    std::uint32_t version = 0;
+    std::uint32_t blockSize = 0;
+    std::uint32_t voxelBytes = 0;
+    float voxel = 0.f;
+    float trunc = 0.f;
+    std::uint64_t maxBlocks = 0;
+    std::int32_t pixelStep = 1;
+    std::uint64_t blockCount = 0;
+
+    in.read(magic.data(), magic.size());
+    if (!in ||
+        magic != kTsdfCheckpointMagic ||
+        !readPod(in, &version) ||
+        version != kTsdfCheckpointVersion ||
+        !readPod(in, &blockSize) ||
+        !readPod(in, &voxelBytes) ||
+        !readPod(in, &voxel) ||
+        !readPod(in, &trunc) ||
+        !readPod(in, &maxBlocks) ||
+        !readPod(in, &pixelStep) ||
+        !readPod(in, &blockCount)) {
+        return false;
+    }
+
+    if (blockSize != kTsdfBlockSize ||
+        voxelBytes != sizeof(TsdfVoxel) ||
+        !std::isfinite(voxel) || voxel < 1e-4f || voxel > 0.5f ||
+        !std::isfinite(trunc) || trunc < voxel || trunc > 2.f ||
+        blockCount > 131072u ||
+        maxBlocks < blockCount ||
+        maxBlocks > 131072u) {
+        return false;
+    }
+
+    TsdfEngine loaded;
+    loaded.setVoxelSize(voxel);
+    loaded.setTruncation(trunc);
+    loaded.setMaxBlocks(static_cast<size_t>(maxBlocks));
+    loaded.setPixelStep(pixelStep);
+
+    for (std::uint64_t bi = 0; bi < blockCount; ++bi) {
+        std::int32_t bx = 0, by = 0, bz = 0;
+        if (!readPod(in, &bx) || !readPod(in, &by) || !readPod(in, &bz)) {
+            return false;
+        }
+        TsdfBlock* block = loaded.blockFor(bx, by, bz, true);
+        if (!block) return false;
+        in.read(reinterpret_cast<char*>(block->voxels), sizeof(block->voxels));
+        if (!in) return false;
+
+        for (int lz = 0; lz < kTsdfBlockSize; ++lz) {
+            for (int ly = 0; ly < kTsdfBlockSize; ++ly) {
+                for (int lx = 0; lx < kTsdfBlockSize; ++lx) {
+                    const TsdfVoxel& v =
+                        block->voxels[(lz * kTsdfBlockSize + ly) * kTsdfBlockSize + lx];
+                    if (v.weight == 0) continue;
+                    ++loaded.liveVoxels_;
+                    if (v.colorWeight > 0) ++loaded.liveColoredVoxels_;
+
+                    const int vx = bx * kTsdfBlockSize + lx;
+                    const int vy = by * kTsdfBlockSize + ly;
+                    const int vz = bz * kTsdfBlockSize + lz;
+                    if (!loaded.hasBounds_) {
+                        loaded.minV_[0] = loaded.maxV_[0] = vx;
+                        loaded.minV_[1] = loaded.maxV_[1] = vy;
+                        loaded.minV_[2] = loaded.maxV_[2] = vz;
+                        loaded.hasBounds_ = true;
+                    } else {
+                        loaded.minV_[0] = std::min(loaded.minV_[0], vx);
+                        loaded.minV_[1] = std::min(loaded.minV_[1], vy);
+                        loaded.minV_[2] = std::min(loaded.minV_[2], vz);
+                        loaded.maxV_[0] = std::max(loaded.maxV_[0], vx);
+                        loaded.maxV_[1] = std::max(loaded.maxV_[1], vy);
+                        loaded.maxV_[2] = std::max(loaded.maxV_[2], vz);
+                    }
+                }
+            }
+        }
+    }
+
+    // Reject trailing corruption only when stream itself failed. Forward-compatible
+    // metadata can be appended in a later format version.
+    if (!in && !in.eof()) return false;
+
+    *this = std::move(loaded);
+    return true;
 }
 
 // ============================================================================

@@ -100,6 +100,31 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var tvTrackingState: TextView
     private lateinit var tvScanStateBadge: TextView
     private lateinit var mainScanUi: android.view.View
+    private lateinit var viewerBackdrop: android.view.View
+    private lateinit var modelViewerOverlay: android.view.View
+    private lateinit var tvViewerStats: TextView
+    private lateinit var toolAutoLabel: TextView
+    private lateinit var toolModeLabel: TextView
+    private lateinit var toolLightLabel: TextView
+    private lateinit var toolCameraLabel: TextView
+    private lateinit var toolLockLabel: TextView
+    private lateinit var viewerModeTexture: TextView
+    private lateinit var viewerModeSolid: TextView
+    private lateinit var viewerModeWire: TextView
+    private lateinit var viewerModeInspect: TextView
+    private lateinit var viewerModeSurface: TextView
+    private lateinit var reviewProgressSurface: android.widget.ProgressBar
+    private lateinit var tvReviewSurface: TextView
+    private var lastSurfaceCoveragePercent = 0
+    private var lastSurfaceRobustPercent = 0
+    private var viewerBaseMesh: com.mobilescan3d.export.ExportManager.MeshData? = null
+    private var viewerSurfaceVertices: FloatArray? = null
+    @Volatile private var recoveryCheckpointBusy = false
+    private var recoveryLastCheckpointMs = 0L
+    private var recoveryPromptConsumed = false
+    private lateinit var tvViewerDimensions: TextView
+    private lateinit var tvViewerTopology: TextView
+    @Volatile private var viewerAnalysisToken = 0
     private lateinit var viewpointCoverageView: com.mobilescan3d.ui.ViewpointCoverageView
     private lateinit var scanReviewOverlay: android.view.View
     private lateinit var reviewContinueButton: android.widget.Button
@@ -351,6 +376,8 @@ private var lastRelocPollMs = 0L
     private var viewerPanMode = false
     private var viewerMoved = false
     private var viewerMultiTouch = false
+    private var viewerLastMidX = 0f
+    private var viewerLastMidY = 0f
     private val viewerScaleDetector by lazy {
         android.view.ScaleGestureDetector(this,
             object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -670,7 +697,7 @@ private var lastRelocPollMs = 0L
         val savedDistance = scanPrefs.getFloat("max_distance_m", 1f)
         scanMaxDistanceMeters = if (savedDistance.isFinite()) savedDistance.coerceIn(.2f, 5f) else 1f
         autoFillLight = scanPrefs.getBoolean("auto_fill_light", true)
-        scanVoxelProfile = scanPrefs.getInt("voxel_profile", 0).coerceIn(0, 2)
+        scanVoxelProfile = scanPrefs.getInt("voxel_profile", 3).coerceIn(0, 3)
 
         // —— 换皮：使用 UI 替换包提供的 XML 布局，保留全部扫描/融合/导出核心逻辑 ——
         setContentView(R.layout.activity_mobile_scan)
@@ -842,6 +869,23 @@ private var lastRelocPollMs = 0L
         tvReviewViewpoint = findViewById(R.id.tvReviewViewpoint)
         tvReviewGeometry = findViewById(R.id.tvReviewGeometry)
         tvReviewTexture = findViewById(R.id.tvReviewTexture)
+        viewerBackdrop = findViewById(R.id.viewerBackdrop)
+        modelViewerOverlay = findViewById(R.id.modelViewerOverlay)
+        tvViewerStats = findViewById(R.id.tvViewerStats)
+        toolAutoLabel = findViewById(R.id.toolAutoLabel)
+        toolModeLabel = findViewById(R.id.toolModeLabel)
+        toolLightLabel = findViewById(R.id.toolLightLabel)
+        toolCameraLabel = findViewById(R.id.toolCameraLabel)
+        toolLockLabel = findViewById(R.id.toolLockLabel)
+        viewerModeTexture = findViewById(R.id.viewerModeTexture)
+        viewerModeSolid = findViewById(R.id.viewerModeSolid)
+        viewerModeWire = findViewById(R.id.viewerModeWire)
+        viewerModeInspect = findViewById(R.id.viewerModeInspect)
+        viewerModeSurface = findViewById(R.id.viewerModeSurface)
+        reviewProgressSurface = findViewById(R.id.reviewProgressSurface)
+        tvReviewSurface = findViewById(R.id.tvReviewSurface)
+        tvViewerDimensions = findViewById(R.id.tvViewerDimensions)
+        tvViewerTopology = findViewById(R.id.tvViewerTopology)
         // 参考稿：标题 "MobileScan" 白 + "3D" 主蓝
         val titleTv = findViewById<TextView>(R.id.title)
         val titleStr = titleTv.text.toString()
@@ -863,6 +907,32 @@ private var lastRelocPollMs = 0L
         findViewById<android.view.View>(R.id.btnExport).setOnClickListener { showExportDrawer() }
         findViewById<android.view.View>(R.id.btnViewModel).setOnClickListener { toggleModelViewer() }
         findViewById<android.view.View>(R.id.btnSettings).setOnClickListener { showSettingsMenu() }
+        findViewById<android.view.View>(R.id.btnHelp).setOnClickListener { showScanUiHelp() }
+        findViewById<android.view.View>(R.id.toolAuto).setOnClickListener { showScanSettings() }
+        findViewById<android.view.View>(R.id.toolMode).setOnClickListener { showModeDialog() }
+        findViewById<android.view.View>(R.id.toolLight).setOnClickListener { toggleAutoFillLightFromToolbar() }
+        findViewById<android.view.View>(R.id.tabLiveScan).setOnClickListener {
+            if (modelViewerActive) exitModelViewer()
+        }
+        findViewById<android.view.View>(R.id.tabReviewScan).setOnClickListener {
+            when {
+                scanning || scanPaused -> enterScanReview()
+                else -> toggleModelViewer()
+            }
+        }
+        findViewById<android.view.View>(R.id.tabModelProcess).setOnClickListener { showExportDrawer() }
+        findViewById<android.view.View>(R.id.btnViewerClose).setOnClickListener { exitModelViewer() }
+        findViewById<android.view.View>(R.id.btnViewerReset).setOnClickListener {
+            glView.queueEvent { renderer.resetViewerView() }
+            glView.requestRender()
+        }
+        findViewById<android.view.View>(R.id.btnViewerExport).setOnClickListener { showExportDrawer() }
+        findViewById<android.view.View>(R.id.btnViewerHelp).setOnClickListener { showViewerHelp() }
+        viewerModeTexture.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_TEXTURE) }
+        viewerModeSolid.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_SOLID) }
+        viewerModeWire.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_WIREFRAME) }
+        viewerModeInspect.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_INSPECT) }
+        viewerModeSurface.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_SURFACE) }
         findViewById<android.view.View>(R.id.toolCamera).setOnClickListener { showCameraRangeDialog() }
         findViewById<android.view.View>(R.id.toolLock).setOnClickListener {
             objectLockEnabled = !objectLockEnabled
@@ -884,13 +954,38 @@ private var lastRelocPollMs = 0L
         findViewById<android.view.View>(R.id.toolRealtime).setOnClickListener { cycleArLayer() }
         findViewById<android.view.View>(R.id.toolRestoreAr).setOnClickListener { restoreLatestPersistentAr() }
 
-        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(container) { view, insets ->
-            val safe = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars() or
-                androidx.core.view.WindowInsetsCompat.Type.displayCutout())
-            view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
+        // Round 4 / OnePlus 15:
+        // Keep the camera/GL full-bleed, but inset every touch/control surface
+        // using the *real* system bar + display cutout geometry. The official
+        // spec gives screen size/resolution, not a guaranteed punch-hole radius,
+        // so no physical cutout diameter is hard-coded here.
+        val rootView = findViewById<android.view.View>(R.id.root)
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        androidx.core.view.WindowInsetsControllerCompat(window, rootView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(rootView) { _, insets ->
+            val safe = insets.getInsets(
+                androidx.core.view.WindowInsetsCompat.Type.systemBars() or
+                    androidx.core.view.WindowInsetsCompat.Type.displayCutout()
+            )
+            mainScanUi.setPadding(
+                safe.left + dp(12),
+                safe.top + dp(6),
+                safe.right + dp(12),
+                safe.bottom + dp(5)
+            )
+            scanReviewOverlay.setPadding(
+                safe.left, safe.top, safe.right, safe.bottom
+            )
+            modelViewerOverlay.setPadding(
+                safe.left, safe.top, safe.right, safe.bottom
+            )
             insets
         }
-        androidx.core.view.ViewCompat.requestApplyInsets(container)
+        androidx.core.view.ViewCompat.requestApplyInsets(rootView)
 
         // vc159 ThermalGuard：订阅系统热状态，用于在设备发烫时自动降载。
         // OnThermalStatusChangedListener / currentThermalStatus 需要 API 29，
@@ -2738,7 +2833,102 @@ private var lastRelocPollMs = 0L
      * session exists. Pause/resume is a separate reversible action.
      */
     private fun handlePrimaryScanAction() {
-        if (scanning || scanPaused) enterScanReview() else startScan()
+        if (scanning || scanPaused) enterScanReview() else runScanPreflight()
+    }
+
+    /**
+     * Round 5 preflight: fail early on conditions that would make a 3D scan
+     * unusable instead of letting the user discover them halfway around an object.
+     */
+    private fun runScanPreflight() {
+        if (!ensureSystemReady()) return
+
+        if (!recoveryPromptConsumed) {
+            val recovery = com.mobilescan3d.persistence.ScanRecoveryManager.latest(applicationContext)
+            if (recovery != null) {
+                recoveryPromptConsumed = true
+                val ageMin = ((System.currentTimeMillis() - recovery.createdAtMs).coerceAtLeast(0L) / 60000L)
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("发现未完成扫描")
+                    .setMessage(
+                        "检测到约 ${ageMin} 分钟前的自动断点。\n\n" +
+                            "可以恢复已融合的几何并进入 3D 检查/导出。为避免把新的 VINS " +
+                            "坐标系错误融合进旧模型，恢复后不会直接继续扫描。"
+                    )
+                    .setNegativeButton("忽略") { _, _ -> runScanPreflight() }
+                    .setNeutralButton("删除断点") { _, _ ->
+                        com.mobilescan3d.persistence.ScanRecoveryManager.clear(applicationContext)
+                        runScanPreflight()
+                    }
+                    .setPositiveButton("恢复模型") { _, _ -> restoreRecoveryCheckpoint(recovery) }
+                    .show()
+                return
+            }
+        }
+
+        val critical = ArrayList<String>()
+        val warnings = ArrayList<String>()
+
+        if (cameraDevice == null) {
+            critical.add("相机尚未就绪")
+        }
+        if (!::depthProvider.isInitialized || !depthProvider.available) {
+            critical.add("深度链当前不可用")
+        }
+
+        val sm = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        if (sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) == null) {
+            critical.add("缺少陀螺仪，无法稳定定位")
+        }
+        if (sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) == null) {
+            critical.add("缺少加速度计，无法稳定定位")
+        }
+
+        val freeBytes = filesDir.usableSpace
+        val freeMb = freeBytes / (1024L * 1024L)
+        if (freeMb < 512L) {
+            warnings.add("可用存储仅约 ${freeMb}MB，建议至少预留 512MB")
+        }
+        if (scanVoxelProfile == 3) {
+            val p = resolvedScanVoxelProfile()
+            warnings.add(
+                "智能重建将使用：" +
+                    when (p) {
+                        0 -> "精细物体（4mm 目标体素）"
+                        1 -> "快速物体（8mm 目标体素）"
+                        else -> "房间/大场景（20mm 场景体素）"
+                    }
+            )
+        }
+
+        if (critical.isEmpty() && warnings.isEmpty()) {
+            startScan()
+            return
+        }
+
+        val message = buildString {
+            if (critical.isNotEmpty()) {
+                append("需要处理：\n")
+                critical.forEach { append("• ").append(it).append('\n') }
+            }
+            if (warnings.isNotEmpty()) {
+                if (isNotEmpty()) append('\n')
+                append("建议：\n")
+                warnings.forEach { append("• ").append(it).append('\n') }
+            }
+        }.trim()
+
+        val builder = android.app.AlertDialog.Builder(this)
+            .setTitle(if (critical.isEmpty()) "扫描前检查" else "暂时不能开始扫描")
+            .setMessage(message)
+            .setNegativeButton("返回", null)
+
+        if (critical.isEmpty()) {
+            builder.setPositiveButton("继续扫描") { _, _ -> startScan() }
+        } else {
+            builder.setPositiveButton("重新检查") { _, _ -> runScanPreflight() }
+        }
+        builder.show()
     }
 
     private fun togglePauseScan() {
@@ -2813,6 +3003,8 @@ private var lastRelocPollMs = 0L
         lastViewpointCoveragePercent = 0
         lastGeometryQualityPercent = 0
         lastTextureQualityPercent = 0
+        lastSurfaceCoveragePercent = 0
+        lastSurfaceRobustPercent = 0
         lastCoverageGuidance = ""
         if (::viewpointCoverageView.isInitialized) viewpointCoverageView.clearCoverage()
         showScanReview(false)
@@ -2837,6 +3029,9 @@ private var lastRelocPollMs = 0L
             if (::depthProvider.isInitialized) depthProvider.reset()
         }
         sessionStartTs = System.currentTimeMillis()
+        // A deliberate new scan supersedes an older unfinished checkpoint.
+        com.mobilescan3d.persistence.ScanRecoveryManager.clear(applicationContext)
+        recoveryLastCheckpointMs = android.os.SystemClock.elapsedRealtime()
         val formatter = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
         sessionId = formatter.format(java.util.Date()) + "_" + (sessionStartTs % 100000L)
         // V0.10: preserve previous PLY metadata. plySessionMatch tells us
@@ -2911,7 +3106,7 @@ private var lastRelocPollMs = 0L
             // 截断距离 = voxel×4（tsdf_engine 固定系数），目标侧 16mm，
             // 立体深度噪声典型 5~15mm，尚在容忍带内。
             // 注意：nativeCreate 已 reset TSDF，这里在复位后设置档位才有效。
-            NativeBridge.nativeSetVoxelProfile(scanVoxelProfile)
+            NativeBridge.nativeSetVoxelProfile(resolvedScanVoxelProfile())
             NativeBridge.nativeSetScanMaxDistance(scanMaxDistanceMeters)
             NativeBridge.nativeSetDepthCalibrationEnabled(true)
             if (objectLockEnabled) {
@@ -2953,6 +3148,159 @@ private var lastRelocPollMs = 0L
      * 当前帧 target depth 点。查看期退回「网格」档 —— 不透明 + 真实顶点色，
      * 那时要看的是几何质量，一次性点和诊断色只会干扰判断。
      */
+    private fun maybeSaveRecoveryCheckpoint() {
+        if (!scanning || !sessionCreated || recoveryCheckpointBusy) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (recoveryLastCheckpointMs != 0L && now - recoveryLastCheckpointMs < 90_000L) return
+        saveRecoveryCheckpoint(force = false)
+    }
+
+    private fun saveRecoveryCheckpoint(force: Boolean) {
+        if (!sessionCreated || recoveryCheckpointBusy) return
+        val handler = depthHandler ?: return
+        recoveryCheckpointBusy = true
+        val token = scanSessionToken
+        val savedSession = sessionId
+        val profile = resolvedScanVoxelProfile()
+        val hadTarget = objectLockEnabled || targetConfidence > 0f
+        handler.post {
+            val ok = synchronized(depthSessionLock) {
+                if (token != scanSessionToken || !sessionCreated) {
+                    false
+                } else {
+                    com.mobilescan3d.persistence.ScanRecoveryManager.save(
+                        applicationContext,
+                        savedSession,
+                        profile,
+                        hadTarget
+                    )
+                }
+            }
+            recoveryLastCheckpointMs = android.os.SystemClock.elapsedRealtime()
+            recoveryCheckpointBusy = false
+            if (force && !ok) {
+                android.util.Log.w("ScanRecovery", "checkpoint save failed")
+            }
+        }
+    }
+
+    /**
+     * Restore an unfinished TSDF into the native mesh pipeline.
+     *
+     * This is intentionally a salvage path: VINS estimator state is not serialized,
+     * so restored geometry opens in the independent 3D viewer for inspection/export.
+     * It is NOT fused with newly initialized camera poses.
+     */
+    private fun restoreRecoveryCheckpoint(
+        info: com.mobilescan3d.persistence.ScanRecoveryManager.Info
+    ) {
+        if (modelOperationBusy || scanning) return
+        if (cameraDevice == null || nativeW <= 0 || nativeH <= 0) {
+            toast("请等待相机初始化完成后再恢复")
+            return
+        }
+        modelOperationBusy = true
+        scanSessionToken++
+        val token = scanSessionToken
+        scanNativeReady = false
+        scanning = false
+        scanPaused = false
+        renderer.clearMesh()
+        renderer.clearTexturedMesh()
+
+        cameraHandler?.post {
+            val loaded = synchronized(depthSessionLock) {
+                NativeBridge.nativeDestroy()
+                val created = NativeBridge.nativeCreate(
+                    nativeW, nativeH, nativeFx, nativeFy, nativeCx, nativeCy
+                )
+                if (!created) {
+                    false
+                } else {
+                    NativeBridge.nativeSetVoxelProfile(info.voxelProfile)
+                    com.mobilescan3d.persistence.ScanRecoveryManager.loadIntoNative(info)
+                }
+            }
+            if (!loaded) {
+                runOnUiThread {
+                    modelOperationBusy = false
+                    toast("未完成扫描恢复失败")
+                }
+                return@post
+            }
+            sessionCreated = true
+            sessionId = info.sessionId + "_recovered"
+            runOnUiThread {
+                if (isDestroyed || token != scanSessionToken) {
+                    modelOperationBusy = false
+                    return@runOnUiThread
+                }
+                exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
+                    if (isDestroyed || token != scanSessionToken) {
+                        modelOperationBusy = false
+                        return@buildMeshAsync
+                    }
+                    modelOperationBusy = false
+                    if (mesh == null || mesh.triangleCount <= 0) {
+                        toast("断点中没有足够几何可恢复")
+                        return@buildMeshAsync
+                    }
+                    // Keep the checkpoint until the user explicitly starts a new scan.
+                    enterRecoveredModelViewer(mesh)
+                }
+            }
+        }
+    }
+
+    private fun enterRecoveredModelViewer(
+        mesh: com.mobilescan3d.export.ExportManager.MeshData
+    ) {
+        renderer.clearTexturedMesh()
+        renderer.setMesh(mesh.vertices, mesh.indices)
+        viewerBaseMesh = mesh
+        renderer.setViewerStyle(PointCloudRenderer.VIEWER_STYLE_SOLID)
+        renderer.setViewerBoundaryEdges(null)
+        updateViewerModeUi(PointCloudRenderer.VIEWER_STYLE_SOLID)
+        analyzeViewerMesh(mesh)
+
+        // Compute bounds for the same automatic viewer camera used by normal model view.
+        var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var minZ = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE; var maxY = -Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
+        var i = 0
+        while (i + 2 < mesh.vertices.size) {
+            val x = mesh.vertices[i]
+            val y = mesh.vertices[i + 1]
+            val z = mesh.vertices[i + 2]
+            if (x.isFinite() && y.isFinite() && z.isFinite()) {
+                minX = kotlin.math.min(minX, x); maxX = kotlin.math.max(maxX, x)
+                minY = kotlin.math.min(minY, y); maxY = kotlin.math.max(maxY, y)
+                minZ = kotlin.math.min(minZ, z); maxZ = kotlin.math.max(maxZ, z)
+            }
+            i += NativeBridge.MESH_VERTEX_FLOATS
+        }
+        if (minX <= maxX) {
+            val cx = (minX + maxX) * 0.5f
+            val cy = (minY + maxY) * 0.5f
+            val cz = (minZ + maxZ) * 0.5f
+            val radius = kotlin.math.max(
+                0.03f,
+                0.5f * kotlin.math.sqrt(
+                    (maxX - minX) * (maxX - minX) +
+                        (maxY - minY) * (maxY - minY) +
+                        (maxZ - minZ) * (maxZ - minZ)
+                )
+            )
+            glView.queueEvent { renderer.setViewerFrame(cx, cy, cz, radius) }
+        }
+        renderer.drawMode = PointCloudRenderer.DRAW_MODEL_VIEWER
+        modelViewerActive = true
+        glView.isClickable = true
+        tvViewerStats.text = "${mesh.triangleCount} 面 · 断点恢复几何 · 可检查/导出"
+        setScanOverlayVisible(false)
+        glView.requestRender()
+        toast("已恢复未完成几何；可检查后导出，或返回开始新扫描")
+    }
+
     private fun applyScanArLayer(scanNow: Boolean) {
         if (scanNow) {
             arDrawMode = PointCloudRenderer.DRAW_LIVE
@@ -3006,6 +3354,7 @@ private var lastRelocPollMs = 0L
         applyScanArLayer(false)
         showScanReview(true)
         updateReviewUi()
+        saveRecoveryCheckpoint(force = true)
         buildReviewPreviewMesh()
     }
 
@@ -3093,6 +3442,9 @@ private var lastRelocPollMs = 0L
 
     private fun showScanReview(show: Boolean) {
         if (!::scanReviewOverlay.isInitialized) return
+        if (show && modelViewerActive) {
+            exitModelViewer()
+        }
         scanReviewOverlay.visibility =
             if (show) android.view.View.VISIBLE else android.view.View.GONE
         if (::mainScanUi.isInitialized) {
@@ -3126,13 +3478,16 @@ private var lastRelocPollMs = 0L
                 if (isDestroyed || token != scanSessionToken || !scanReviewActive) return@buildMeshAsync
                 if (mesh != null && mesh.triangleCount > 0) {
                     renderer.clearTexturedMesh()
-                    renderer.setMesh(mesh.vertices, mesh.indices)
+                    val weights = exportManager.meshObservationWeights(mesh.vertexCount)
+                    val heat = buildSurfaceObservationHeatmap(mesh.vertices, weights)
+                    renderer.setMesh(heat ?: mesh.vertices, mesh.indices)
+                    updateSurfaceObservationStats(weights)
                     arMeshViewing = true
                     arDrawMode = PointCloudRenderer.DRAW_MESH
                     renderer.drawMode = arDrawMode
                     renderer.setMeshAlpha(viewMeshAlpha)
                     glView.requestRender()
-                    tvReviewTopHint.text = "旋转手机观察模型缺口，再决定补扫或生成"
+                    tvReviewTopHint.text = "表面热力已开启：优先补扫红/黄区域，再决定生成"
                 } else {
                     tvReviewTopHint.text = "网格信息不足，建议继续补扫"
                 }
@@ -3149,11 +3504,13 @@ private var lastRelocPollMs = 0L
         val viewpoint = lastViewpointCoveragePercent.coerceIn(0, 100)
         val geometry = lastGeometryQualityPercent.coerceIn(0, 100)
         val textureQ = lastTextureQualityPercent.coerceIn(0, 100)
+        val surface = lastSurfaceCoveragePercent.coerceIn(0, 100)
         val overall = (
-            capture * 0.34f +
-                viewpoint * 0.30f +
-                geometry * 0.22f +
-                textureQ * 0.14f
+            capture * 0.20f +
+                viewpoint * 0.15f +
+                surface * 0.35f +
+                geometry * 0.20f +
+                textureQ * 0.10f
             ).toInt().coerceIn(0, 100)
 
         tvReviewScore.text = "$overall"
@@ -3184,10 +3541,12 @@ private var lastRelocPollMs = 0L
 
         reviewProgressCapture.progress = capture
         reviewProgressViewpoint.progress = viewpoint
+        reviewProgressSurface.progress = surface
         reviewProgressGeometry.progress = geometry
         reviewProgressTexture.progress = textureQ
         tvReviewCapture.text = "$capture%"
         tvReviewViewpoint.text = "$viewpoint%"
+        tvReviewSurface.text = "$surface%"
         tvReviewGeometry.text = "$geometry%"
         tvReviewTexture.text = "$textureQ%"
         tvReviewMissing.text = reviewMissingViewsText()
@@ -3209,6 +3568,7 @@ private var lastRelocPollMs = 0L
         scanPaused = false
         scanReviewActive = false
         showScanReview(false)
+        com.mobilescan3d.persistence.ScanRecoveryManager.clear(applicationContext)
         cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
         multiCam?.updateScanState(false, sessionId, false)
         // V0.5：停扫后不再派发深度推理 / TSDF 融合（见 processImage 的
@@ -3427,6 +3787,12 @@ private var lastRelocPollMs = 0L
             return
         }
         renderer.setMesh(mesh.vertices, mesh.indices)
+        viewerBaseMesh = mesh
+        viewerSurfaceVertices = null
+        renderer.setViewerStyle(PointCloudRenderer.VIEWER_STYLE_TEXTURE)
+        renderer.setViewerBoundaryEdges(null)
+        updateViewerModeUi(PointCloudRenderer.VIEWER_STYLE_TEXTURE)
+        analyzeViewerMesh(mesh)
         val cx = (minX + maxX) * 0.5f
         val cy = (minY + maxY) * 0.5f
         val cz = (minZ + maxZ) * 0.5f
@@ -3448,13 +3814,121 @@ private var lastRelocPollMs = 0L
         modelViewerActive = true
         glView.isClickable = true
         modelViewerButton?.text = "退出查看"
+        if (::tvViewerStats.isInitialized) {
+            tvViewerStats.text = "${mesh.triangleCount} 面 · ${mesh.vertexCount} 顶点 · 可旋转检查"
+        }
         setScanOverlayVisible(false)
         glView.requestRender()
-        toast("拖动=旋转 · 双指=缩放 · 长按后拖=移动 · 长按「退出查看」重置视角")
+        toast("单指旋转 · 双指缩放/平移")
+    }
+
+    private fun setViewerPresentation(style: Int) {
+        if (!modelViewerActive) return
+        val base = viewerBaseMesh
+        if (base != null) {
+            if (style == PointCloudRenderer.VIEWER_STYLE_SURFACE && viewerSurfaceVertices != null) {
+                renderer.setMesh(viewerSurfaceVertices, base.indices)
+            } else {
+                renderer.setMesh(base.vertices, base.indices)
+            }
+        }
+        renderer.setViewerStyle(style)
+        updateViewerModeUi(style)
+        glView.requestRender()
+        when (style) {
+            PointCloudRenderer.VIEWER_STYLE_INSPECT ->
+                toast("红色边线 = 网格真实开放边界；不一定都是错误，也可能是有意保留的开口")
+            PointCloudRenderer.VIEWER_STYLE_SURFACE ->
+                toast("表面观测热力来自 TSDF 真实融合权重：红弱、黄可用、绿稳定")
+        }
+    }
+
+    private fun updateViewerModeUi(style: Int) {
+        if (!::viewerModeTexture.isInitialized) return
+        val items = listOf(
+            viewerModeTexture to PointCloudRenderer.VIEWER_STYLE_TEXTURE,
+            viewerModeSolid to PointCloudRenderer.VIEWER_STYLE_SOLID,
+            viewerModeWire to PointCloudRenderer.VIEWER_STYLE_WIREFRAME,
+            viewerModeInspect to PointCloudRenderer.VIEWER_STYLE_INSPECT,
+            viewerModeSurface to PointCloudRenderer.VIEWER_STYLE_SURFACE
+        )
+        items.forEach { (view, mode) ->
+            if (mode == style) {
+                view.setBackgroundResource(R.drawable.bg_viewer_mode_active)
+                view.setTextColor(getColor(R.color.scan_text_primary))
+                view.setTypeface(null, android.graphics.Typeface.BOLD)
+            } else {
+                view.background = null
+                view.setTextColor(getColor(R.color.scan_text_secondary))
+                view.setTypeface(null, android.graphics.Typeface.NORMAL)
+            }
+        }
+    }
+
+    private fun analyzeViewerMesh(mesh: com.mobilescan3d.export.ExportManager.MeshData) {
+        val token = ++viewerAnalysisToken
+        tvViewerDimensions.text = "尺寸：分析中"
+        tvViewerTopology.text = "拓扑：分析中"
+
+        Thread {
+            val result = try {
+                com.mobilescan3d.mesh.MeshInspectionAnalyzer.analyze(
+                    mesh.vertices, mesh.indices
+                )
+            } catch (_: Throwable) {
+                null
+            }
+            val observationWeights = try {
+                exportManager.meshObservationWeights(mesh.vertexCount)
+            } catch (_: Throwable) {
+                FloatArray(0)
+            }
+            val observationHeat = buildSurfaceObservationHeatmap(
+                mesh.vertices, observationWeights
+            )
+            runOnUiThread {
+                if (isDestroyed || token != viewerAnalysisToken || !modelViewerActive) return@runOnUiThread
+                if (result == null) {
+                    tvViewerDimensions.text = "尺寸：分析失败"
+                    tvViewerTopology.text = "拓扑：暂不可用"
+                    return@runOnUiThread
+                }
+
+                fun fmtMeters(v: Float): String =
+                    if (v < 1f) "${(v * 100f).toInt()}cm" else "%.2fm".format(v)
+
+                tvViewerDimensions.text =
+                    "尺寸：${fmtMeters(result.width)} × ${fmtMeters(result.height)} × ${fmtMeters(result.depth)}"
+
+                tvViewerTopology.text = when {
+                    !result.topologyComplete ->
+                        "拓扑：模型过大，跳过开放边精确分析"
+                    result.boundaryEdgeCount == 0 && result.nonManifoldEdgeCount == 0 ->
+                        "拓扑：未检测到开放边"
+                    else ->
+                        "拓扑：${result.boundaryEdgeCount} 条开放边 · ${result.nonManifoldEdgeCount} 处非流形"
+                }
+
+                renderer.setViewerBoundaryEdges(
+                    if (result.topologyComplete) result.boundaryEdges else null
+                )
+                viewerSurfaceVertices = observationHeat
+                updateSurfaceObservationStats(observationWeights)
+                if (observationWeights.isNotEmpty()) {
+                    tvViewerTopology.text = tvViewerTopology.text.toString() +
+                        " · 表面稳定 ${lastSurfaceCoveragePercent}%"
+                }
+                glView.requestRender()
+            }
+        }.start()
     }
 
     /** 退出查看模式：恢复 AR 图层与触摸穿透。 */
     private fun exitModelViewer() {
+        viewerAnalysisToken++
+        renderer.setViewerBoundaryEdges(null)
+        viewerBaseMesh = null
+        viewerSurfaceVertices = null
         cancelViewerLongPress()
         viewerPanMode = false
         viewerMoved = false
@@ -3466,13 +3940,42 @@ private var lastRelocPollMs = 0L
         glView.requestRender()
     }
 
-    /** 进入/退出模型查看器时，显隐扫描页浮层，避免全屏模型下按钮仍可点击造成误触。 */
+    /**
+     * Dedicated viewer composition:
+     * - scan controls disappear as one unit
+     * - camera texture is hidden
+     * - neutral 3D grid backdrop is revealed
+     * - GL remains interactive above it
+     * - viewer controls are the only active UI
+     */
     private fun setScanOverlayVisible(visible: Boolean) {
-        val v = if (visible) android.view.View.VISIBLE else android.view.View.GONE
-        listOf(
-            R.id.statusCard, R.id.toolRail, R.id.scanReticle, R.id.tvZoom,
-            R.id.hudCard, R.id.viewpointCoverage, R.id.btnExport, R.id.btnStartScan
-        ).forEach { findViewById<android.view.View>(it).visibility = v }
+        if (::mainScanUi.isInitialized) {
+            mainScanUi.visibility =
+                if (visible) android.view.View.VISIBLE else android.view.View.GONE
+        }
+        if (::modelViewerOverlay.isInitialized) {
+            modelViewerOverlay.visibility =
+                if (visible) android.view.View.GONE else android.view.View.VISIBLE
+        }
+        if (::viewerBackdrop.isInitialized) {
+            viewerBackdrop.visibility =
+                if (visible) android.view.View.GONE else android.view.View.VISIBLE
+        }
+        if (::texture.isInitialized) {
+            texture.visibility =
+                if (visible) android.view.View.VISIBLE else android.view.View.INVISIBLE
+        }
+        if (::scanReticleView.isInitialized) {
+            scanReticleView.visibility =
+                if (visible) android.view.View.VISIBLE else android.view.View.GONE
+        }
+        if (::targetOverlay.isInitialized) {
+            targetOverlay.visibility =
+                if (visible) android.view.View.VISIBLE else android.view.View.GONE
+        }
+        if (::targetWarningText.isInitialized && !visible) {
+            targetWarningText.visibility = android.view.View.GONE
+        }
     }
 
     /** VINS world uses +Z up: yaw must preserve height, with the center at the anchor. */
@@ -3555,76 +4058,80 @@ private var lastRelocPollMs = 0L
      *  - 按住 300ms 未动 -> 震动一下进入平移，之后拖动 = 物体跟手平移
      */
     private fun handleModelViewerTouch(event: android.view.MotionEvent) {
-        if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN) viewerMultiTouch = false
-        if (event.pointerCount > 1) {
-            viewerMultiTouch = true
-            cancelViewerLongPress()
-            viewerPanMode = false
-        }
         viewerScaleDetector.onTouchEvent(event)
-        // After a pinch, wait for ALL fingers to lift. Pointer-index changes must not rotate/pan.
-        if (viewerMultiTouch) {
-            if (event.actionMasked == android.view.MotionEvent.ACTION_UP ||
-                event.actionMasked == android.view.MotionEvent.ACTION_CANCEL) {
-                viewerMultiTouch = false
-                viewerMoved = false
-            }
-            return
-        }
+
+        fun midpointX(): Float =
+            if (event.pointerCount >= 2) (event.getX(0) + event.getX(1)) * 0.5f else event.x
+        fun midpointY(): Float =
+            if (event.pointerCount >= 2) (event.getY(0) + event.getY(1)) * 0.5f else event.y
+
         when (event.actionMasked) {
             android.view.MotionEvent.ACTION_DOWN -> {
+                viewerMultiTouch = false
+                viewerLastX = event.x
+                viewerLastY = event.y
                 viewerDownX = event.x
                 viewerDownY = event.y
-                viewerLastX = event.x
-                viewerLastY = event.y
-                viewerPanMode = false
                 viewerMoved = false
-                val r = Runnable {
-                    viewerLongPressRunnable = null
-                    if (!viewerMoved) {
-                        viewerPanMode = true
-                        // 触觉反馈：告诉用户手势已从「旋转」切到「平移」
-                        try {
-                            val hh = getSystemService(android.content.Context.VIBRATOR_SERVICE)
-                                    as? android.os.Vibrator
-                            @Suppress("DEPRECATION")
-                            hh?.vibrate(20L)
-                        } catch (_: Throwable) {
+                cancelViewerLongPress()
+            }
+
+            android.view.MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount >= 2) {
+                    viewerMultiTouch = true
+                    viewerLastMidX = midpointX()
+                    viewerLastMidY = midpointY()
+                    cancelViewerLongPress()
+                }
+            }
+
+            android.view.MotionEvent.ACTION_MOVE -> {
+                if (event.pointerCount >= 2 || viewerMultiTouch) {
+                    if (event.pointerCount >= 2) {
+                        val mx = midpointX()
+                        val my = midpointY()
+                        val dx = mx - viewerLastMidX
+                        val dy = my - viewerLastMidY
+                        viewerLastMidX = mx
+                        viewerLastMidY = my
+                        // ScaleGestureDetector handles pinch distance; midpoint delta
+                        // handles the standard two-finger pan gesture.
+                        if (dx != 0f || dy != 0f) {
+                            glView.queueEvent { renderer.panViewer(dx, dy) }
+                            glView.requestRender()
                         }
                     }
+                    return
                 }
-                viewerLongPressRunnable = r
-                viewerHandler.postDelayed(r, viewerLongPressMs)
-            }
-            android.view.MotionEvent.ACTION_MOVE -> {
-                val dx = event.x - viewerLastX
-                val dy = event.y - viewerLastY
-                viewerLastX = event.x
-                viewerLastY = event.y
-                if (!viewerMoved) {
-                    val tx = event.x - viewerDownX
-                    val ty = event.y - viewerDownY
-                    if (tx * tx + ty * ty > 20f * 20f) {
-                        viewerMoved = true
-                        // 300ms 内就开始拖 = 旋转手势，长按判定作废
-                        if (!viewerPanMode) cancelViewerLongPress()
-                    } else if (!viewerPanMode) {
-                        // 还没确定手势类型也没挪出 slop，先不动作
-                        return
+
+                if (!viewerScaleDetector.isInProgress) {
+                    val dx = event.x - viewerLastX
+                    val dy = event.y - viewerLastY
+                    viewerLastX = event.x
+                    viewerLastY = event.y
+                    if (dx != 0f || dy != 0f) {
+                        glView.queueEvent {
+                            renderer.rotateViewer(
+                                dx * viewerRotRadPerPx,
+                                dy * viewerRotRadPerPx
+                            )
+                        }
+                        glView.requestRender()
                     }
                 }
-                if (viewerPanMode) {
-                    glView.queueEvent { renderer.panViewer(dx, dy) }
-                } else {
-                    glView.queueEvent { renderer.rotateViewer(dx * viewerRotRadPerPx, dy * viewerRotRadPerPx) }
-                }
-                glView.requestRender()
             }
+
+            android.view.MotionEvent.ACTION_POINTER_UP -> {
+                // Keep multi-touch latched until all fingers lift. This avoids the
+                // classic pointer-index jump from unexpectedly rotating the model.
+                viewerMultiTouch = true
+            }
+
             android.view.MotionEvent.ACTION_UP,
             android.view.MotionEvent.ACTION_CANCEL -> {
-                cancelViewerLongPress()
-                viewerPanMode = false
+                viewerMultiTouch = false
                 viewerMoved = false
+                cancelViewerLongPress()
             }
         }
     }
@@ -4333,6 +4840,7 @@ private var lastRelocPollMs = 0L
         // V0.12: 网格快照走自己的 5s 节拍（函数内部自带节流与忙碌门），
         // 这里绝不做任何按相机帧率的 native 重操作。
         maybeRefreshLiveMesh()
+        maybeSaveRecoveryCheckpoint()
         if (::hqCapture.isInitialized && !cameraRangeSwitching) {
             hqCapture.onFrameTick(ts, scanning, cameraDevice, captureSession)
             syncCaptureStateFromController()
@@ -4478,6 +4986,54 @@ private var lastRelocPollMs = 0L
             else -> "关"
         }
         tvCameraMode.text = cameraRangeStatus.substringBefore("·").trim()
+        if (::toolCameraLabel.isInitialized) {
+            toolCameraLabel.text = tvCameraMode.text
+        }
+        if (::toolLightLabel.isInitialized) {
+            toolLightLabel.text = when {
+                torchFailed -> "故障"
+                torchRequested -> "已开启"
+                !torchAvailable -> "不可用"
+                autoFillLight -> "自动"
+                else -> "关闭"
+            }
+            toolLightLabel.setTextColor(
+                getColor(
+                    when {
+                        torchFailed -> R.color.scan_danger
+                        torchRequested || autoFillLight -> R.color.scan_primary
+                        else -> R.color.scan_text_muted
+                    }
+                )
+            )
+        }
+        if (::toolLockLabel.isInitialized) {
+            toolLockLabel.text = when {
+                !objectLockEnabled -> "未锁定"
+                targetConfidence >= 0.55f -> "已锁定"
+                else -> "待选择"
+            }
+            toolLockLabel.setTextColor(
+                getColor(
+                    when {
+                        targetConfidence >= 0.55f && objectLockEnabled -> R.color.scan_success
+                        objectLockEnabled -> R.color.scan_warning
+                        else -> R.color.scan_text_muted
+                    }
+                )
+            )
+        }
+        if (::toolModeLabel.isInitialized) {
+            toolModeLabel.text = when (scanVoxelProfile) {
+                0 -> "精细物体"
+                1 -> "快速物体"
+                2 -> "房间"
+                else -> "智能推荐"
+            }
+        }
+        if (::toolAutoLabel.isInitialized) {
+            toolAutoLabel.text = if (autoFillLight) "自动" else "自定义"
+        }
         val depthOk = ::depthProvider.isInitialized && depthProvider.available && depthLastError.isEmpty()
         tvDepth.text = if (depthOk) "深度: 有效" else "深度: 等待"
         tvMapCount.text = "地图: $shown"
@@ -4777,6 +5333,67 @@ private var lastRelocPollMs = 0L
         )
     }
 
+    private fun updateSurfaceObservationStats(weights: FloatArray) {
+        if (weights.isEmpty()) {
+            lastSurfaceCoveragePercent = 0
+            lastSurfaceRobustPercent = 0
+            return
+        }
+        var usable = 0
+        var robust = 0
+        var valid = 0
+        for (w in weights) {
+            if (!w.isFinite() || w <= 0f) continue
+            valid++
+            if (w >= 4f) usable++
+            if (w >= 8f) robust++
+        }
+        if (valid <= 0) {
+            lastSurfaceCoveragePercent = 0
+            lastSurfaceRobustPercent = 0
+        } else {
+            lastSurfaceCoveragePercent = (usable * 100 / valid).coerceIn(0, 100)
+            lastSurfaceRobustPercent = (robust * 100 / valid).coerceIn(0, 100)
+        }
+    }
+
+    /**
+     * Replaces only RGB fields of the 9-float mesh vertex layout.
+     * Geometry/normals stay byte-for-byte unchanged.
+     *
+     * Heat semantics:
+     *   weak < 2 TSDF weight  -> red
+     *   2..6                  -> red/yellow -> yellow/green
+     *   >= 8                  -> green
+     */
+    private fun buildSurfaceObservationHeatmap(
+        base: FloatArray,
+        weights: FloatArray
+    ): FloatArray? {
+        val vertexCount = base.size / NativeBridge.MESH_VERTEX_FLOATS
+        if (vertexCount <= 0 || weights.size < vertexCount) return null
+        val out = base.copyOf()
+        for (i in 0 until vertexCount) {
+            val w = weights[i].coerceIn(0f, 10f)
+            val (r, g, b) = when {
+                w < 2f -> Triple(1.0f, 0.20f + 0.18f * w, 0.12f)
+                w < 6f -> {
+                    val t = (w - 2f) / 4f
+                    Triple(1.0f - 0.35f * t, 0.56f + 0.38f * t, 0.10f)
+                }
+                else -> {
+                    val t = ((w - 6f) / 4f).coerceIn(0f, 1f)
+                    Triple(0.30f - 0.12f * t, 0.92f + 0.06f * t, 0.38f + 0.24f * t)
+                }
+            }
+            val o = i * NativeBridge.MESH_VERTEX_FLOATS
+            out[o + 6] = r
+            out[o + 7] = g
+            out[o + 8] = b
+        }
+        return out
+    }
+
     private fun computeCoverageGuidance(): String {
         val sideMissing = (0 until 12).count { viewpointCoverage[it] < 0.38f }
         val topMissing = viewpointCoverage[12] < 0.34f
@@ -4806,6 +5423,9 @@ private var lastRelocPollMs = 0L
         if (viewpointCoverage[12] < 0.34f) notes.add("顶部视角不足")
         if (viewpointCoverage[13] < 0.30f) notes.add("底部/遮挡边缘不足")
         if (lastGeometryQualityPercent < 55) notes.add("几何重复观测偏少")
+        if (lastSurfaceCoveragePercent in 1..64) {
+            notes.add("真实表面稳定观测不足（${lastSurfaceCoveragePercent}%）")
+        }
         if (lastTextureQualityPercent < 55) notes.add("纹理画质偏弱")
         return if (notes.isEmpty()) {
             "未发现明显的视角短板；仍建议观察预览网格是否存在真实缺口。"
@@ -5199,6 +5819,57 @@ private var lastRelocPollMs = 0L
             .show()
     }
 
+    private fun showScanUiHelp() {
+        val message =
+            "主界面已按 20:9 竖屏扫描工作流整理：\n\n" +
+                "• 左侧：扫描设置 / 重建模式 / 对焦防抖\n" +
+                "• 右侧：镜头 / 补光 / 物体锁定 / 实时预览\n" +
+                "• 中央：保持目标在扫描框内，缓慢环绕\n" +
+                "• 底部：导出 / 开始或完成扫描 / 3D模型\n\n" +
+                "顶部区域通过 Android DisplayCutout 动态避让前置摄像头，" +
+                "不会依赖固定挖孔尺寸。"
+        android.app.AlertDialog.Builder(this)
+            .setTitle("扫描界面")
+            .setMessage(message)
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
+    private fun showViewerHelp() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("3D 模型查看")
+            .setMessage(
+                "单指拖动：旋转模型\n" +
+                    "双指捏合：缩放\n" +
+                    "双指一起拖动：平移\n\n" +
+                    "顶部可切换纹理 / 实体 / 线框 / 缺口 / 表面观测。\n" +
+                    "“缺口”模式中的红线是真实拓扑开放边，不是估算热力图。\n\n" +
+                    "右侧“重置”可回到自动构图；“AR摆放”会退出独立查看器，" +
+                    "把模型放回真实相机画面。"
+            )
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
+    private fun toggleAutoFillLightFromToolbar() {
+        if (!torchAvailable) {
+            toast("当前镜头没有可用闪光灯")
+            return
+        }
+        autoFillLight = !autoFillLight
+        getSharedPreferences("scan_settings", Context.MODE_PRIVATE).edit()
+            .putBoolean("auto_fill_light", autoFillLight)
+            .apply()
+        if (!autoFillLight) {
+            cameraHandler?.post {
+                resetFillLight()
+                applyCaptureSettings()
+            }
+        }
+        toast(if (autoFillLight) "已开启自动补光" else "已关闭自动补光")
+        updateHeader()
+    }
+
     private fun showSettingsMenu() {
         android.widget.PopupMenu(this, findViewById(R.id.btnSettings)!!).apply {
             menu.add("相机参数")
@@ -5346,7 +6017,12 @@ private var lastRelocPollMs = 0L
             toast("请先停止扫描并等待模型操作完成；档位用于下一次扫描")
             return
         }
-        val labels = arrayOf("物体精细 · 4mm 目标体素", "物体快速 · 8mm 目标体素", "房间 · 20mm 场景体素")
+        val labels = arrayOf(
+            "物体精细 · 4mm 目标体素",
+            "物体快速 · 8mm 目标体素",
+            "房间/大场景 · 20mm 场景体素",
+            "智能推荐 · 按距离与目标锁定自动选择"
+        )
         android.app.AlertDialog.Builder(this)
             .setTitle("重建档位（体素设置，非测量精度）")
             .setSingleChoiceItems(labels, scanVoxelProfile) { dialog, which ->
@@ -5354,11 +6030,22 @@ private var lastRelocPollMs = 0L
                 getSharedPreferences("scan_settings", Context.MODE_PRIVATE).edit()
                     .putInt("voxel_profile", which).apply()
                 toast("下次扫描使用：${labels[which]}")
+                updateHeader()
                 dialog.dismiss()
             }
             .setNegativeButton("取消", null)
             .show()
     }
+
+    private fun resolvedScanVoxelProfile(): Int {
+        if (scanVoxelProfile in 0..2) return scanVoxelProfile
+        return when {
+            objectLockEnabled || scanMaxDistanceMeters <= 1.25f -> 0
+            scanMaxDistanceMeters <= 2.4f -> 1
+            else -> 2
+        }
+    }
+
 
     private fun remapDeviceToCamera(x: Float, y: Float, z: Float, out: FloatArray, offset: Int) {
         if (lensFacing != CameraCharacteristics.LENS_FACING_BACK) {

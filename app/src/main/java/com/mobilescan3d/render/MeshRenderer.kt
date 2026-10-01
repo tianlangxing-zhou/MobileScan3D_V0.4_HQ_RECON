@@ -106,6 +106,15 @@ class MeshRenderer {
 
     private var vbo = 0
     private var ibo = 0
+    private var wireIbo = 0
+    private var boundaryIbo = 0
+    private var wireIndexCount = 0
+    private var boundaryIndexCount = 0
+
+    /** Viewer-only presentation flags. AR rendering leaves these false. */
+    @Volatile var viewerWireframeOnly = false
+    @Volatile var viewerWireframeOverlay = false
+    @Volatile var viewerBoundaryOverlay = false
 
     private var glReady = false
     private var supportsUintIndex = false
@@ -144,6 +153,8 @@ class MeshRenderer {
     private data class PendingMesh(val vertices: FloatArray?, val indices: IntArray?)
     @Volatile private var pendingMesh = PendingMesh(null, null)
     private var uploadedMesh: PendingMesh? = null
+    @Volatile private var pendingBoundaryEdges: IntArray? = null
+    private var uploadedBoundaryEdges: IntArray? = null
 
     /** 最近一次上传失败的原因（HUD / 报告用）。 */
     @Volatile
@@ -158,7 +169,12 @@ class MeshRenderer {
         glReady = false
         vbo = 0
         ibo = 0
+        wireIbo = 0
+        boundaryIbo = 0
+        wireIndexCount = 0
+        boundaryIndexCount = 0
         uploadedMesh = null
+        uploadedBoundaryEdges = null
         uploadedVertexCount = 0
         uploadedTriangleCount = 0
         program = link(VERT, FRAG)
@@ -192,10 +208,12 @@ class MeshRenderer {
         val exts = GLES20.glGetString(GLES20.GL_EXTENSIONS) ?: ""
         supportsUintIndex = exts.contains("GL_OES_element_index_uint")
 
-        val bufs = IntArray(2)
-        GLES20.glGenBuffers(2, bufs, 0)
+        val bufs = IntArray(4)
+        GLES20.glGenBuffers(4, bufs, 0)
         vbo = bufs[0]
         ibo = bufs[1]
+        wireIbo = bufs[2]
+        boundaryIbo = bufs[3]
 
         glReady = true
         Log.i(TAG, "mesh program ready, uintIndex=$supportsUintIndex")
@@ -204,17 +222,22 @@ class MeshRenderer {
 
     /** GL 上下文销毁前调用（`onSurfaceCreated` 里重建即可，无需显式释放）。 */
     fun release() {
-        if (vbo != 0 || ibo != 0) {
-            GLES20.glDeleteBuffers(2, intArrayOf(vbo, ibo), 0)
+        if (vbo != 0 || ibo != 0 || wireIbo != 0 || boundaryIbo != 0) {
+            GLES20.glDeleteBuffers(4, intArrayOf(vbo, ibo, wireIbo, boundaryIbo), 0)
         }
         if (program != 0) {
             GLES20.glDeleteProgram(program)
         }
         vbo = 0
         ibo = 0
+        wireIbo = 0
+        boundaryIbo = 0
+        wireIndexCount = 0
+        boundaryIndexCount = 0
         program = 0
         glReady = false
         uploadedMesh = null
+        uploadedBoundaryEdges = null
         uploadedVertexCount = 0
         uploadedTriangleCount = 0
     }
@@ -229,10 +252,16 @@ class MeshRenderer {
      */
     fun setMesh(vertices: FloatArray?, indices: IntArray?) {
         pendingMesh = PendingMesh(vertices, indices)
+        pendingBoundaryEdges = null
+    }
+
+    fun setBoundaryEdges(indices: IntArray?) {
+        pendingBoundaryEdges = indices
     }
 
     fun clearMesh() {
         pendingMesh = PendingMesh(null, null)
+        pendingBoundaryEdges = null
     }
 
     val hasPendingMesh: Boolean get() = pendingMesh.let { it.vertices != null && it.indices != null }
@@ -258,6 +287,7 @@ class MeshRenderer {
         if (!glReady) return 0
         if (pose.size < 12 || cameraToView.size < 6) return 0
         uploadIfNeeded()
+        uploadBoundaryIfNeeded()
         if (uploadedTriangleCount <= 0) return 0
 
         GLES20.glUseProgram(program)
@@ -310,9 +340,31 @@ class MeshRenderer {
             GLES20.glVertexAttribPointer(aColor, 3, GLES20.GL_FLOAT, false, stride, 6 * 4)
         }
 
-        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ibo)
         val type = if (supportsUintIndex) GLES20.GL_UNSIGNED_INT else GLES20.GL_UNSIGNED_SHORT
-        GLES20.glDrawElements(GLES20.GL_TRIANGLES, uploadedTriangleCount * 3, type, 0)
+
+        if (!viewerWireframeOnly) {
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, ibo)
+            GLES20.glDrawElements(GLES20.GL_TRIANGLES, uploadedTriangleCount * 3, type, 0)
+        }
+
+        if ((viewerWireframeOnly || viewerWireframeOverlay) && wireIndexCount > 0) {
+            GLES20.glUniform1f(uAlpha, 1f)
+            GLES20.glUniform1f(uUseTint, 1f)
+            GLES20.glUniform3f(uTint, 0.18f, 0.72f, 1.00f)
+            GLES20.glLineWidth(1.25f)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, wireIbo)
+            GLES20.glDrawElements(GLES20.GL_LINES, wireIndexCount, type, 0)
+        }
+
+        // "缺口检查"只高亮真实的拓扑开放边：这些边只被一个三角形使用。
+        if (viewerBoundaryOverlay && boundaryIndexCount > 0) {
+            GLES20.glUniform1f(uAlpha, 1f)
+            GLES20.glUniform1f(uUseTint, 1f)
+            GLES20.glUniform3f(uTint, 1.00f, 0.28f, 0.18f)
+            GLES20.glLineWidth(3f)
+            GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, boundaryIbo)
+            GLES20.glDrawElements(GLES20.GL_LINES, boundaryIndexCount, type, 0)
+        }
 
         GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
@@ -401,6 +453,28 @@ class MeshRenderer {
             )
             idxBytes = triCount * 3 * 2
         }
+        // Viewer wireframe is intentionally bounded: drawing every edge of a
+        // multi-million-triangle HQ mesh can overwhelm a mobile GPU. Sampling
+        // keeps the inspection readable while preserving the real geometry.
+        val maxWireTriangles = 120_000
+        val step = kotlin.math.max(1, (triCount + maxWireTriangles - 1) / maxWireTriangles)
+        val sampledTriangles = (triCount + step - 1) / step
+        val wire = IntArray(sampledTriangles * 6)
+        var wp = 0
+        var ti = 0
+        while (ti < triCount) {
+            val base = ti * 3
+            val a = idx[base]
+            val b = idx[base + 1]
+            val c = idx[base + 2]
+            wire[wp++] = a; wire[wp++] = b
+            wire[wp++] = b; wire[wp++] = c
+            wire[wp++] = c; wire[wp++] = a
+            ti += step
+        }
+        uploadIndexArray(wireIbo, wire, wp)
+        wireIndexCount = wp
+
         GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
         GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
 
@@ -409,6 +483,43 @@ class MeshRenderer {
         uploadedTriangleCount = triCount
         lastError = ""
         Log.i(TAG, "mesh uploaded: verts=$vcount tris=$triCount idxBytes=$idxBytes")
+    }
+
+    private fun uploadBoundaryIfNeeded() {
+        val edges = pendingBoundaryEdges
+        if (edges === uploadedBoundaryEdges) return
+        uploadedBoundaryEdges = edges
+        if (edges == null || edges.size < 2) {
+            boundaryIndexCount = 0
+            return
+        }
+        uploadIndexArray(boundaryIbo, edges, edges.size)
+        boundaryIndexCount = edges.size
+    }
+
+    private fun uploadIndexArray(buffer: Int, values: IntArray, count: Int) {
+        if (buffer == 0 || count <= 0) return
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, buffer)
+        if (supportsUintIndex) {
+            val out = ByteBuffer.allocateDirect(count * 4)
+                .order(ByteOrder.nativeOrder())
+                .asIntBuffer()
+            out.put(values, 0, count)
+            out.flip()
+            GLES20.glBufferData(
+                GLES20.GL_ELEMENT_ARRAY_BUFFER, count * 4, out, GLES20.GL_STATIC_DRAW
+            )
+        } else {
+            val out = ByteBuffer.allocateDirect(count * 2)
+                .order(ByteOrder.nativeOrder())
+                .asShortBuffer()
+            for (i in 0 until count) out.put(values[i].toShort())
+            out.flip()
+            GLES20.glBufferData(
+                GLES20.GL_ELEMENT_ARRAY_BUFFER, count * 2, out, GLES20.GL_STATIC_DRAW
+            )
+        }
+        GLES20.glBindBuffer(GLES20.GL_ELEMENT_ARRAY_BUFFER, 0)
     }
 
     private fun compile(type: Int, src: String): Int {

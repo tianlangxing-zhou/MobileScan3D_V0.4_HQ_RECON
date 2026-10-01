@@ -137,6 +137,18 @@ public:
     /** 仍保留：把表面附近的体素导出成只有顶点的 PLY（兼容旧导出路径）。 */
     bool exportPly(const std::string& path) const;
 
+    /**
+     * Round 6 recovery snapshot.
+     *
+     * Binary snapshot contains the exact sparse TSDF blocks and their weights/colors.
+     * It is intended for recovering unfinished geometry after a process/device
+     * interruption. It does NOT serialize VINS/IMU estimator state, therefore a
+     * restored snapshot is opened as a recoverable model, not silently fused with a
+     * new coordinate frame.
+     */
+    bool saveCheckpoint(const std::string& path) const;
+    bool loadCheckpoint(const std::string& path);
+
     // ------------------------------------------------------------- mesh 提取
     /** 整数体素坐标处的 tsdf。未分配或 weight==0 时返回 kEmptyTsdf。 */
     int16_t tsdfAt(int vx, int vy, int vz) const;

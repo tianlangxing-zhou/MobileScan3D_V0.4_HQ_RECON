@@ -102,6 +102,19 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
 
     /** 绘制模式：见 DRAW_* 常量 */
     @Volatile var drawMode = DRAW_LIVE
+
+    /** Round 5 dedicated 3D-viewer presentation. */
+    @Volatile private var viewerStyle = VIEWER_STYLE_TEXTURE
+
+    fun setViewerStyle(style: Int) {
+        viewerStyle = style.coerceIn(VIEWER_STYLE_TEXTURE, VIEWER_STYLE_SURFACE)
+    }
+
+    fun getViewerStyle(): Int = viewerStyle
+
+    fun setViewerBoundaryEdges(edges: IntArray?) {
+        meshRenderer.setBoundaryEdges(edges)
+    }
     /** 累计点云的 hits 过滤门限 */
     @Volatile var accumulatedMinHits = NativeBridge.AR_MIN_HITS_CONFIRMED
     /** 最近一次实际画出的点数（HUD / 报告用） */
@@ -404,22 +417,54 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
             val fx = VIEWER_FOCAL_NORM * viewportH / viewportW.coerceAtLeast(1)
             val near = 0.02f
             val far = viewerDist * 10f + 10f
-            // 查看模式必须不透明 + 真实顶点色；退出后恢复 AR 模式的设置。
+            // Viewer styles are intentionally isolated from AR rendering.
             val savedAlpha = meshRenderer.alpha
             val savedTint = meshRenderer.useTint
+            val savedTintR = meshRenderer.tintR
+            val savedTintG = meshRenderer.tintG
+            val savedTintB = meshRenderer.tintB
             val savedTexAlpha = texturedMeshRenderer.alpha
+
             meshRenderer.alpha = 1f
-            meshRenderer.useTint = false
+            meshRenderer.viewerWireframeOnly = false
+            meshRenderer.viewerWireframeOverlay = false
+            meshRenderer.viewerBoundaryOverlay = false
             texturedMeshRenderer.alpha = 1f
+
+            when (viewerStyle) {
+                VIEWER_STYLE_SOLID -> {
+                    meshRenderer.useTint = true
+                    meshRenderer.tintR = 0.72f
+                    meshRenderer.tintG = 0.79f
+                    meshRenderer.tintB = 0.88f
+                }
+                VIEWER_STYLE_WIREFRAME -> {
+                    meshRenderer.useTint = true
+                    meshRenderer.tintR = 0.12f
+                    meshRenderer.tintG = 0.20f
+                    meshRenderer.tintB = 0.27f
+                    meshRenderer.viewerWireframeOnly = true
+                }
+                VIEWER_STYLE_INSPECT -> {
+                    meshRenderer.useTint = true
+                    meshRenderer.tintR = 0.56f
+                    meshRenderer.tintG = 0.63f
+                    meshRenderer.tintB = 0.70f
+                    meshRenderer.viewerWireframeOverlay = true
+                    meshRenderer.viewerBoundaryOverlay = true
+                }
+                else -> meshRenderer.useTint = false
+            }
+
             var drawn = 0
             try {
-                if (texturedMeshRenderer.hasAsset) {
+                if (viewerStyle == VIEWER_STYLE_TEXTURE && texturedMeshRenderer.hasAsset) {
                     drawn = texturedMeshRenderer.draw(
                         pose, fx, VIEWER_FOCAL_NORM, 0.5f, 0.5f, 1, 1,
                         IDENTITY_CAMERA_TO_VIEW, near, far
                     )
                 }
-                if (drawn <= 0) {
+                if (drawn <= 0 || viewerStyle != VIEWER_STYLE_TEXTURE) {
                     drawn = meshRenderer.draw(
                         pose, fx, VIEWER_FOCAL_NORM, 0.5f, 0.5f, 1, 1,
                         IDENTITY_CAMERA_TO_VIEW, near, far
@@ -429,8 +474,15 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
                 drawn = 0
             }
             drawnMeshTriangles = drawn
+
+            meshRenderer.viewerWireframeOnly = false
+            meshRenderer.viewerWireframeOverlay = false
+            meshRenderer.viewerBoundaryOverlay = false
             meshRenderer.alpha = savedAlpha
             meshRenderer.useTint = savedTint
+            meshRenderer.tintR = savedTintR
+            meshRenderer.tintG = savedTintG
+            meshRenderer.tintB = savedTintB
             texturedMeshRenderer.alpha = savedTexAlpha
             return
         }
@@ -724,6 +776,13 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
          * cameraToView 恒等 —— 直接把 [0,1] 的 camera UV 映到屏幕。
          */
         const val DRAW_MODEL_VIEWER = 5
+
+        const val VIEWER_STYLE_TEXTURE = 0
+        const val VIEWER_STYLE_SOLID = 1
+        const val VIEWER_STYLE_WIREFRAME = 2
+        const val VIEWER_STYLE_INSPECT = 3
+        /** Round 6: TSDF observation heatmap colors supplied by MainActivity. */
+        const val VIEWER_STYLE_SURFACE = 4
 
         /** 查看器合成相机的归一化焦距（竖直方向）。越大模型看起来越「平」。 */
         private const val VIEWER_FOCAL_NORM = 1.2f

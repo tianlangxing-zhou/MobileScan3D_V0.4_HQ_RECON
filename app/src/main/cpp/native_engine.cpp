@@ -5758,3 +5758,116 @@ Java_com_mobilescan3d_NativeBridge_nativeGetMeshCleanupStats(
     env->SetIntArrayRegion(out, 0, 10, values);
     return JNI_TRUE;
 }
+
+// ============================================================================
+//  Round 6: TSDF checkpoint save/load + per-vertex observation strength
+//  (merged from R5_R6 cumulative incremental patch; native_engine.cpp
+//   three-way merge — these are pure additions at file end, vc175/vc176
+//   calibration/epoch fixes in the middle are preserved)
+// ============================================================================
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeSaveTsdfCheckpoint(
+        JNIEnv* env, jobject, jstring scenePath, jstring targetPath) {
+    if (!scenePath || !targetPath) return JNI_FALSE;
+    const char* scene = env->GetStringUTFChars(scenePath, nullptr);
+    const char* target = env->GetStringUTFChars(targetPath, nullptr);
+    if (!scene || !target) {
+        if (scene) env->ReleaseStringUTFChars(scenePath, scene);
+        if (target) env->ReleaseStringUTFChars(targetPath, target);
+        return JNI_FALSE;
+    }
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        ok = tsdf.saveCheckpoint(scene) && targetTsdf.saveCheckpoint(target);
+    }
+    env->ReleaseStringUTFChars(scenePath, scene);
+    env->ReleaseStringUTFChars(targetPath, target);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeLoadTsdfCheckpoint(
+        JNIEnv* env, jobject, jstring scenePath, jstring targetPath) {
+    if (!scenePath || !targetPath) return JNI_FALSE;
+    const char* scene = env->GetStringUTFChars(scenePath, nullptr);
+    const char* target = env->GetStringUTFChars(targetPath, nullptr);
+    if (!scene || !target) {
+        if (scene) env->ReleaseStringUTFChars(scenePath, scene);
+        if (target) env->ReleaseStringUTFChars(targetPath, target);
+        return JNI_FALSE;
+    }
+
+    TsdfEngine sceneLoaded;
+    TsdfEngine targetLoaded;
+    const bool filesOk =
+        sceneLoaded.loadCheckpoint(scene) &&
+        targetLoaded.loadCheckpoint(target);
+
+    bool ok = false;
+    if (filesOk) {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        tsdf = std::move(sceneLoaded);
+        targetTsdf = std::move(targetLoaded);
+        targetLockEverArmed = targetTsdf.voxels() > 0;
+        resetMeshPipeline();
+        meshDirty = true;
+        ok = tsdf.voxels() > 0 || targetTsdf.voxels() > 0;
+    }
+
+    env->ReleaseStringUTFChars(scenePath, scene);
+    env->ReleaseStringUTFChars(targetPath, target);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Round 6: per-mesh-vertex TSDF observation strength.
+ *
+ * Output is de-quantized TSDF weight (roughly accumulated confidence, 0..64),
+ * sampled in a 3x3x3 neighborhood around the final mesh vertex. This is tied to
+ * the actual reconstructed surface, unlike viewpoint-orbit coverage.
+ */
+extern "C" JNIEXPORT jint JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetMeshObservationWeights(
+        JNIEnv* env, jobject, jfloatArray out, jint maxVertices) {
+    if (!out || maxVertices <= 0) return 0;
+    std::vector<jfloat> values;
+    size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        const Mesh& m = meshEngine.mesh();
+        const size_t nv = m.vertexCount();
+        if (nv == 0 || m.positions.size() < nv * 3) return 0;
+
+        const jsize cap = env->GetArrayLength(out);
+        n = std::min(
+            std::min(static_cast<size_t>(maxVertices), nv),
+            static_cast<size_t>(std::max<jsize>(0, cap)));
+        if (n == 0) return 0;
+
+        const TsdfEngine& src = (targetTsdf.voxels() > 0) ? targetTsdf : tsdf;
+        const float voxel = src.voxelSize();
+        if (!(voxel > 1e-5f) || !std::isfinite(voxel)) return 0;
+
+        values.resize(n, 0.f);
+        for (size_t i = 0; i < n; ++i) {
+            const float x = m.positions[i * 3 + 0];
+            const float y = m.positions[i * 3 + 1];
+            const float z = m.positions[i * 3 + 2];
+            const int vx = static_cast<int>(std::lround(x / voxel));
+            const int vy = static_cast<int>(std::lround(y / voxel));
+            const int vz = static_cast<int>(std::lround(z / voxel));
+
+            uint16_t best = 0;
+            for (int dz = -1; dz <= 1; ++dz)
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx)
+                        best = std::max(best, src.weightAt(vx + dx, vy + dy, vz + dz));
+
+            values[i] = static_cast<jfloat>(best) / kTsdfWeightScale;
+        }
+    }
+    env->SetFloatArrayRegion(out, 0, static_cast<jsize>(n), values.data());
+    return static_cast<jint>(n);
+}

@@ -504,6 +504,13 @@ object NativeBridge {
     /** 拉索引（三角形，每 3 个一组）。返回实际写入的索引数。 */
     external fun nativeGetMeshIndices(out: IntArray, maxIndices: Int): Int
 
+    /** Round 6: actual TSDF observation strength for final mesh vertices. */
+    external fun nativeGetMeshObservationWeights(out: FloatArray, maxVertices: Int): Int
+
+    /** Round 6: crash/interruption salvage snapshot of scene + target TSDF. */
+    external fun nativeSaveTsdfCheckpoint(scenePath: String, targetPath: String): Boolean
+    external fun nativeLoadTsdfCheckpoint(scenePath: String, targetPath: String): Boolean
+
     external fun nativeResetMesh()
 
     /** 导出 glTF 2.0 二进制（GLB），逐顶点颜色。返回是否成功。 */

@@ -13,28 +13,26 @@
     <ImageView
         android:layout_width="20dp"
         android:layout_height="20dp"
-        android:contentDescription="镜头"
-        android:src="@drawable/ic_camera" />
+        android:contentDescription="补光"
+        android:src="@drawable/ic_brightness" />
 
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
         android:includeFontPadding="false"
-        android:text="镜头"
+        android:text="补光"
         android:textColor="@color/scan_text_primary"
         android:textSize="9.5sp"
         android:textStyle="bold" />
 
     <TextView
-        android:id="@+id/toolCameraLabel"
+        android:id="@+id/toolLightLabel"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="2dp"
-        android:ellipsize="end"
         android:includeFontPadding="false"
-        android:maxLines="1"
         android:text="自动"
-        android:textColor="@color/scan_text_muted"
-        android:textSize="8.3sp" />
+        android:textColor="@color/scan_primary"
+        android:textSize="8.5sp" />
 </LinearLayout>
