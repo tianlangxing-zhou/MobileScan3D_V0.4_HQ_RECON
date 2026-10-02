@@ -3407,6 +3407,9 @@ private var lastRelocPollMs = 0L
         glView.isClickable = true
         tvViewerStats.text = "${mesh.triangleCount} 面 · 断点恢复几何 · 可检查/导出"
         setScanOverlayVisible(false)
+        // 与 enterModelViewerWith 一致：查看器模式 GL 画不透明深背景，必须切回非 on-top
+        // 否则 setZOrderOnTop(true) 会把 modelViewerOverlay 的普通 View 按钮盖住（黑屏只见模型）。
+        if (::glView.isInitialized) glView.setZOrderOnTop(false)
         glView.requestRender()
         toast("已恢复未完成几何；可检查后导出，或返回开始新扫描")
     }
@@ -4053,7 +4056,18 @@ private var lastRelocPollMs = 0L
         // 若进入查看器前 SurfaceTexture 曾被销毁重建（切后台/权限弹窗），glView 可能
         // 仍处于 INVISIBLE，导致 3D 模型查看器空白。这里显式置为可见。
         glView.visibility = android.view.View.VISIBLE
-        glView.bringToFront()
+        // 查看器模式：把 GL 层从「永远置顶」切回普通层叠。
+        //
+        // glView 创建时用了 setZOrderOnTop(true)，GL surface 会被合成分在所有普通 View
+        // 之上。实时 AR 需要这样（透明叠加在相机上）。但查看器里 GL 画的是**不透明深色
+        // 背景**（onDrawFrame 的 glClearColor alpha=1），一旦 glView 保持 VISIBLE 且置顶，
+        // modelViewerOverlay 的「退出/模式/统计」按钮这些普通 View 就永远被 GL 盖住 ——
+        // 表现为「只有模型、全黑、UI 看不见但功能还在」，且第 1 次进能看见、第 2/3/4 次
+        // 看不见（首次靠首帧揭示的 INVISIBLE→VISIBLE 窗口期侥幸露出，相机持续出帧后
+        // glView 保持置顶，之后每次进入都被盖住）。
+        // 解决办法：查看器进入时切到非 on-top，让普通 View overlay 浮到 GL 之上；
+        // 退出查看器再切回 setZOrderOnTop(true) 恢复 AR 的透明叠加。
+        glView.setZOrderOnTop(false)
         glView.requestRender()
         toast("单指旋转 · 双指缩放/平移")
     }
@@ -4311,6 +4325,9 @@ private var lastRelocPollMs = 0L
         renderer.drawMode = arDrawMode
         modelViewerButton?.text = "查看模型"
         setScanOverlayVisible(true)
+        // 退出查看器恢复 AR 层叠：实时 AR 的 GL 透明叠加需要 setZOrderOnTop(true)
+        // 才能盖在 TextureView 相机画面之上（进入查看器时被我们切回了 false）。
+        glView.setZOrderOnTop(true)
         glView.requestRender()
     }
 
