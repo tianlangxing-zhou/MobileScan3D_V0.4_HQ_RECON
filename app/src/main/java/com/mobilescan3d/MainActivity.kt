@@ -484,7 +484,8 @@ private var lastRelocPollMs = 0L
      * CPU 吃光，反而拖慢 VIO 让模型更差。5 秒一次已足够让用户看出
      * 「模型在长」——而点云是每帧刷新的，画面并不会显得僵。
      */
-    private val liveMeshRefreshPeriodMs = 5_000L
+    // vc18402: 实时网格退避下限从 5s 降到 3s，让模型更快跟上被扫描物体。
+    private val liveMeshRefreshPeriodMs = 3_000L
     /**
      * V0.13.20：实时网格重建的自适应退避上限。
      *
@@ -494,11 +495,12 @@ private var lastRelocPollMs = 0L
      * 与构建耗时逐一对应），VINS 位姿历史出现空洞 → AR 卡顿 + HQ 纹理关键帧被丢。
      *
      * 因此按「上一次构建越慢、下一次间隔越长」退避，把固定 5s 节拍改成
-     * `clamp(上次构建耗时 × 15, 5s, 30s)`：构建 1186ms 时退到约 17.8s，
-     * 便宜的构建（<333ms）仍保持 5s。这是治标——根治需要把全局锁只覆盖
-     * 「Marching Tetrahedra 提取」这一段，把清理/QEM 挪到锁外。
+     * `clamp(上次构建耗时 × 8, 3s, 12s)`：构建 1s 时退到约 8s，
+     * 便宜的构建（<375ms）仍保持 3s。vc18402 把系数 15→8、上限 30s→12s、
+     * 下限 5s→3s，兼顾「模型跟手」与「不长停顿阻塞相机」。这是治标——
+     * 根治需要把全局锁只覆盖「Marching Tetrahedra 提取」这一段。
      */
-    private val liveMeshRefreshPeriodMaxMs = 30_000L
+    private val liveMeshRefreshPeriodMaxMs = 12_000L
     /** 上一次实时网格构建在 native 侧的实际耗时（ms），用于自适应退避。 */
     @Volatile private var liveMeshLastBuildMs = 0L
     /** Fusion Epoch 诊断槽缓冲（HUD / 报告用，走 UI 线程）。 */
@@ -730,7 +732,9 @@ private var lastRelocPollMs = 0L
         val scanPrefs = getSharedPreferences("scan_settings", Context.MODE_PRIVATE)
         val savedDistance = scanPrefs.getFloat("max_distance_m", 1f)
         scanMaxDistanceMeters = if (savedDistance.isFinite()) savedDistance.coerceIn(.2f, 5f) else 1f
-        autoFillLight = scanPrefs.getBoolean("auto_fill_light", true)
+        // vc18402: 补光改为纯手动。默认关闭自动补光策略（autoFillLight=false），
+        // 用户点工具栏补光按钮直接手动开/关 torch（见 toggleManualFillLight）。
+        autoFillLight = scanPrefs.getBoolean("auto_fill_light", false)
         scanVoxelProfile = scanPrefs.getInt("voxel_profile", 3).coerceIn(0, 3)
         guidedScanEnabled = scanPrefs.getBoolean("guided_scan_enabled", true)
 
@@ -951,7 +955,7 @@ private var lastRelocPollMs = 0L
         findViewById<android.view.View>(R.id.btnSettings).setOnClickListener { showSettingsMenu() }
         findViewById<android.view.View>(R.id.statusCard).setOnClickListener { showScanDetails() }
         findViewById<android.view.View>(R.id.toolLock).setOnClickListener { toggleObjectTracking() }
-        findViewById<android.view.View>(R.id.toolLight).setOnClickListener { toggleAutoFillLightFromToolbar() }
+        findViewById<android.view.View>(R.id.toolLight).setOnClickListener { toggleManualFillLight() }
         findViewById<android.view.View>(R.id.btnViewerClose).setOnClickListener { exitModelViewer() }
         findViewById<android.view.View>(R.id.btnViewerReset).setOnClickListener {
             glView.queueEvent { renderer.resetViewerView() }
@@ -2904,15 +2908,10 @@ private var lastRelocPollMs = 0L
     }
 
     private fun updateAutoFillLight() {
-        if (!scanning || !resumed || !autoFillLight || !torchAvailable || torchFailed || torchRequested) return
-        if (!::hqCapture.isInitialized || !hqCapture.canChangeFillLight()) return
-        val st = hqCapture.stats
-        if (autoLightPolicy.update(android.os.SystemClock.elapsedRealtime(),
-                st.lumaP50, st.lumaP95, st.iso, st.exposureNs)) {
-            torchRequested = true
-            hqCapture.setFillLight(true)
-            applyCaptureSettings()
-        }
+        // vc18402: 补光改为**纯手动**，彻底停用 AutoLightPolicy 自动变暗检测。
+        // torchRequested 现在只由手动开关（工具栏/设置对话框）驱动，此地不再置位。
+        // autoFillLight 字段仅保留作「历史自动模式」的 UI/诊断展示占位，不参与控制。
+        return
     }
 
     private fun resetFillLight() {
@@ -4960,11 +4959,11 @@ private var lastRelocPollMs = 0L
         if (::hqCapture.isInitialized && hqCapture.captureBusy()) return
 
         val now = android.os.SystemClock.elapsedRealtime()
-        // V0.13.20 自适应退避：上一次构建越慢，下一次间隔越长（5s..30s）。
-        // 固定的 5s 节拍在大体素场下会变成「每 5s 冻结相机 ~1s」。
+        // V0.13.20 自适应退避：上一次构建越慢，下一次间隔越长（3s..12s）。
+        // vc18402 降了下限/上限/系数，让实时网格更快跟上被扫描物体。
         // vc159 ThermalGuard：发烫时再乘一个热状态系数（×1/×2/×4），封顶 60s，
         // 减少「全核 QEM 满载 + 冻结相机」的次数。
-        val interval = ((liveMeshLastBuildMs * 15L)
+        val interval = ((liveMeshLastBuildMs * 8L)
             .coerceIn(liveMeshRefreshPeriodMs, liveMeshRefreshPeriodMaxMs) *
             thermalMeshIntervalScale()).coerceAtMost(60_000L)
         if (now - lastLiveMeshRefreshMs < interval) return
@@ -5420,7 +5419,6 @@ private var lastRelocPollMs = 0L
             torchFailed -> "补光不可用"
             torchRequested -> "补光已开启"
             !torchAvailable -> "无闪光灯"
-            autoFillLight -> "自动补光"
             else -> "补光关闭"
         }
         headerStatus.text = "FPS %.1f · %s · ≤%.1fm · %s\n镜头：%s".format(
@@ -5519,7 +5517,7 @@ private var lastRelocPollMs = 0L
         }
         tvAutoLight.text = when {
             torchFailed -> "故障"
-            torchRequested || autoFillLight -> "开"
+            torchRequested -> "开"
             !torchAvailable -> "无"
             else -> "关"
         }
@@ -5532,14 +5530,13 @@ private var lastRelocPollMs = 0L
                 torchFailed -> "故障"
                 torchRequested -> "已开启"
                 !torchAvailable -> "不可用"
-                autoFillLight -> "自动"
                 else -> "关闭"
             }
             toolLightLabel.setTextColor(
                 getColor(
                     when {
                         torchFailed -> R.color.scan_danger
-                        torchRequested || autoFillLight -> R.color.scan_primary
+                        torchRequested -> R.color.scan_primary
                         else -> R.color.scan_text_muted
                     }
                 )
@@ -5570,13 +5567,15 @@ private var lastRelocPollMs = 0L
             }
         }
         if (::toolAutoLabel.isInitialized) {
+            // 该 label 属于 toolAuto「自动扫描设置」工具，与补光无关；
+            // 保持扫描模式的既有显示（历史上误用 autoFillLight，纯手动后恒自定义）。
             toolAutoLabel.text = if (autoFillLight) "自动" else "自定义"
         }
         val depthOk = ::depthProvider.isInitialized && depthProvider.available && depthLastError.isEmpty()
         tvDepth.text = if (depthOk) "深度: 有效" else "深度: 等待"
         tvDepth.setTextColor(getColor(if (depthOk) R.color.scan_success else R.color.scan_warning))
         findViewById<android.view.View>(R.id.toolLight).contentDescription =
-            "补光：${toolLightLabel.text}，点按切换自动补光"
+            "补光：${toolLightLabel.text}，点按切换手动补光"
         findViewById<android.view.View>(R.id.toolRealtime).contentDescription =
             "预览图层：${arDrawModeLabel()}，点按切换"
         tvMapCount.text = "地图: $shown"
@@ -6508,24 +6507,32 @@ private var lastRelocPollMs = 0L
             .show()
     }
 
-    private fun toggleAutoFillLightFromToolbar() {
+    /**
+     * vc18402: 补光改为**纯手动**。点击工具栏补光按钮直接开/关 torch，
+     * 不再走 AutoLightPolicy 自动变暗检测（autoFillLight 恒 false 已停用）。
+     * 手动开灯后 hqCapture 会让 3A 收敛后稳定补光；关灯即时熄灭。
+     */
+    private fun toggleManualFillLight() {
         if (!torchAvailable) {
             toast("当前镜头没有可用闪光灯")
             return
         }
-        autoFillLight = !autoFillLight
-        getSharedPreferences("scan_settings", Context.MODE_PRIVATE).edit()
-            .putBoolean("auto_fill_light", autoFillLight)
-            .apply()
-        if (!autoFillLight) {
+        if (torchRequested) {
             cameraHandler?.post {
+                torchRequested = false
                 resetFillLight()
                 applyCaptureSettings()
             }
+            toast("已关闭补光")
+        } else {
+            torchRequested = true
+            if (::hqCapture.isInitialized) hqCapture.setFillLight(true)
+            cameraHandler?.post { applyCaptureSettings() }
+            toast("已开启补光")
         }
-        toast(if (autoFillLight) "已开启自动补光" else "已关闭自动补光")
         updateHeader()
     }
+
 
     private fun applyDeviceCalibrationProfileToNative(): Boolean {
         return com.mobilescan3d.calibration.DeviceCalibrationManager.applyToNative(applicationContext)
@@ -7093,23 +7100,29 @@ private var lastRelocPollMs = 0L
         })
         updateLabel()
         val light = android.widget.CheckBox(this).apply {
-            text = "暗光时自动持续补光"
-            isChecked = autoFillLight
+            text = "开启补光（手动）"
+            isChecked = torchRequested
         }
         panel.addView(label)
         panel.addView(slider)
         panel.addView(light)
         panel.addView(TextView(this).apply {
-            text = "仅在设定距离内采集点云和模型，默认 1 米。单目距离依赖定位和深度标定，并非测距仪。补光开启后保持至停扫或退到后台，避免反复闪烁；无闪光灯的镜头无法补光。"
+            text = "仅在设定距离内采集点云和模型，默认 1 米。单目距离依赖定位和深度标定，并非测距仪。vc18402 起补光改为纯手动：勾选即开启 torch，取消即熄灭，持续至停扫或退到后台；无闪光灯的镜头无法补光。"
         })
         android.app.AlertDialog.Builder(this).setTitle("扫描距离与补光").setView(android.widget.ScrollView(this).apply { addView(panel) })
             .setNegativeButton("取消", null)
             .setPositiveButton("保存") { _, _ ->
                 scanMaxDistanceMeters = .2f + slider.progress / 10f
-                autoFillLight = light.isChecked
+                val wantLight = light.isChecked
+                if (wantLight != torchRequested) {
+                    torchRequested = wantLight
+                    if (::hqCapture.isInitialized) hqCapture.setFillLight(wantLight)
+                    cameraHandler?.post { applyCaptureSettings() }
+                }
                 getSharedPreferences("scan_settings", Context.MODE_PRIVATE).edit()
                     .putFloat("max_distance_m", scanMaxDistanceMeters)
-                    .putBoolean("auto_fill_light", autoFillLight).apply()
+                    .apply()
+                updateHeader()
             }.show()
     }
 
