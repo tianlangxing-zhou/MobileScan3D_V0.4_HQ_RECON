@@ -34,6 +34,7 @@
 #include "depth_refinement.h"
 #include "color_contours.h"
 #include "fusion_guard.h"
+#include "frame_icp.h"
 #include "depth_geometry.h"
 #include "scan_policy.h"
 #include "fusion_evidence.h"
@@ -374,6 +375,25 @@ static constexpr int kTemporalStaleMaxConsecRejects = 4;
 static uint64_t temporalStaleWrites = 0;        // 过期参考下降权写入的帧数
 static uint64_t temporalStaleMotionRejects = 0; // 过期参考+大位移拒写帧数
 static int temporalStaleConsecRejects = 0;      // 连续拒写计数（有界放行）
+
+// V0.13.41（vc184 / Option A）帧到模型 ICP 位姿精修：
+// vc183 实测暴露的矛盾 —— 三道门全按「位姿重投影一致性」判据，VINS 渐变漂移
+// 让重投影残差超容差 → guard checks=20 rejected=20、fused 13/60（不重影的
+// 代价是几乎不融合：开放边 1.2~1.5 万、纹理烘焙 0 关键帧、质量分 39~48）。
+// 治法：每帧先对齐 surfel 稳定模型求刚体修正量（frame_icp.h），修正后的
+// 位姿进三道门与 TSDF/surfel 写入。修正每帧独立（不回馈 VINS、不跨帧累计）、
+// 有界（>8cm 或 >6° 放弃）、欠约束放弃（行为退回旧版）。漂移被就地抵消，
+// 重投影判据重新成立 → 门放行、几何对齐写入。
+// 模型就绪门槛：粗索引（2cm 稳定代表点）达到该数量才尝试 —— 模型没建立时
+// 没有「对齐目标」，修正无从谈起。
+static constexpr size_t kIcpMinModelPoints = 2000;
+static uint64_t icpAttempts = 0;       // 进入 ICP 主流程的帧数（模型就绪+样本足）
+static uint64_t icpAppliedCount = 0;   // 修正被采纳的帧数
+static uint64_t icpRejectSamples = 0;  // 帧内有效深度样本不足
+static uint64_t icpRejectOverlap = 0;  // 与模型无重叠（新区域/模型未建立）
+static uint64_t icpRejectBound = 0;    // 修正超界（防 ICP 拉飞）
+static uint64_t icpRejectDegenerate = 0; // 刚体拟合退化（共面病态）
+static frame_icp::Diag lastIcpDiag;    // 上一帧 ICP 结果（诊断输出用）
 
 // V0.13.39：epoch 开启/重锚会更换深度->米制映射（epochCalib）。lastFusedDepth
 // 是**旧映射域**的融合深度（见 temporalConsistencyMask 处的域一致性注释），
@@ -817,10 +837,14 @@ static constexpr float kObjMin = 0.30f;             // 远离物体点最低保�
  */
 static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& s,
                              float confidence, bool haveObj, float objCx, float objCy,
-                             const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr) {
+                             const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr,
+                             const float* poseR = nullptr, const float* poseT = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
         return;
     }
+    // V0.13.41：poseR/poseT 非空时替代 s.R/s.t（ICP 修正位姿），其余不变。
+    const float* poseRot = poseR ? poseR : s.R;
+    const float* poseTrans = poseT ? poseT : s.t;
     // 与 fuseDepth 同一套内参降采样（深度 256² -> 相机分辨率）。
     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
@@ -868,9 +892,9 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
             float Xc = (x - dCx) * z / dFx;
             float Yc = (y - dCy) * z / dFy;
             float Xw, Yw, Zw;
-            rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
+            rotatePoint(poseRot, poseTrans, Xc, Yc, z, Xw, Yw, Zw);
             size_t o = ((size_t)yy * s.w + xx) * 3;
-            auto geometry = adaptive::geometry(depth,w,h,x,y,dFx,dFy,dCx,dCy,s.R);
+            auto geometry = adaptive::geometry(depth,w,h,x,y,dFx,dFy,dCx,dCy,poseRot);
             if(contourPriority && contourPriority[size_t(y)*w+x]) {
                 geometry.protectedDetail=true;geometry.colorBoundary=true;
             }
@@ -890,16 +914,20 @@ static void feedSceneSurfels(const float* depth, int w, int h, const FrameSnap& 
  * @param pixelWeight 可选逐像素可信度（长度 w*h，[0,1]），nullptr 表示整帧同权。
  */
 static void fuseDepth(const float* depth, int w, int h, const FrameSnap& s, float confidence,
-                      const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr) {
+                      const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr,
+                      const float* poseR = nullptr, const float* poseT = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || s.w <= 0 || s.h <= 0) {
         return;
     }
+    // V0.13.41：poseR/poseT 非空时替代 s.R/s.t（ICP 修正位姿），其余不变。
+    const float* poseRot = poseR ? poseR : s.R;
+    const float* poseTrans = poseT ? poseT : s.t;
     // 评审 P0-2：深度现在以 256² 到达（不再上采样到相机分辨率），内参必须按
     // 深度/相机分辨率比降采样，否则几何会被拉伸到相机分辨率量级。
     const auto dk = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
     tsdf.integrateDepth(depth, w, h, s.rgb.data(), s.w, s.h,
-                        dFx, dFy, dCx, dCy, s.R, s.t, confidence,
+                        dFx, dFy, dCx, dCy, poseRot, poseTrans, confidence,
                         1.f, 0.f, pixelWeight, true, contourPriority);
     // 注意：场景 surfel（g）的喂入已**解耦**到 feedSceneSurfels()，
     // 与 TSDF 共用融合门控；暂停时保留已有几何，不再喂不可信观测。
@@ -1356,10 +1384,14 @@ static float currentTargetDepthScale() {
  */
 static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s,
                             const cv::Mat& maskIn, float confidence,
-                            const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr) {
+                            const float* pixelWeight = nullptr, const uint8_t* contourPriority = nullptr,
+                            const float* poseR = nullptr, const float* poseT = nullptr) {
     if (!depth || w < 4 || h < 4 || s.rgb.empty() || maskIn.empty()) {
         return;
     }
+    // V0.13.41：poseR/poseT 非空时替代 s.R/s.t（ICP 修正位姿），其余不变。
+    const float* poseRot = poseR ? poseR : s.R;
+    const float* poseTrans = poseT ? poseT : s.t;
     if (maskIn.cols != w || maskIn.rows != h || maskIn.type() != CV_8U) {
         return;
     }
@@ -1392,7 +1424,7 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
     const float dFx = dk.fx, dFy = dk.fy, dCx = dk.cx, dCy = dk.cy;
     filterScanRange(masked, w, h, dFx, dFy, dCx, dCy);
     targetTsdf.integrateDepth(masked.data(), w, h, s.rgb.data(), s.w, s.h,
-                              dFx, dFy, dCx, dCy, s.R, s.t, confidence,
+                              dFx, dFy, dCx, dCy, poseRot, poseTrans, confidence,
                               1.f, 0.f, pixelWeight, true, contourPriority);
 
     targetG.beginFrame();
@@ -1421,9 +1453,9 @@ static void fuseTargetDepth(const float* depth, int w, int h, const FrameSnap& s
             const float Xc = (x - dCx) * z / dFx;
             const float Yc = (y - dCy) * z / dFy;
             float Xw, Yw, Zw;
-            rotatePoint(s.R, s.t, Xc, Yc, z, Xw, Yw, Zw);
+            rotatePoint(poseRot, poseTrans, Xc, Yc, z, Xw, Yw, Zw);
             const size_t o = (static_cast<size_t>(yy) * s.w + xx) * 3;
-            auto geometry = adaptive::geometry(masked.data(),w,h,x,y,dFx,dFy,dCx,dCy,s.R);
+            auto geometry = adaptive::geometry(masked.data(),w,h,x,y,dFx,dFy,dCx,dCy,poseRot);
             if(contourPriority && contourPriority[size_t(y)*w+x]) {
                 geometry.protectedDetail=true;geometry.colorBoundary=true;
             }
@@ -2920,6 +2952,15 @@ static void nativeOnDepthMapImpl(
              (unsigned long long)fusionGuard.rejected,
              fusionGuard.lastTested,
              static_cast<double>(fusionGuard.lastRatio));
+        LOGI("FrameICP attempts=%llu applied=%llu rejectSamples=%llu rejectOverlap=%llu "
+             "rejectBound=%llu rejectDegenerate=%llu lastApplied=%d lastReason=%d "
+             "lastInliers=%d lastRmse=%.4f lastTrans=%.4f lastRotDeg=%.3f",
+             (unsigned long long)icpAttempts, (unsigned long long)icpAppliedCount,
+             (unsigned long long)icpRejectSamples, (unsigned long long)icpRejectOverlap,
+             (unsigned long long)icpRejectBound, (unsigned long long)icpRejectDegenerate,
+             lastIcpDiag.applied ? 1 : 0, lastIcpDiag.reason, lastIcpDiag.inliers,
+             static_cast<double>(lastIcpDiag.rmseM), static_cast<double>(lastIcpDiag.transM),
+             static_cast<double>(lastIcpDiag.rotDeg));
     }
 
     // V0.13.22 深度取证专用行（每 30 帧）：定位「模型发平、与实物对不上位置」。
@@ -3155,6 +3196,38 @@ static void nativeOnDepthMapImpl(
         const bool sameK = temporalK.fx == lastFuseK[0] && temporalK.fy == lastFuseK[1] &&
                            temporalK.cx == lastFuseK[2] && temporalK.cy == lastFuseK[3];
         const bool metricDepth = epochActive && calibEnabledEff;
+        // ---- V0.13.41 帧到模型 ICP 位姿精修（Option A）----
+        // effR/effT 是本帧后续**所有**位姿消费者的统一入口：时序比对、
+        // stale-motion 检查、fusionGuard、TSDF/surfel/target 写入、参考链
+        // 更新。ICP 采纳时为修正位姿，否则恒等于 VINS 原始位姿（旧版行为）。
+        const float* effR = match->R;
+        const float* effT = match->t;
+        float icpOutR[9];
+        float icpOutT[3];
+        if (metricDepth && !zEpoch.empty() &&
+            g.compressedCount() >= kIcpMinModelPoints) {
+            ++icpAttempts;
+            lastIcpDiag = frame_icp::frameToModelIcp(
+                zEpoch.data(), w, h, temporalK.fx, temporalK.fy,
+                temporalK.cx, temporalK.cy, match->R, match->t,
+                [](float px, float py, float pz, float maxD,
+                   float* ox, float* oy, float* oz) {
+                    return g.nearestStableSurfel(px, py, pz, maxD, ox, oy, oz);
+                },
+                icpOutR, icpOutT);
+            switch (lastIcpDiag.reason) {
+                case frame_icp::kIcpRejectSamples: ++icpRejectSamples; break;
+                case frame_icp::kIcpRejectOverlap: ++icpRejectOverlap; break;
+                case frame_icp::kIcpRejectBound: ++icpRejectBound; break;
+                case frame_icp::kIcpRejectDegenerate: ++icpRejectDegenerate; break;
+                default: break;
+            }
+            if (lastIcpDiag.applied) {
+                effR = icpOutR;
+                effT = icpOutT;
+                ++icpAppliedCount;
+            }
+        }
         // V0.13.22：参考必须「存在 + 时间戳前进 + 未超时效」才参与比对。
         // 参考过旧时本帧按中性放行（temporalMaskValid 保持 false，逐像素退化为边缘因子），
         // 这是从「融合失败 -> 参考冻结 -> 一致性崩塌 -> 再拒」死锁里脱身的关键。
@@ -3172,9 +3245,9 @@ static void nativeOnDepthMapImpl(
                 // 位移/转角超限 -> 位姿或标定在断档期间系统性漂移，这种帧
                 // 全权重落盘就是「同表面两份」的来源，先拒；连续拒到上限后
                 // 放一帧弱锚定（conf×0.35）推动参考链前进，死锁不会复发。
-                float relT[3] = {match->t[0] - lastFuseT[0],
-                                 match->t[1] - lastFuseT[1],
-                                 match->t[2] - lastFuseT[2]};
+                float relT[3] = {effT[0] - lastFuseT[0],
+                                 effT[1] - lastFuseT[1],
+                                 effT[2] - lastFuseT[2]};
                 const float transNorm = std::sqrt(relT[0] * relT[0] +
                                                   relT[1] * relT[1] +
                                                   relT[2] * relT[2]);
@@ -3183,7 +3256,7 @@ static void nativeOnDepthMapImpl(
                     for (int j = 0; j < 3; ++j) {
                         float acc = 0.f;
                         for (int k = 0; k < 3; ++k) {
-                            acc += match->R[k * 3 + i] * lastFuseR[k * 3 + j];
+                            acc += effR[k * 3 + i] * lastFuseR[k * 3 + j];
                         }
                         relR[i * 3 + j] = acc;
                     }
@@ -3210,22 +3283,24 @@ static void nativeOnDepthMapImpl(
         if (refFresh && lastFuseCalibrated == metricDepth &&
             lastFusedDepth.size() == (size_t)w * h && lastFuseW == w && lastFuseH == h && sameK) {
             // Pc_cur = Rcur^T * Rprev * Pc_prev + Rcur^T * (tprev - tcur)
+            // （Rcur/tcur = ICP 修正后的 effR/effT：相对位姿在漂移被抵消后
+            // 重新真实，重投影一致性判据才能按设计容差工作。）
             float Rrel[9];
             float trel[3];
-            const float dv[3] = {lastFuseT[0] - match->t[0],
-                                 lastFuseT[1] - match->t[1],
-                                 lastFuseT[2] - match->t[2]};
+            const float dv[3] = {lastFuseT[0] - effT[0],
+                                 lastFuseT[1] - effT[1],
+                                 lastFuseT[2] - effT[2]};
             for (int i = 0; i < 3; ++i) {
                 for (int j = 0; j < 3; ++j) {
                     float acc = 0.f;
                     for (int k = 0; k < 3; ++k) {
-                        acc += match->R[k * 3 + i] * lastFuseR[k * 3 + j];
+                        acc += effR[k * 3 + i] * lastFuseR[k * 3 + j];
                     }
                     Rrel[i * 3 + j] = acc;
                 }
                 float acc = 0.f;
                 for (int k = 0; k < 3; ++k) {
-                    acc += match->R[k * 3 + i] * dv[k];
+                    acc += effR[k * 3 + i] * dv[k];
                 }
                 trel[i] = acc;
             }
@@ -3365,7 +3440,7 @@ static void nativeOnDepthMapImpl(
         // integrated samples are retained; reject a second shell on return visits.
         const float guardK[4]={temporalK.fx,temporalK.fy,temporalK.cx,temporalK.cy};
         bool modelAccepted=true;
-        if(fusionRanged)modelAccepted=fusionGuard.accept(fusionRanged,w,h,guardK,match->R,match->t,
+        if(fusionRanged)modelAccepted=fusionGuard.accept(fusionRanged,w,h,guardK,effR,effT,
                                                         static_cast<uint64_t>(t));
         if(!modelAccepted) {
             fusionDepth=nullptr;fusionRanged=nullptr;
@@ -3378,13 +3453,14 @@ static void nativeOnDepthMapImpl(
         if (fusionRanged != nullptr) {
             const auto tFuse = std::chrono::steady_clock::now();
             // 全场景地图
-            fuseDepth(fusionRanged, w, h, *match, conf, pixelWeight, contourPriority);
+            fuseDepth(fusionRanged, w, h, *match, conf, pixelWeight, contourPriority, effR, effT);
 
             // 目标专用模型：**只有 presenceOk、mask 有效、且 mask 时序稳定
             // 才允许融合**。这是「墙/天花板/桌子进不了目标点云」的落地点；
             // V0.13 又加了一道 —— mask 单帧整块跳变的那一帧也不进。
             if (haveTi && presenceOk && maskOk && maskTemporalOk) {
-                fuseTargetDepth(fusionRanged, w, h, *match, targetMaskMat, conf, pixelWeight, contourPriority);
+                fuseTargetDepth(fusionRanged, w, h, *match, targetMaskMat, conf,
+                                pixelWeight, contourPriority, effR, effT);
             }
             gPerf[kPerfFuse].push(perfMsSince(tFuse));
             fusionFusedFrames++;
@@ -3403,7 +3479,7 @@ static void nativeOnDepthMapImpl(
             const auto tSurfel=std::chrono::steady_clock::now();
             feedSceneSurfels(fusionRanged,w,h,*match,conf,
                             (haveTi && maskOk),targetMaskStats.centerX,targetMaskStats.centerY,
-                            pixelWeight,contourPriority);
+                            pixelWeight,contourPriority,effR,effT);
             gPerf[kPerfSurfel].push(perfMsSince(tSurfel));
         }
 
@@ -3489,13 +3565,13 @@ static void nativeOnDepthMapImpl(
             lastFusedDepth.assign(fusionRanged, fusionRanged + (size_t)w * h);
             for(size_t i=0;i<lastFusedDepth.size();++i)
                 if(pixelWeight && pixelWeight[i]<=0)lastFusedDepth[i]=0;
-            fusionGuard.commit(fusionRanged,w,h,guardK,match->R,match->t,
+            fusionGuard.commit(fusionRanged,w,h,guardK,effR,effT,
                                static_cast<uint64_t>(t),pixelWeight);
             for (int i = 0; i < 9; ++i) {
-                lastFuseR[i] = match->R[i];
+                lastFuseR[i] = effR[i];
             }
             for (int i = 0; i < 3; ++i) {
-                lastFuseT[i] = match->t[i];
+                lastFuseT[i] = effT[i];
             }
             haveLastFusePose = true;
             lastFuseCalibrated = metricDepth;

@@ -70,8 +70,8 @@ android {
         applicationId = "com.mobilescan3d"
         minSdk = 26
         targetSdk = 36
-        versionCode = 18302
-        versionName = "0.15.2-recovery-loop"
+        versionCode = 18400
+        versionName = "0.15.3-frame-icp"
         resValue("string", "version_text", "v$versionName")
         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")

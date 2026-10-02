@@ -68,6 +68,14 @@ public:
     size_t copyPoints(float* out, size_t maxPoints, int minHits) const;
     /** 满足 hits >= minHits 的点数（用于 HUD / 报告里的「确认」「稳定」计数） */
     size_t confirmedCount(int minHits) const;
+    /**
+     * vc184 frame-to-model ICP 最近邻查询：在粗体素索引（2cm 稳定共面代表点）
+     * 的 3×3×3 邻域内找最近 surfel。maxDistM 内找到返回 true 并写出位置。
+     * 只读、不改状态、不分配 —— ICP 热路径上每帧调用数千次。
+     */
+    bool nearestStableSurfel(float x, float y, float z, float maxDistM,
+                             float* ox = nullptr, float* oy = nullptr,
+                             float* oz = nullptr) const;
     void boundingBox(float* minX, float* minY, float* minZ,
                      float* maxX, float* maxY, float* maxZ) const;
     void centroid(float* x, float* y, float* z) const;

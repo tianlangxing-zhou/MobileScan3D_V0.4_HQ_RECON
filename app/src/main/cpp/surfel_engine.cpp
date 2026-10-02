@@ -123,6 +123,46 @@ size_t SurfelEngine::copyPoints(float* out, size_t maxPoints, int minHits) const
     return written;
 }
 
+bool SurfelEngine::nearestStableSurfel(float x, float y, float z, float maxDistM,
+                                       float* ox, float* oy, float* oz) const {
+    if (!(std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) ||
+        !(maxDistM > 0.f)) {
+        return false;
+    }
+    // 粗索引 cell=2cm；3×3×3 邻域覆盖 ±2cm（含跨格达 ~4cm）。
+    const float inv = 50.f; // 1/0.02
+    const int kx = int(std::floor(x * inv));
+    const int ky = int(std::floor(y * inv));
+    const int kz = int(std::floor(z * inv));
+    float best2 = maxDistM * maxDistM;
+    bool found = false;
+    float bx = 0.f, by = 0.f, bz = 0.f;
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                auto it = coarseIndex_.find(Key{kx + dx, ky + dy, kz + dz});
+                if (it == coarseIndex_.end()) continue;
+                // 同一格可能被压缩成多个 surfel？粗索引一格一代表，
+                // 但 erase/swap 期间一格可能短暂多值 —— 直接线性扫该桶不可行，
+                // 现实现一格一 entry，取它即可。
+                const Surfel& a = g_[it->second];
+                const float ex = a.px - x, ey = a.py - y, ez = a.pz - z;
+                const float d2 = ex * ex + ey * ey + ez * ez;
+                if (d2 <= best2) {
+                    best2 = d2;
+                    found = true;
+                    bx = a.px; by = a.py; bz = a.pz;
+                }
+            }
+        }
+    }
+    if (!found) return false;
+    if (ox) *ox = bx;
+    if (oy) *oy = by;
+    if (oz) *oz = bz;
+    return true;
+}
+
 void SurfelEngine::boundingBox(float* minX, float* minY, float* minZ,
                                  float* maxX, float* maxY, float* maxZ) const {
     if (!minX || !minY || !minZ || !maxX || !maxY || !maxZ) {
