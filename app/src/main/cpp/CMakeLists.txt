@@ -72,11 +72,11 @@ set(OPENCV_ANDROID_SDK "" CACHE PATH "OpenCV Android SDK directory (optional; if
 
 # --- Ceres：仍为外部预编译依赖，必须配置 ---
 if(NOT CERES_SOURCE_DIR)
-    message(FATAL_ERROR "CERES_SOURCE_DIR is not configured. Set ceres.sourceDir in local.properties.")
+    message(FATAL_ERROR "CERES_SOURCE_DIR is not configured. Set ceres.sourceDir in local.properties or CERES_SOURCE_DIR in the environment.")
 endif()
 
 if(NOT CERES_BUILD_DIR)
-    message(FATAL_ERROR "CERES_BUILD_DIR is not configured. Set ceres.buildDir in local.properties.")
+    message(FATAL_ERROR "CERES_BUILD_DIR is not configured. Set ceres.buildDir in local.properties or CERES_BUILD_DIR in the environment.")
 endif()
 
 set(CERES_STATIC_LIB "${CERES_BUILD_DIR}/lib/libceres.a")

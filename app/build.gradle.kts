@@ -7,24 +7,32 @@ val localProperties = Properties().apply {
     }
 }
 
-fun requiredLocalPath(name: String): String {
-    return localProperties.getProperty(name)
+fun configuredPath(propertyName: String, environmentName: String): String? {
+    return localProperties.getProperty(propertyName)
+        ?.takeIf { it.isNotBlank() }
         ?.replace("\\", "/")
+        ?: System.getenv(environmentName)
+            ?.takeIf { it.isNotBlank() }
+            ?.replace("\\", "/")
+}
+
+fun requiredLocalPath(propertyName: String, environmentName: String): String {
+    return configuredPath(propertyName, environmentName)
         ?: error(
-            "Missing '$name' in local.properties. " +
-                "Please configure Ceres/OpenCV paths."
+            "Missing '$propertyName'. Configure it in local.properties or set $environmentName. " +
+                "See README_CONSUMER_RELEASE_ZH.md for a reproducible build setup."
         )
 }
 
-fun optionalLocalPath(name: String): String? {
-    return localProperties.getProperty(name)?.replace("\\", "/")
+fun optionalLocalPath(propertyName: String, environmentName: String): String? {
+    return configuredPath(propertyName, environmentName)
 }
 
-val ceresSourceDir = requiredLocalPath("ceres.sourceDir")
-val ceresBuildDir = requiredLocalPath("ceres.buildDir")
+val ceresSourceDir = requiredLocalPath("ceres.sourceDir", "CERES_SOURCE_DIR")
+val ceresBuildDir = requiredLocalPath("ceres.buildDir", "CERES_BUILD_DIR")
 // OpenCV 4.12 已 vendoring 进仓库（third_party/opencv4android 头 + jniLibs 运行库），
 // opencv.sdkDir 仅作为可选覆盖；不设则 CMake 使用仓库内默认，链接库==运行库保证 4.12 一致。
-val opencvSdkDir: String? = optionalLocalPath("opencv.sdkDir")
+val opencvSdkDir: String? = optionalLocalPath("opencv.sdkDir", "OPENCV_ANDROID_SDK")
 
 fun gitOutput(vararg args: String): String {
     return try {
@@ -62,8 +70,8 @@ android {
         applicationId = "com.mobilescan3d"
         minSdk = 26
         targetSdk = 36
-        versionCode = 180
-        versionName = "0.13.40-stale-ref-guard"
+        versionCode = 18302
+        versionName = "0.15.2-recovery-loop"
         resValue("string", "version_text", "v$versionName")
         buildConfigField("String", "GIT_COMMIT", "\"$gitBuildId\"")
         buildConfigField("long", "BUILD_TIME_MS", "${buildTimestamp}L")
@@ -96,8 +104,19 @@ android {
     }
 
     buildTypes {
-        release { isMinifyEnabled = false }
+        release {
+            // Keep R8 disabled until JNI/native class-name entry points have an explicit keep audit.
+            // A smaller APK is not worth a release-only native crash.
+            isMinifyEnabled = false
+            isDebuggable = false
+            isJniDebuggable = false
+        }
         debug { isDebuggable = true }
+    }
+
+    lint {
+        abortOnError = true
+        checkReleaseBuilds = true
     }
 
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }

@@ -1,38 +1,44 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="64dp"
-    android:layout_marginBottom="2dp"
-    android:background="@drawable/bg_tool_item"
+    android:layout_height="wrap_content"
+    android:minHeight="60dp"
+    android:layout_marginBottom="8dp"
+    android:background="@drawable/bg_focus_surface"
     android:clickable="true"
     android:focusable="true"
-    android:foreground="?android:attr/selectableItemBackgroundBorderless"
+    android:foreground="?android:attr/selectableItemBackground"
     android:gravity="center"
-    android:orientation="vertical">
+    android:orientation="vertical"
+    android:padding="5dp"
+    android:contentDescription="物体追踪，点按开启或关闭">
 
     <ImageView
         android:layout_width="20dp"
         android:layout_height="20dp"
-        android:contentDescription="物体锁定"
-        android:src="@drawable/ic_cube" />
+        android:importantForAccessibility="no"
+        android:src="@drawable/ic_target" />
 
     <TextView
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
+        android:layout_marginTop="3dp"
+        android:gravity="center"
         android:includeFontPadding="false"
-        android:text="物体锁定"
+        android:text="追踪"
         android:textColor="@color/scan_text_primary"
-        android:textSize="9sp"
+        android:textSize="9.5sp"
         android:textStyle="bold" />
 
     <TextView
         android:id="@+id/toolLockLabel"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
+        android:layout_marginTop="1dp"
+        android:gravity="center"
         android:includeFontPadding="false"
-        android:text="未锁定"
+        android:maxLines="1"
+        android:text="关闭"
         android:textColor="@color/scan_text_muted"
-        android:textSize="8.3sp" />
+        android:textSize="8.2sp" />
 </LinearLayout>

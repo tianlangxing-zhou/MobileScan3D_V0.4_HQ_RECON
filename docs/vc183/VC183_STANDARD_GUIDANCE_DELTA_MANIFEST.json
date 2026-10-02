@@ -1,0 +1,30 @@
+{
+  "package": "MobileScan3D_vc183_standard_scan_guidance_delta",
+  "type": "documentation_and_planning_delta_only",
+  "base_version": {
+    "versionCode": 182,
+    "versionName": "0.14.2-consumer-ux2",
+    "base_zip": "MobileScan3D_vc182_consumer_ux_merged.zip",
+    "base_sha256": "f9e2cd3dd886ed3ad6aa9260723e08b0874a589603ab427fe856869cbdf128f3"
+  },
+  "proposed_next_version": {
+    "versionCode": 183,
+    "versionName": "0.15.0-guided-scan"
+  },
+  "contains_full_project": false,
+  "contains_source_code_changes": false,
+  "purpose": [
+    "formalize adaptive standard scan guidance",
+    "define next-best-view interaction and state machine",
+    "define vc183 engineering roadmap",
+    "define acceptance and test criteria"
+  ],
+  "files": [
+    "README_DELTA_VC183.md",
+    "STANDARD_SCAN_GUIDANCE_SPEC_ZH.md",
+    "NEXT_VERSION_PLAN_VC183_ZH.md",
+    "ACCEPTANCE_CRITERIA_VC183_ZH.md",
+    "VC183_DELTA_MANIFEST.json"
+  ],
+  "apply_to": "Place files under docs/vc183/ in the vc182 project. No source files are overwritten."
+}

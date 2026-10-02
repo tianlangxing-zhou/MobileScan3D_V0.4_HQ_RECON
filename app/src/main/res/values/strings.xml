@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">MobileScan 3D</string>
+    <string name="app_name">MobileScan3D</string>
     <string name="fps">FPS</string>
     <string name="distance">距离</string>
     <string name="auto_light">自动补光</string>
@@ -12,7 +12,7 @@
     <string name="map_count">地图: 0</string>
     <string name="draw_count">绘制: 0</string>
     <string name="non_metric">非米制</string>
-    <string name="object_lock">物体锁定</string>
+    <string name="object_lock">物体追踪</string>
     <string name="unlocked">未锁定</string>
     <string name="focus_stabilization">对焦/防抖</string>
     <string name="placement">摆放</string>
@@ -24,4 +24,12 @@
     <string name="view_model">查看模型</string>
     <string name="start_scan">开始扫描</string>
     <string name="stop_scan">停止扫描</string>
+
+    <string name="camera_permission_title">允许相机用于本地 3D 扫描</string>
+    <string name="camera_permission_message">MobileScan3D 需要相机画面来重建 3D 模型，并使用陀螺仪和加速度计估计手机运动。扫描与模型处理默认在本机完成；应用未声明网络访问权限。你可以稍后在系统设置中撤回相机权限。</string>
+    <string name="camera_permission_continue">继续授权</string>
+    <string name="camera_permission_not_now">暂不</string>
+    <string name="privacy_data_title">隐私与数据</string>
+    <string name="privacy_data_message">• 相机：用于采集扫描画面。\n• 运动传感器：用于视觉惯性定位。\n• 本地处理：当前应用未声明网络访问权限，扫描数据不会由应用主动上传。\n• 本地文件：断点、诊断和模型保存在应用私有目录；导出模型时仅写入你通过系统文件选择器指定的位置。\n• 权限：可随时在 Android 系统设置中撤回相机权限。\n\n正式上架前仍需提供与你的实际发行主体、支持渠道和数据实践一致的隐私政策。</string>
+    <string name="privacy_data_menu">隐私与数据</string>
 </resources>

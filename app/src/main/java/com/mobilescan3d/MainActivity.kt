@@ -93,6 +93,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var hudCompact: TextView
     private lateinit var pauseButton: android.widget.Button
     private lateinit var scanReticleView: com.mobilescan3d.ui.ScanReticleView
+    private lateinit var scanGuidanceOverlay: com.mobilescan3d.ui.guidance.ScanGuidanceOverlay
+    private lateinit var tvGuidanceStep: TextView
+    private val scanGuidanceController = com.mobilescan3d.scan.guidance.ScanGuidanceController()
+    @Volatile private var guidedScanEnabled = true
     private lateinit var scanProgressView: android.widget.ProgressBar
     private lateinit var tvScanProgressPercent: TextView
     private lateinit var tvMotionState: TextView
@@ -158,6 +162,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var lastGeometryQualityPercent = 0
     private var lastTextureQualityPercent = 0
     private var lastCoverageGuidance = ""
+
+    // vc183.2: review -> targeted re-scan -> automatic review loop.
+    private var reviewRecoveryPlan =
+        com.mobilescan3d.scan.guidance.ScanRecoveryPlanner.Plan(emptyList(), "")
+    private var recoveryRound = 0
+    private var recoveryActive = false
+    private var recoveryStartedMs = 0L
+    private var recoveryReadySinceMs = 0L
 
     // Round 2 scanner UX state. These are presentation-layer signals only;
     // they do not alter reconstruction math or calibration.
@@ -704,6 +716,7 @@ private var lastRelocPollMs = 0L
         scanMaxDistanceMeters = if (savedDistance.isFinite()) savedDistance.coerceIn(.2f, 5f) else 1f
         autoFillLight = scanPrefs.getBoolean("auto_fill_light", true)
         scanVoxelProfile = scanPrefs.getInt("voxel_profile", 3).coerceIn(0, 3)
+        guidedScanEnabled = scanPrefs.getBoolean("guided_scan_enabled", true)
 
         // —— 换皮：使用 UI 替换包提供的 XML 布局，保留全部扫描/融合/导出核心逻辑 ——
         setContentView(R.layout.activity_mobile_scan)
@@ -783,7 +796,9 @@ private var lastRelocPollMs = 0L
             renderer = PointCloudRenderer()
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
-            setZOrderOnTop(true)
+            // Keep the transparent GL surface above the camera preview, but below normal
+            // Android controls so the 3D viewer top bar and "退出" action stay visible.
+            setZOrderMediaOverlay(true)
             isClickable = false
             isFocusable = false
         }
@@ -846,6 +861,8 @@ private var lastRelocPollMs = 0L
         hudCompact = TextView(this) // On-demand details; no permanent viewport overlay.
         pauseButton = findViewById(R.id.btnPauseScan)
         scanReticleView = findViewById(R.id.scanReticle)
+        scanGuidanceOverlay = findViewById(R.id.scanGuidanceOverlay)
+        tvGuidanceStep = findViewById(R.id.tvGuidanceStep)
         scanProgressView = findViewById(R.id.scanProgress)
         tvScanProgressPercent = findViewById(R.id.tvScanProgressPercent)
         tvMotionState = TextView(this) // On-demand details; no permanent viewport overlay.
@@ -878,7 +895,7 @@ private var lastRelocPollMs = 0L
         toolModeLabel = TextView(this) // On-demand details; no permanent viewport overlay.
         toolLightLabel = findViewById(R.id.toolLightLabel)
         toolCameraLabel = TextView(this) // On-demand details; no permanent viewport overlay.
-        toolLockLabel = TextView(this) // On-demand details; no permanent viewport overlay.
+        toolLockLabel = findViewById(R.id.toolLockLabel)
         viewerModeTexture = findViewById(R.id.viewerModeTexture)
         viewerModeSolid = findViewById(R.id.viewerModeSolid)
         viewerModeWire = findViewById(R.id.viewerModeWire)
@@ -896,6 +913,7 @@ private var lastRelocPollMs = 0L
         findViewById<android.view.View>(R.id.btnViewModel).setOnClickListener { toggleModelViewer() }
         findViewById<android.view.View>(R.id.btnSettings).setOnClickListener { showSettingsMenu() }
         findViewById<android.view.View>(R.id.statusCard).setOnClickListener { showScanDetails() }
+        findViewById<android.view.View>(R.id.toolLock).setOnClickListener { toggleObjectTracking() }
         findViewById<android.view.View>(R.id.toolLight).setOnClickListener { toggleAutoFillLightFromToolbar() }
         findViewById<android.view.View>(R.id.btnViewerClose).setOnClickListener { exitModelViewer() }
         findViewById<android.view.View>(R.id.btnViewerReset).setOnClickListener {
@@ -1007,10 +1025,65 @@ private var lastRelocPollMs = 0L
         }
 
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), 100)
+            requestCameraAccess()
         } else {
             startSystem()
         }
+    }
+
+    private fun requestCameraAccess() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            if (!systemInitialized) startSystem()
+            return
+        }
+
+        val permissionPrefs = getSharedPreferences("privacy_settings", Context.MODE_PRIVATE)
+        val requestedBefore = permissionPrefs.getBoolean("camera_permission_requested", false)
+        val systemWantsRationale = shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)
+
+        // After a permanent denial Android may stop showing the system prompt. Send the user
+        // directly to app settings instead of creating a dead-end "Authorize" loop.
+        if (requestedBefore && !systemWantsRationale) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("相机权限已关闭")
+                .setMessage("请在系统设置中允许相机权限，然后返回 MobileScan3D 继续扫描。")
+                .setPositiveButton("打开系统设置") { _, _ ->
+                    startActivity(
+                        android.content.Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.parse("package:$packageName")
+                        )
+                    )
+                }
+                .setNegativeButton("取消", null)
+                .show()
+            return
+        }
+
+        val shouldExplain =
+            !permissionPrefs.getBoolean("camera_intro_seen", false) || systemWantsRationale
+
+        fun launchSystemPermission() {
+            permissionPrefs.edit()
+                .putBoolean("camera_intro_seen", true)
+                .putBoolean("camera_permission_requested", true)
+                .apply()
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), 100)
+        }
+
+        if (!shouldExplain) {
+            launchSystemPermission()
+            return
+        }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle(getString(R.string.camera_permission_title))
+            .setMessage(getString(R.string.camera_permission_message))
+            .setPositiveButton(getString(R.string.camera_permission_continue)) { _, _ ->
+                launchSystemPermission()
+            }
+            .setNegativeButton(getString(R.string.camera_permission_not_now), null)
+            .show()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
@@ -1018,6 +1091,7 @@ private var lastRelocPollMs = 0L
         if (requestCode == 100) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 primaryButton.text = "开始扫描"
+                warningBanner.visibility = android.view.View.GONE
                 startSystem()
             } else {
                 primaryButton.text = "启用相机"
@@ -1033,7 +1107,7 @@ private var lastRelocPollMs = 0L
             android.app.AlertDialog.Builder(this).setTitle("需要相机权限")
                 .setMessage("扫描需要相机画面。可重新授权，或在系统设置中开启相机权限。")
                 .setPositiveButton("授权") { _, _ ->
-                    requestPermissions(arrayOf(Manifest.permission.CAMERA), 100)
+                    requestCameraAccess()
                 }
                 .setNeutralButton("系统设置") { _, _ ->
                     startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -1941,7 +2015,7 @@ private var lastRelocPollMs = 0L
             targetOverlay.state = TargetUiState(
                 visible = true, state = NativeBridge.TARGET_STATE_ARMED
             )
-            toast("框选无效，请重新框选（框太小或未开启物体锁定）")
+            toast("框选无效，请重新框选（框太小或未开启物体追踪）")
             return
         }
         targetTapX = (vx0 + vx1) * 0.5f
@@ -2849,8 +2923,12 @@ private var lastRelocPollMs = 0L
 
         val freeBytes = filesDir.usableSpace
         val freeMb = freeBytes / (1024L * 1024L)
-        if (freeMb < 512L) {
-            warnings.add("可用存储仅约 ${freeMb}MB，建议至少预留 512MB")
+        when {
+            freeMb < 256L -> critical.add("可用存储仅约 ${freeMb}MB，至少需要 256MB 才能开始扫描")
+            freeMb < 1024L -> warnings.add("可用存储仅约 ${freeMb}MB，长时间/HQ 扫描建议至少预留 1GB")
+        }
+        if (guidedScanEnabled && (!objectLockEnabled || targetConfidence < 0.35f)) {
+            warnings.add("标准扫描会先引导锁定主体；开始后按右侧“追踪”并点选或拖框选择物体")
         }
         if (scanVoxelProfile == 3) {
             val p = resolvedScanVoxelProfile()
@@ -2967,6 +3045,19 @@ private var lastRelocPollMs = 0L
         lastSurfaceCoveragePercent = 0
         lastSurfaceRobustPercent = 0
         lastCoverageGuidance = ""
+        recoveryRound = 0
+        recoveryActive = false
+        recoveryStartedMs = 0L
+        recoveryReadySinceMs = 0L
+        reviewRecoveryPlan =
+            com.mobilescan3d.scan.guidance.ScanRecoveryPlanner.Plan(emptyList(), "")
+        scanGuidanceController.reset()
+        if (::scanGuidanceOverlay.isInitialized) scanGuidanceOverlay.resetGuidance()
+        if (guidedScanEnabled && !objectLockEnabled) {
+            objectLockEnabled = true
+            NativeBridge.nativeSetObjectLockEnabled(true)
+            if (::targetOverlay.isInitialized) targetOverlay.state = TargetUiState(visible = true, state = 1)
+        }
         if (::viewpointCoverageView.isInitialized) viewpointCoverageView.clearCoverage()
         showScanReview(false)
         depthCompletedMs = android.os.SystemClock.elapsedRealtime()
@@ -3309,6 +3400,9 @@ private var lastRelocPollMs = 0L
         scanReviewActive = true
         scanNativeReady = false
         reviewInterrupted = false
+        recoveryActive = false
+        recoveryReadySinceMs = 0L
+        scanGuidanceController.clearRecoveryTargets()
         synchronized(depthSessionLock) { depthGeneration++ }
         arMeshViewing = true
         cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
@@ -3330,6 +3424,21 @@ private var lastRelocPollMs = 0L
             return
         }
 
+        val canUseDirectedRecovery =
+            guidedScanEnabled && reviewRecoveryPlan.targets.isNotEmpty() && recoveryRound < MAX_RECOVERY_ROUNDS
+        if (canUseDirectedRecovery) {
+            recoveryRound++
+            recoveryActive = true
+            recoveryStartedMs = android.os.SystemClock.elapsedRealtime()
+            recoveryReadySinceMs = 0L
+            scanGuidanceController.setRecoveryTargets(reviewRecoveryPlan.targets)
+        } else {
+            recoveryActive = false
+            recoveryStartedMs = 0L
+            recoveryReadySinceMs = 0L
+            scanGuidanceController.clearRecoveryTargets()
+        }
+
         scanReviewActive = false
         scanning = true
         scanPaused = false
@@ -3345,6 +3454,12 @@ private var lastRelocPollMs = 0L
         pauseButton.visibility = android.view.View.VISIBLE
         pauseButton.text = "暂停"
         updateHeader()
+        if (canUseDirectedRecovery) {
+            val first = reviewRecoveryPlan.targets.first()
+            toast("第 $recoveryRound 轮定向补扫：先补${first.label}")
+        } else if (reviewRecoveryPlan.targets.isNotEmpty() && recoveryRound >= MAX_RECOVERY_ROUNDS) {
+            toast("已完成 $MAX_RECOVERY_ROUNDS 轮定向补扫，本轮按自由扫描继续")
+        }
     }
 
     private fun finalizeFromScanReview() {
@@ -3398,6 +3513,18 @@ private var lastRelocPollMs = 0L
         lastViewpointCoveragePercent = 0
         viewpointCoverage.fill(0f)
         viewpointCoverageView.clearCoverage()
+        recoveryRound = 0
+        recoveryActive = false
+        recoveryStartedMs = 0L
+        recoveryReadySinceMs = 0L
+        reviewRecoveryPlan =
+            com.mobilescan3d.scan.guidance.ScanRecoveryPlanner.Plan(emptyList(), "")
+        scanGuidanceController.reset()
+        if (::scanGuidanceOverlay.isInitialized) {
+            scanGuidanceOverlay.resetGuidance()
+            scanGuidanceOverlay.visibility = android.view.View.GONE
+        }
+        if (::tvGuidanceStep.isInitialized) tvGuidanceStep.visibility = android.view.View.GONE
         primaryButton.text = "开始扫描"
         pauseButton.visibility = android.view.View.GONE
         tvScanStateBadge.text = "待扫描"
@@ -3418,6 +3545,16 @@ private var lastRelocPollMs = 0L
         if (::scanReticleView.isInitialized) {
             scanReticleView.visibility =
                 if (show) android.view.View.GONE else android.view.View.VISIBLE
+        }
+        if (::scanGuidanceOverlay.isInitialized) {
+            scanGuidanceOverlay.visibility = if (show || !guidedScanEnabled || !(scanning || scanPaused)) {
+                android.view.View.GONE
+            } else android.view.View.VISIBLE
+        }
+        if (::tvGuidanceStep.isInitialized) {
+            tvGuidanceStep.visibility = if (show || !guidedScanEnabled || !(scanning || scanPaused)) {
+                android.view.View.GONE
+            } else android.view.View.VISIBLE
         }
         if (::targetOverlay.isInitialized) {
             targetOverlay.visibility =
@@ -3513,7 +3650,38 @@ private var lastRelocPollMs = 0L
         tvReviewSurface.text = "$surface%"
         tvReviewGeometry.text = "$geometry%"
         tvReviewTexture.text = "$textureQ%"
-        tvReviewMissing.text = reviewMissingViewsText()
+
+        reviewRecoveryPlan = com.mobilescan3d.scan.guidance.ScanRecoveryPlanner.build(
+            coverage = viewpointCoverage,
+            currentSector = coverageCurrentSector,
+            captureSufficiency = capture,
+            surfaceCoverage = surface,
+            geometryQuality = geometry,
+            maxTargets = 3
+        )
+        val recoveryNote = when {
+            reviewRecoveryPlan.targets.isEmpty() ->
+                "视角补扫：没有明确短板；请重点观察红/黄表面热力区域。"
+            recoveryRound >= MAX_RECOVERY_ROUNDS ->
+                "${reviewRecoveryPlan.summary} · 已达到自动定向补扫建议轮数，可自由补扫或直接生成。"
+            else ->
+                "${reviewRecoveryPlan.summary} · 点“继续补扫”后会直接给出方向箭头。"
+        }
+        tvReviewMissing.text = reviewMissingViewsText() + "\n" + recoveryNote
+
+        reviewContinueButton.text = when {
+            reviewRecoveryPlan.targets.isEmpty() -> "继续补扫"
+            recoveryRound >= MAX_RECOVERY_ROUNDS -> "自由补扫"
+            else -> "继续补扫 · ${reviewRecoveryPlan.targets.size}处"
+        }
+        tvReviewTopHint.text = when {
+            reviewRecoveryPlan.targets.isEmpty() ->
+                "红/黄区域表示真实表面观测偏弱；未发现明确的视角补扫方向"
+            recoveryRound >= MAX_RECOVERY_ROUNDS ->
+                "红/黄区域表示真实表面观测偏弱；可自由补扫或生成当前模型"
+            else ->
+                "红/黄=真实低观测表面 · ${reviewRecoveryPlan.summary}"
+        }
 
         reviewContinueButton.isEnabled = !reviewInterrupted
         if (reviewInterrupted) {
@@ -3972,6 +4140,11 @@ private var lastRelocPollMs = 0L
         if (::modelViewerOverlay.isInitialized) {
             modelViewerOverlay.visibility =
                 if (visible) android.view.View.GONE else android.view.View.VISIBLE
+            if (!visible) {
+                // GLSurfaceView owns a separate Surface. Reassert the Android control layer
+                // whenever the viewer opens so its exit action cannot vanish behind GL.
+                modelViewerOverlay.bringToFront()
+            }
         }
         if (::viewerBackdrop.isInitialized) {
             viewerBackdrop.visibility =
@@ -5025,9 +5198,9 @@ private var lastRelocPollMs = 0L
         }
         if (::toolLockLabel.isInitialized) {
             toolLockLabel.text = when {
-                !objectLockEnabled -> "未锁定"
-                targetConfidence >= 0.55f -> "已锁定"
-                else -> "待选择"
+                !objectLockEnabled -> "关闭"
+                targetConfidence >= 0.55f -> "追踪中"
+                else -> "选目标"
             }
             toolLockLabel.setTextColor(
                 getColor(
@@ -5252,6 +5425,92 @@ private var lastRelocPollMs = 0L
             scanPaused,
             reticleWarning
         )
+
+        updateStandardScanGuidance(
+            vinsOk = vinsOk,
+            vinsEverInitialized = everInit,
+            distanceMeters = distance,
+            nativeGuidance = guidance
+        )
+    }
+
+    private fun updateStandardScanGuidance(
+        vinsOk: Boolean,
+        vinsEverInitialized: Boolean,
+        distanceMeters: Float,
+        nativeGuidance: String
+    ) {
+        if (!guidedScanEnabled) {
+            lastCoverageGuidance = if (scanning) computeCoverageGuidance() else ""
+            if (::scanGuidanceOverlay.isInitialized) {
+                scanGuidanceOverlay.resetGuidance()
+                scanGuidanceOverlay.visibility = android.view.View.GONE
+            }
+            if (::tvGuidanceStep.isInitialized) tvGuidanceStep.visibility = android.view.View.GONE
+            return
+        }
+
+        val active = scanning || scanPaused
+        val output = scanGuidanceController.evaluate(
+            com.mobilescan3d.scan.guidance.ScanGuidanceInput(
+                active = active,
+                paused = scanPaused,
+                guidedMode = true,
+                objectTrackingEnabled = objectLockEnabled,
+                targetConfidence = targetConfidence,
+                vinsInitialized = vinsOk,
+                vinsEverInitialized = vinsEverInitialized,
+                distanceMeters = distanceMeters,
+                maxDistanceMeters = scanMaxDistanceMeters,
+                angularSpeedDps = scanAngularSpeedDps,
+                coverage = viewpointCoverage,
+                currentSector = coverageCurrentSector,
+                currentElevationDeg = coverageCurrentElevationDeg,
+                captureSufficiency = lastScanSufficiency,
+                geometryQuality = lastGeometryQualityPercent,
+                surfaceCoverage = lastSurfaceCoveragePercent,
+                nativeGuidance = nativeGuidance,
+                nowMs = android.os.SystemClock.elapsedRealtime()
+            )
+        )
+
+        lastCoverageGuidance = output.primaryInstruction
+
+        if (recoveryActive && output.recoveryMode && output.recoveryRemaining == 0 && scanning && !scanPaused) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (recoveryReadySinceMs == 0L) recoveryReadySinceMs = now
+            if (now - recoveryReadySinceMs >= RECOVERY_AUTO_REVIEW_HOLD_MS &&
+                now - recoveryStartedMs >= RECOVERY_MIN_SCAN_MS &&
+                scanNativeReady
+            ) {
+                recoveryReadySinceMs = 0L
+                recoveryActive = false
+                toast("定向补扫完成，重新检查模型")
+                enterScanReview()
+                return
+            }
+        } else if (recoveryActive) {
+            recoveryReadySinceMs = 0L
+        }
+
+        if (::scanGuidanceOverlay.isInitialized) {
+            scanGuidanceOverlay.visibility = if (active) android.view.View.VISIBLE else android.view.View.GONE
+            scanGuidanceOverlay.setGuidance(viewpointCoverage, coverageCurrentSector, output)
+        }
+        if (::tvGuidanceStep.isInitialized) {
+            tvGuidanceStep.visibility = if (active) android.view.View.VISIBLE else android.view.View.GONE
+            tvGuidanceStep.text = output.stepLabel
+            tvGuidanceStep.setTextColor(
+                getColor(
+                    when (output.severity) {
+                        com.mobilescan3d.scan.guidance.GuidanceSeverity.SUCCESS -> R.color.scan_success
+                        com.mobilescan3d.scan.guidance.GuidanceSeverity.WARNING,
+                        com.mobilescan3d.scan.guidance.GuidanceSeverity.DANGER -> R.color.scan_warning
+                        else -> R.color.scan_primary
+                    }
+                )
+            )
+        }
     }
 
     /**
@@ -5349,7 +5608,7 @@ private var lastRelocPollMs = 0L
             viewpointCoverage[13] * 0.08f
         lastViewpointCoveragePercent =
             (weighted * 100f).toInt().coerceIn(0, 100)
-        lastCoverageGuidance = computeCoverageGuidance()
+        if (!guidedScanEnabled) lastCoverageGuidance = computeCoverageGuidance()
         viewpointCoverageView.setCoverage(
             viewpointCoverage, coverageCurrentSector, lastViewpointCoveragePercent
         )
@@ -5443,7 +5702,7 @@ private var lastRelocPollMs = 0L
         val notes = ArrayList<String>()
         if (sideMissing > 0) notes.add("侧面仍有 $sideMissing 个视角采集不足")
         if (viewpointCoverage[12] < 0.34f) notes.add("顶部视角不足")
-        if (viewpointCoverage[13] < 0.30f) notes.add("底部/遮挡边缘不足")
+        if (viewpointCoverage[13] < 0.30f && lastScanSufficiency < 82) notes.add("下半部/遮挡边缘视角偏少（桌面接触底面无需强制补扫）")
         if (lastGeometryQualityPercent < 55) notes.add("几何重复观测偏少")
         if (lastSurfaceCoveragePercent in 1..64) {
             notes.add("真实表面稳定观测不足（${lastSurfaceCoveragePercent}%）")
@@ -5474,7 +5733,7 @@ private var lastRelocPollMs = 0L
                 warningBanner.setBackgroundResource(R.drawable.bg_hint_warning)
                 warningBanner.setTextColor(getColor(R.color.scan_warning))
             }
-            scanning && text.contains("覆盖良好") -> {
+            scanning && (text.contains("覆盖良好") || text.contains("可以完成") || text.contains("扫描完整")) -> {
                 warningBanner.setBackgroundResource(R.drawable.bg_hint_success)
                 warningBanner.setTextColor(getColor(R.color.scan_success))
             }
@@ -5845,10 +6104,12 @@ private var lastRelocPollMs = 0L
         val message =
             "取景优先的扫描界面：\n\n" +
                 "• 顶部：深度 / 距离 / 尺度，点按查看完整状态\n" +
-                "• 右侧：自动补光 / 预览图层，点按切换\n" +
-                "• 更多：物体锁定 / 镜头 / 对焦 / 重建档位 / 导出\n" +
+                "• 右侧：物体追踪 / 自动补光 / 预览图层，点按切换\n" +
+                "• 标准扫描：按 1/4–4/4 步骤跟随轨迹环与方向箭头移动\n" +
+                "• 更多：可切换标准引导 / 自由扫描，以及镜头 / 对焦 / 重建档位 / 导出\n" +
                 "• 底部：开始或完成扫描 / 暂停继续 / 模型\n\n" +
-                "采集百分比表示采集充分度；视角百分比是估算的环绕覆盖，" +
+                "方向箭头表示下一建议视角；保持镜头朝向物体并围绕物体移动，" +
+                "不要站在原地只旋转手机。采集百分比表示采集充分度；视角百分比是估算的环绕覆盖，" +
                 "均不代表真实表面积的完整度。完成扫描后仍会进入检查页，" +
                 "可继续补扫或生成模型。\n\n" +
                 "控件会自动避让系统栏与屏幕挖孔；中央画面保留点按对焦和物体框选。"
@@ -6267,7 +6528,7 @@ private var lastRelocPollMs = 0L
         }
     }
 
-    private fun toggleObjectLockFromMenu() {
+    private fun toggleObjectTracking() {
         objectLockEnabled = !objectLockEnabled
         NativeBridge.nativeSetObjectLockEnabled(objectLockEnabled)
         if (objectLockEnabled) {
@@ -6280,14 +6541,17 @@ private var lastRelocPollMs = 0L
             lastTargetUiState = NativeBridge.TARGET_STATE_OFF
             targetWarningText.visibility = android.view.View.GONE
         }
-        toast(if (objectLockEnabled) "点击需要扫描的物体" else "已退出物体锁定")
+        toast(
+            if (objectLockEnabled) "物体追踪已开启 · 点击物体或拖框选择目标"
+            else "物体追踪已关闭"
+        )
         updateHeader()
     }
 
     /** Less-used controls stay reachable without permanently covering the object. */
     private fun showSettingsMenu() {
         android.widget.PopupMenu(this, findViewById(R.id.btnSettings)!!).apply {
-            menu.add(0, 1, 0, if (objectLockEnabled) "退出物体锁定" else "物体锁定")
+            menu.add(0, 14, 0, if (guidedScanEnabled) "扫描方式：标准引导" else "扫描方式：自由扫描")
             menu.add(0, 2, 1, "镜头与距离")
             menu.add(0, 3, 2, "对焦 / 防抖")
             menu.add(0, 4, 3, "重建档位")
@@ -6300,9 +6564,10 @@ private var lastRelocPollMs = 0L
             advanced.add(0, 10, 1, "设备标定中心")
             advanced.add(0, 11, 2, "扫描质量诊断")
             advanced.add(0, 12, 3, "使用帮助")
+            advanced.add(0, 13, 4, this@MainActivity.getString(R.string.privacy_data_menu))
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
-                    1 -> toggleObjectLockFromMenu()
+                    14 -> toggleGuidedScanMode()
                     2 -> showCameraRangeDialog()
                     3 -> showFocusStabDialog()
                     4 -> showModeDialog()
@@ -6314,12 +6579,40 @@ private var lastRelocPollMs = 0L
                     10 -> showCalibrationCenter()
                     11 -> showScanQualityReport()
                     12 -> showScanUiHelp()
+                    13 -> showPrivacyAndDataInfo()
                     else -> return@setOnMenuItemClickListener false
                 }
                 true
             }
             show()
         }
+    }
+
+    private fun toggleGuidedScanMode() {
+        if (scanning || scanPaused) {
+            toast("请结束当前扫描后再切换扫描方式")
+            return
+        }
+        guidedScanEnabled = !guidedScanEnabled
+        getSharedPreferences("scan_settings", Context.MODE_PRIVATE).edit()
+            .putBoolean("guided_scan_enabled", guidedScanEnabled)
+            .apply()
+        scanGuidanceController.reset()
+        if (::scanGuidanceOverlay.isInitialized) {
+            scanGuidanceOverlay.resetGuidance()
+            scanGuidanceOverlay.visibility = android.view.View.GONE
+        }
+        if (::tvGuidanceStep.isInitialized) tvGuidanceStep.visibility = android.view.View.GONE
+        toast(if (guidedScanEnabled) "已切换为标准扫描引导" else "已切换为自由扫描")
+        updateHeader()
+    }
+
+    private fun showPrivacyAndDataInfo() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle(getString(R.string.privacy_data_title))
+            .setMessage(getString(R.string.privacy_data_message))
+            .setPositiveButton("关闭", null)
+            .show()
     }
 
     private fun showScanDetails() {
@@ -6342,7 +6635,9 @@ private var lastRelocPollMs = 0L
                 tvMotionState.text.toString(),
                 tvDistanceState.text.toString(),
                 tvTrackingState.text.toString(),
-                "物体锁定：${toolLockLabel.text}",
+                "物体追踪：${toolLockLabel.text}",
+                "扫描方式：${if (guidedScanEnabled) "标准引导" else "自由扫描"}",
+                "补扫轮次：$recoveryRound / $MAX_RECOVERY_ROUNDS",
                 "重建档位：${toolModeLabel.text}",
                 "采集充分度 $lastScanSufficiency% · 视角覆盖 $lastViewpointCoveragePercent%",
                 "打开时的状态快照；视角覆盖为估算值。"
@@ -6652,6 +6947,19 @@ private var lastRelocPollMs = 0L
         if (::cameraManager.isInitialized && texture.isAvailable && cameraDevice == null && !openingCamera) {
             openCamera()
         }
+    }
+
+    private val MAX_RECOVERY_ROUNDS = 3
+    private val RECOVERY_AUTO_REVIEW_HOLD_MS = 1_600L
+    private val RECOVERY_MIN_SCAN_MS = 3_500L
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (modelViewerActive) {
+            exitModelViewer()
+            return
+        }
+        super.onBackPressed()
     }
 
     override fun onDestroy() {
