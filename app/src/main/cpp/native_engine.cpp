@@ -2354,7 +2354,10 @@ static void nativeOnDepthMapImpl(
     }
 
     static std::vector<float> refinedDepth;
-    depth_refinement::spatial(d.data(), w, h, representation == 1, refinedDepth);
+    depth_refinement::spatial(
+        d.data(), w, h, representation == 1,
+        sourceWeights.empty() ? nullptr : sourceWeights.data(),
+        refinedDepth);
     d.swap(refinedDepth);
 
     // Fetch timestamp-aligned sparse observations before taking gStateMutex.
@@ -3211,8 +3214,12 @@ static void nativeOnDepthMapImpl(
                 zEpoch.data(), w, h, temporalK.fx, temporalK.fy,
                 temporalK.cx, temporalK.cy, match->R, match->t,
                 [](float px, float py, float pz, float maxD,
-                   float* ox, float* oy, float* oz) {
-                    return g.nearestStableSurfel(px, py, pz, maxD, ox, oy, oz);
+                   float* ox, float* oy, float* oz,
+                   float* onx, float* ony, float* onz,
+                   uint16_t* ohits) {
+                    return g.nearestStableSurfel(
+                        px, py, pz, maxD,
+                        ox, oy, oz, onx, ony, onz, ohits);
                 },
                 icpOutR, icpOutT);
             switch (lastIcpDiag.reason) {

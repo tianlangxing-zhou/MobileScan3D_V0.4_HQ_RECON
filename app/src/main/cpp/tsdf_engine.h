@@ -87,7 +87,14 @@ public:
     float truncation() const { return trunc_; }
 
     /** 块数上限（控制内存）。每块 sizeof(TsdfBlock) = 4096 字节。 */
-    void setMaxBlocks(size_t n) { maxBlocks_ = n < 64 ? 64 : n; }
+    void setMaxBlocks(size_t n) {
+        maxBlocks_ = n < 64 ? 64 : n;
+        // Warm-reserve only a common working-set size. Reserving the theoretical
+        // max (which can exceed one million blocks on large-memory phones) would
+        // trade rehash stalls for unnecessary bucket memory at scan start.
+        const size_t warmBlocks = std::min<size_t>(maxBlocks_, 262144);
+        if (blocks_.bucket_count() < warmBlocks) blocks_.reserve(warmBlocks);
+    }
     size_t maxBlocks() const { return maxBlocks_; }
 
     /** 融合时的像素步长（1 = 每像素，2 = 隔一个像素）。步长越大越快、越稀。 */

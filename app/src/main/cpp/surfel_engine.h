@@ -69,13 +69,20 @@ public:
     /** 满足 hits >= minHits 的点数（用于 HUD / 报告里的「确认」「稳定」计数） */
     size_t confirmedCount(int minHits) const;
     /**
-     * vc184 frame-to-model ICP 最近邻查询：在粗体素索引（2cm 稳定共面代表点）
-     * 的 3×3×3 邻域内找最近 surfel。maxDistM 内找到返回 true 并写出位置。
-     * 只读、不改状态、不分配 —— ICP 热路径上每帧调用数千次。
+     * 帧到模型 ICP 最近邻查询。
+     *
+     * 粗索引 cell=2cm。搜索半径由 maxDistM 动态换算成 shell，避免旧实现
+     * “ICP 允许 6cm，但哈希只查 ±1 cell”导致 4~6cm 对应点永远不可见。
+     *
+     * 常见近邻先查 3×3×3；只有近邻不足时才逐 shell 扩大。可选返回稳定
+     * surfel 法向与 hits，供鲁棒 point-to-plane ICP 使用。
      */
     bool nearestStableSurfel(float x, float y, float z, float maxDistM,
                              float* ox = nullptr, float* oy = nullptr,
-                             float* oz = nullptr) const;
+                             float* oz = nullptr,
+                             float* onx = nullptr, float* ony = nullptr,
+                             float* onz = nullptr,
+                             uint16_t* ohits = nullptr) const;
     void boundingBox(float* minX, float* minY, float* minZ,
                      float* maxX, float* maxY, float* maxZ) const;
     void centroid(float* x, float* y, float* z) const;

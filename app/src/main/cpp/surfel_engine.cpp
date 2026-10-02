@@ -124,42 +124,80 @@ size_t SurfelEngine::copyPoints(float* out, size_t maxPoints, int minHits) const
 }
 
 bool SurfelEngine::nearestStableSurfel(float x, float y, float z, float maxDistM,
-                                       float* ox, float* oy, float* oz) const {
+                                       float* ox, float* oy, float* oz,
+                                       float* onx, float* ony, float* onz,
+                                       uint16_t* ohits) const {
     if (!(std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) ||
-        !(maxDistM > 0.f)) {
+        !(std::isfinite(maxDistM) && maxDistM > 0.f) ||
+        coarseIndex_.empty()) {
         return false;
     }
-    // 粗索引 cell=2cm；3×3×3 邻域覆盖 ±2cm（含跨格达 ~4cm）。
-    const float inv = 50.f; // 1/0.02
-    const int kx = int(std::floor(x * inv));
-    const int ky = int(std::floor(y * inv));
-    const int kz = int(std::floor(z * inv));
-    float best2 = maxDistM * maxDistM;
-    bool found = false;
-    float bx = 0.f, by = 0.f, bz = 0.f;
-    for (int dz = -1; dz <= 1; ++dz) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                auto it = coarseIndex_.find(Key{kx + dx, ky + dy, kz + dz});
-                if (it == coarseIndex_.end()) continue;
-                // 同一格可能被压缩成多个 surfel？粗索引一格一代表，
-                // 但 erase/swap 期间一格可能短暂多值 —— 直接线性扫该桶不可行，
-                // 现实现一格一 entry，取它即可。
-                const Surfel& a = g_[it->second];
-                const float ex = a.px - x, ey = a.py - y, ez = a.pz - z;
-                const float d2 = ex * ex + ey * ey + ez * ez;
-                if (d2 <= best2) {
-                    best2 = d2;
-                    found = true;
-                    bx = a.px; by = a.py; bz = a.pz;
+
+    constexpr float kCell = 0.02f;
+    constexpr float kInvCell = 50.f;
+    const int kx = int(std::floor(x * kInvCell));
+    const int ky = int(std::floor(y * kInvCell));
+    const int kz = int(std::floor(z * kInvCell));
+    // maxDist=6cm -> radius=3 cells. Cap protects accidental huge queries.
+    const int maxRadius = std::clamp(
+        int(std::ceil(maxDistM / kCell)), 1, 4);
+
+    const float limit2 = maxDistM * maxDistM;
+    float best2 = limit2;
+    size_t bestIndex = size_t(-1);
+
+    // Search Chebyshev shells. r=1 is the legacy 3×3×3 fast path.
+    // Expanding only the outer shell avoids re-querying earlier cells.
+    for (int r = 1; r <= maxRadius; ++r) {
+        for (int dz = -r; dz <= r; ++dz) {
+            for (int dy = -r; dy <= r; ++dy) {
+                for (int dx = -r; dx <= r; ++dx) {
+                    if (r > 1 &&
+                        std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != r) {
+                        continue;
+                    }
+                    auto it = coarseIndex_.find(Key{kx + dx, ky + dy, kz + dz});
+                    if (it == coarseIndex_.end()) continue;
+                    const size_t idx = it->second;
+                    if (idx >= g_.size()) continue;
+                    const Surfel& a = g_[idx];
+                    const float ex = a.px - x;
+                    const float ey = a.py - y;
+                    const float ez = a.pz - z;
+                    const float d2 = ex * ex + ey * ey + ez * ez;
+                    if (d2 <= best2) {
+                        best2 = d2;
+                        bestIndex = idx;
+                    }
                 }
             }
         }
+
+        // If the nearest match is already well inside the first 2cm cell shell,
+        // a farther shell cannot provide a materially better ICP anchor.
+        if (bestIndex != size_t(-1) && best2 <= 0.000324f) { // 1.8cm²; shell r=2 cannot beat this materially
+            break;
+        }
     }
-    if (!found) return false;
-    if (ox) *ox = bx;
-    if (oy) *oy = by;
-    if (oz) *oz = bz;
+
+    if (bestIndex == size_t(-1)) return false;
+    const Surfel& best = g_[bestIndex];
+    if (ox) *ox = best.px;
+    if (oy) *oy = best.py;
+    if (oz) *oz = best.pz;
+
+    float nx = best.nx, ny = best.ny, nz = best.nz;
+    const float n2 = nx * nx + ny * ny + nz * nz;
+    if (n2 > 1e-10f && std::isfinite(n2)) {
+        const float inv = 1.f / std::sqrt(n2);
+        nx *= inv; ny *= inv; nz *= inv;
+    } else {
+        nx = ny = nz = 0.f;
+    }
+    if (onx) *onx = nx;
+    if (ony) *ony = ny;
+    if (onz) *onz = nz;
+    if (ohits) *ohits = best.hits;
     return true;
 }
 
@@ -246,7 +284,10 @@ void SurfelEngine::erasePoint(size_t i) {
 }
 void SurfelEngine::rebuildIndex() {
     // Swap releases old hash nodes/buckets after compaction, unlike clear alone.
-    decltype(index_) fine,coarse;confirmed_=stable_=0;
+    decltype(index_) fine,coarse;
+    fine.reserve(g_.size());
+    coarse.reserve(std::max<size_t>(64, g_.size()/4));
+    confirmed_=stable_=0;
     for(size_t i=0;i<g_.size();++i){auto& a=g_[i];(a.coarse?coarse:fine)[keyFor(a)]=i;if(a.hits>=2)++confirmed_;if(a.state>=2)++stable_;}
     index_.swap(fine);coarseIndex_.swap(coarse);
 }
@@ -260,7 +301,11 @@ void SurfelEngine::ingestAdaptivePoint(float x,float y,float z,uint8_t r,uint8_t
         Surfel& a=g_[coarse->second];
         const float dot=a.nx*geo.nx+a.ny*geo.ny+a.nz*geo.nz;
         const float error=std::fabs((x-a.px)*a.nx+(y-a.py)*a.ny+(z-a.pz)*a.nz);
-        if(geo.protectedDetail || dot<.996f || error>.002f) {
+        // Compression accepts dot>.98 / plane error<5mm. Reactivation must use
+        // hysteresis rather than the old .996/2mm thresholds, otherwise a patch
+        // is compressed into an ICP anchor and immediately expanded again on
+        // ordinary sensor noise. Still reactivate real detail/geometry changes.
+        if(geo.protectedDetail || dot<.985f || error>.004f) {
             // Keep a representative while restoring fine cells from fresh observations.
             Surfel old=a;erasePoint(coarse->second);old.coarse=false;old.hits=1;old.state=0;
             old.fusionWeight=std::max(.05f,old.opacity/255.f);
@@ -295,8 +340,9 @@ void SurfelEngine::endFrame() {
     // V0.13.42（vc185 重叠修复）：压缩频率 16→8 帧，让粗索引（ICP 锚）
     // 在模型刚有一小块稳定几何时就尽快建立，避免环绕漂移下迟迟无锚可修偏。
     if(!frame_ || frame_%8 || g_.size()<3)return;
-    struct Group {size_t first=0,count=0;bool valid=true;double x=0,y=0,z=0,r=0,g=0,b=0;};
+    struct Group {size_t first=0,count=0;bool valid=true;double x=0,y=0,z=0,r=0,g=0,b=0,nx=0,ny=0,nz=0;};
     std::unordered_map<Key,Group,Hash> groups;
+    groups.reserve(std::max<size_t>(64, g_.size()/2));
     for(size_t i=0;i<g_.size();++i) {
         const auto& a=g_[i];
         const Key k{int(std::floor(a.px/.02f)),int(std::floor(a.py/.02f)),int(std::floor(a.pz/.02f))};
@@ -305,7 +351,7 @@ void SurfelEngine::endFrame() {
         q.valid=q.valid && !a.coarse && !a.detail && a.hits>=3 && frame_>=a.protectedUntil &&
             frame_-a.lastFrame<=40 && (a.nx*ref.nx+a.ny*ref.ny+a.nz*ref.nz)>.98f &&
             std::fabs((a.px-ref.px)*ref.nx+(a.py-ref.py)*ref.ny+(a.pz-ref.pz)*ref.nz)<.005f;
-        ++q.count;q.x+=a.px;q.y+=a.py;q.z+=a.pz;q.r+=a.red;q.g+=a.green;q.b+=a.blue;
+        ++q.count;q.x+=a.px;q.y+=a.py;q.z+=a.pz;q.r+=a.red;q.g+=a.green;q.b+=a.blue;q.nx+=a.nx;q.ny+=a.ny;q.nz+=a.nz;
     }
     size_t removed=0;
     for(const auto& kv:groups)if(kv.second.valid&&kv.second.count>=2)removed+=kv.second.count-1;
@@ -320,6 +366,8 @@ void SurfelEngine::endFrame() {
             a.px=float(q.x/q.count);a.py=float(q.y/q.count);a.pz=float(q.z/q.count);
             a.red=float(q.r/q.count);a.green=float(q.g/q.count);a.blue=float(q.b/q.count);
             a.r=uint8_t(std::lround(a.red));a.g=uint8_t(std::lround(a.green));a.b=uint8_t(std::lround(a.blue));
+            const float nn=float(std::sqrt(q.nx*q.nx+q.ny*q.ny+q.nz*q.nz));
+            if(nn>1e-6f && std::isfinite(nn)){a.nx=float(q.nx)/nn;a.ny=float(q.ny)/nn;a.nz=float(q.nz)/nn;}
             a.coarse=true;a.sx=a.sy=a.sz=.016f;
         }
         compact.push_back(a);

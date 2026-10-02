@@ -833,12 +833,70 @@ struct Quadric {
     }
 };
 
+inline bool solveQemPoint(const Quadric& q,
+                          float ax, float ay, float az,
+                          float bx, float by, float bz,
+                          float* ox, float* oy, float* oz) {
+    // Minimize v^T Q v with homogeneous w=1:
+    // [q00 q01 q02] [x] = -[q03]
+    // [q01 q11 q12] [y]    [q13]
+    // [q02 q12 q22] [z]    [q23]
+    const double a00=q.q[0], a01=q.q[1], a02=q.q[2];
+    const double a11=q.q[4], a12=q.q[5], a22=q.q[7];
+    const double b0=-q.q[3], b1=-q.q[6], b2=-q.q[8];
+
+    const double c00 = a11*a22 - a12*a12;
+    const double c01 = a02*a12 - a01*a22;
+    const double c02 = a01*a12 - a02*a11;
+    const double c11 = a00*a22 - a02*a02;
+    const double c12 = a01*a02 - a00*a12;
+    const double c22 = a00*a11 - a01*a01;
+    const double det = a00*c00 + a01*c01 + a02*c02;
+
+    const float mx=(ax+bx)*0.5f, my=(ay+by)*0.5f, mz=(az+bz)*0.5f;
+    float bestX=mx, bestY=my, bestZ=mz;
+    float bestCost=q.eval(mx,my,mz);
+
+    auto consider=[&](float x,float y,float z) {
+        if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)) return;
+        const float cost=q.eval(x,y,z);
+        if(std::isfinite(cost) && cost<bestCost) {
+            bestCost=cost;bestX=x;bestY=y;bestZ=z;
+        }
+    };
+    consider(ax,ay,az);
+    consider(bx,by,bz);
+
+    const double scale =
+        std::max({std::fabs(a00),std::fabs(a11),std::fabs(a22),1e-12});
+    if(std::fabs(det) > scale*scale*scale*1e-10) {
+        const double x=(c00*b0+c01*b1+c02*b2)/det;
+        const double y=(c01*b0+c11*b1+c12*b2)/det;
+        const double z=(c02*b0+c12*b1+c22*b2)/det;
+        const float edge=std::sqrt(
+            (ax-bx)*(ax-bx)+(ay-by)*(ay-by)+(az-bz)*(az-bz));
+        const float dx=float(x)-mx,dy=float(y)-my,dz=float(z)-mz;
+        const float fromMid=std::sqrt(dx*dx+dy*dy+dz*dz);
+        // A formally valid solution can still sit far outside the local edge
+        // when the quadric is nearly singular. Keep the collapse local.
+        if(edge<1e-8f || fromMid<=edge*1.5f) {
+            consider(float(x),float(y),float(z));
+        }
+    }
+
+    *ox=bestX;*oy=bestY;*oz=bestZ;
+    return std::isfinite(bestCost);
+}
+
 struct QEntry {
     float cost;
     uint32_t v0;
     uint32_t v1;
     uint32_t ver0;
     uint32_t ver1;
+    float x;
+    float y;
+    float z;
 };
 
 struct QGreater {
@@ -908,11 +966,14 @@ bool meshDecimate(Mesh& mesh, size_t targetTriangles, MeshBuildStats* stats) {
         if (!edgeSeen.insert(k).second) {
             return;
         }
-        const float mx = (mesh.positions[a * 3 + 0] + mesh.positions[b * 3 + 0]) * 0.5f;
-        const float my = (mesh.positions[a * 3 + 1] + mesh.positions[b * 3 + 1]) * 0.5f;
-        const float mz = (mesh.positions[a * 3 + 2] + mesh.positions[b * 3 + 2]) * 0.5f;
+        const float ax=mesh.positions[a*3+0], ay=mesh.positions[a*3+1], az=mesh.positions[a*3+2];
+        const float bx=mesh.positions[b*3+0], by=mesh.positions[b*3+1], bz=mesh.positions[b*3+2];
         const Quadric q = quad[a] + quad[b];
-        pq.push(QEntry{q.eval(mx, my, mz), a, b, vVer[a], vVer[b]});
+        float tx=0.f,ty=0.f,tz=0.f;
+        if(!solveQemPoint(q,ax,ay,az,bx,by,bz,&tx,&ty,&tz)) return;
+        const float cost=q.eval(tx,ty,tz);
+        if(!std::isfinite(cost)) return;
+        pq.push(QEntry{cost, a, b, vVer[a], vVer[b], tx, ty, tz});
     };
     for (size_t t = 0; t < liveTris; ++t) {
         if (!triValid[t]) {
@@ -938,14 +999,53 @@ bool meshDecimate(Mesh& mesh, size_t targetTriangles, MeshBuildStats* stats) {
         }
         const uint32_t keep = e.v0;
         const uint32_t drop = e.v1;
+        const float target[3]={e.x,e.y,e.z};
 
-        // 放到中点（不做矩阵求解，避免奇异时的数值爆炸）
-        mesh.positions[keep * 3 + 0] =
-            (mesh.positions[keep * 3 + 0] + mesh.positions[drop * 3 + 0]) * 0.5f;
-        mesh.positions[keep * 3 + 1] =
-            (mesh.positions[keep * 3 + 1] + mesh.positions[drop * 3 + 1]) * 0.5f;
-        mesh.positions[keep * 3 + 2] =
-            (mesh.positions[keep * 3 + 2] + mesh.positions[drop * 3 + 2]) * 0.5f;
+        // Reject collapses that would create a degenerate face or rotate an
+        // adjacent face normal by more than 70 degrees. This is especially
+        // important for thin parts and sharp consumer objects.
+        const float kMinArea2=1e-14f;
+        const float kMinNormalDot=0.34202014f; // cos(70°)
+        auto faceSafe=[&](uint32_t ti)->bool {
+            if(ti>=tris.size() || !triValid[ti]) return true;
+            const auto& tr=tris[ti];
+            bool hasKeep=false,hasDrop=false;
+            for(int k=0;k<3;++k){hasKeep|=tr[k]==keep;hasDrop|=tr[k]==drop;}
+            if(hasKeep&&hasDrop) return true; // this face is expected to vanish
+
+            float oldP[3][3],newP[3][3];
+            for(int k=0;k<3;++k){
+                const uint32_t v=tr[k];
+                if(v>=nv || !vValid[v]) return false;
+                oldP[k][0]=mesh.positions[v*3+0];
+                oldP[k][1]=mesh.positions[v*3+1];
+                oldP[k][2]=mesh.positions[v*3+2];
+                if(v==keep||v==drop){
+                    newP[k][0]=target[0];newP[k][1]=target[1];newP[k][2]=target[2];
+                }else{
+                    newP[k][0]=oldP[k][0];newP[k][1]=oldP[k][1];newP[k][2]=oldP[k][2];
+                }
+            }
+            auto normal=[](const float p[3][3],float n[3])->float{
+                const float ax=p[1][0]-p[0][0],ay=p[1][1]-p[0][1],az=p[1][2]-p[0][2];
+                const float bx=p[2][0]-p[0][0],by=p[2][1]-p[0][1],bz=p[2][2]-p[0][2];
+                n[0]=ay*bz-az*by;n[1]=az*bx-ax*bz;n[2]=ax*by-ay*bx;
+                return std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+            };
+            float no[3],nn[3];
+            const float lo=normal(oldP,no),ln=normal(newP,nn);
+            if(!(lo>kMinArea2 && ln>kMinArea2)) return false;
+            const float dot=(no[0]*nn[0]+no[1]*nn[1]+no[2]*nn[2])/(lo*ln);
+            return std::isfinite(dot)&&dot>=kMinNormalDot;
+        };
+        bool collapseSafe=true;
+        for(uint32_t ti:vTris[keep]) if(!faceSafe(ti)){collapseSafe=false;break;}
+        if(collapseSafe) for(uint32_t ti:vTris[drop]) if(!faceSafe(ti)){collapseSafe=false;break;}
+        if(!collapseSafe) continue;
+
+        mesh.positions[keep * 3 + 0] = target[0];
+        mesh.positions[keep * 3 + 1] = target[1];
+        mesh.positions[keep * 3 + 2] = target[2];
         if (mesh.colors.size() >= nv * 3) {
             for (int k = 0; k < 3; ++k) {
                 mesh.colors[keep * 3 + k] =

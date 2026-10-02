@@ -381,10 +381,27 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
 
             const float xn = (static_cast<float>(x) - cx) * invFx;
             const float yn = (static_cast<float>(y) - cy) * invFy;
+            const float rayLen = std::sqrt(1.f + xn * xn + yn * yn);
+            if (!std::isfinite(rayLen) || rayLen < 1e-4f) continue;
 
             if (adaptiveSampling) {
                 auto geo = adaptive::geometry(depth,w,h,x,y,fx,fy,cx,cy,R,depthScale,depthShift);
                 if(contourPriority && contourPriority[size_t(y)*w+x])geo.protectedDetail=true;
+
+                // On a reliable locally-planar patch, downweight very grazing
+                // measurements. They have larger depth-to-surface uncertainty and
+                // otherwise tend to thicken silhouettes. Keep a 0.55 floor so
+                // side surfaces still accumulate normally.
+                if(!geo.protectedDetail) {
+                    const float rcx=xn/rayLen, rcy=yn/rayLen, rcz=1.f/rayLen;
+                    const float rwx=R[0]*rcx+R[1]*rcy+R[2]*rcz;
+                    const float rwy=R[3]*rcx+R[4]*rcy+R[5]*rcz;
+                    const float rwz=R[6]*rcx+R[7]*rcy+R[8]*rcz;
+                    const float incidence=std::clamp(
+                        std::fabs(geo.nx*rwx+geo.ny*rwy+geo.nz*rwz),0.f,1.f);
+                    obsWeight *= 0.55f + 0.45f*incidence;
+                }
+
                 const float xc=xn*z, yc=yn*z;
                 const float wx=R[0]*xc+R[1]*yc+R[2]*z+t[0];
                 const float wy=R[3]*xc+R[4]*yc+R[5]*z+t[1];
@@ -401,9 +418,7 @@ void TsdfEngine::integrateDepth(const float* depth, int w, int h,
 
             // 沿射线推进时把步长按射线方向长度归一化（dzStep = voxel / |ray|），
             // 否则掠射角下相邻采样点会跳过体素，表面上会出现空洞与条纹。
-            const float rayLen = std::sqrt(1.f + xn * xn + yn * yn);
-            if (!std::isfinite(rayLen)) continue;
-            float dzStep = voxel_ / (rayLen > 1e-4f ? rayLen : 1.f);
+            float dzStep = voxel_ / rayLen;
             if (dzStep < 1e-5f) {
                 dzStep = 1e-5f;
             }

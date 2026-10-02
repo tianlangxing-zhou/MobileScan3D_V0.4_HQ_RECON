@@ -24,9 +24,9 @@
 //   3. **欠约束放弃**：样本/内点/重叠不足（新区域、模型未建立）时不修正，
 //      行为与旧版完全一致。
 //
-// 平面简并防护：共面点云的点对点 Kabsch 在法向旋转上欠定（最小奇异值
-// →0）。这里用「逐迭代旋转限幅 + 总转角上限」夹住；即使偶发选错，下一帧
-// 重新独立求解，不放大。
+// 几何简并防护：优先使用带 Huber 鲁棒核的 point-to-plane；当 6×6
+// 法方程可观测维度不足时自动退回 trimmed Kabsch。两条路径都保留逐迭代
+// 与总修正上限；修正仍不回馈 VINS，因此坏匹配不会跨帧累积。
 // ============================================================================
 
 #include <Eigen/Dense>
@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace frame_icp {
@@ -58,22 +59,24 @@ static constexpr float kIcpConvRotDeg = 0.08f;
 
 enum RejectReason {
     kIcpOk = 0,
-    kIcpRejectSamples = 1,   // 帧内有效深度样本不足
-    kIcpRejectOverlap = 2,   // 与稳定模型内点/重叠不足（新区域或模型未建立）
-    kIcpRejectBound = 3,     // 修正量超界（ICP 可能拉飞，放弃）
-    kIcpRejectDegenerate = 4 // 刚体拟合退化（奇异值塌缩，放弃）
+    kIcpRejectSamples = 1,
+    kIcpRejectOverlap = 2,
+    kIcpRejectBound = 3,
+    kIcpRejectDegenerate = 4
 };
 
 struct Diag {
-    bool attempted = false;  // 进入了 ICP 主流程（模型就绪且深度有效）
-    bool applied = false;    // 修正被采纳
+    bool attempted = false;
+    bool applied = false;
     int reason = kIcpOk;
     int iterations = 0;
     int samples = 0;
     int inliers = 0;
-    float rmseM = -1.f;      // 采纳时的内点 RMSE（米）
-    float transM = 0.f;      // 总修正平移
-    float rotDeg = 0.f;      // 总修正转角
+    int pointToPlaneIterations = 0;
+    int pointToPointFallbacks = 0;
+    float rmseM = -1.f;
+    float transM = 0.f;
+    float rotDeg = 0.f;
 };
 
 inline float rotationAngleDeg(const Eigen::Matrix3f& R) {
@@ -82,12 +85,6 @@ inline float rotationAngleDeg(const Eigen::Matrix3f& R) {
     return std::acos(c) * 57.2957795f;
 }
 
-/**
- * Kabsch 刚体拟合：求 Rc/tc 使 |Rc*src + tc - dst| 最小。
- * 返回 false 表示退化（协方差有效秩低于 2，典型为近共线输入），调用方应放弃
- * 本次修正。共面输入保留：桌面/墙面是扫描中的主要稳定几何，点到点 Kabsch
- * 仍能约束平面内平移与旋转；真正欠约束的是近共线点集。
- */
 inline bool rigidFit(const std::vector<Eigen::Vector3f>& src,
                      const std::vector<Eigen::Vector3f>& dst,
                      Eigen::Matrix3f* outR, Eigen::Vector3f* outT) {
@@ -102,11 +99,11 @@ inline bool rigidFit(const std::vector<Eigen::Vector3f>& src,
     for (size_t i = 0; i < n; ++i) {
         H += (src[i] - cs) * (dst[i] - cd).transpose();
     }
-    Eigen::JacobiSVD<Eigen::Matrix3f> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::JacobiSVD<Eigen::Matrix3f> svd(
+        H, Eigen::ComputeFullU | Eigen::ComputeFullV);
     const Eigen::Vector3f& s = svd.singularValues();
-    if (!(s(0) > 1e-9f) || s(1) < 1e-6f * s(0)) {
-        return false; // 近共线：刚体修正的旋转/平移约束不足
-    }
+    if (!(s(0) > 1e-9f) || s(1) < 1e-6f * s(0)) return false;
+
     Eigen::Matrix3f R = svd.matrixV() * svd.matrixU().transpose();
     if (R.determinant() < 0.f) {
         Eigen::Matrix3f V = svd.matrixV();
@@ -115,16 +112,115 @@ inline bool rigidFit(const std::vector<Eigen::Vector3f>& src,
     }
     *outR = R;
     *outT = cd - R * cs;
+    return outR->allFinite() && outT->allFinite();
+}
+
+struct Correspondence {
+    Eigen::Vector3f p;
+    Eigen::Vector3f q;
+    Eigen::Vector3f n;
+    float d2 = 0.f;
+    bool normalValid = false;
+};
+
+/**
+ * Robust point-to-plane increment using Huber IRLS + Gauss-Newton.
+ *
+ * The linearization is around the correspondence centroid rather than the world
+ * origin. This reduces rotation/translation coupling when world coordinates are
+ * not close to zero. Rank-deficient planar/linear configurations deliberately
+ * return false so the caller can use the bounded point-to-point Kabsch fallback.
+ */
+inline bool pointToPlaneStep(const std::vector<Correspondence>& corr,
+                             float huberM,
+                             Eigen::Matrix3f* outR,
+                             Eigen::Vector3f* outT) {
+    using Matrix6f = Eigen::Matrix<float, 6, 6>;
+    using Vector6f = Eigen::Matrix<float, 6, 1>;
+
+    Eigen::Vector3f pivot = Eigen::Vector3f::Zero();
+    int normals = 0;
+    for (const auto& c : corr) {
+        if (!c.normalValid) continue;
+        pivot += c.p;
+        ++normals;
+    }
+    if (normals < 32) return false;
+    pivot /= float(normals);
+
+    Matrix6f A = Matrix6f::Zero();
+    Vector6f b = Vector6f::Zero();
+    int used = 0;
+    for (const auto& c : corr) {
+        if (!c.normalValid) continue;
+        const Eigen::Vector3f n = c.n;
+        const float r = n.dot(c.p - c.q);
+        if (!std::isfinite(r)) continue;
+
+        const float absR = std::fabs(r);
+        const float w = absR <= huberM || absR < 1e-8f
+            ? 1.f : (huberM / absR);
+        const Eigen::Vector3f rotational = (c.p - pivot).cross(n);
+
+        Vector6f J;
+        J << rotational.x(), rotational.y(), rotational.z(),
+             n.x(), n.y(), n.z();
+        A.noalias() += w * (J * J.transpose());
+        b.noalias() += w * J * r;
+        ++used;
+    }
+    if (used < 32) return false;
+
+    Eigen::SelfAdjointEigenSolver<Matrix6f> eig(A);
+    if (eig.info() != Eigen::Success) return false;
+    const auto ev = eig.eigenvalues();
+    const float maxEv = ev.maxCoeff();
+    if (!(maxEv > 1e-8f) || !std::isfinite(maxEv)) return false;
+
+    // A single plane has only ~3 independent point-to-plane constraints.
+    // Require at least five observable modes; otherwise Kabsch is safer.
+    int rank = 0;
+    for (int i = 0; i < 6; ++i) {
+        if (ev[i] > maxEv * 1e-5f) ++rank;
+    }
+    if (rank < 5) return false;
+
+    const float damping = std::max(1e-6f, A.trace() * 1e-7f);
+    A.diagonal().array() += damping;
+    Eigen::LDLT<Matrix6f> ldlt(A);
+    if (ldlt.info() != Eigen::Success) return false;
+    Vector6f delta = ldlt.solve(-b);
+    if (ldlt.info() != Eigen::Success || !delta.allFinite()) return false;
+
+    Eigen::Vector3f omega = delta.head<3>();
+    Eigen::Vector3f localT = delta.tail<3>();
+
+    const float angle = omega.norm();
+    Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
+    if (angle > 1e-8f) {
+        R = Eigen::AngleAxisf(angle, omega / angle).toRotationMatrix();
+    }
+    // localT is translation in a frame whose rotation pivot is `pivot`.
+    Eigen::Vector3f t = pivot - R * pivot + localT;
+    if (!R.allFinite() || !t.allFinite()) return false;
+    *outR = R;
+    *outT = t;
     return true;
 }
 
 /**
  * 帧到模型 ICP 位姿精修。
  *
- * @param depth   epoch 米制深度（与进 TSDF 同域），w×h
- * @param R,t     当前帧 VINS cam→world 位姿（列主序 3x3，world = R*p_cam + t）
- * @param nearest 世界点最近邻查询（典型实现：SurfelEngine::nearestStableSurfel）
- * @param outR,outT 修正后的位姿（仅 applied=true 时有效）
+ * Mature reconstruction systems commonly use point-to-plane ICP because it
+ * converges faster near surfaces, and robust losses to reduce outlier influence.
+ * This implementation keeps the existing safety design:
+ *   - correction is per-frame and never fed back into VINS;
+ *   - total/per-iteration motion is bounded;
+ *   - degenerate point-to-plane systems fall back to trimmed Kabsch;
+ *   - downstream temporal/fusion guards remain active.
+ *
+ * NearestFn must return target position + optional target normal:
+ *   nearest(px,py,pz,maxDist,&qx,&qy,&qz,&nx,&ny,&nz,&hits)
  */
 template <class NearestFn>
 Diag frameToModelIcp(const float* depth, int w, int h,
@@ -133,24 +229,29 @@ Diag frameToModelIcp(const float* depth, int w, int h,
                      NearestFn&& nearest,
                      float outR[9], float outT[3]) {
     Diag d;
-    if (!depth || !R || !t || w < 16 || h < 16) { d.reason = kIcpRejectSamples; return d; }
+    if (!depth || !R || !t || w < 16 || h < 16 ||
+        !(fx > 1e-6f) || !(fy > 1e-6f)) {
+        d.reason = kIcpRejectSamples;
+        return d;
+    }
 
-    // ---- 1) 反投影采样（相机系 → 原始位姿世界系）----
     std::vector<Eigen::Vector3f> pts;
-    pts.reserve((size_t)(w / kIcpSampleStep + 1) * (h / kIcpSampleStep + 1));
+    pts.reserve((size_t)(w / kIcpSampleStep + 1) *
+                (h / kIcpSampleStep + 1));
     for (int y = kIcpSampleStep / 2; y < h; y += kIcpSampleStep) {
         for (int x = kIcpSampleStep / 2; x < w; x += kIcpSampleStep) {
             const float z = depth[(size_t)y * w + x];
-            if (!(z > 0.08f && z < 8.f)) continue;
+            if (!(z > 0.08f && z < 8.f) || !std::isfinite(z)) continue;
             const float xc = (x - cx) * z / fx;
             const float yc = (y - cy) * z / fy;
-            Eigen::Vector3f pw(R[0] * xc + R[1] * yc + R[2] * z + t[0],
-                               R[3] * xc + R[4] * yc + R[5] * z + t[1],
-                               R[6] * xc + R[7] * yc + R[8] * z + t[2]);
-            if (!pw.allFinite()) continue;
-            pts.push_back(pw);
+            Eigen::Vector3f pw(
+                R[0] * xc + R[1] * yc + R[2] * z + t[0],
+                R[3] * xc + R[4] * yc + R[5] * z + t[1],
+                R[6] * xc + R[7] * yc + R[8] * z + t[2]);
+            if (pw.allFinite()) pts.push_back(pw);
         }
     }
+
     d.samples = (int)pts.size();
     if (d.samples < kIcpMinSamples) {
         d.reason = kIcpRejectSamples;
@@ -158,88 +259,169 @@ Diag frameToModelIcp(const float* depth, int w, int h,
     }
     d.attempted = true;
 
-    // ---- 2) 迭代 trimmed point-to-point ICP ----
-    const int minInliers = std::max(kIcpMinInliers, (int)(pts.size() * kIcpMinOverlap));
+    const int minInliers =
+        std::max(kIcpMinInliers, (int)(pts.size() * kIcpMinOverlap));
+
     Eigen::Matrix3f totalR = Eigen::Matrix3f::Identity();
     Eigen::Vector3f totalT = Eigen::Vector3f::Zero();
     std::vector<Eigen::Vector3f> cur = pts;
-    std::vector<Eigen::Vector3f> model;
+
+    std::vector<Correspondence> corr;
+    corr.reserve(cur.size());
+    std::vector<float> distanceWork;
+    distanceWork.reserve(cur.size());
+    std::vector<Eigen::Vector3f> src;
+    std::vector<Eigen::Vector3f> dst;
+    src.reserve(cur.size());
+    dst.reserve(cur.size());
+
     float rmse = -1.f;
     int lastInl = 0;
+
     for (int iter = 0; iter < kIcpMaxIterations; ++iter) {
         ++d.iterations;
-        model.clear();
-        std::vector<Eigen::Vector3f> src;
-        src.reserve(cur.size());
-        model.reserve(cur.size());
+
+        // Coarse-to-fine correspondence radius: tolerate early drift, then
+        // tighten to prevent nearby parallel surfaces from being merged.
+        const float corrM =
+            iter < 2 ? kIcpMaxCorrM :
+            (iter < 5 ? std::min(kIcpMaxCorrM, 0.045f)
+                      : std::min(kIcpMaxCorrM, 0.030f));
+
+        corr.clear();
+        distanceWork.clear();
         for (const auto& p : cur) {
-            float qx, qy, qz;
-            if (nearest(p.x(), p.y(), p.z(), kIcpMaxCorrM, &qx, &qy, &qz)) {
-                src.push_back(p);
-                model.push_back(Eigen::Vector3f(qx, qy, qz));
+            float qx=0, qy=0, qz=0, nx=0, ny=0, nz=0;
+            uint16_t hits = 0;
+            if (!nearest(p.x(), p.y(), p.z(), corrM,
+                         &qx, &qy, &qz, &nx, &ny, &nz, &hits)) {
+                continue;
             }
+            Correspondence c;
+            c.p = p;
+            c.q = Eigen::Vector3f(qx, qy, qz);
+            c.n = Eigen::Vector3f(nx, ny, nz);
+            c.d2 = (c.p - c.q).squaredNorm();
+            const float n2 = c.n.squaredNorm();
+            c.normalValid =
+                hits >= 2 && n2 > 0.90f && n2 < 1.10f && c.n.allFinite();
+            corr.push_back(c);
+            distanceWork.push_back(c.d2);
         }
-        const int inl = (int)src.size();
-        lastInl = inl;
-        if (inl < minInliers) {
+
+        if ((int)corr.size() < minInliers) {
             if (iter == 0) {
-                // 首轮就无重叠：新区域或模型未建立，行为退回旧版（不修正）。
                 d.reason = kIcpRejectOverlap;
-                return d;
-            }
-            break; // 收敛中失去重叠：保留上一步累计修正
-        }
-        Eigen::Matrix3f Rc;
-        Eigen::Vector3f tc;
-        if (!rigidFit(src, model, &Rc, &tc)) {
-            if (iter == 0) {
-                d.reason = kIcpRejectDegenerate;
                 return d;
             }
             break;
         }
-        // 平面简并防护：逐迭代旋转限幅（超限只取方向、截断幅度）。
-        const float rotDeg = rotationAngleDeg(Rc);
-        if (rotDeg > kIcpPerIterRotDeg) {
-            // 用轴角重参数化到限幅值；平移同步缩放，避免旋转被截而平移全量。
-            const float scale = kIcpPerIterRotDeg / rotDeg;
-            Eigen::AngleAxisf aa{Eigen::Quaternionf(Rc)};
-            aa.angle() *= scale;
-            Rc = aa.toRotationMatrix();
-            tc *= scale;
+
+        // True residual trimming: retain the best ~85% correspondences, but
+        // never tighten below 1.5cm during coarse alignment.
+        const size_t keepIndex =
+            std::min(distanceWork.size() - 1,
+                     (distanceWork.size() * 85) / 100);
+        std::nth_element(
+            distanceWork.begin(),
+            distanceWork.begin() + keepIndex,
+            distanceWork.end());
+        const float p85 = std::sqrt(
+            std::max(0.f, distanceWork[keepIndex]));
+        const float trimM =
+            std::min(corrM, std::max(0.015f, p85 * 1.20f));
+        const float trim2 = trimM * trimM;
+
+        size_t writeIndex = 0;
+        for (size_t i = 0; i < corr.size(); ++i) {
+            if (corr[i].d2 <= trim2) {
+                if (writeIndex != i) corr[writeIndex] = corr[i];
+                ++writeIndex;
+            }
         }
+        corr.resize(writeIndex);
+        lastInl = (int)corr.size();
+        if (lastInl < minInliers) {
+            if (iter == 0) {
+                d.reason = kIcpRejectOverlap;
+                return d;
+            }
+            break;
+        }
+
+        Eigen::Matrix3f Rc = Eigen::Matrix3f::Identity();
+        Eigen::Vector3f tc = Eigen::Vector3f::Zero();
+
+        const float huberM = std::clamp(corrM * 0.22f, 0.006f, 0.012f);
+        bool solved = pointToPlaneStep(corr, huberM, &Rc, &tc);
+        if (solved) {
+            ++d.pointToPlaneIterations;
+        } else {
+            src.clear();
+            dst.clear();
+            for (const auto& c : corr) {
+                src.push_back(c.p);
+                dst.push_back(c.q);
+            }
+            if (!rigidFit(src, dst, &Rc, &tc)) {
+                if (iter == 0) {
+                    d.reason = kIcpRejectDegenerate;
+                    return d;
+                }
+                break;
+            }
+            ++d.pointToPointFallbacks;
+        }
+
+        // Bound one GN/Kabsch increment. Scale rotation and translation together
+        // so the step remains a coherent rigid update.
+        const float rotDeg = rotationAngleDeg(Rc);
+        const float trans = tc.norm();
+        float stepScale = 1.f;
+        if (rotDeg > kIcpPerIterRotDeg && rotDeg > 1e-5f) {
+            stepScale = std::min(stepScale, kIcpPerIterRotDeg / rotDeg);
+        }
+        constexpr float kPerIterTransM = 0.025f;
+        if (trans > kPerIterTransM && trans > 1e-6f) {
+            stepScale = std::min(stepScale, kPerIterTransM / trans);
+        }
+        if (stepScale < 0.9999f) {
+            Eigen::AngleAxisf aa{Eigen::Quaternionf(Rc)};
+            aa.angle() *= stepScale;
+            Rc = aa.toRotationMatrix();
+            tc *= stepScale;
+        }
+
+        double sum = 0.0;
+        for (const auto& c : corr) {
+            const Eigen::Vector3f diff = (Rc * c.p + tc) - c.q;
+            sum += double(diff.squaredNorm());
+        }
+        rmse = float(std::sqrt(sum / double(corr.size())));
+
         for (auto& p : cur) p = Rc * p + tc;
         totalR = Rc * totalR;
         totalT = Rc * totalT + tc;
-        // 收敛判定
+
         const float dTrans = tc.norm();
         const float dRot = rotationAngleDeg(Rc);
-        double sum = 0.0;
-        for (size_t i = 0; i < src.size(); ++i) {
-            const Eigen::Vector3f diff = (Rc * src[i] + tc) - model[i];
-            sum += double(diff.squaredNorm());
-        }
-        rmse = float(std::sqrt(sum / double(src.size())));
         if (dTrans < kIcpConvTransM && dRot < kIcpConvRotDeg) break;
     }
 
-    // ---- 3) 有界性检查 ----
     d.transM = totalT.norm();
     d.rotDeg = rotationAngleDeg(totalR);
-    if (d.transM > kIcpMaxTransM || d.rotDeg > kIcpMaxRotDeg) {
+    if (!std::isfinite(d.transM) || !std::isfinite(d.rotDeg) ||
+        d.transM > kIcpMaxTransM || d.rotDeg > kIcpMaxRotDeg) {
         d.reason = kIcpRejectBound;
         return d;
     }
+
     d.rmseM = rmse;
-    d.inliers = lastInl; // 最近一次迭代的匹配内点数
+    d.inliers = lastInl;
     if (d.transM < 0.0002f && d.rotDeg < 0.02f) {
-        // 修正量可忽略：不算 applied，避免统计噪声。
         return d;
     }
 
-    // ---- 4) 输出修正后位姿：p' = Rt*(M·p + t) + tt ----
-    // native_engine 的 R 是**行主序**（rotatePoint：Xw = R[0]x+R[1]y+R[2]z+...）。
-    // M' = Rt·M（行主序写出），t' = Rt·t + tt。
     Eigen::Matrix3f M;
     for (int r = 0; r < 3; ++r) {
         for (int c = 0; c < 3; ++c) M(r, c) = R[r * 3 + c];
@@ -251,8 +433,10 @@ Diag frameToModelIcp(const float* depth, int w, int h,
         for (int c = 0; c < 3; ++c) outR[r * 3 + c] = Mp(r, c);
     }
     for (int i = 0; i < 3; ++i) outT[i] = tp[i];
+
     d.applied = true;
     return d;
 }
+
 
 } // namespace frame_icp
