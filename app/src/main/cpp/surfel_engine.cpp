@@ -292,7 +292,9 @@ void SurfelEngine::ingestAdaptivePoint(float x,float y,float z,uint8_t r,uint8_t
     a.detail=geo.protectedDetail;a.nx=geo.nx;a.ny=geo.ny;a.nz=geo.nz;a.lastFrame=frame_;
 }
 void SurfelEngine::endFrame() {
-    if(!frame_ || frame_%16 || g_.size()<3)return;
+    // V0.13.42（vc185 重叠修复）：压缩频率 16→8 帧，让粗索引（ICP 锚）
+    // 在模型刚有一小块稳定几何时就尽快建立，避免环绕漂移下迟迟无锚可修偏。
+    if(!frame_ || frame_%8 || g_.size()<3)return;
     struct Group {size_t first=0,count=0;bool valid=true;double x=0,y=0,z=0,r=0,g=0,b=0;};
     std::unordered_map<Key,Group,Hash> groups;
     for(size_t i=0;i<g_.size();++i) {
@@ -300,20 +302,20 @@ void SurfelEngine::endFrame() {
         const Key k{int(std::floor(a.px/.02f)),int(std::floor(a.py/.02f)),int(std::floor(a.pz/.02f))};
         auto& q=groups[k];if(q.count==0)q.first=i;
         const auto& ref=g_[q.first];
-        q.valid=q.valid && !a.coarse && !a.detail && a.hits>=6 && frame_>=a.protectedUntil &&
-            frame_-a.lastFrame<=32 && (a.nx*ref.nx+a.ny*ref.ny+a.nz*ref.nz)>.996f &&
-            std::fabs((a.px-ref.px)*ref.nx+(a.py-ref.py)*ref.ny+(a.pz-ref.pz)*ref.nz)<.002f;
+        q.valid=q.valid && !a.coarse && !a.detail && a.hits>=3 && frame_>=a.protectedUntil &&
+            frame_-a.lastFrame<=40 && (a.nx*ref.nx+a.ny*ref.ny+a.nz*ref.nz)>.98f &&
+            std::fabs((a.px-ref.px)*ref.nx+(a.py-ref.py)*ref.ny+(a.pz-ref.pz)*ref.nz)<.005f;
         ++q.count;q.x+=a.px;q.y+=a.py;q.z+=a.pz;q.r+=a.red;q.g+=a.green;q.b+=a.blue;
     }
     size_t removed=0;
-    for(const auto& kv:groups)if(kv.second.valid&&kv.second.count>=3)removed+=kv.second.count-1;
+    for(const auto& kv:groups)if(kv.second.valid&&kv.second.count>=2)removed+=kv.second.count-1;
     if(!removed)return;
     std::vector<Surfel> compact;compact.reserve(g_.size()-removed);
     for(size_t i=0;i<g_.size();++i) {
         auto a=g_[i];
         const Key k{int(std::floor(a.px/.02f)),int(std::floor(a.py/.02f)),int(std::floor(a.pz/.02f))};
         const auto& q=groups.at(k);
-        if(q.valid && q.count>=3) {
+        if(q.valid && q.count>=2) {
             if(i!=q.first)continue;
             a.px=float(q.x/q.count);a.py=float(q.y/q.count);a.pz=float(q.z/q.count);
             a.red=float(q.r/q.count);a.green=float(q.g/q.count);a.blue=float(q.b/q.count);

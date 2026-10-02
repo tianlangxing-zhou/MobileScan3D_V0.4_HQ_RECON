@@ -391,7 +391,11 @@ static uint64_t temporalStaleMotionRejects = 0;
 static int temporalStaleConsecRejects = 0;
 
 // V0.13.41（vc184 / Option A）帧到模型 ICP 位姿精修。
-static constexpr size_t kIcpMinModelPoints = 2000;
+// vc185 死锁根治：原 2000 使 ICP 在模型刚建阶段永不触发（真机 attempts=0，
+// compressedCount 受 guard/时序全拒影响长不到 2000）→ 位姿不修正 → 下一帧继续
+// 漂移 → guard/时序继续全拒 → 几何冻结 + 穿插错位。降到 120：模型只需有一小块
+// 稳定几何（粗索引代表点）就让 ICP 开始介入修偏，形成正反馈（修正→放行→增长）。
+static constexpr size_t kIcpMinModelPoints = 120;
 static uint64_t icpAttempts = 0;
 static uint64_t icpAppliedCount = 0;
 static uint64_t icpRejectSamples = 0;
@@ -399,6 +403,9 @@ static uint64_t icpRejectOverlap = 0;
 static uint64_t icpRejectBound = 0;
 static uint64_t icpRejectDegenerate = 0;
 static frame_icp::Diag lastIcpDiag;
+// vc185 死锁根治：模型未成熟（粗索引代表点 < ICP 触发门槛）时 guard 降权放行而非
+// 整帧否决的帧数。用于诊断「死锁是否被打破、初始模型是否成功建立」。
+static uint64_t guardImmatureWrites = 0;
 
 static void resetTemporalReferenceForEpochChange() {
     lastFusedDepth.clear();
@@ -2931,7 +2938,8 @@ static void nativeOnDepthMapImpl(
         // 它一涨就说明死锁修复生效；guard 三项说明重复壳护罩到底拦了多少。
         LOGI("FusionDiag depthFrames=%llu usable=%d epochActive=%d epochSusp=%d fused=%llu gated=%llu "
              "| temporal checks=%llu rejects=%llu ratio=%.3f tested=%d agree=%d stale=%llu refAgeMs=%.0f "
-             "| guard refs=%lld checks=%llu rejected=%llu tested=%d ratio=%.3f",
+             "| guard refs=%lld checks=%llu rejected=%llu tested=%d ratio=%.3f "
+             "| icpMdlPts=%lld guardEarlyW=%llu",
              (unsigned long long)depthFrames, depthCalibrator.usable() ? 1 : 0,
              epochActive ? 1 : 0, epochSuspended ? 1 : 0,
              (unsigned long long)fusionFusedFrames, (unsigned long long)fusionGatedFrames,
@@ -2943,7 +2951,9 @@ static void nativeOnDepthMapImpl(
              (unsigned long long)fusionGuard.checks,
              (unsigned long long)fusionGuard.rejected,
              fusionGuard.lastTested,
-             static_cast<double>(fusionGuard.lastRatio));
+             static_cast<double>(fusionGuard.lastRatio),
+             (long long)g.compressedCount(),
+             (unsigned long long)guardImmatureWrites);
         LOGI("FrameICP attempts=%llu applied=%llu rejectSamples=%llu rejectOverlap=%llu "
              "rejectBound=%llu rejectDegenerate=%llu lastApplied=%d lastReason=%d "
              "lastInliers=%d lastRmse=%.4f lastTrans=%.4f lastRotDeg=%.3f",
@@ -3418,8 +3428,27 @@ static void nativeOnDepthMapImpl(
         // integrated samples are retained; reject a second shell on return visits.
         const float guardK[4]={temporalK.fx,temporalK.fy,temporalK.cx,temporalK.cy};
         bool modelAccepted=true;
-        if(fusionRanged)modelAccepted=fusionGuard.accept(fusionRanged,w,h,guardK,effR,effT,
-                                                        static_cast<uint64_t>(t));
+        if(fusionRanged) {
+            modelAccepted=fusionGuard.accept(fusionRanged,w,h,guardK,effR,effT,
+                                             static_cast<uint64_t>(t));
+            // vc185 死锁根治：guard 在模型未成熟期（粗索引代表点 < ICP 触发门槛）的
+            // 整帧否决，会让 surfel 永远喂不进来 → coarse 粗索引恒为 0 → ICP 永不
+            // 触发 → 位姿永不修正 → 下一帧继续漂移继续拒。这是「围绕旋转→穿插、
+            // 模型不长」的鸡生蛋闭环。这里的健壮修正：一旦 ICP 已能把修正位姿喂给
+            // guard（modelAccepted 仍可能因一致性崩而拒），只要模型还没建立就把它
+            // 降级为「conf 压到最低但仍尝写」盲区让位，等效于 V0.13.22「不整帧丢弃、
+            // 只降权」在 guard 层的收尾版——先让小块稳定几何长出来给 ICP 当锚。
+            const bool modelEarly = g.compressedCount() < kIcpMinModelPoints;
+            if (!modelAccepted && modelEarly) {
+                // 模型早期 guard 拒绝是「VINS 暂未修正 + 无稳定几何可防壳」的误拒；
+                // 若按严格语义整帧黑掉，surfel 喂不进 → 粗索引涨不动 → ICP 永不触发 → 死锁。
+                // 这里语义修正为「防壳保护在模型建立前不适用」：中等降权 + 放行，
+                // 让初始几何以低权重长出给 ICP 当锚；模型建立后严格 gate 恢复。
+                conf = std::min(conf, confidence * 0.5f);
+                modelAccepted = true;
+                ++guardImmatureWrites;
+            }
+        }
         if(!modelAccepted) {
             fusionDepth=nullptr;fusionRanged=nullptr;
         }

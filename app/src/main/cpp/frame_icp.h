@@ -39,17 +39,22 @@
 namespace frame_icp {
 
 // ---- 参数（全部可被调用方覆盖的默认值见 frameToModelIcp 签名）----
+// vc185 死锁根治：围绕旋转时 VINS 渐变漂移，首段稳定几何很小（几千 surfel、
+// 共面代表点可能才一两百）。原门限（400 采样/250 内点/20% 重叠/3cm 邻域/6次迭代）
+// 在模型小 + 漂移较大时全部触发拒绝 → attempts 进入但 applied=0 → 位姿不修 →
+// 死锁。全面下调：早期小模型即可收敛出有效修正，同时仍有界（kIcpMaxTransM/
+// kIcpMaxRotDeg/逐迭代限幅）兜底，不会把碎模型拉飞。
 static constexpr int kIcpSampleStep = 4;        // 256x192 深度 → ~3k 采样点
-static constexpr int kIcpMaxIterations = 6;
-static constexpr float kIcpMaxCorrM = 0.03f;    // 对应漂移量级：cm 级
-static constexpr int kIcpMinSamples = 400;
-static constexpr int kIcpMinInliers = 250;
-static constexpr float kIcpMinOverlap = 0.20f;   // 内点/采样 < 20% 视为新区域
-static constexpr float kIcpMaxTransM = 0.08f;   // 单帧修正上限 8cm
-static constexpr float kIcpMaxRotDeg = 6.f;     // 单帧修正上限 6°
+static constexpr int kIcpMaxIterations = 9;
+static constexpr float kIcpMaxCorrM = 0.06f;    // 容漂移达 6cm：漂移 cm 级时 3cm 邻域很可能匹配不上
+static constexpr int kIcpMinSamples = 160;
+static constexpr int kIcpMinInliers = 60;
+static constexpr float kIcpMinOverlap = 0.08f;  // 内点/采样 ≥ 8% 即可（早期重叠稀疏）
+static constexpr float kIcpMaxTransM = 0.10f;   // 单帧修正上限 10cm（漂移可达
+static constexpr float kIcpMaxRotDeg = 8.f;     // 单帧修正上限 8°
 static constexpr float kIcpPerIterRotDeg = 2.f; // 平面简并防护：逐迭代限幅
-static constexpr float kIcpConvTransM = 0.0005f;
-static constexpr float kIcpConvRotDeg = 0.05f;
+static constexpr float kIcpConvTransM = 0.0008f;
+static constexpr float kIcpConvRotDeg = 0.08f;
 
 enum RejectReason {
     kIcpOk = 0,

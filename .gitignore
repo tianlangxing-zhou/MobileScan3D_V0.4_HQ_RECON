@@ -2,6 +2,9 @@
 .idea/
 local.properties
 **/build/
+app/.cxx/
+.workbuddy/
+local.properties.bak*
 *.apk
 *.aab
 *.log
