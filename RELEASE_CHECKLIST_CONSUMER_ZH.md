@@ -1,21 +1,9 @@
-# MobileScan3D 消费级发布 Gate
-
-## 必须通过（P0）
-
-- [ ] VINS-Mono / CamOdoCal / Ceres / OpenCV / TensorFlow Lite / xatlas 等依赖完成许可证盘点并满足发行义务。
-- [ ] 完整仓库 `bundleRelease` 成功；release lint 0 error。
-- [ ] 签名、applicationId、versionCode/versionName 与商店后台一致。
-- [ ] 隐私政策内容与实际行为一致，特别是相机、传感器、本地文件、诊断文件和未来任何联网能力。
-- [ ] 首次授权拒绝、永久拒绝、系统设置恢复均可继续使用。
-- [ ] 缺模型 / 模型损坏 / depth provider 初始化失败时有清晰提示，不崩溃。
-- [ ] 低存储、热状态、后台切换、来电/锁屏、进程被杀均有可理解的恢复结果。
-- [ ] 生成 GLB 可被至少 2 个第三方查看器正确打开，坐标轴、尺度、纹理方向正确。
-- [ ] 10 分钟连续扫描无 OOM、ANR、明显内存持续增长。
-
-## 建议通过（P1）
-
-- [ ] 关键页面 TalkBack/大字体可用，48dp 触控目标满足。
-- [ ] 主要文案均迁移到 resources，准备 `values-en`。
-- [ ] 建立设备兼容白名单/灰名单与已知问题列表。
-- [ ] 建立扫描质量基线：成功率、生成耗时、模型顶点/三角形预算、纹理覆盖率、恢复成功率。
-- [ ] 上架素材明确“本地处理”“推荐设备”“典型扫描时长”和当前限制，避免过度承诺。
+# MobileScan3D 消费级 Release Checklist
+- [ ] assembleRelease / bundleRelease / release lint
+- [ ] OnePlus/Xiaomi/OPPO/vivo/Samsung 权限返回不黑屏
+- [ ] Viewer 普通退出按钮 + PopupWindow 兜底可见
+- [ ] 两点测量；未校准尺度不得冒充米制
+- [ ] GLB / OBJ 系统分享
+- [ ] 我的模型：恢复/分享/重命名/删除
+- [ ] 5/10/20 分钟扫描稳定性
+- [ ] 第三方许可证审计与 Open Source Notices

@@ -900,6 +900,37 @@
                     android:textStyle="bold" />
             </LinearLayout>
 
+            <LinearLayout
+                android:id="@+id/btnViewerMeasure"
+                android:layout_width="match_parent"
+                android:layout_height="62dp"
+                android:layout_marginBottom="2dp"
+                android:background="@drawable/bg_tool_item"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <ImageView
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:contentDescription="两点测量"
+                    android:importantForAccessibility="no"
+                    android:src="@drawable/ic_measure" />
+
+                <TextView
+                    android:id="@+id/tvViewerMeasureLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="5dp"
+                    android:includeFontPadding="false"
+                    android:text="测量"
+                    android:textColor="@color/scan_text_primary"
+                    android:textSize="9.5sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
             <include
                 android:id="@+id/toolPlacement"
                 layout="@layout/item_scan_tool_placement" />

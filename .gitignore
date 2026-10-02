@@ -1,28 +1,12 @@
-# Android / Gradle
 .gradle/
 .idea/
-.kotlin/
-build/
-app/build/
-app/.cxx/
 local.properties
-*.iml
+**/build/
 *.apk
 *.aab
-
-# IDE / OS
-.DS_Store
-
-# Local diagnostics / captures
-scanlogs/
-captured_data/
 *.log
-
-# Temporary review / backup files
+captures/
+diagnostics/
 *.bak
-*.bak_*
-*.bak_before_*
-.v07_backup_*/
-.v071_backup_*/
-.v06_backup_*/
-.workbuddy/
+*.tmp
+.DS_Store

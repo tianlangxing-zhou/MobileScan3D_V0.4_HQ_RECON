@@ -2,8 +2,10 @@ package com.mobilescan3d
 
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Rect
@@ -100,6 +102,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var tvGuidanceStep: TextView
     private val scanGuidanceController = com.mobilescan3d.scan.guidance.ScanGuidanceController()
     @Volatile private var guidedScanEnabled = true
+    private val adaptiveScanAdvisor = com.mobilescan3d.scan.adaptive.AdaptiveScanAdvisor()
+    private var adaptiveScanAdvice = ""
     private lateinit var scanProgressView: android.widget.ProgressBar
     private lateinit var tvScanProgressPercent: TextView
     private lateinit var tvMotionState: TextView
@@ -113,6 +117,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var tvViewerStats: TextView
     private lateinit var viewerOptimizeButton: android.view.View
     private lateinit var viewerOptimizeLabel: TextView
+    private lateinit var viewerMeasureButton: android.view.View
+    private lateinit var viewerMeasureLabel: TextView
+    private var viewerMeasurementMode = false
+    private var viewerMeasurePointA: FloatArray? = null
+    private var viewerMeasurePointB: FloatArray? = null
+    private var viewerExitPopup: android.widget.PopupWindow? = null
     @Volatile private var viewerMeshOptimized = false
     private lateinit var toolAutoLabel: TextView
     private lateinit var toolModeLabel: TextView
@@ -930,6 +940,8 @@ private var lastRelocPollMs = 0L
         tvViewerTopology = findViewById(R.id.tvViewerTopology)
         viewerOptimizeButton = findViewById(R.id.btnViewerOptimize)
         viewerOptimizeLabel = findViewById(R.id.tvViewerOptimizeLabel)
+        viewerMeasureButton = findViewById(R.id.btnViewerMeasure)
+        viewerMeasureLabel = findViewById(R.id.tvViewerMeasureLabel)
         findViewById<android.view.View>(R.id.btnStartScan).setOnClickListener { handlePrimaryScanAction() }
         findViewById<android.view.View>(R.id.btnPauseScan).setOnClickListener { togglePauseScan() }
         reviewContinueButton.setOnClickListener { resumeFromScanReview() }
@@ -948,6 +960,7 @@ private var lastRelocPollMs = 0L
         findViewById<android.view.View>(R.id.btnViewerExport).setOnClickListener { showExportDrawer() }
         findViewById<android.view.View>(R.id.btnViewerReport).setOnClickListener { showScanQualityReport() }
         viewerOptimizeButton.setOnClickListener { toggleModelOptimization() }
+        viewerMeasureButton.setOnClickListener { toggleViewerMeasurement() }
         findViewById<android.view.View>(R.id.btnViewerSegment).setOnClickListener { showSegmentMergeDialog() }
         findViewById<android.view.View>(R.id.btnViewerHelp).setOnClickListener { showViewerHelp() }
         viewerModeTexture.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_TEXTURE) }
@@ -3099,6 +3112,8 @@ private var lastRelocPollMs = 0L
         lastSurfaceCoveragePercent = 0
         lastSurfaceRobustPercent = 0
         lastCoverageGuidance = ""
+        adaptiveScanAdvisor.reset()
+        adaptiveScanAdvice = ""
         recoveryRound = 0
         recoveryActive = false
         recoveryStartedMs = 0L
@@ -4202,6 +4217,68 @@ private var lastRelocPollMs = 0L
         }
     }
 
+    private fun toggleViewerMeasurement() {
+        if (!modelViewerActive) {
+            toast("请先进入 3D 模型查看")
+            return
+        }
+        viewerMeasurementMode = !viewerMeasurementMode
+        viewerMeasurePointA = null
+        viewerMeasurePointB = null
+        viewerMeasureLabel.text = if (viewerMeasurementMode) "结束" else "测量"
+        viewerMeasureButton.setBackgroundResource(
+            if (viewerMeasurementMode) R.drawable.bg_tool_active else R.drawable.bg_tool_item
+        )
+        if (viewerMeasurementMode) {
+            tvViewerStats.text = "测量模式 · 依次轻点模型上的两个位置"
+            toast("两点测量：依次轻点两个模型位置；拖动仍可旋转")
+        } else {
+            viewerBaseMesh?.let {
+                tvViewerStats.text = "${it.triangleCount} 面 · ${it.vertexCount} 顶点 · 可旋转检查"
+            }
+        }
+    }
+
+    private fun handleViewerMeasurementTap(x: Float, y: Float) {
+        if (!viewerMeasurementMode) return
+        val mesh = viewerBaseMesh ?: return
+        val picked = renderer.pickViewerVertex(
+            mesh.vertices,
+            x,
+            y,
+            34f * resources.displayMetrics.density
+        )
+        if (picked == null) {
+            toast("没有选中模型表面，请更靠近模型轮廓点击")
+            return
+        }
+        if (viewerMeasurePointA == null || viewerMeasurePointB != null) {
+            viewerMeasurePointA = picked
+            viewerMeasurePointB = null
+            tvViewerStats.text = "测量模式 · 已选第 1 点，请选择第 2 点"
+            return
+        }
+
+        viewerMeasurePointB = picked
+        val a = viewerMeasurePointA ?: return
+        val dx = picked[0] - a[0]
+        val dy = picked[1] - a[1]
+        val dz = picked[2] - a[2]
+        val d = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+
+        val text = if (metricLabel() == "米制") {
+            when {
+                d < 0.01f -> "距离：%.1f mm".format(d * 1000f)
+                d < 1f -> "距离：%.2f cm".format(d * 100f)
+                else -> "距离：%.3f m".format(d)
+            }
+        } else {
+            "距离：%.4f 模型单位（尺度未校准，仅供相对比较）".format(d)
+        }
+        tvViewerStats.text = text
+        toast(text)
+    }
+
     private fun setViewerPresentation(style: Int) {
         if (!modelViewerActive) return
         if (style == PointCloudRenderer.VIEWER_STYLE_SURFACE && multiSegmentMergedActive) {
@@ -4317,6 +4394,14 @@ private var lastRelocPollMs = 0L
         renderer.setViewerBoundaryEdges(null)
         viewerBaseMesh = null
         viewerSurfaceVertices = null
+        viewerMeasurementMode = false
+        viewerMeasurePointA = null
+        viewerMeasurePointB = null
+        if (::viewerMeasureLabel.isInitialized) viewerMeasureLabel.text = "测量"
+        if (::viewerMeasureButton.isInitialized) {
+            viewerMeasureButton.setBackgroundResource(R.drawable.bg_tool_item)
+        }
+        dismissViewerExitPopup()
         cancelViewerLongPress()
         viewerPanMode = false
         viewerMoved = false
@@ -4372,6 +4457,45 @@ private var lastRelocPollMs = 0L
         if (::targetWarningText.isInitialized && !visible) {
             targetWarningText.visibility = android.view.View.GONE
         }
+    }
+
+    private fun showViewerExitPopup() {
+        dismissViewerExitPopup()
+        val root = findViewById<android.view.View>(R.id.root)
+        val density = resources.displayMetrics.density
+        val button = android.widget.Button(this).apply {
+            text = "退出"
+            textSize = 12f
+            isAllCaps = false
+            setTextColor(getColor(R.color.scan_text_primary))
+            setBackgroundResource(R.drawable.bg_tool)
+            contentDescription = "退出3D模型查看"
+            setOnClickListener { exitModelViewer() }
+        }
+        viewerExitPopup = android.widget.PopupWindow(
+            button,
+            (72f * density).toInt(),
+            (48f * density).toInt(),
+            false
+        ).apply {
+            isClippingEnabled = true
+            elevation = 18f * density
+            inputMethodMode = android.widget.PopupWindow.INPUT_METHOD_NOT_NEEDED
+            setBackgroundDrawable(
+                android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT)
+            )
+            showAtLocation(
+                root,
+                android.view.Gravity.TOP or android.view.Gravity.START,
+                (16f * density).toInt(),
+                (48f * density).toInt()
+            )
+        }
+    }
+
+    private fun dismissViewerExitPopup() {
+        runCatching { viewerExitPopup?.dismiss() }
+        viewerExitPopup = null
     }
 
     /** VINS world uses +Z up: yaw must preserve height, with the center at the anchor. */
@@ -4506,6 +4630,12 @@ private var lastRelocPollMs = 0L
                     viewerLastX = event.x
                     viewerLastY = event.y
                     if (dx != 0f || dy != 0f) {
+                        val totalDx = event.x - viewerDownX
+                        val totalDy = event.y - viewerDownY
+                        val threshold = 8f * resources.displayMetrics.density
+                        if (totalDx * totalDx + totalDy * totalDy > threshold * threshold) {
+                            viewerMoved = true
+                        }
                         glView.queueEvent {
                             renderer.rotateViewer(
                                 dx * viewerRotRadPerPx,
@@ -4525,6 +4655,14 @@ private var lastRelocPollMs = 0L
 
             android.view.MotionEvent.ACTION_UP,
             android.view.MotionEvent.ACTION_CANCEL -> {
+                val wasTap =
+                    event.actionMasked == android.view.MotionEvent.ACTION_UP &&
+                        !viewerMultiTouch &&
+                        !viewerMoved &&
+                        !viewerScaleDetector.isInProgress
+                if (wasTap && viewerMeasurementMode) {
+                    handleViewerMeasurementTap(event.x, event.y)
+                }
                 viewerMultiTouch = false
                 viewerMoved = false
                 cancelViewerLongPress()
@@ -4967,6 +5105,10 @@ private var lastRelocPollMs = 0L
 // --------------------------------------------------------- V0.7 persistent AR
 
     private fun restoreLatestPersistentAr() {
+        restorePersistentArPackage(null)
+    }
+
+    private fun restorePersistentArPackage(selected: ScanPackageManager.PackageInfo?) {
         if (!ensureSystemReady()) return
         if (scanning || modelOperationBusy) {
             toast("请先停止扫描，并等待当前模型操作完成")
@@ -4988,7 +5130,7 @@ private var lastRelocPollMs = 0L
         val token = scanSessionToken
         kotlin.concurrent.thread(name = "ScanPackageRestore", isDaemon = true) {
             val result = try {
-                val info = ScanPackageManager.latest(applicationContext)
+                val info = selected ?: ScanPackageManager.latest(applicationContext)
                 if (info == null) {
                     ScanPackageManager.Result(false, "没有可恢复的完整扫描包")
                 } else {
@@ -5500,6 +5642,19 @@ private var lastRelocPollMs = 0L
                     kotlin.math.ln(1.0 + 6000.0)
                 ).toFloat().coerceIn(0f, 1f)
             val stableRatio = if (confirmed > 0f) (stable / confirmed).coerceIn(0f, 1f) else 0f
+            val features = scanUiMetrics[NativeBridge.SCAN_UI_FEATURES].coerceAtLeast(0f)
+            adaptiveScanAdvice = adaptiveScanAdvisor.evaluate(
+                com.mobilescan3d.scan.adaptive.AdaptiveScanAdvisor.Input(
+                    active = scanning,
+                    targetSelected = objectLockEnabled && targetConfidence >= 0.30f,
+                    targetConfidence = targetConfidence,
+                    sharpness = sharpness,
+                    exposure = exposure,
+                    featureCount = features,
+                    stableRatio = stableRatio,
+                    nowMs = android.os.SystemClock.elapsedRealtime()
+                )
+            ).text
             val imageQuality = (sharpness * 0.58f + exposure * 0.42f).coerceIn(0f, 1f)
             lastGeometryQualityPercent = (
                 (stableRatio * 0.72f + pointScore * 0.28f) * 100f
@@ -5633,11 +5788,19 @@ private var lastRelocPollMs = 0L
             reticleWarning
         )
 
+        val consumerGuidance = when {
+            guidance.contains("模糊") ||
+                guidance.contains("曝光") ||
+                guidance.contains("放慢") ||
+                guidance.contains("跟踪") -> guidance
+            adaptiveScanAdvice.isNotBlank() -> adaptiveScanAdvice
+            else -> guidance
+        }
         updateStandardScanGuidance(
             vinsOk = vinsOk,
             vinsEverInitialized = everInit,
             distanceMeters = distance,
-            nativeGuidance = guidance
+            nativeGuidance = consumerGuidance
         )
     }
 
@@ -6757,6 +6920,44 @@ private var lastRelocPollMs = 0L
         updateHeader()
     }
 
+    private fun showProjectLibrary() {
+        if (!::exportManager.isInitialized) return
+        com.mobilescan3d.ui.library.ProjectLibraryDialog.show(
+            activity = this,
+            exportDir = exportManager.dir,
+            callbacks = com.mobilescan3d.ui.library.ProjectLibraryDialog.Callbacks(
+                restorePackage = { restorePersistentArPackage(it) },
+                restoreRecovery = { restoreRecoveryCheckpoint(it) },
+                shareFile = { shareModelFile(it) }
+            )
+        )
+    }
+
+    private fun shareModelFile(file: java.io.File) {
+        if (!file.isFile || file.length() <= 0L) {
+            toast("模型文件不存在")
+            return
+        }
+        try {
+            val uri = FileProvider.getUriForFile(this, "${packageName}.files", file)
+            val mime = when (file.extension.lowercase()) {
+                "glb" -> "model/gltf-binary"
+                "obj" -> "text/plain"
+                "ply" -> "application/octet-stream"
+                else -> "application/octet-stream"
+            }
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = mime
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, file.name)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, "分享模型"))
+        } catch (t: Throwable) {
+            toast("无法分享模型：${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
     /** Less-used controls stay reachable without permanently covering the object. */
     private fun showSettingsMenu() {
         android.widget.PopupMenu(this, findViewById(R.id.btnSettings)!!).apply {
@@ -6767,7 +6968,8 @@ private var lastRelocPollMs = 0L
             menu.add(0, 5, 4, "扫描距离与补光")
             menu.add(0, 6, 5, "扫描状态详情")
             menu.add(0, 7, 6, "扫描检查")
-            menu.add(0, 8, 7, "导出 / 模型处理")
+            menu.add(0, 15, 7, "我的模型")
+            menu.add(0, 8, 8, "导出 / 模型处理")
             val advanced = menu.addSubMenu("高级与帮助")
             advanced.add(0, 9, 0, "相机参数")
             advanced.add(0, 10, 1, "设备标定中心")
@@ -6783,6 +6985,7 @@ private var lastRelocPollMs = 0L
                     5 -> showScanSettings()
                     6 -> showScanDetails()
                     7 -> if (scanning || scanPaused) enterScanReview() else toggleModelViewer()
+                    15 -> showProjectLibrary()
                     8 -> showExportDrawer()
                     9 -> showCameraParams()
                     10 -> showCalibrationCenter()
@@ -6951,6 +7154,30 @@ private var lastRelocPollMs = 0L
         }
     }
 
+    private fun exportCurrentObj() {
+        if (!::exportManager.isInitialized) return
+        if (scanning || modelOperationBusy || segmentMergeBusy) {
+            toast("请先停止扫描，并等待当前模型操作完成")
+            return
+        }
+        modelOperationBusy = true
+        toast("正在导出 OBJ…")
+        exportManager.exportCurrentMeshObjAsync(sessionId.ifBlank { "scan" }) { result ->
+            modelOperationBusy = false
+            if (isDestroyed) return@exportCurrentMeshObjAsync
+            if (result.ok) {
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("OBJ 导出完成")
+                    .setMessage("${result.file.name}\n${result.fileBytes / 1024} KB · ${result.triangles} 面")
+                    .setNegativeButton("关闭", null)
+                    .setPositiveButton("分享") { _, _ -> shareModelFile(result.file) }
+                    .show()
+            } else {
+                toast(result.message)
+            }
+        }
+    }
+
     private fun showExportDrawer() {
         if (!ensureSystemReady()) return
         android.app.AlertDialog.Builder(this)
@@ -6963,6 +7190,8 @@ private var lastRelocPollMs = 0L
                     "生成网格 + 导出 GLB（HQ）",
                     "只生成网格（AR 预览）",
                     "保存 GLB 到文件…",
+                    "导出 OBJ（当前网格）",
+                    "分享最近模型…",
                     "硬表面规整 + 照片贴图 GLB",
                     "长方体拟合 + 照片贴图 GLB（可能补面）",
                     "正方体拟合 + 照片贴图 GLB（可能补面）"
@@ -6974,9 +7203,11 @@ private var lastRelocPollMs = 0L
                     2 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_NORMAL)
                     3 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ)
                     5 -> saveLatestGlb()
-                    6 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 1)
-                    7 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 2)
-                    8 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 3)
+                    6 -> exportCurrentObj()
+                    7 -> lastModelFile?.let { shareModelFile(it) } ?: toast("还没有可分享的模型")
+                    8 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 1)
+                    9 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 2)
+                    10 -> buildMeshAndExport(sessionId, NativeBridge.MESH_QUALITY_HQ, 3)
                     else -> {
                         // 预览网格不需要每次都重建：缓存命中就直接挂上去。
                         val cached = if (::exportManager.isInitialized) exportManager.lastMesh else null

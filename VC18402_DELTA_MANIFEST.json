@@ -1,0 +1,49 @@
+{
+  "package": "MobileScan3D_vc18402_missing_features_delta",
+  "type": "source_code_overlay_delta",
+  "apply_on": {
+    "archive": "MobileScan3D_core_algo_vc18401.zip",
+    "sha256": "123d096489296a25162d63a10c9200cea098f3842e7f91f2b9c0c210930b597e",
+    "versionCode": 18401,
+    "versionName": "0.15.4-model-cleanup-camera-fix"
+  },
+  "result": {
+    "versionCode": 18402,
+    "versionName": "0.15.4-consumer-gap-fix"
+  },
+  "implemented": [
+    "3D viewer separate-window exit fallback while retaining OnePlus setZOrderOnTop fix",
+    "consumer project library for packages, GLB/OBJ exports and unfinished checkpoint",
+    "project alias rename/share/delete/restore",
+    "two-point model measurement with scale honesty",
+    "OBJ export from current/optimized mesh",
+    "Android FileProvider system sharing",
+    "local adaptive low-light/overexposure/low-texture/reconstructability risk advice",
+    "consumer release checklist and third-party license gate"
+  ],
+  "reconstruction_math_changed": false,
+  "validation": {
+    "android_xml_parse": "passed",
+    "static_integration_checks": "passed",
+    "full_android_build": "not_run_in_snapshot_environment"
+  },
+  "files": [
+    "app/build.gradle.kts",
+    "app/src/main/AndroidManifest.xml",
+    "app/src/main/res/xml/share_paths.xml",
+    "app/src/main/res/layout/activity_mobile_scan.xml",
+    "app/src/main/res/drawable/ic_measure.xml",
+    "app/src/main/java/com/mobilescan3d/MainActivity.kt",
+    "app/src/main/java/com/mobilescan3d/PointCloudRenderer.kt",
+    "app/src/main/java/com/mobilescan3d/export/ExportManager.kt",
+    "app/src/main/java/com/mobilescan3d/persistence/ModelProjectLibrary.kt",
+    "app/src/main/java/com/mobilescan3d/ui/library/ProjectLibraryDialog.kt",
+    "app/src/main/java/com/mobilescan3d/scan/adaptive/AdaptiveScanAdvisor.kt",
+    "app/src/main/java/com/mobilescan3d/scan/guidance/ScanGuidanceController.kt",
+    ".gitignore",
+    "README_CONSUMER_RELEASE_ZH.md",
+    "RELEASE_CHECKLIST_CONSUMER_ZH.md",
+    "docs/compliance/THIRD_PARTY_LICENSE_AUDIT_REQUIRED_ZH.md",
+    "docs/vc184/VC18402_GAP_FIX_NOTES_ZH.md"
+  ]
+}

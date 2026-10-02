@@ -157,6 +157,17 @@ class ScanGuidanceController {
             )
         }
 
+        if (native.contains("纹理较少") ||
+            native.contains("表面可重建性") ||
+            native.contains("光线不足") ||
+            native.contains("过曝明显")) {
+            return ScanGuidanceOutput(
+                GuidanceStage.MOTION_WARNING, stepLabel, native,
+                GuidanceSeverity.WARNING, candidate, orbitDirection,
+                GuidanceVertical.NONE, completion
+            )
+        }
+
         // High angular motion while the camera position remains in the same orbit
         // sector is a practical sign of "turning the phone" instead of walking around
         // the object. The user-facing copy explicitly corrects that common mistake.

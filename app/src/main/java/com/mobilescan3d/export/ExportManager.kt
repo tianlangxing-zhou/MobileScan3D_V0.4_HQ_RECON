@@ -49,6 +49,15 @@ class ExportManager(context: Context) {
         val triangleCount: Int get() = indexCount / 3
     }
 
+    data class ObjResult(
+        val ok: Boolean,
+        val file: File,
+        val vertices: Int,
+        val triangles: Int,
+        val fileBytes: Long,
+        val message: String
+    )
+
     data class PlyResult(
         val ok: Boolean,
         val file: File,
@@ -237,6 +246,87 @@ class ExportManager(context: Context) {
         val mesh = pullMesh()
         synchronized(meshCacheLock) { lastMesh = mesh }
         return mesh
+    }
+
+    /**
+     * Export the exact current mesh to OBJ. If the user optimized the model,
+     * this does not rebuild from TSDF and discard the reviewed geometry.
+     */
+    fun exportCurrentMeshObjAsync(
+        sessionId: String,
+        onDone: (ObjResult) -> Unit
+    ) {
+        val generation = meshGeneration.get()
+        io.execute {
+            if (generation != meshGeneration.get()) return@execute
+            val safeId = sessionId.replace(Regex("[^A-Za-z0-9_-]"), "_").take(80)
+            val file = File(outputDir, "scan_${safeId}_current.obj")
+            var mesh: MeshData? = null
+            var message = ""
+            var ok = false
+            try {
+                mesh = synchronized(meshCacheLock) { lastMesh } ?: pullMesh()
+                if (mesh == null || mesh!!.triangleCount <= 0) {
+                    if (NativeBridge.nativeBuildMesh(NativeBridge.MESH_QUALITY_NORMAL)) {
+                        mesh = pullMesh()
+                    }
+                }
+                val m = mesh
+                if (m == null || m.vertexCount <= 0 || m.triangleCount <= 0) {
+                    message = "OBJ 导出失败：当前没有可用网格"
+                } else {
+                    file.bufferedWriter(Charsets.UTF_8).use { out ->
+                        out.appendLine("# MobileScan3D OBJ")
+                        out.appendLine("# scale follows current reconstruction")
+                        for (i in 0 until m.vertexCount) {
+                            val o = i * NativeBridge.MESH_VERTEX_FLOATS
+                            out.append("v ")
+                                .append(m.vertices[o].toString()).append(' ')
+                                .append(m.vertices[o + 1].toString()).append(' ')
+                                .append(m.vertices[o + 2].toString()).append('\n')
+                        }
+                        for (i in 0 until m.vertexCount) {
+                            val o = i * NativeBridge.MESH_VERTEX_FLOATS
+                            out.append("vn ")
+                                .append(m.vertices[o + 3].toString()).append(' ')
+                                .append(m.vertices[o + 4].toString()).append(' ')
+                                .append(m.vertices[o + 5].toString()).append('\n')
+                        }
+                        var t = 0
+                        while (t + 2 < m.indexCount) {
+                            val a = m.indices[t] + 1
+                            val b = m.indices[t + 1] + 1
+                            val c = m.indices[t + 2] + 1
+                            if (a in 1..m.vertexCount &&
+                                b in 1..m.vertexCount &&
+                                c in 1..m.vertexCount
+                            ) {
+                                out.append("f $a//$a $b//$b $c//$c\n")
+                            }
+                            t += 3
+                        }
+                    }
+                    ok = file.isFile && file.length() > 0L
+                    message = if (ok) "OBJ 已导出：${file.absolutePath}" else "OBJ 写入失败"
+                    if (ok) synchronized(meshCacheLock) { lastMesh = m }
+                }
+            } catch (t: Throwable) {
+                file.delete()
+                message = "OBJ 导出异常：${t.message ?: t.javaClass.simpleName}"
+            }
+            val m = mesh
+            val result = ObjResult(
+                ok = ok,
+                file = file,
+                vertices = m?.vertexCount ?: 0,
+                triangles = m?.triangleCount ?: 0,
+                fileBytes = if (ok) file.length() else 0L,
+                message = message
+            )
+            main.post {
+                if (generation == meshGeneration.get()) onDone(result)
+            }
+        }
     }
 
     fun meshOptimizationStats(): MeshOptimizationStats? {

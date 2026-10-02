@@ -239,6 +239,66 @@ class PointCloudRenderer : GLSurfaceView.Renderer {
         )
     }
 
+    /**
+     * Pick the nearest projected mesh vertex to a viewer-screen tap.
+     * Uses the same synthetic orbit camera as onDrawFrame().
+     */
+    fun pickViewerVertex(
+        vertices: FloatArray,
+        screenX: Float,
+        screenY: Float,
+        maxDistancePx: Float
+    ): FloatArray? {
+        if (vertices.size < NativeBridge.MESH_VERTEX_FLOATS || viewportW <= 0 || viewportH <= 0) {
+            return null
+        }
+        val pose = FloatArray(12)
+        computeViewerPose(pose)
+        val fx = VIEWER_FOCAL_NORM * viewportH / viewportW.coerceAtLeast(1)
+        val fy = VIEWER_FOCAL_NORM
+        val pickRadius = maxDistancePx.coerceAtLeast(8f)
+        var bestD2 = pickRadius * pickRadius
+        var bestDepth = Float.MAX_VALUE
+        var bx = 0f
+        var by = 0f
+        var bz = 0f
+        var found = false
+
+        var i = 0
+        while (i + 2 < vertices.size) {
+            val wx = vertices[i]
+            val wy = vertices[i + 1]
+            val wz = vertices[i + 2]
+            if (wx.isFinite() && wy.isFinite() && wz.isFinite()) {
+                val dx = wx - pose[9]
+                val dy = wy - pose[10]
+                val dz = wz - pose[11]
+                val cx = pose[0] * dx + pose[3] * dy + pose[6] * dz
+                val cy = pose[1] * dx + pose[4] * dy + pose[7] * dz
+                val cz = pose[2] * dx + pose[5] * dy + pose[8] * dz
+                if (cz > 0.02f) {
+                    val px = (fx * cx / cz + 0.5f) * viewportW
+                    val py = (fy * cy / cz + 0.5f) * viewportH
+                    val sx = px - screenX
+                    val sy = py - screenY
+                    val d2 = sx * sx + sy * sy
+                    if (d2 < bestD2 ||
+                        (kotlin.math.abs(d2 - bestD2) < 1f && cz < bestDepth)
+                    ) {
+                        bestD2 = d2
+                        bestDepth = cz
+                        bx = wx
+                        by = wy
+                        bz = wz
+                        found = true
+                    }
+                }
+            }
+            i += NativeBridge.MESH_VERTEX_FLOATS
+        }
+        return if (found) floatArrayOf(bx, by, bz) else null
+    }
+
     fun setTexturedMesh(
         vertices8: FloatArray?,
         indices: IntArray?,
