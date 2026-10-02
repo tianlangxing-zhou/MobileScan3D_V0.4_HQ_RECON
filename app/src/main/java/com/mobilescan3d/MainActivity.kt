@@ -1233,19 +1233,21 @@ private var lastRelocPollMs = 0L
                     // requestRender() 本身线程安全，这里是相机线程。
                     if (!previewFrameSeen) {
                         previewFrameSeen = true
-                        // Make the camera visible before exposing the independent GL Surface.
-                        // Keep this on the UI thread: changing SurfaceView visibility from the
-                        // CameraCapture handler can race SurfaceFlinger during permission return.
+                        android.util.Log.i("CameraPreview", "first frame received; GL overlay enabled")
+                    }
+                    // 实时 3D 叠加层（点云/AR）由 glView 承载，首帧前隐藏以规避 OnePlus
+                    // 权限返回时的黑屏。但一次性门控 + post 内 resumed/isAvailable 条件在
+                    // 「首次授权」时序下可能失败，使 glView 永久停留 INVISIBLE、实时点云
+                    // 永远不显示。改为每帧纠正：只要相机在出帧且 glView 尚不可见就显示它。
+                    if (::glView.isInitialized && glView.visibility != android.view.View.VISIBLE) {
                         texture.post {
-                            if (!isDestroyed && resumed && texture.isAvailable) {
+                            if (!isDestroyed && texture.isAvailable) {
                                 glView.visibility = android.view.View.VISIBLE
                                 glView.bringToFront()
                                 glView.requestRender()
-                                android.util.Log.i("CameraPreview", "first frame received; GL overlay enabled")
                             }
                         }
-                    }
-                    if (::glView.isInitialized && glView.visibility == android.view.View.VISIBLE) {
+                    } else if (::glView.isInitialized && glView.visibility == android.view.View.VISIBLE) {
                         glView.requestRender()
                     }
                     val f = stMatrixFloats
@@ -4047,6 +4049,11 @@ private var lastRelocPollMs = 0L
             tvViewerStats.text = "${mesh.triangleCount} 面 · ${mesh.vertexCount} 顶点 · 可旋转检查"
         }
         setScanOverlayVisible(false)
+        // 确保承载 3D 的 glView 可见：glView 初始 INVISIBLE、仅相机首帧后被显示；
+        // 若进入查看器前 SurfaceTexture 曾被销毁重建（切后台/权限弹窗），glView 可能
+        // 仍处于 INVISIBLE，导致 3D 模型查看器空白。这里显式置为可见。
+        glView.visibility = android.view.View.VISIBLE
+        glView.bringToFront()
         glView.requestRender()
         toast("单指旋转 · 双指缩放/平移")
     }
