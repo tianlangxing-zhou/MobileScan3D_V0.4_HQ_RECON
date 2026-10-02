@@ -16,7 +16,7 @@
         android:id="@+id/cameraPreviewContainer"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#04070B">
+        android:background="@android:color/transparent">
 
         <com.mobilescan3d.ui.ModelViewerBackdropView
             android:id="@+id/viewerBackdrop"

@@ -72,6 +72,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var sensorManager: SensorManager
     private lateinit var texture: TextureView
     private lateinit var glView: GLSurfaceView
+    // SurfaceView 的首帧合成在部分 OnePlus HAL 上会在权限 Activity 返回时留下黑色缓冲。
+    // 先让 TextureView 独占显示，收到真实预览帧后再挂载透明 GL 叠加层。
+    @Volatile private var previewFrameSeen = false
     private lateinit var renderer: PointCloudRenderer
 
     private lateinit var primaryButton: android.widget.Button
@@ -803,6 +806,11 @@ private var lastRelocPollMs = 0L
             renderer = PointCloudRenderer()
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+            // Do not place the separate GL Surface above TextureView until Camera2 has
+            // delivered at least one real SurfaceTexture frame. On some OnePlus builds,
+            // the permission Activity return recreates the GL surface first; its initial
+            // transparent buffer is composed as opaque black and hides the camera.
+            visibility = android.view.View.INVISIBLE
             // Keep the transparent GL surface above the camera preview, but below normal
             // Android controls so the 3D viewer top bar and "退出" action stay visible.
             // SurfaceView is opaque by default on some Android/HAL combinations: it then
@@ -1113,9 +1121,11 @@ private var lastRelocPollMs = 0L
                 // The permission dialog pauses/resumes the activity on several Android builds.
                 // Reassert alpha compositing after the callback so a newly-created TextureView
                 // is not covered by a stale opaque GL buffer.
-                glView.setZOrderMediaOverlay(true)
+                // Keep the GL Surface hidden until the first Camera2 frame. Toggling
+                // Z-order here races the permission Activity return on OnePlus devices.
+                previewFrameSeen = false
+                glView.visibility = android.view.View.INVISIBLE
                 texture.invalidate()
-                glView.requestRender()
                 startSystem()
             } else {
                 primaryButton.text = "启用相机"
@@ -1199,6 +1209,8 @@ private var lastRelocPollMs = 0L
             }
 
             override fun onSurfaceTextureDestroyed(st: android.graphics.SurfaceTexture): Boolean {
+                previewFrameSeen = false
+                if (::glView.isInitialized) glView.visibility = android.view.View.INVISIBLE
                 closeCamera()
                 return true
             }
@@ -1219,7 +1231,23 @@ private var lastRelocPollMs = 0L
                     // 「滞后、跳动、追着画面跑」。渲染模式仍是 RENDERMODE_WHEN_DIRTY，
                     // 只是把驱动信号从「深度帧」换成「相机帧」。
                     // requestRender() 本身线程安全，这里是相机线程。
-                    if (::glView.isInitialized) glView.requestRender()
+                    if (!previewFrameSeen) {
+                        previewFrameSeen = true
+                        // Make the camera visible before exposing the independent GL Surface.
+                        // Keep this on the UI thread: changing SurfaceView visibility from the
+                        // CameraCapture handler can race SurfaceFlinger during permission return.
+                        texture.post {
+                            if (!isDestroyed && resumed && texture.isAvailable) {
+                                glView.visibility = android.view.View.VISIBLE
+                                glView.bringToFront()
+                                glView.requestRender()
+                                android.util.Log.i("CameraPreview", "first frame received; GL overlay enabled")
+                            }
+                        }
+                    }
+                    if (::glView.isInitialized && glView.visibility == android.view.View.VISIBLE) {
+                        glView.requestRender()
+                    }
                     val f = stMatrixFloats
                     // TextureView uses top-left UV; SurfaceTexture expects bottom-left GL UV.
                     // Both touch selection and AR projection consume this corrected affine.
