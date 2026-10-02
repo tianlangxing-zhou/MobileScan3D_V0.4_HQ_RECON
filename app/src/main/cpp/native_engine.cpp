@@ -112,6 +112,28 @@ static constexpr int MESH_VERTEX_FLOATS = 9;
 // 的嵌套；而烘焙路径若反向取锁就是死锁。共用一把锁的代价可以忽略 ——
 // 纹理状态只在会话开始/结束与停扫导出时变化，不在每帧路径上。
 static MeshPostProcessStats meshCleanupStats;
+
+// vc183.3 consumer model optimization. One exact geometry backup is retained so
+// the operation is reversible. TSDF stays untouched; only the current export/
+// viewer mesh is replaced after the entire cleanup pipeline succeeds.
+static Mesh gMeshOptimizationBackup;
+static bool gMeshOptimizationUndoAvailable = false;
+static bool gMeshOptimized = false;
+static int gMeshOptimizationProfile = -1;
+static int gMeshOptimizationStatus = 0; // 0 none, 1 success, 2 hard-surface skip, 3 guard reject, 4 already optimized, 5 undone
+static double gMeshOptimizationMs = 0.0;
+static MeshPostProcessStats gMeshOptimizationStats;
+
+static void resetMeshOptimizationStateUnlocked() {
+    gMeshOptimizationBackup.clear();
+    gMeshOptimizationUndoAvailable = false;
+    gMeshOptimized = false;
+    gMeshOptimizationProfile = -1;
+    gMeshOptimizationStatus = 0;
+    gMeshOptimizationMs = 0.0;
+    gMeshOptimizationStats = MeshPostProcessStats{};
+}
+
 static std::vector<TextureKeyframe> gTextureKeyframes;
 static TextureBakeStats textureBakeStats;
 static UvUnwrapStats uvUnwrapStats;
@@ -359,48 +381,25 @@ static uint64_t temporalRejects = 0;
 static constexpr uint64_t kTemporalRefMaxAgeNs = 3000000000ULL;  // 3.0 s
 static uint64_t temporalRefStale = 0;    // 因参考过旧而跳过比对的帧数
 static float lastTemporalRefAgeMs = -1.f; // 上一帧参考的年龄（诊断用）
-
 // V0.13.39 过期参考加固（重叠/错位修复 B 案）：
-// 「参考过旧 → 中性放行」是 vc162 死锁的逃生门，但放行期间帧**全权重、零比对**
-// 落盘 —— 融合一旦中断 >3s（epoch 切换/标定拒绝/取景离开），恢复后的第一批帧
-// 携带的位姿/标定与中断前可能已系统性地错开（真机实测 0.37m 硬跳变复制、
-// meanSignedDiff=-0.11），这正是「同一表面出现两份」的主通道。
-// 加固后：过期参考仍放行（死锁逃生门保留），但 (a) 全帧降权 conf×0.45，错位
-// 壳在 TSDF 里竞争不过旧表面；(b) 相对旧参考位移/转角超限的帧直接拒写，连续
-// 拒写上限 4 帧后必须放一帧锚定帧（conf×0.35）重新推动参考链，杜绝死锁复发。
 static constexpr float kTemporalStaleConfFactor = 0.45f;
-static constexpr float kTemporalStaleMaxTrans = 0.10f;   // m，相对旧参考
-static constexpr float kTemporalStaleMaxRot = 0.21f;     // rad ≈ 12°
+static constexpr float kTemporalStaleMaxTrans = 0.10f;
+static constexpr float kTemporalStaleMaxRot = 0.21f;
 static constexpr int kTemporalStaleMaxConsecRejects = 4;
-static uint64_t temporalStaleWrites = 0;        // 过期参考下降权写入的帧数
-static uint64_t temporalStaleMotionRejects = 0; // 过期参考+大位移拒写帧数
-static int temporalStaleConsecRejects = 0;      // 连续拒写计数（有界放行）
+static uint64_t temporalStaleWrites = 0;
+static uint64_t temporalStaleMotionRejects = 0;
+static int temporalStaleConsecRejects = 0;
 
-// V0.13.41（vc184 / Option A）帧到模型 ICP 位姿精修：
-// vc183 实测暴露的矛盾 —— 三道门全按「位姿重投影一致性」判据，VINS 渐变漂移
-// 让重投影残差超容差 → guard checks=20 rejected=20、fused 13/60（不重影的
-// 代价是几乎不融合：开放边 1.2~1.5 万、纹理烘焙 0 关键帧、质量分 39~48）。
-// 治法：每帧先对齐 surfel 稳定模型求刚体修正量（frame_icp.h），修正后的
-// 位姿进三道门与 TSDF/surfel 写入。修正每帧独立（不回馈 VINS、不跨帧累计）、
-// 有界（>8cm 或 >6° 放弃）、欠约束放弃（行为退回旧版）。漂移被就地抵消，
-// 重投影判据重新成立 → 门放行、几何对齐写入。
-// 模型就绪门槛：粗索引（2cm 稳定代表点）达到该数量才尝试 —— 模型没建立时
-// 没有「对齐目标」，修正无从谈起。
+// V0.13.41（vc184 / Option A）帧到模型 ICP 位姿精修。
 static constexpr size_t kIcpMinModelPoints = 2000;
-static uint64_t icpAttempts = 0;       // 进入 ICP 主流程的帧数（模型就绪+样本足）
-static uint64_t icpAppliedCount = 0;   // 修正被采纳的帧数
-static uint64_t icpRejectSamples = 0;  // 帧内有效深度样本不足
-static uint64_t icpRejectOverlap = 0;  // 与模型无重叠（新区域/模型未建立）
-static uint64_t icpRejectBound = 0;    // 修正超界（防 ICP 拉飞）
-static uint64_t icpRejectDegenerate = 0; // 刚体拟合退化（共面病态）
-static frame_icp::Diag lastIcpDiag;    // 上一帧 ICP 结果（诊断输出用）
+static uint64_t icpAttempts = 0;
+static uint64_t icpAppliedCount = 0;
+static uint64_t icpRejectSamples = 0;
+static uint64_t icpRejectOverlap = 0;
+static uint64_t icpRejectBound = 0;
+static uint64_t icpRejectDegenerate = 0;
+static frame_icp::Diag lastIcpDiag;
 
-// V0.13.39：epoch 开启/重锚会更换深度->米制映射（epochCalib）。lastFusedDepth
-// 是**旧映射域**的融合深度（见 temporalConsistencyMask 处的域一致性注释），
-// 跨域比较会把新 epoch 的每一帧都判成「全面冲突」（真机实测 ratio=0.001、
-// meanSignedDiff=-0.11m）—— 时序门控全零、融合冻住，直到参考过期 3s 后进入
-// 「中性放行」无门控窗口，跳变几何由此成批落盘。epoch 变更时把参考一并作废，
-// 下一帧以新域重新建立参考：代价只是 1 帧无比对，换来域内自洽。
 static void resetTemporalReferenceForEpochChange() {
     lastFusedDepth.clear();
     haveLastFusePose = false;
@@ -1284,9 +1283,6 @@ static void resetDepthCalibration() {
     lastTemporalRatio = 1.f;
     temporalChecks = 0;
     temporalRejects = 0;
-    temporalStaleWrites = 0;
-    temporalStaleMotionRejects = 0;
-    temporalStaleConsecRejects = 0;
     lastTemporalTested = 0;
     lastTemporalAgree = 0;
     lastTemporalDisagree = 0;
@@ -1306,10 +1302,13 @@ static void resetDepthCalibration() {
 
 static void resetMeshPipeline() {
     meshEngine = MeshEngine();
+    resetMeshOptimizationStateUnlocked();
+    meshCleanupStats = MeshPostProcessStats{};
     meshHasHardEdges = false;
     hardSurfaceStats = {};
     meshStats = MeshBuildStats{};
     meshCleanupStats = MeshPostProcessStats{};
+    resetMeshOptimizationStateUnlocked();
     gTextureKeyframes.clear();
     textureBakeStats = TextureBakeStats{};
     uvUnwrapStats = UvUnwrapStats{};
@@ -2714,7 +2713,6 @@ static void nativeOnDepthMapImpl(
                 epochBadStreak = 0;
                 ++epochIndex;
                 ++epochOpens;
-                resetTemporalReferenceForEpochChange();
             }
         } else if (epochActive && frozenEvidenceGood) {
             // Current sparse geometry supports the mapping that built this map.
@@ -2769,7 +2767,6 @@ static void nativeOnDepthMapImpl(
                 epochCatastrophicStreak = 0;
                 ++epochIndex;
                 ++epochOpens;
-                resetTemporalReferenceForEpochChange();
             }
         } else {
             // Monitor the frozen/live mapping disagreement at the SAME raw value.
@@ -2869,8 +2866,6 @@ static void nativeOnDepthMapImpl(
                         epochRefZ = zLiveAnchor;
                         epochLastDriftRel = 0.f;
                         ++epochReanchors;
-                        // 重锚换了映射域，旧参考跨域比对只会全面冲突，作废。
-                        resetTemporalReferenceForEpochChange();
                         LOGI("EpochReanchor: reanchored to live calib "
                              "scale=%.5f shift=%.4f at refRaw=%.2f "
                              "(zFrozen=%.4f zLive=%.4f) total=%llu",
@@ -2936,7 +2931,6 @@ static void nativeOnDepthMapImpl(
         // 它一涨就说明死锁修复生效；guard 三项说明重复壳护罩到底拦了多少。
         LOGI("FusionDiag depthFrames=%llu usable=%d epochActive=%d epochSusp=%d fused=%llu gated=%llu "
              "| temporal checks=%llu rejects=%llu ratio=%.3f tested=%d agree=%d stale=%llu refAgeMs=%.0f "
-             "staleW=%llu staleRej=%llu "
              "| guard refs=%lld checks=%llu rejected=%llu tested=%d ratio=%.3f",
              (unsigned long long)depthFrames, depthCalibrator.usable() ? 1 : 0,
              epochActive ? 1 : 0, epochSuspended ? 1 : 0,
@@ -2945,8 +2939,6 @@ static void nativeOnDepthMapImpl(
              static_cast<double>(lastDiagTemporalRatio), lastDiagTemporalTested,
              lastDiagTemporalAgree, (unsigned long long)temporalRefStale,
              static_cast<double>(lastTemporalRefAgeMs),
-             (unsigned long long)temporalStaleWrites,
-             (unsigned long long)temporalStaleMotionRejects,
              static_cast<long long>(fusionGuard.references()),
              (unsigned long long)fusionGuard.checks,
              (unsigned long long)fusionGuard.rejected,
@@ -3190,8 +3182,6 @@ static void nativeOnDepthMapImpl(
         float conf = confidence;
         bool temporalAccepted = true;
         bool temporalMaskValid = false;
-        // V0.13.39：过期参考帧是否因大位移被拒写（在下方 fusionDepth 选择后生效）。
-        bool staleMotionBlocked = false;
         const auto temporalK = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
         const bool sameK = temporalK.fx == lastFuseK[0] && temporalK.fy == lastFuseK[1] &&
                            temporalK.cx == lastFuseK[2] && temporalK.cy == lastFuseK[3];
@@ -3240,11 +3230,7 @@ static void nativeOnDepthMapImpl(
             lastTemporalRefAgeMs = refNewer ? static_cast<float>(refAgeNs) / 1e6f : -1.f;
             if (refNewer && !refFresh) {
                 ++temporalRefStale;
-                // V0.13.39 过期参考加固：量出当前帧相对旧参考的相机运动。
-                // 位移小 -> 帧内容大概率仍与旧几何对得上，降权放行即可；
-                // 位移/转角超限 -> 位姿或标定在断档期间系统性漂移，这种帧
-                // 全权重落盘就是「同表面两份」的来源，先拒；连续拒到上限后
-                // 放一帧弱锚定（conf×0.35）推动参考链前进，死锁不会复发。
+// 过期参考加固：大位移帧有界拒写，连续拒写后弱锚定恢复参考链。
                 float relT[3] = {effT[0] - lastFuseT[0],
                                  effT[1] - lastFuseT[1],
                                  effT[2] - lastFuseT[2]};
@@ -3268,11 +3254,10 @@ static void nativeOnDepthMapImpl(
                                          rotAngle > kTemporalStaleMaxRot;
                 if (motionLarge &&
                     temporalStaleConsecRejects < kTemporalStaleMaxConsecRejects) {
-                    staleMotionBlocked = true;
+                    temporalAccepted = false;
                     ++temporalStaleMotionRejects;
                     ++temporalStaleConsecRejects;
                 } else {
-                    // 弱锚定帧：降权写入并成为新参考，参考链由此恢复新鲜。
                     conf = std::min(conf, confidence * (motionLarge
                         ? 0.35f : kTemporalStaleConfFactor));
                     ++temporalStaleWrites;
@@ -3403,13 +3388,6 @@ static void nativeOnDepthMapImpl(
         // 整帧一致性只做「额外降权」，不再做「否决」。
         if (!temporalAccepted && fusionDepth != nullptr) {
             conf = std::min(conf, confidence * 0.35f);
-        }
-        // V0.13.39：过期参考 + 相对旧参考大位移 -> 本帧不进 dense 融合。
-        // 只挡 dense（TSDF/surfel/目标）；稀疏 stereo anchor 自带米制尺度
-        // 与残差门，不受影响。此否决有界（连续 ≤4 帧必放弱锚定帧），不会
-        // 重演 vc162 的「参考冻结 → 永拒」死锁。
-        if (staleMotionBlocked) {
-            fusionDepth = nullptr;
         }
 
         // ---- 逐像素融合权重 ----
@@ -5403,6 +5381,7 @@ static jboolean buildMeshWithShape(jint quality, jint shape) {
 
     MeshOptions opt;
     opt.quality = meshQuality;
+    resetMeshOptimizationStateUnlocked();
     meshHasHardEdges = false;
     hardSurfaceStats = {};
     const bool requestedShape = shape >= 1 && shape <= 3;
@@ -5667,6 +5646,8 @@ Java_com_mobilescan3d_NativeBridge_nativeAlignCurrentMeshToReference(
 
     {
         std::lock_guard<std::mutex> lk(gStateMutex);
+        resetMeshOptimizationStateUnlocked();
+        meshCleanupStats = MeshPostProcessStats{};
         meshEngine.replaceExportMesh(std::move(merged));
         meshStats.outVertices = meshEngine.mesh().vertexCount();
         meshStats.outTriangles = meshEngine.mesh().triangleCount();
@@ -5762,6 +5743,259 @@ static AosMesh toAosMesh(const Mesh& m) {
     }
     out.indices = m.indices;
     return out;
+}
+
+
+/** vc183.3: V0.6 AoS mesh -> core SoA Mesh after successful cleanup. */
+static Mesh fromAosMesh(const AosMesh& m) {
+    Mesh out;
+    if (m.empty()) return out;
+    const std::size_t n = m.vertices.size();
+    out.positions.resize(n * 3u);
+    out.normals.resize(n * 3u);
+    out.colors.resize(n * 3u);
+    for (std::size_t i = 0; i < n; ++i) {
+        const AosVertex& v = m.vertices[i];
+        out.positions[i*3u + 0u] = v.px;
+        out.positions[i*3u + 1u] = v.py;
+        out.positions[i*3u + 2u] = v.pz;
+        out.normals[i*3u + 0u] = v.nx;
+        out.normals[i*3u + 1u] = v.ny;
+        out.normals[i*3u + 2u] = v.nz;
+        out.colors[i*3u + 0u] = v.r;
+        out.colors[i*3u + 1u] = v.g;
+        out.colors[i*3u + 2u] = v.b;
+    }
+    out.indices = m.indices;
+    return out;
+}
+
+
+
+/**
+ * vc183.3 one-click consumer mesh optimization.
+ *
+ * profile: 0 light / 1 standard / 2 strong. UI uses STANDARD(1).
+ * The expensive processing runs on a private copy outside gStateMutex. The
+ * current model is only replaced after every stage succeeds and a safety guard
+ * confirms that cleanup did not destroy most of the object.
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeOptimizeMesh(
+        JNIEnv*, jobject, jint profile, jboolean removeSupportPlane) {
+    const auto started = std::chrono::steady_clock::now();
+    Mesh original;
+    float sourceVoxelSize = 0.004f;
+    int sourceQuality = 1;
+    bool hardEdges = false;
+    uint64_t nativeGeneration = 0;
+    uint64_t sourceBuilds = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        if (meshEngine.mesh().empty()) return JNI_FALSE;
+        if (gMeshOptimized) {
+            gMeshOptimizationStatus = 4;
+            return JNI_FALSE;
+        }
+        if (meshHasHardEdges) {
+            // A fitted cuboid/cube may intentionally use independent vertices
+            // per face; welding/component filtering would destroy its hard edges.
+            gMeshOptimizationStatus = 2;
+            return JNI_FALSE;
+        }
+        original = meshEngine.mesh();
+        sourceVoxelSize = meshStats.voxelSize > 0.f ? meshStats.voxelSize : 0.004f;
+        sourceQuality = meshQuality;
+        nativeGeneration = gNativeGeneration;
+        sourceBuilds = meshBuilds;
+    }
+
+    AosMesh cleaned = toAosMesh(original);
+    if (cleaned.empty()) return JNI_FALSE;
+
+    const int p = std::clamp(static_cast<int>(profile), 0, 2);
+    MeshPostProcessOptions opt;
+    if (p == 0) {
+        opt.weldEpsilon = std::clamp(sourceVoxelSize * 0.055f, 0.00020f, 0.00085f);
+        opt.minComponentTriangles = sourceQuality >= 2 ? 18 : 28;
+        opt.minComponentAreaRatio = 0.0015f;
+        opt.maxHoleEdges = sourceQuality >= 2 ? 48 : 36;
+        opt.maxHoleDiameterMeters = sourceQuality >= 2 ? 0.045f : 0.055f;
+        opt.maxHoleDiameterBBoxRatio = 0.085f;
+        opt.targetTriangles = sourceQuality >= 2 ? 280000 : (sourceQuality <= 0 ? 30000 : 110000);
+        opt.qemMaxPasses = 6;
+        opt.qemMaxNormalFlipDeg = 62.f;
+        opt.supportPlaneMaxRemovalRatio = 0.35f;
+    } else if (p == 2) {
+        opt.weldEpsilon = std::clamp(sourceVoxelSize * 0.10f, 0.00035f, 0.00135f);
+        opt.minComponentTriangles = sourceQuality >= 2 ? 42 : 72;
+        opt.minComponentAreaRatio = 0.0045f;
+        opt.maxHoleEdges = sourceQuality >= 2 ? 80 : 64;
+        opt.maxHoleDiameterMeters = sourceQuality >= 2 ? 0.070f : 0.085f;
+        opt.maxHoleDiameterBBoxRatio = 0.13f;
+        opt.targetTriangles = sourceQuality >= 2 ? 120000 : (sourceQuality <= 0 ? 18000 : 55000);
+        opt.qemMaxPasses = 12;
+        opt.qemMaxNormalFlipDeg = 72.f;
+        opt.supportPlaneMaxRemovalRatio = 0.50f;
+    } else {
+        opt.weldEpsilon = std::clamp(sourceVoxelSize * 0.08f, 0.00030f, 0.00120f);
+        opt.minComponentTriangles = sourceQuality >= 2 ? 24 : (sourceQuality <= 0 ? 64 : 48);
+        opt.minComponentAreaRatio = sourceQuality >= 2 ? 0.0020f : 0.0035f;
+        opt.maxHoleEdges = sourceQuality >= 2 ? 72 : 56;
+        opt.maxHoleDiameterMeters = sourceQuality >= 2 ? 0.060f : 0.075f;
+        opt.maxHoleDiameterBBoxRatio = sourceQuality >= 2 ? 0.10f : 0.12f;
+        opt.targetTriangles = sourceQuality >= 2 ? 180000 : (sourceQuality <= 0 ? 26000 : 80000);
+        opt.qemMaxPasses = 10;
+        opt.qemMaxNormalFlipDeg = sourceQuality >= 2 ? 65.f : 72.f;
+        opt.supportPlaneMaxRemovalRatio = 0.45f;
+    }
+    opt.preserveBoundary = true;
+    opt.removeSupportPlane = removeSupportPlane == JNI_TRUE;
+    opt.supportPlaneBandMeters = std::clamp(sourceVoxelSize * 2.2f, 0.0025f, 0.012f);
+
+    MeshPostProcessStats stats;
+    bool ok = false;
+    try {
+        ok = MeshPostProcessor::run(cleaned, opt, &stats);
+    } catch (const std::exception& ex) {
+        LOGI("nativeOptimizeMesh cleanup exception: %s", ex.what());
+        ok = false;
+    } catch (...) {
+        LOGI("nativeOptimizeMesh cleanup unknown exception");
+        ok = false;
+    }
+    if (!ok || cleaned.empty()) return JNI_FALSE;
+
+    const std::size_t inputTris = std::max<std::size_t>(1, original.triangleCount());
+    const std::size_t outputTris = cleaned.triangleCount();
+    // Consumer safety gate: an automatic cleanup is not allowed to replace the
+    // model if it leaves only a tiny fraction of the source geometry.
+    if (outputTris < 24u ||
+        static_cast<double>(outputTris) < static_cast<double>(inputTris) * 0.08) {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        gMeshOptimizationStatus = 3;
+        gMeshOptimizationProfile = p;
+        gMeshOptimizationStats = stats;
+        gMeshOptimizationMs = perfMsSince(started);
+        return JNI_FALSE;
+    }
+
+    Mesh optimized = fromAosMesh(cleaned);
+    if (optimized.empty()) return JNI_FALSE;
+
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        // The source mesh must still be the same one we copied. Never publish a
+        // late optimization into a rebuilt/new session mesh.
+        if (nativeGeneration != gNativeGeneration ||
+            sourceBuilds != meshBuilds ||
+            meshEngine.mesh().triangleCount() != original.triangleCount() ||
+            meshEngine.mesh().vertexCount() != original.vertexCount()) {
+            return JNI_FALSE;
+        }
+
+        gMeshOptimizationBackup = std::move(original);
+        gMeshOptimizationUndoAvailable = true;
+        meshEngine.replaceExportMesh(std::move(optimized));
+        meshStats.outVertices = meshEngine.mesh().vertexCount();
+        meshStats.outTriangles = meshEngine.mesh().triangleCount();
+        meshStats.ok = true;
+        meshStats.note += " | vc183.3 consumer optimized";
+        meshDirty = false;
+
+        gMeshOptimized = true;
+        gMeshOptimizationProfile = p;
+        gMeshOptimizationStatus = 1;
+        gMeshOptimizationMs = perfMsSince(started);
+        gMeshOptimizationStats = stats;
+        meshCleanupStats = stats;
+    }
+    {
+        // Textured AR geometry from a previous export no longer matches the
+        // optimized topology. Clear it; the next export will rebake textures.
+        std::lock_guard<std::mutex> alk(gArAssetMutex);
+        gArTexturedAsset.clear();
+    }
+
+    LOGI("nativeOptimizeMesh p=%d ok=1 verts=%zu->%zu tris=%zu->%zu "
+         "comps=%zu compTris=%zu holes=%zu plane=%d/%zu collapsed=%zu ms=%.1f",
+         p,
+         gMeshOptimizationStats.inputVertices, gMeshOptimizationStats.outputVertices,
+         gMeshOptimizationStats.inputTriangles, gMeshOptimizationStats.outputTriangles,
+         gMeshOptimizationStats.removedComponents,
+         gMeshOptimizationStats.removedComponentTriangles,
+         gMeshOptimizationStats.filledHoles,
+         gMeshOptimizationStats.supportPlaneDetected ? 1 : 0,
+         gMeshOptimizationStats.supportPlaneTrianglesRemoved,
+         gMeshOptimizationStats.qemCollapsedEdges,
+         gMeshOptimizationMs);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeUndoMeshOptimization(
+        JNIEnv*, jobject) {
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        if (!gMeshOptimizationUndoAvailable || gMeshOptimizationBackup.empty()) {
+            return JNI_FALSE;
+        }
+        meshEngine.replaceExportMesh(std::move(gMeshOptimizationBackup));
+        meshStats.outVertices = meshEngine.mesh().vertexCount();
+        meshStats.outTriangles = meshEngine.mesh().triangleCount();
+        meshStats.ok = true;
+        meshStats.note += " | vc183.3 optimization undone";
+        meshDirty = false;
+
+        gMeshOptimizationUndoAvailable = false;
+        gMeshOptimized = false;
+        gMeshOptimizationStatus = 5;
+        meshCleanupStats = MeshPostProcessStats{};
+    }
+    {
+        std::lock_guard<std::mutex> alk(gArAssetMutex);
+        gArTexturedAsset.clear();
+    }
+    return JNI_TRUE;
+}
+
+/**
+ * 18 integer slots:
+ * 0 inV, 1 inTri, 2 outV, 3 outTri, 4 weldedV,
+ * 5 removedComponents, 6 removedComponentTriangles,
+ * 7 boundaryLoops, 8 filledHoles, 9 addedHoleTriangles,
+ * 10 qemCollapsedEdges, 11 supportPlaneDetected, 12 supportPlaneRemovedTriangles,
+ * 13 profile, 14 undoAvailable, 15 optimized, 16 status, 17 elapsedMs.
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_mobilescan3d_NativeBridge_nativeGetMeshOptimizationStats(
+        JNIEnv* env, jobject, jintArray out) {
+    if (!out || env->GetArrayLength(out) < 18) return JNI_FALSE;
+    jint v[18] = {0};
+    {
+        std::lock_guard<std::mutex> lk(gStateMutex);
+        v[0] = static_cast<jint>(gMeshOptimizationStats.inputVertices);
+        v[1] = static_cast<jint>(gMeshOptimizationStats.inputTriangles);
+        v[2] = static_cast<jint>(gMeshOptimizationStats.outputVertices);
+        v[3] = static_cast<jint>(gMeshOptimizationStats.outputTriangles);
+        v[4] = static_cast<jint>(gMeshOptimizationStats.weldedVertices);
+        v[5] = static_cast<jint>(gMeshOptimizationStats.removedComponents);
+        v[6] = static_cast<jint>(gMeshOptimizationStats.removedComponentTriangles);
+        v[7] = static_cast<jint>(gMeshOptimizationStats.boundaryLoops);
+        v[8] = static_cast<jint>(gMeshOptimizationStats.filledHoles);
+        v[9] = static_cast<jint>(gMeshOptimizationStats.addedHoleTriangles);
+        v[10] = static_cast<jint>(gMeshOptimizationStats.qemCollapsedEdges);
+        v[11] = gMeshOptimizationStats.supportPlaneDetected ? 1 : 0;
+        v[12] = static_cast<jint>(gMeshOptimizationStats.supportPlaneTrianglesRemoved);
+        v[13] = gMeshOptimizationProfile;
+        v[14] = gMeshOptimizationUndoAvailable ? 1 : 0;
+        v[15] = gMeshOptimized ? 1 : 0;
+        v[16] = gMeshOptimizationStatus;
+        v[17] = static_cast<jint>(std::clamp(gMeshOptimizationMs, 0.0, 2147483000.0));
+    }
+    env->SetIntArrayRegion(out, 0, 18, v);
+    return env->ExceptionCheck() ? JNI_FALSE : JNI_TRUE;
 }
 
 /** 开始新一轮扫描时清空 HQ 关键帧登记表。 */
@@ -5862,6 +6096,8 @@ static jboolean nativeBakeTexturedGlbImpl(
     float sourceVoxelSize = 0.f;
     int sourceQuality = 1;
     bool preserveHardEdges = false;
+    bool alreadyOptimized = false;
+    MeshPostProcessStats existingOptimizationStats;
     std::vector<TextureKeyframe> keyframes;
     uint64_t bakeGeneration = 0;
     {
@@ -5873,6 +6109,8 @@ static jboolean nativeBakeTexturedGlbImpl(
         sourceVoxelSize = meshStats.voxelSize;
         sourceQuality = meshQuality;
         preserveHardEdges = meshHasHardEdges;
+        alreadyOptimized = gMeshOptimized;
+        existingOptimizationStats = gMeshOptimizationStats;
         meshCopy = toAosMesh(src);
         keyframes = gTextureKeyframes;
         bakeGeneration = gNativeGeneration;
@@ -5902,9 +6140,15 @@ static jboolean nativeBakeTexturedGlbImpl(
     // Welding/smoothing a fitted box destroys its independent face normals and may
     // remove its two-triangle components. Keep the fitted geometry exactly as built.
     if (preserveHardEdges) {
+        cleanupStats.inputVertices = cleanupStats.outputVertices = meshCopy.vertices.size();
         cleanupStats.inputTriangles = cleanupStats.outputTriangles = meshCopy.triangleCount();
-    }
-    if (!preserveHardEdges && !MeshPostProcessor::run(meshCopy, cleanup, &cleanupStats)) {
+    } else if (alreadyOptimized) {
+        // vc183.3: do not run QEM/component filtering a second time during export.
+        // The viewer mesh is already the reviewed optimized asset.
+        cleanupStats = existingOptimizationStats;
+        cleanupStats.inputVertices = cleanupStats.outputVertices = meshCopy.vertices.size();
+        cleanupStats.inputTriangles = cleanupStats.outputTriangles = meshCopy.triangleCount();
+    } else if (!MeshPostProcessor::run(meshCopy, cleanup, &cleanupStats)) {
         LOGI("nativeBakeTexturedGlb FAILED: mesh cleanup");
         return JNI_FALSE;
     }

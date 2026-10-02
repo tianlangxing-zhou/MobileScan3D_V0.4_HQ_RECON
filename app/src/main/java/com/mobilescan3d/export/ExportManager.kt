@@ -70,6 +70,34 @@ class ExportManager(context: Context) {
         val persistenceMessage: String? = null
     )
 
+    data class MeshOptimizationStats(
+        val inputVertices: Int,
+        val inputTriangles: Int,
+        val outputVertices: Int,
+        val outputTriangles: Int,
+        val weldedVertices: Int,
+        val removedComponents: Int,
+        val removedComponentTriangles: Int,
+        val boundaryLoops: Int,
+        val filledHoles: Int,
+        val addedHoleTriangles: Int,
+        val qemCollapsedEdges: Int,
+        val supportPlaneDetected: Boolean,
+        val supportPlaneTrianglesRemoved: Int,
+        val profile: Int,
+        val undoAvailable: Boolean,
+        val optimized: Boolean,
+        val status: Int,
+        val elapsedMs: Int
+    )
+
+    data class MeshOptimizationResult(
+        val ok: Boolean,
+        val mesh: MeshData?,
+        val stats: MeshOptimizationStats?,
+        val undone: Boolean = false
+    )
+
     private val outputDir: File = context.getExternalFilesDir(null) ?: context.filesDir
     private val appContext = context.applicationContext
 
@@ -209,6 +237,86 @@ class ExportManager(context: Context) {
         val mesh = pullMesh()
         synchronized(meshCacheLock) { lastMesh = mesh }
         return mesh
+    }
+
+    fun meshOptimizationStats(): MeshOptimizationStats? {
+        return try {
+            val raw = IntArray(NativeBridge.MESH_OPTIMIZATION_STATS_SLOTS)
+            if (!NativeBridge.nativeGetMeshOptimizationStats(raw)) return null
+            MeshOptimizationStats(
+                inputVertices = raw[0],
+                inputTriangles = raw[1],
+                outputVertices = raw[2],
+                outputTriangles = raw[3],
+                weldedVertices = raw[4],
+                removedComponents = raw[5],
+                removedComponentTriangles = raw[6],
+                boundaryLoops = raw[7],
+                filledHoles = raw[8],
+                addedHoleTriangles = raw[9],
+                qemCollapsedEdges = raw[10],
+                supportPlaneDetected = raw[11] == 1,
+                supportPlaneTrianglesRemoved = raw[12],
+                profile = raw[13],
+                undoAvailable = raw[14] == 1,
+                optimized = raw[15] == 1,
+                status = raw[16],
+                elapsedMs = raw[17]
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "meshOptimizationStats failed", t)
+            null
+        }
+    }
+
+    fun optimizeCurrentMeshAsync(
+        profile: Int = NativeBridge.MESH_OPT_PROFILE_STANDARD,
+        removeSupportPlane: Boolean = true,
+        onDone: (MeshOptimizationResult) -> Unit
+    ) {
+        val generation = meshGeneration.get()
+        io.execute {
+            if (generation != meshGeneration.get()) return@execute
+            val ok = try {
+                NativeBridge.nativeOptimizeMesh(profile.coerceIn(0, 2), removeSupportPlane)
+            } catch (t: Throwable) {
+                Log.e(TAG, "nativeOptimizeMesh failed", t)
+                false
+            }
+            val stats = meshOptimizationStats()
+            val mesh = if (ok) pullMesh() else null
+            synchronized(meshCacheLock) {
+                if (generation == meshGeneration.get() && mesh != null) lastMesh = mesh
+            }
+            main.post {
+                if (generation == meshGeneration.get()) {
+                    onDone(MeshOptimizationResult(ok && mesh != null, mesh, stats))
+                }
+            }
+        }
+    }
+
+    fun undoMeshOptimizationAsync(onDone: (MeshOptimizationResult) -> Unit) {
+        val generation = meshGeneration.get()
+        io.execute {
+            if (generation != meshGeneration.get()) return@execute
+            val ok = try {
+                NativeBridge.nativeUndoMeshOptimization()
+            } catch (t: Throwable) {
+                Log.e(TAG, "nativeUndoMeshOptimization failed", t)
+                false
+            }
+            val stats = meshOptimizationStats()
+            val mesh = if (ok) pullMesh() else null
+            synchronized(meshCacheLock) {
+                if (generation == meshGeneration.get() && mesh != null) lastMesh = mesh
+            }
+            main.post {
+                if (generation == meshGeneration.get()) {
+                    onDone(MeshOptimizationResult(ok && mesh != null, mesh, stats, undone = ok))
+                }
+            }
+        }
     }
 
     /**
@@ -353,18 +461,33 @@ class ExportManager(context: Context) {
             try {
                 checkGeneration()
                 staging.delete()
-                lastMesh = null
                 // Never reuse an earlier bake when this export falls back to vertex color.
                 NativeBridge.nativeClearTexturedArAsset()
-                ok = NativeBridge.nativeBuildMeshWithShape(q, shapeMode)
-                checkGeneration()
-                shapeReport = if (shapeMode > 0) NativeBridge.nativeGetHardSurfaceReport() else ""
-                if (ok) {
+
+                val optimization = meshOptimizationStats()
+                val preserveOptimizedMesh =
+                    shapeMode == 0 && optimization?.optimized == true
+
+                if (preserveOptimizedMesh) {
+                    // vc183.3: exporting must not rebuild from TSDF and silently throw
+                    // away the exact geometry the user just reviewed/optimized.
                     val mesh = pullMesh()
                     lastMesh = mesh
                     verts = mesh?.vertexCount ?: 0
                     tris = mesh?.triangleCount ?: 0
                     ok = verts > 0 && tris > 0
+                } else {
+                    lastMesh = null
+                    ok = NativeBridge.nativeBuildMeshWithShape(q, shapeMode)
+                    checkGeneration()
+                    shapeReport = if (shapeMode > 0) NativeBridge.nativeGetHardSurfaceReport() else ""
+                    if (ok) {
+                        val mesh = pullMesh()
+                        lastMesh = mesh
+                        verts = mesh?.vertexCount ?: 0
+                        tris = mesh?.triangleCount ?: 0
+                        ok = verts > 0 && tris > 0
+                    }
                 }
                 if (ok) {
                     // V0.6：优先烘焙 HQ 多视角纹理，产出内嵌 JPEG atlas 的自包含

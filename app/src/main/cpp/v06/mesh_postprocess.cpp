@@ -365,6 +365,19 @@ bool MeshPostProcessor::run(
         &stats.filledHoles,
         &stats.addedHoleTriangles);
 
+    if (options.removeSupportPlane) {
+        removeSupportPlane(
+            mesh,
+            options.supportPlaneMaxTiltDeg,
+            options.supportPlaneBottomRatio,
+            options.supportPlaneMinAreaRatio,
+            options.supportPlaneCorePaddingRatio,
+            options.supportPlaneBandMeters,
+            options.supportPlaneMaxRemovalRatio,
+            &stats.supportPlaneDetected,
+            &stats.supportPlaneTrianglesRemoved);
+    }
+
     if (options.targetTriangles > 0 &&
         mesh.triangleCount() > static_cast<std::size_t>(options.targetTriangles)) {
         simplifyQem(
@@ -592,6 +605,206 @@ bool MeshPostProcessor::removeSmallComponents(
 
     if (removedComponents) *removedComponents = remComp;
     if (removedTriangles) *removedTriangles = remTri;
+    return !mesh.empty();
+}
+
+
+bool MeshPostProcessor::removeSupportPlane(
+        AosMesh& mesh,
+        float maxTiltDeg,
+        float bottomRatio,
+        float minAreaRatio,
+        float corePaddingRatio,
+        float bandMeters,
+        float maxRemovalRatio,
+        bool* detectedOut,
+        std::size_t* removedTrianglesOut) {
+    if (detectedOut) *detectedOut = false;
+    if (removedTrianglesOut) *removedTrianglesOut = 0;
+    if (mesh.empty() || mesh.vertices.size() < 8 || mesh.triangleCount() < 16) {
+        return !mesh.empty();
+    }
+
+    Vec3 bbMin{
+        std::numeric_limits<double>::max(),
+        std::numeric_limits<double>::max(),
+        std::numeric_limits<double>::max()
+    };
+    Vec3 bbMax{
+        -std::numeric_limits<double>::max(),
+        -std::numeric_limits<double>::max(),
+        -std::numeric_limits<double>::max()
+    };
+    for (const auto& v : mesh.vertices) {
+        const Vec3 p = pos(v);
+        bbMin.x = std::min(bbMin.x, p.x);
+        bbMin.y = std::min(bbMin.y, p.y);
+        bbMin.z = std::min(bbMin.z, p.z);
+        bbMax.x = std::max(bbMax.x, p.x);
+        bbMax.y = std::max(bbMax.y, p.y);
+        bbMax.z = std::max(bbMax.z, p.z);
+    }
+
+    const double dx = bbMax.x - bbMin.x;
+    const double dy = bbMax.y - bbMin.y;
+    const double dz = bbMax.z - bbMin.z;
+    if (!(dx > 1e-5) || !(dy > 1e-5) || !(dz > 1e-5)) return true;
+
+    const double maxCandidateZ =
+        bbMin.z + dz * std::clamp(static_cast<double>(bottomRatio), 0.10, 0.45);
+    const double binSize = std::max(
+        0.0015,
+        std::max(
+            static_cast<double>(bandMeters),
+            dz * 0.012));
+    const double cosTilt = std::cos(
+        std::clamp(static_cast<double>(maxTiltDeg), 5.0, 35.0) *
+        3.14159265358979323846 / 180.0);
+
+    struct PlaneBin {
+        double area = 0.0;
+        double weightedZ = 0.0;
+        std::size_t triangles = 0;
+        double minX = std::numeric_limits<double>::max();
+        double minY = std::numeric_limits<double>::max();
+        double maxX = -std::numeric_limits<double>::max();
+        double maxY = -std::numeric_limits<double>::max();
+    };
+
+    std::unordered_map<long long, PlaneBin> bins;
+    double totalArea = 0.0;
+    const std::size_t triCount = mesh.triangleCount();
+
+    auto triInfo = [&](std::size_t t, Vec3* centroid, Vec3* normal, double* area) -> bool {
+        const auto ia = mesh.indices[t*3u + 0u];
+        const auto ib = mesh.indices[t*3u + 1u];
+        const auto ic = mesh.indices[t*3u + 2u];
+        if (ia >= mesh.vertices.size() || ib >= mesh.vertices.size() || ic >= mesh.vertices.size()) {
+            return false;
+        }
+        const Vec3 a = pos(mesh.vertices[ia]);
+        const Vec3 b = pos(mesh.vertices[ib]);
+        const Vec3 c = pos(mesh.vertices[ic]);
+        const Vec3 cr = cross(b - a, c - a);
+        const double twice = norm(cr);
+        if (!(twice > 1e-14)) return false;
+        *centroid = (a + b + c) / 3.0;
+        *normal = cr / twice;
+        *area = 0.5 * twice;
+        return true;
+    };
+
+    for (std::size_t t = 0; t < triCount; ++t) {
+        Vec3 c, n;
+        double area = 0.0;
+        if (!triInfo(t, &c, &n, &area)) continue;
+        totalArea += area;
+        if (c.z > maxCandidateZ || std::abs(n.z) < cosTilt) continue;
+        const long long key = static_cast<long long>(
+            std::llround((c.z - bbMin.z) / binSize));
+        auto& bin = bins[key];
+        bin.area += area;
+        bin.weightedZ += c.z * area;
+        ++bin.triangles;
+        bin.minX = std::min(bin.minX, c.x);
+        bin.minY = std::min(bin.minY, c.y);
+        bin.maxX = std::max(bin.maxX, c.x);
+        bin.maxY = std::max(bin.maxY, c.y);
+    }
+
+    if (!(totalArea > 1e-12) || bins.empty()) return true;
+
+    const PlaneBin* best = nullptr;
+    for (const auto& kv : bins) {
+        const auto& b = kv.second;
+        if (b.triangles < 8) continue;
+        if (!best || b.area > best->area) best = &b;
+    }
+    if (!best || best->area < totalArea * std::max(0.01f, minAreaRatio)) return true;
+
+    const double planeZ = best->weightedZ / std::max(1e-12, best->area);
+    const double coreStartZ = planeZ + std::max(binSize * 2.0, dz * 0.10);
+
+    // Estimate the object's footprint from geometry safely above the support
+    // surface. A flat-bottomed cube therefore has a core footprint almost equal
+    // to its bottom and will not be mistaken for a removable table.
+    double coreMinX = std::numeric_limits<double>::max();
+    double coreMinY = std::numeric_limits<double>::max();
+    double coreMaxX = -std::numeric_limits<double>::max();
+    double coreMaxY = -std::numeric_limits<double>::max();
+    std::size_t coreVertices = 0;
+    for (const auto& v : mesh.vertices) {
+        const Vec3 p = pos(v);
+        if (p.z <= coreStartZ) continue;
+        coreMinX = std::min(coreMinX, p.x);
+        coreMinY = std::min(coreMinY, p.y);
+        coreMaxX = std::max(coreMaxX, p.x);
+        coreMaxY = std::max(coreMaxY, p.y);
+        ++coreVertices;
+    }
+    if (coreVertices < 6 || !(coreMaxX > coreMinX) || !(coreMaxY > coreMinY)) return true;
+
+    const double coreSpanX = coreMaxX - coreMinX;
+    const double coreSpanY = coreMaxY - coreMinY;
+    const double pad = std::max(dx, dy) *
+        std::clamp(static_cast<double>(corePaddingRatio), 0.01, 0.15);
+    const double safeMinX = coreMinX - pad;
+    const double safeMaxX = coreMaxX + pad;
+    const double safeMinY = coreMinY - pad;
+    const double safeMaxY = coreMaxY + pad;
+
+    const double planeSpanX = best->maxX - best->minX;
+    const double planeSpanY = best->maxY - best->minY;
+    const double extentMargin = std::max(0.003, std::max(dx, dy) * 0.025);
+    const bool extendsBeyondCore =
+        planeSpanX > coreSpanX + extentMargin ||
+        planeSpanY > coreSpanY + extentMargin;
+    if (!extendsBeyondCore) return true;
+
+    const double zTolerance = std::max(binSize * 1.6, dz * 0.018);
+    std::vector<std::uint8_t> remove(triCount, 0);
+    std::size_t removeCount = 0;
+    double removableArea = 0.0;
+
+    for (std::size_t t = 0; t < triCount; ++t) {
+        Vec3 c, n;
+        double area = 0.0;
+        if (!triInfo(t, &c, &n, &area)) continue;
+        if (std::abs(n.z) < cosTilt || std::abs(c.z - planeZ) > zTolerance) continue;
+
+        const bool outsideCore =
+            c.x < safeMinX || c.x > safeMaxX ||
+            c.y < safeMinY || c.y > safeMaxY;
+        if (!outsideCore) continue;
+
+        remove[t] = 1;
+        ++removeCount;
+        removableArea += area;
+    }
+
+    if (removeCount < 6 ||
+        removableArea < best->area * 0.16 ||
+        static_cast<double>(removeCount) >
+            static_cast<double>(triCount) *
+                std::clamp(static_cast<double>(maxRemovalRatio), 0.15, 0.60)) {
+        return true;
+    }
+
+    std::vector<std::uint32_t> newIndices;
+    newIndices.reserve(mesh.indices.size() - removeCount * 3u);
+    for (std::size_t t = 0; t < triCount; ++t) {
+        if (remove[t]) continue;
+        newIndices.push_back(mesh.indices[t*3u + 0u]);
+        newIndices.push_back(mesh.indices[t*3u + 1u]);
+        newIndices.push_back(mesh.indices[t*3u + 2u]);
+    }
+
+    mesh.indices.swap(newIndices);
+    compactMesh(mesh, 1e-12f);
+    recomputeNormals(mesh);
+
+    if (detectedOut) *detectedOut = true;
+    if (removedTrianglesOut) *removedTrianglesOut = removeCount;
     return !mesh.empty();
 }
 

@@ -274,6 +274,18 @@ object NativeBridge {
     const val MESH_CLEANUP_INDEX_QEM_COLLAPSED_EDGES = 8
     const val MESH_CLEANUP_INDEX_OUTPUT_VERTICES = 9
 
+    // vc183.3 one-click model optimization.
+    const val MESH_OPTIMIZATION_STATS_SLOTS = 18
+    const val MESH_OPT_PROFILE_LIGHT = 0
+    const val MESH_OPT_PROFILE_STANDARD = 1
+    const val MESH_OPT_PROFILE_STRONG = 2
+    const val MESH_OPT_STATUS_NONE = 0
+    const val MESH_OPT_STATUS_SUCCESS = 1
+    const val MESH_OPT_STATUS_HARD_SURFACE_SKIPPED = 2
+    const val MESH_OPT_STATUS_GUARD_REJECTED = 3
+    const val MESH_OPT_STATUS_ALREADY_OPTIMIZED = 4
+    const val MESH_OPT_STATUS_UNDONE = 5
+
     // HQ 多视角纹理烘焙统计。
     const val TEXTURE_STATS_SLOTS = 9
     const val TEXTURE_STATS_INDEX_REGISTERED_KEYFRAMES = 0
@@ -544,6 +556,11 @@ object NativeBridge {
     external fun nativeLoadTsdfCheckpoint(scenePath: String, targetPath: String): Boolean
 
     external fun nativeResetMesh()
+
+    /** vc183.3: optimize the current viewer/export mesh without changing TSDF. */
+    external fun nativeOptimizeMesh(profile: Int, removeSupportPlane: Boolean): Boolean
+    external fun nativeUndoMeshOptimization(): Boolean
+    external fun nativeGetMeshOptimizationStats(out: IntArray): Boolean
 
     /** 导出 glTF 2.0 二进制（GLB），逐顶点颜色。返回是否成功。 */
     external fun nativeExportGlb(path: String): Boolean

@@ -108,6 +108,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var viewerBackdrop: android.view.View
     private lateinit var modelViewerOverlay: android.view.View
     private lateinit var tvViewerStats: TextView
+    private lateinit var viewerOptimizeButton: android.view.View
+    private lateinit var viewerOptimizeLabel: TextView
+    @Volatile private var viewerMeshOptimized = false
     private lateinit var toolAutoLabel: TextView
     private lateinit var toolModeLabel: TextView
     private lateinit var toolLightLabel: TextView
@@ -724,7 +727,11 @@ private var lastRelocPollMs = 0L
         val density = resources.displayMetrics.density
         fun dp(value: Int) = (value * density + .5f).toInt()
 
-        texture = TextureView(this)
+        texture = TextureView(this).apply {
+            // Keep the camera buffer explicitly translucent so the sibling AR SurfaceView
+            // cannot force a black fallback buffer on the first permission-return frame.
+            setOpaque(false)
+        }
         container.addView(texture, ViewGroup.LayoutParams(-1, -1))
         targetOverlay = TargetLockOverlay(this)
         targetOverlay.isClickable = false
@@ -798,7 +805,15 @@ private var lastRelocPollMs = 0L
             renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
             // Keep the transparent GL surface above the camera preview, but below normal
             // Android controls so the 3D viewer top bar and "退出" action stay visible.
-            setZOrderMediaOverlay(true)
+            // SurfaceView is opaque by default on some Android/HAL combinations: it then
+            // paints a black rectangle over TextureView even though the GL clear alpha is 0.
+            // Explicitly opt into alpha compositing for the AR overlay before the first frame.
+            // On OnePlus 15 the media-overlay path can keep an opaque black SurfaceView
+            // buffer after the runtime permission activity returns, even while TextureView
+            // reports valid camera frames. A top translucent SurfaceView is composited
+            // correctly on this HAL and preserves the transparent AR pass.
+            setZOrderOnTop(true)
+            holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
             isClickable = false
             isFocusable = false
         }
@@ -905,6 +920,8 @@ private var lastRelocPollMs = 0L
         tvReviewSurface = findViewById(R.id.tvReviewSurface)
         tvViewerDimensions = findViewById(R.id.tvViewerDimensions)
         tvViewerTopology = findViewById(R.id.tvViewerTopology)
+        viewerOptimizeButton = findViewById(R.id.btnViewerOptimize)
+        viewerOptimizeLabel = findViewById(R.id.tvViewerOptimizeLabel)
         findViewById<android.view.View>(R.id.btnStartScan).setOnClickListener { handlePrimaryScanAction() }
         findViewById<android.view.View>(R.id.btnPauseScan).setOnClickListener { togglePauseScan() }
         reviewContinueButton.setOnClickListener { resumeFromScanReview() }
@@ -922,6 +939,7 @@ private var lastRelocPollMs = 0L
         }
         findViewById<android.view.View>(R.id.btnViewerExport).setOnClickListener { showExportDrawer() }
         findViewById<android.view.View>(R.id.btnViewerReport).setOnClickListener { showScanQualityReport() }
+        viewerOptimizeButton.setOnClickListener { toggleModelOptimization() }
         findViewById<android.view.View>(R.id.btnViewerSegment).setOnClickListener { showSegmentMergeDialog() }
         findViewById<android.view.View>(R.id.btnViewerHelp).setOnClickListener { showViewerHelp() }
         viewerModeTexture.setOnClickListener { setViewerPresentation(PointCloudRenderer.VIEWER_STYLE_TEXTURE) }
@@ -1092,6 +1110,12 @@ private var lastRelocPollMs = 0L
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 primaryButton.text = "开始扫描"
                 warningBanner.visibility = android.view.View.GONE
+                // The permission dialog pauses/resumes the activity on several Android builds.
+                // Reassert alpha compositing after the callback so a newly-created TextureView
+                // is not covered by a stale opaque GL buffer.
+                glView.setZOrderMediaOverlay(true)
+                texture.invalidate()
+                glView.requestRender()
                 startSystem()
             } else {
                 primaryButton.text = "启用相机"
@@ -3965,6 +3989,7 @@ private var lastRelocPollMs = 0L
         renderer.setMesh(mesh.vertices, mesh.indices)
         viewerBaseMesh = mesh
         viewerSurfaceVertices = null
+        syncViewerOptimizationState()
         renderer.setViewerStyle(PointCloudRenderer.VIEWER_STYLE_TEXTURE)
         renderer.setViewerBoundaryEdges(null)
         updateViewerModeUi(PointCloudRenderer.VIEWER_STYLE_TEXTURE)
@@ -3996,6 +4021,136 @@ private var lastRelocPollMs = 0L
         setScanOverlayVisible(false)
         glView.requestRender()
         toast("单指旋转 · 双指缩放/平移")
+    }
+
+    private fun syncViewerOptimizationState() {
+        val stats = if (::exportManager.isInitialized) exportManager.meshOptimizationStats() else null
+        viewerMeshOptimized = stats?.optimized == true
+        if (::viewerOptimizeLabel.isInitialized) {
+            viewerOptimizeLabel.text = if (viewerMeshOptimized) "撤销" else "优化"
+            viewerOptimizeLabel.setTextColor(
+                getColor(if (viewerMeshOptimized) R.color.scan_warning else R.color.scan_primary)
+            )
+        }
+        if (::viewerOptimizeButton.isInitialized) {
+            viewerOptimizeButton.setBackgroundResource(
+                if (viewerMeshOptimized) R.drawable.bg_tool_item else R.drawable.bg_tool_active
+            )
+            viewerOptimizeButton.contentDescription =
+                if (viewerMeshOptimized) "撤销模型优化" else "一键优化模型"
+        }
+    }
+
+    private fun toggleModelOptimization() {
+        if (!modelViewerActive || modelOperationBusy || segmentMergeBusy) {
+            toast("请先进入稳定的 3D 模型查看状态")
+            return
+        }
+        if (viewerMeshOptimized) {
+            undoModelOptimization()
+        } else {
+            runModelOptimization()
+        }
+    }
+
+    private fun runModelOptimization() {
+        val current = viewerBaseMesh ?: exportManager.lastMesh
+        if (current == null || current.triangleCount <= 0) {
+            toast("当前没有可优化的网格")
+            return
+        }
+
+        modelOperationBusy = true
+        viewerOptimizeButton.isEnabled = false
+        tvViewerStats.text = "正在优化 · 去浮点 / 去孤岛 / 去桌面 / 补小孔 / 简化…"
+
+        exportManager.optimizeCurrentMeshAsync(
+            profile = NativeBridge.MESH_OPT_PROFILE_STANDARD,
+            removeSupportPlane = true
+        ) { result ->
+            modelOperationBusy = false
+            viewerOptimizeButton.isEnabled = true
+            if (!modelViewerActive) return@optimizeCurrentMeshAsync
+
+            val stats = result.stats
+            if (!result.ok || result.mesh == null) {
+                syncViewerOptimizationState()
+                val message = when (stats?.status) {
+                    NativeBridge.MESH_OPT_STATUS_HARD_SURFACE_SKIPPED ->
+                        "当前是平面/立方体等硬表面拟合模型。自动焊接和简化可能破坏硬边，因此本次未修改模型。"
+                    NativeBridge.MESH_OPT_STATUS_GUARD_REJECTED ->
+                        "安全门判断优化结果删除了过多几何，因此已放弃结果，原模型保持不变。"
+                    NativeBridge.MESH_OPT_STATUS_ALREADY_OPTIMIZED ->
+                        "当前模型已经优化，可先点“撤销”恢复原模型。"
+                    else ->
+                        "优化未完成，原模型保持不变。"
+                }
+                tvViewerStats.text = "${current.triangleCount} 面 · 原模型未修改"
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("模型优化未应用")
+                    .setMessage(message)
+                    .setPositiveButton("关闭", null)
+                    .show()
+                return@optimizeCurrentMeshAsync
+            }
+
+            renderer.clearTexturedMesh()
+            viewerMeshOptimized = true
+            enterModelViewerWith(result.mesh)
+            viewerMeshOptimized = true
+            syncViewerOptimizationState()
+
+            val s = stats
+            if (s != null) {
+                val tableLine = if (s.supportPlaneDetected) {
+                    "去桌面/支撑平面：移除 ${s.supportPlaneTrianglesRemoved} 面"
+                } else {
+                    "去桌面/支撑平面：未检测到可安全删除的区域"
+                }
+                val reduction = if (s.inputTriangles > 0) {
+                    ((s.inputTriangles - s.outputTriangles).coerceAtLeast(0) * 100 / s.inputTriangles)
+                } else 0
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("模型优化完成")
+                    .setMessage(
+                        "三角面：${s.inputTriangles} → ${s.outputTriangles}（减少 ${reduction}%）\n" +
+                            "去孤岛：${s.removedComponents} 个 / ${s.removedComponentTriangles} 面\n" +
+                            "$tableLine\n" +
+                            "小孔修复：${s.filledHoles} 个（新增 ${s.addedHoleTriangles} 面）\n" +
+                            "网格简化：塌缩 ${s.qemCollapsedEdges} 条边\n" +
+                            "耗时：${s.elapsedMs} ms\n\n" +
+                            "原模型仍保留，可随时点右侧“撤销”。"
+                    )
+                    .setPositiveButton("完成", null)
+                    .show()
+            } else {
+                toast("模型优化完成 · 可随时撤销")
+            }
+        }
+    }
+
+    private fun undoModelOptimization() {
+        modelOperationBusy = true
+        viewerOptimizeButton.isEnabled = false
+        tvViewerStats.text = "正在恢复优化前模型…"
+        exportManager.undoMeshOptimizationAsync { result ->
+            modelOperationBusy = false
+            viewerOptimizeButton.isEnabled = true
+            if (!modelViewerActive) return@undoMeshOptimizationAsync
+
+            if (!result.ok || result.mesh == null) {
+                syncViewerOptimizationState()
+                toast("没有可恢复的优化前模型")
+                return@undoMeshOptimizationAsync
+            }
+
+            renderer.clearTexturedMesh()
+            viewerMeshOptimized = false
+            enterModelViewerWith(result.mesh)
+            viewerMeshOptimized = false
+            syncViewerOptimizationState()
+            toast("已恢复优化前的原始模型")
+        }
     }
 
     private fun setViewerPresentation(style: Int) {
@@ -6497,6 +6652,8 @@ private var lastRelocPollMs = 0L
                 multiSegmentMergedActive = true
                 viewerBaseMesh = merged
                 viewerSurfaceVertices = null
+                viewerMeshOptimized = false
+                syncViewerOptimizationState()
                 renderer.clearTexturedMesh()
                 renderer.setMesh(merged.vertices, merged.indices)
                 renderer.setViewerBoundaryEdges(null)

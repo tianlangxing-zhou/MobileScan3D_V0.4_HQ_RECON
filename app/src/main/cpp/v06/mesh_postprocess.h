@@ -24,6 +24,20 @@ struct MeshPostProcessOptions {
     float qemMaxNormalFlipDeg = 72.0f;
     bool preserveBoundary = true;
 
+    // vc183.3: conservative support/table-plane removal.
+    //
+    // VINS world +Z is physical UP. We only remove nearly-horizontal triangles
+    // near the lowest part of the model AND outside the XY footprint estimated
+    // from geometry above the support plane. This intentionally prefers leaving
+    // some table behind over deleting a real flat bottom from the object.
+    bool removeSupportPlane = false;
+    float supportPlaneMaxTiltDeg = 18.0f;
+    float supportPlaneBottomRatio = 0.30f;
+    float supportPlaneMinAreaRatio = 0.055f;
+    float supportPlaneCorePaddingRatio = 0.055f;
+    float supportPlaneBandMeters = 0.006f;
+    float supportPlaneMaxRemovalRatio = 0.45f;
+
     float minTriangleArea = 1e-10f;
 };
 
@@ -41,6 +55,9 @@ struct MeshPostProcessStats {
 
     std::size_t qemCollapsedEdges = 0;
     std::size_t qemPasses = 0;
+
+    bool supportPlaneDetected = false;
+    std::size_t supportPlaneTrianglesRemoved = 0;
 
     std::size_t outputVertices = 0;
     std::size_t outputTriangles = 0;
@@ -73,6 +90,17 @@ public:
         std::size_t* boundaryLoops = nullptr,
         std::size_t* filledHoles = nullptr,
         std::size_t* addedTriangles = nullptr);
+
+    static bool removeSupportPlane(
+        AosMesh& mesh,
+        float maxTiltDeg,
+        float bottomRatio,
+        float minAreaRatio,
+        float corePaddingRatio,
+        float bandMeters,
+        float maxRemovalRatio,
+        bool* detected = nullptr,
+        std::size_t* removedTriangles = nullptr);
 
     static bool simplifyQem(
         AosMesh& mesh,
