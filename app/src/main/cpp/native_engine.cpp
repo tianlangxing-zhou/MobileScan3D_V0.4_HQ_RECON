@@ -358,6 +358,37 @@ static uint64_t temporalRejects = 0;
 static constexpr uint64_t kTemporalRefMaxAgeNs = 3000000000ULL;  // 3.0 s
 static uint64_t temporalRefStale = 0;    // 因参考过旧而跳过比对的帧数
 static float lastTemporalRefAgeMs = -1.f; // 上一帧参考的年龄（诊断用）
+
+// V0.13.39 过期参考加固（重叠/错位修复 B 案）：
+// 「参考过旧 → 中性放行」是 vc162 死锁的逃生门，但放行期间帧**全权重、零比对**
+// 落盘 —— 融合一旦中断 >3s（epoch 切换/标定拒绝/取景离开），恢复后的第一批帧
+// 携带的位姿/标定与中断前可能已系统性地错开（真机实测 0.37m 硬跳变复制、
+// meanSignedDiff=-0.11），这正是「同一表面出现两份」的主通道。
+// 加固后：过期参考仍放行（死锁逃生门保留），但 (a) 全帧降权 conf×0.45，错位
+// 壳在 TSDF 里竞争不过旧表面；(b) 相对旧参考位移/转角超限的帧直接拒写，连续
+// 拒写上限 4 帧后必须放一帧锚定帧（conf×0.35）重新推动参考链，杜绝死锁复发。
+static constexpr float kTemporalStaleConfFactor = 0.45f;
+static constexpr float kTemporalStaleMaxTrans = 0.10f;   // m，相对旧参考
+static constexpr float kTemporalStaleMaxRot = 0.21f;     // rad ≈ 12°
+static constexpr int kTemporalStaleMaxConsecRejects = 4;
+static uint64_t temporalStaleWrites = 0;        // 过期参考下降权写入的帧数
+static uint64_t temporalStaleMotionRejects = 0; // 过期参考+大位移拒写帧数
+static int temporalStaleConsecRejects = 0;      // 连续拒写计数（有界放行）
+
+// V0.13.39：epoch 开启/重锚会更换深度->米制映射（epochCalib）。lastFusedDepth
+// 是**旧映射域**的融合深度（见 temporalConsistencyMask 处的域一致性注释），
+// 跨域比较会把新 epoch 的每一帧都判成「全面冲突」（真机实测 ratio=0.001、
+// meanSignedDiff=-0.11m）—— 时序门控全零、融合冻住，直到参考过期 3s 后进入
+// 「中性放行」无门控窗口，跳变几何由此成批落盘。epoch 变更时把参考一并作废，
+// 下一帧以新域重新建立参考：代价只是 1 帧无比对，换来域内自洽。
+static void resetTemporalReferenceForEpochChange() {
+    lastFusedDepth.clear();
+    haveLastFusePose = false;
+    lastFuseCalibrated = false;
+    lastFuseW = lastFuseH = 0;
+    lastFuseTs = 0;
+    temporalStaleConsecRejects = 0;
+}
 // FusionDiag 打在 2137 的逐帧重置**之前**的时机上，lastTemporal* 会被清零，
 // 所以另存一份「上一帧真实结果」专供诊断，否则日志里 ratio 永远是 1。
 static float lastDiagTemporalRatio = 1.f;
@@ -1225,6 +1256,9 @@ static void resetDepthCalibration() {
     lastTemporalRatio = 1.f;
     temporalChecks = 0;
     temporalRejects = 0;
+    temporalStaleWrites = 0;
+    temporalStaleMotionRejects = 0;
+    temporalStaleConsecRejects = 0;
     lastTemporalTested = 0;
     lastTemporalAgree = 0;
     lastTemporalDisagree = 0;
@@ -2648,6 +2682,7 @@ static void nativeOnDepthMapImpl(
                 epochBadStreak = 0;
                 ++epochIndex;
                 ++epochOpens;
+                resetTemporalReferenceForEpochChange();
             }
         } else if (epochActive && frozenEvidenceGood) {
             // Current sparse geometry supports the mapping that built this map.
@@ -2702,6 +2737,7 @@ static void nativeOnDepthMapImpl(
                 epochCatastrophicStreak = 0;
                 ++epochIndex;
                 ++epochOpens;
+                resetTemporalReferenceForEpochChange();
             }
         } else {
             // Monitor the frozen/live mapping disagreement at the SAME raw value.
@@ -2801,6 +2837,8 @@ static void nativeOnDepthMapImpl(
                         epochRefZ = zLiveAnchor;
                         epochLastDriftRel = 0.f;
                         ++epochReanchors;
+                        // 重锚换了映射域，旧参考跨域比对只会全面冲突，作废。
+                        resetTemporalReferenceForEpochChange();
                         LOGI("EpochReanchor: reanchored to live calib "
                              "scale=%.5f shift=%.4f at refRaw=%.2f "
                              "(zFrozen=%.4f zLive=%.4f) total=%llu",
@@ -2866,6 +2904,7 @@ static void nativeOnDepthMapImpl(
         // 它一涨就说明死锁修复生效；guard 三项说明重复壳护罩到底拦了多少。
         LOGI("FusionDiag depthFrames=%llu usable=%d epochActive=%d epochSusp=%d fused=%llu gated=%llu "
              "| temporal checks=%llu rejects=%llu ratio=%.3f tested=%d agree=%d stale=%llu refAgeMs=%.0f "
+             "staleW=%llu staleRej=%llu "
              "| guard refs=%lld checks=%llu rejected=%llu tested=%d ratio=%.3f",
              (unsigned long long)depthFrames, depthCalibrator.usable() ? 1 : 0,
              epochActive ? 1 : 0, epochSuspended ? 1 : 0,
@@ -2874,6 +2913,8 @@ static void nativeOnDepthMapImpl(
              static_cast<double>(lastDiagTemporalRatio), lastDiagTemporalTested,
              lastDiagTemporalAgree, (unsigned long long)temporalRefStale,
              static_cast<double>(lastTemporalRefAgeMs),
+             (unsigned long long)temporalStaleWrites,
+             (unsigned long long)temporalStaleMotionRejects,
              static_cast<long long>(fusionGuard.references()),
              (unsigned long long)fusionGuard.checks,
              (unsigned long long)fusionGuard.rejected,
@@ -3108,6 +3149,8 @@ static void nativeOnDepthMapImpl(
         float conf = confidence;
         bool temporalAccepted = true;
         bool temporalMaskValid = false;
+        // V0.13.39：过期参考帧是否因大位移被拒写（在下方 fusionDepth 选择后生效）。
+        bool staleMotionBlocked = false;
         const auto temporalK = depthIntrinsics(gFx, gFy, gCx, gCy, gV07InputW, gV07InputH, w, h);
         const bool sameK = temporalK.fx == lastFuseK[0] && temporalK.fy == lastFuseK[1] &&
                            temporalK.cx == lastFuseK[2] && temporalK.cy == lastFuseK[3];
@@ -3124,6 +3167,44 @@ static void nativeOnDepthMapImpl(
             lastTemporalRefAgeMs = refNewer ? static_cast<float>(refAgeNs) / 1e6f : -1.f;
             if (refNewer && !refFresh) {
                 ++temporalRefStale;
+                // V0.13.39 过期参考加固：量出当前帧相对旧参考的相机运动。
+                // 位移小 -> 帧内容大概率仍与旧几何对得上，降权放行即可；
+                // 位移/转角超限 -> 位姿或标定在断档期间系统性漂移，这种帧
+                // 全权重落盘就是「同表面两份」的来源，先拒；连续拒到上限后
+                // 放一帧弱锚定（conf×0.35）推动参考链前进，死锁不会复发。
+                float relT[3] = {match->t[0] - lastFuseT[0],
+                                 match->t[1] - lastFuseT[1],
+                                 match->t[2] - lastFuseT[2]};
+                const float transNorm = std::sqrt(relT[0] * relT[0] +
+                                                  relT[1] * relT[1] +
+                                                  relT[2] * relT[2]);
+                float relR[9];
+                for (int i = 0; i < 3; ++i) {
+                    for (int j = 0; j < 3; ++j) {
+                        float acc = 0.f;
+                        for (int k = 0; k < 3; ++k) {
+                            acc += match->R[k * 3 + i] * lastFuseR[k * 3 + j];
+                        }
+                        relR[i * 3 + j] = acc;
+                    }
+                }
+                const float cosTheta =
+                    std::clamp((relR[0] + relR[4] + relR[8] - 1.f) * 0.5f, -1.f, 1.f);
+                const float rotAngle = std::acos(cosTheta);
+                const bool motionLarge = transNorm > kTemporalStaleMaxTrans ||
+                                         rotAngle > kTemporalStaleMaxRot;
+                if (motionLarge &&
+                    temporalStaleConsecRejects < kTemporalStaleMaxConsecRejects) {
+                    staleMotionBlocked = true;
+                    ++temporalStaleMotionRejects;
+                    ++temporalStaleConsecRejects;
+                } else {
+                    // 弱锚定帧：降权写入并成为新参考，参考链由此恢复新鲜。
+                    conf = std::min(conf, confidence * (motionLarge
+                        ? 0.35f : kTemporalStaleConfFactor));
+                    ++temporalStaleWrites;
+                    temporalStaleConsecRejects = 0;
+                }
             }
         }
         if (refFresh && lastFuseCalibrated == metricDepth &&
@@ -3247,6 +3328,13 @@ static void nativeOnDepthMapImpl(
         // 整帧一致性只做「额外降权」，不再做「否决」。
         if (!temporalAccepted && fusionDepth != nullptr) {
             conf = std::min(conf, confidence * 0.35f);
+        }
+        // V0.13.39：过期参考 + 相对旧参考大位移 -> 本帧不进 dense 融合。
+        // 只挡 dense（TSDF/surfel/目标）；稀疏 stereo anchor 自带米制尺度
+        // 与残差门，不受影响。此否决有界（连续 ≤4 帧必放弱锚定帧），不会
+        // 重演 vc162 的「参考冻结 → 永拒」死锁。
+        if (staleMotionBlocked) {
+            fusionDepth = nullptr;
         }
 
         // ---- 逐像素融合权重 ----
