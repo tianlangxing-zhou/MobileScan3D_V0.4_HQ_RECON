@@ -24,5 +24,8 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- vc18520 调试入口：离线视频重放桥（视频→native 喂帧管线），不进桌面图标。 -->
+        <activity android:name=".ReplayActivity" android:screenOrientation="portrait" android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale"/>
     </application>
 </manifest>
