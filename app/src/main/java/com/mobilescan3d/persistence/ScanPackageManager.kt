@@ -5,6 +5,9 @@ import com.mobilescan3d.NativeBridge
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
 /**
  * V0.7 cross-session scan package.
@@ -28,6 +31,7 @@ object ScanPackageManager {
     private const val MODEL = "model.glb"
     private const val AR_ASSET = "ar_asset.msar"
     private const val VINS_MAP = "vins_map.vmap"
+    private const val MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1_500L * 1024L * 1024L
 
     data class PackageInfo(
         val sessionId: String,
@@ -42,6 +46,12 @@ object ScanPackageManager {
     data class Result(
         val ok: Boolean,
         val message: String,
+        val packageInfo: PackageInfo? = null
+    )
+    data class ArchiveResult(
+        val ok: Boolean,
+        val message: String,
+        val file: File? = null,
         val packageInfo: PackageInfo? = null
     )
 
@@ -313,6 +323,157 @@ object ScanPackageManager {
                 false,
                 "恢复失败：${t.message ?: t.javaClass.simpleName}"
             )
+        }
+    }
+
+    @Synchronized
+    fun exportArchive(
+        context: Context,
+        packageInfo: PackageInfo,
+        outputDir: File
+    ): ArchiveResult {
+        val verified = readPackage(packageInfo.dir)
+            ?: return ArchiveResult(false, "扫描包损坏或校验失败")
+        if (!outputDir.exists() && !outputDir.mkdirs()) {
+            return ArchiveResult(false, "无法创建工程包导出目录")
+        }
+
+        val safe = verified.sessionId
+            .replace(Regex("[^A-Za-z0-9_-]"), "_")
+            .take(72)
+        val out = File(outputDir, "MobileScan3D_${safe}.ms3d.zip")
+        val pending = File(outputDir, out.name + ".pending")
+        pending.delete()
+
+        return try {
+            ZipOutputStream(pending.outputStream().buffered()).use { zip ->
+                fun add(file: File, name: String) {
+                    zip.putNextEntry(ZipEntry(name))
+                    file.inputStream().buffered().use { it.copyTo(zip) }
+                    zip.closeEntry()
+                }
+                add(File(verified.dir, MANIFEST), MANIFEST)
+                add(verified.model, MODEL)
+                add(verified.arAsset, AR_ASSET)
+                add(verified.vinsMap, VINS_MAP)
+
+                val metadata = JSONObject()
+                    .put("archiveFormat", 1)
+                    .put("appPackage", context.packageName)
+                    .put("exportedAtMs", System.currentTimeMillis())
+                    .put("sessionId", verified.sessionId)
+                    .toString(2)
+                    .toByteArray(Charsets.UTF_8)
+                zip.putNextEntry(ZipEntry("archive_meta.json"))
+                zip.write(metadata)
+                zip.closeEntry()
+            }
+
+            if (!pending.isFile || pending.length() <= 0L ||
+                (out.exists() && !out.delete()) ||
+                !pending.renameTo(out)
+            ) {
+                pending.delete()
+                ArchiveResult(false, "工程包原子发布失败")
+            } else {
+                ArchiveResult(true, "工程包已生成：${out.name}", out, verified)
+            }
+        } catch (t: Throwable) {
+            pending.delete()
+            ArchiveResult(false, "工程包导出失败：${t.message ?: t.javaClass.simpleName}")
+        }
+    }
+
+    @Synchronized
+    fun importArchive(
+        context: Context,
+        archive: File
+    ): ArchiveResult {
+        if (!archive.isFile || archive.length() <= 0L) {
+            return ArchiveResult(false, "工程包文件不存在")
+        }
+
+        val importRoot = root(context)
+        val token = java.util.UUID.randomUUID().toString()
+        val tmp = File(importRoot, ".import_$token.tmp")
+        tmp.deleteRecursively()
+        tmp.mkdirs()
+
+        val allowed = setOf(MANIFEST, MODEL, AR_ASSET, VINS_MAP, "archive_meta.json")
+        val required = setOf(MANIFEST, MODEL, AR_ASSET, VINS_MAP)
+        val seen = HashSet<String>()
+        var totalBytes = 0L
+
+        return try {
+            ZipInputStream(archive.inputStream().buffered()).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    val name = entry.name
+                    if (entry.isDirectory) {
+                        zip.closeEntry()
+                        continue
+                    }
+                    if (name !in allowed || "/" in name || "\\" in name || name.startsWith(".")) {
+                        tmp.deleteRecursively()
+                        return ArchiveResult(false, "工程包包含不支持的文件：$name")
+                    }
+                    if (!seen.add(name)) {
+                        tmp.deleteRecursively()
+                        return ArchiveResult(false, "工程包包含重复文件：$name")
+                    }
+
+                    val target = File(tmp, name)
+                    target.outputStream().buffered().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            val n = zip.read(buffer)
+                            if (n <= 0) break
+                            totalBytes += n
+                            if (totalBytes > MAX_ARCHIVE_UNCOMPRESSED_BYTES) {
+                                tmp.deleteRecursively()
+                                return ArchiveResult(false, "工程包解压后过大，已拒绝导入")
+                            }
+                            output.write(buffer, 0, n)
+                        }
+                    }
+                    zip.closeEntry()
+                }
+            }
+
+            if (!seen.containsAll(required)) {
+                tmp.deleteRecursively()
+                return ArchiveResult(false, "工程包缺少必要扫描资产")
+            }
+
+            val verified = readPackage(tmp)
+            if (verified == null) {
+                tmp.deleteRecursively()
+                return ArchiveResult(false, "工程包校验失败：文件损坏或哈希不匹配")
+            }
+
+            val safe = verified.sessionId
+                .replace(Regex("[^A-Za-z0-9_-]"), "_")
+                .take(72)
+            val finalDir = File(importRoot, "${safe}_import_${token.take(8)}")
+            if (finalDir.exists() || !tmp.renameTo(finalDir)) {
+                tmp.deleteRecursively()
+                return ArchiveResult(false, "工程包原子导入失败")
+            }
+
+            val published = readPackage(finalDir)
+            if (published == null) {
+                finalDir.deleteRecursively()
+                ArchiveResult(false, "导入后复核失败")
+            } else {
+                ArchiveResult(
+                    true,
+                    "工程包已导入：${published.sessionId}",
+                    packageInfo = published
+                )
+            }
+        } catch (t: Throwable) {
+            tmp.deleteRecursively()
+            ArchiveResult(false, "工程包导入失败：${t.message ?: t.javaClass.simpleName}")
         }
     }
 

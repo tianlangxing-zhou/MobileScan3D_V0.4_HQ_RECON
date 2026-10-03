@@ -43,6 +43,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private var lastModelFile: java.io.File? = null
     private var pendingModelCopy: java.io.File? = null
+    private val projectArchiveImportLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) importProjectArchiveFromUri(uri)
+        }
+
     private val saveModelLauncher = registerForActivityResult(
         ActivityResultContracts.CreateDocument("model/gltf-binary")
     ) { uri ->
@@ -77,6 +82,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     // SurfaceView 的首帧合成在部分 OnePlus HAL 上会在权限 Activity 返回时留下黑色缓冲。
     // 先让 TextureView 独占显示，收到真实预览帧后再挂载透明 GL 叠加层。
     @Volatile private var previewFrameSeen = false
+    private val cameraPreviewRecoveryPolicy =
+        com.mobilescan3d.scan.camera.CameraPreviewRecoveryPolicy()
+    private val previewWatchdogHandler = Handler(android.os.Looper.getMainLooper())
+    private val previewWatchdogRunnable = Runnable { handleCameraPreviewTimeout() }
+    @Volatile private var cameraCompatMode = false
     private lateinit var renderer: PointCloudRenderer
 
     private lateinit var primaryButton: android.widget.Button
@@ -101,6 +111,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var scanGuidanceOverlay: com.mobilescan3d.ui.guidance.ScanGuidanceOverlay
     private lateinit var tvGuidanceStep: TextView
     private val scanGuidanceController = com.mobilescan3d.scan.guidance.ScanGuidanceController()
+    private val scanMilestoneTracker =
+        com.mobilescan3d.scan.consumer.ScanMilestoneTracker()
+    private lateinit var consumerHaptics: com.mobilescan3d.ui.ConsumerHaptics
+    private lateinit var consumerOperationDialog: com.mobilescan3d.ui.ConsumerOperationDialog
     @Volatile private var guidedScanEnabled = true
     private val adaptiveScanAdvisor = com.mobilescan3d.scan.adaptive.AdaptiveScanAdvisor()
     private var adaptiveScanAdvice = ""
@@ -167,6 +181,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     // Round 3: scan-review + spatial viewpoint-coverage state.
     @Volatile private var scanReviewActive = false
     private var reviewInterrupted = false
+    private var backgroundReviewPreviewPending = false
     private val viewpointCoverage = FloatArray(14) // 12 orbit + top + bottom
     private val coveragePose = FloatArray(NativeBridge.RENDER_POSE_SLOTS)
     private val coverageAnchorWorld = FloatArray(3)
@@ -565,7 +580,6 @@ private var lastRelocPollMs = 0L
     private var lastTargetUiState = 0
     // 最近一次 PresenceGate 结论（协议槽 14）：目标是否真的还在画面里
     @Volatile private var targetPresenceValid = true
-    private var vibrator: android.os.Vibrator? = null
     private val targetAfLockEnabled = false
     private var aeLockAvailable = false
     private var awbLockAvailable = false
@@ -737,9 +751,12 @@ private var lastRelocPollMs = 0L
         autoFillLight = scanPrefs.getBoolean("auto_fill_light", false)
         scanVoxelProfile = scanPrefs.getInt("voxel_profile", 3).coerceIn(0, 3)
         guidedScanEnabled = scanPrefs.getBoolean("guided_scan_enabled", true)
+        cameraCompatMode = scanPrefs.getBoolean("camera_compat_mode", false)
 
         // —— 换皮：使用 UI 替换包提供的 XML 布局，保留全部扫描/融合/导出核心逻辑 ——
         setContentView(R.layout.activity_mobile_scan)
+        consumerHaptics = com.mobilescan3d.ui.ConsumerHaptics(this)
+        consumerOperationDialog = com.mobilescan3d.ui.ConsumerOperationDialog(this)
         val container = findViewById<android.widget.FrameLayout>(R.id.cameraPreviewContainer)
         val density = resources.displayMetrics.density
         fun dp(value: Int) = (value * density + .5f).toInt()
@@ -1059,14 +1076,6 @@ private var lastRelocPollMs = 0L
         // 累计层保持 4f：两层不仅要颜色不同，尺寸上也要能一眼分开。
         renderer.setPointSizes(4f * density, 3f * density)
 
-        // 目标离开画面时震一下。取不到（无马达 / 无权限）就静默降级，
-        // 绝不因为震动失败影响追踪。
-        vibrator = try {
-            getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator
-        } catch (_: Throwable) {
-            null
-        }
-
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestCameraAccess()
         } else {
@@ -1250,6 +1259,7 @@ private var lastRelocPollMs = 0L
                     // requestRender() 本身线程安全，这里是相机线程。
                     if (!previewFrameSeen) {
                         previewFrameSeen = true
+                        cancelCameraPreviewWatchdog(frameArrived = true)
                         android.util.Log.i("CameraPreview", "first frame received; GL overlay enabled")
                     }
                     // 实时 3D 叠加层（点云/AR）由 glView 承载，首帧前隐藏以规避 OnePlus
@@ -1328,6 +1338,80 @@ private var lastRelocPollMs = 0L
         acc?.let { sensorManager.registerListener(this, it, periodUs, 0, sensorHandler) }
     }
 
+    private fun armCameraPreviewWatchdog() {
+        previewWatchdogHandler.removeCallbacks(previewWatchdogRunnable)
+        if (!resumed || isDestroyed || modelViewerActive) return
+        previewWatchdogHandler.postDelayed(previewWatchdogRunnable, 4_500L)
+    }
+
+    private fun cancelCameraPreviewWatchdog(frameArrived: Boolean = false) {
+        previewWatchdogHandler.removeCallbacks(previewWatchdogRunnable)
+        if (frameArrived) cameraPreviewRecoveryPolicy.onFrameReceived()
+    }
+
+    private fun handleCameraPreviewTimeout() {
+        if (!resumed || isDestroyed || modelViewerActive || previewFrameSeen) return
+        when (cameraPreviewRecoveryPolicy.onPreviewTimeout(cameraCompatMode)) {
+            com.mobilescan3d.scan.camera.CameraPreviewRecoveryPolicy.Action.RETRY_CURRENT -> {
+                toast("相机预览未出帧，正在自动重试…")
+                restartCameraAfterPreviewFailure()
+            }
+            com.mobilescan3d.scan.camera.CameraPreviewRecoveryPolicy.Action.ENABLE_COMPAT_AND_RETRY -> {
+                cameraCompatMode = true
+                getSharedPreferences("scan_settings", Context.MODE_PRIVATE)
+                    .edit().putBoolean("camera_compat_mode", true).apply()
+                toast("已自动切换单主摄兼容模式并重试")
+                restartCameraAfterPreviewFailure()
+            }
+            com.mobilescan3d.scan.camera.CameraPreviewRecoveryPolicy.Action.ASK_USER -> {
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("相机预览异常")
+                    .setMessage(
+                        "相机连续没有收到可显示的预览帧。\n\n" +
+                            "当前已使用单主摄兼容模式。可以再次重试；若仍黑屏，建议完全退出应用后重新进入。"
+                    )
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("再次重试") { _, _ ->
+                        cameraPreviewRecoveryPolicy.reset()
+                        restartCameraAfterPreviewFailure()
+                    }
+                    .show()
+            }
+        }
+    }
+
+    private fun restartCameraAfterPreviewFailure() {
+        if (!resumed || isDestroyed) return
+        previewFrameSeen = false
+        if (::glView.isInitialized) glView.visibility = android.view.View.INVISIBLE
+        cameraHandler?.post {
+            closeCamera()
+            texture.postDelayed({
+                if (!isDestroyed && resumed && texture.isAvailable &&
+                    cameraDevice == null && !openingCamera
+                ) {
+                    openCamera()
+                }
+            }, 500L)
+        }
+    }
+
+    private fun setCameraCompatibilityMode(enabled: Boolean, reopen: Boolean = true) {
+        if (scanning || scanPaused) {
+            toast("请结束当前扫描后再切换相机兼容模式")
+            return
+        }
+        if (cameraCompatMode == enabled) return
+        cameraCompatMode = enabled
+        getSharedPreferences("scan_settings", Context.MODE_PRIVATE)
+            .edit().putBoolean("camera_compat_mode", enabled).apply()
+        cameraPreviewRecoveryPolicy.reset()
+        toast(if (enabled) "已开启相机兼容模式 · 仅使用主摄" else "已关闭兼容模式 · 可使用辅助摄像头")
+        if (reopen && resumed && systemInitialized && texture.isAvailable) {
+            restartCameraAfterPreviewFailure()
+        }
+    }
+
     private fun openCamera() {
         if (!resumed || isDestroyed || !systemInitialized) return
         if (cameraDevice != null) return
@@ -1340,6 +1424,8 @@ private var lastRelocPollMs = 0L
             return
         }
         openingCamera = true
+        previewFrameSeen = false
+        armCameraPreviewWatchdog()
         try {
             val id = currentCameraId
             abandonedOpen = false
@@ -1410,7 +1496,7 @@ private var lastRelocPollMs = 0L
             // V0.8: first try a real physical-camera pair. If the HAL does
             // not expose/accept it, preserve the original logical YUV path.
             multiCam?.close()
-            multiCam = MultiCameraFusionController(
+            multiCam = if (cameraCompatMode) null else MultiCameraFusionController(
                 this,
                 cameraManager,
                 id,
@@ -1420,7 +1506,7 @@ private var lastRelocPollMs = 0L
                 android.util.Log.i("MultiCamV08", msg)
                 toast(msg)
             }
-            val multiReady = multiCam?.configure(size) { image ->
+            val multiReady = !cameraCompatMode && multiCam?.configure(size) { image ->
                 processImage(image)
             } == true
             reader = if (multiReady) {
@@ -2224,7 +2310,9 @@ private var lastRelocPollMs = 0L
         if (prev == NativeBridge.TARGET_STATE_TRACKING &&
             (state == NativeBridge.TARGET_STATE_REACQUIRING ||
                 state == NativeBridge.TARGET_STATE_LOST)) {
-            vibrateOnce()
+            if (::consumerHaptics.isInitialized) {
+                consumerHaptics.emit(com.mobilescan3d.ui.ConsumerHaptics.Event.TARGET_LOST)
+            }
         }
 
         val text = when {
@@ -2293,24 +2381,6 @@ private var lastRelocPollMs = 0L
         cy < 0.20f -> "\n↑ 向上移动手机找回目标"
         cy > 0.80f -> "\n↓ 向下移动手机找回目标"
         else -> ""
-    }
-
-    private fun vibrateOnce() {
-        try {
-            val v = vibrator ?: return
-            if (!v.hasVibrator()) return
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                v.vibrate(
-                    android.os.VibrationEffect.createOneShot(
-                        100, android.os.VibrationEffect.DEFAULT_AMPLITUDE
-                    )
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                v.vibrate(100)
-            }
-        } catch (_: Throwable) {
-        }
     }
 
     private fun maybeRelockTargetFocus() {
@@ -2943,8 +3013,33 @@ private var lastRelocPollMs = 0L
      * Round 5 preflight: fail early on conditions that would make a 3D scan
      * unusable instead of letting the user discover them halfway around an object.
      */
+    private fun maybeShowFirstScanCoach(): Boolean {
+        val prefs = getSharedPreferences("scan_settings", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("first_scan_coach_seen", false)) return false
+        if (com.mobilescan3d.persistence.ScanRecoveryManager.latest(applicationContext) != null) {
+            return false
+        }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("第一次扫描 · 记住 3 件事")
+            .setMessage(
+                "1. 先开启“追踪”并选中物体，物体本身保持静止。\n\n" +
+                    "2. 手机围绕物体缓慢移动，保持镜头朝向主体；不要站在原地只转手机，也不建议用转盘代替人移动。\n\n" +
+                    "3. 完成后先看“扫描检查”，优先补红/黄弱观测区域，再生成模型。\n\n" +
+                    "反光、透明、纯色物体更难扫描；增加柔和侧光和有对比的背景通常更有效。"
+            )
+            .setNegativeButton("稍后", null)
+            .setPositiveButton("开始准备") { _, _ ->
+                prefs.edit().putBoolean("first_scan_coach_seen", true).apply()
+                runScanPreflight()
+            }
+            .show()
+        return true
+    }
+
     private fun runScanPreflight() {
         if (!ensureSystemReady()) return
+        if (maybeShowFirstScanCoach()) return
 
         if (!recoveryPromptConsumed) {
             val recovery = com.mobilescan3d.persistence.ScanRecoveryManager.latest(applicationContext)
@@ -2975,6 +3070,12 @@ private var lastRelocPollMs = 0L
         if (cameraDevice == null) {
             critical.add("相机尚未就绪")
         }
+        if (cameraDevice != null && !previewFrameSeen) {
+            critical.add("相机已打开但还没有收到预览帧；请等待画面出现或开启兼容模式")
+        }
+        if (cameraCompatMode) {
+            warnings.add("相机兼容模式已开启：仅使用主摄，优先保证稳定性")
+        }
         if (!::depthProvider.isInitialized || !depthProvider.available) {
             critical.add("深度链当前不可用")
         }
@@ -2992,6 +3093,18 @@ private var lastRelocPollMs = 0L
         when {
             freeMb < 256L -> critical.add("可用存储仅约 ${freeMb}MB，至少需要 256MB 才能开始扫描")
             freeMb < 1024L -> warnings.add("可用存储仅约 ${freeMb}MB，长时间/HQ 扫描建议至少预留 1GB")
+        }
+        val batteryManager = getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        val batteryPercent = batteryManager
+            ?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            ?: -1
+        if (batteryPercent in 0..14) {
+            warnings.add("电量仅约 ${batteryPercent}%，长时间本地重建建议先充电")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            thermalStatus >= PowerManager.THERMAL_STATUS_SEVERE
+        ) {
+            warnings.add("设备温度较高，已自动降载；建议冷却后再进行长时间/HQ 扫描")
         }
         if (guidedScanEnabled && (!objectLockEnabled || targetConfidence < 0.35f)) {
             warnings.add("标准扫描会先引导锁定主体；开始后按右侧“追踪”并点选或拖框选择物体")
@@ -3535,6 +3648,46 @@ private var lastRelocPollMs = 0L
 
     private fun finalizeFromScanReview() {
         if (!scanReviewActive || !sessionCreated) return
+        val gate = com.mobilescan3d.scan.consumer.ScanQualityGate.evaluate(
+            capture = lastScanSufficiency,
+            viewpoint = lastViewpointCoveragePercent,
+            surface = lastSurfaceCoveragePercent,
+            geometry = lastGeometryQualityPercent,
+            texture = lastTextureQualityPercent
+        )
+
+        if (!gate.shouldWarnBeforeGenerate) {
+            finalizeReviewedScanNow()
+            return
+        }
+
+        val detail = buildString {
+            append("当前质量分：").append(gate.score).append("/100\n")
+            if (gate.reasons.isNotEmpty()) {
+                append("\n主要短板：\n")
+                gate.reasons.forEach { append("• ").append(it).append('\n') }
+            }
+            append("\n现在也可以生成，但补扫后通常更容易得到完整、干净的模型。")
+        }.trim()
+
+        val builder = android.app.AlertDialog.Builder(this)
+            .setTitle(if (reviewInterrupted) "生成当前模型？" else "模型还有可改善区域")
+            .setMessage(detail)
+
+        if (!reviewInterrupted) {
+            builder
+                .setNegativeButton("仍然生成") { _, _ -> finalizeReviewedScanNow() }
+                .setPositiveButton("继续补扫") { _, _ -> resumeFromScanReview() }
+        } else {
+            builder
+                .setNegativeButton("返回检查", null)
+                .setPositiveButton("生成当前模型") { _, _ -> finalizeReviewedScanNow() }
+        }
+        builder.show()
+    }
+
+    private fun finalizeReviewedScanNow() {
+        if (!scanReviewActive || !sessionCreated) return
         reviewContinueButton.isEnabled = false
         reviewGenerateButton.isEnabled = false
         reviewDiscardButton.isEnabled = false
@@ -3582,6 +3735,7 @@ private var lastRelocPollMs = 0L
         showScanReview(false)
         lastScanSufficiency = 0
         lastViewpointCoveragePercent = 0
+        scanMilestoneTracker.reset()
         viewpointCoverage.fill(0f)
         viewpointCoverageView.clearCoverage()
         recoveryRound = 0
@@ -3644,9 +3798,14 @@ private var lastRelocPollMs = 0L
     private fun buildReviewPreviewMesh() {
         if (!::exportManager.isInitialized) return
         val token = scanSessionToken
+        consumerOperationDialog.show(
+            "正在准备扫描检查",
+            "正在生成检查用网格与真实表面观测热力。"
+        )
         tvReviewTopHint.text = "正在生成检查用网格…"
         try {
             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_PREVIEW) { mesh ->
+                consumerOperationDialog.dismiss()
                 if (isDestroyed || token != scanSessionToken || !scanReviewActive) return@buildMeshAsync
                 if (mesh != null && mesh.triangleCount > 0) {
                     renderer.clearTexturedMesh()
@@ -3666,6 +3825,7 @@ private var lastRelocPollMs = 0L
                 updateReviewUi()
             }
         } catch (t: Throwable) {
+            consumerOperationDialog.dismiss()
             tvReviewTopHint.text = "预览网格生成失败，可继续补扫后重试"
         }
     }
@@ -3677,13 +3837,14 @@ private var lastRelocPollMs = 0L
         val geometry = lastGeometryQualityPercent.coerceIn(0, 100)
         val textureQ = lastTextureQualityPercent.coerceIn(0, 100)
         val surface = lastSurfaceCoveragePercent.coerceIn(0, 100)
-        val overall = (
-            capture * 0.20f +
-                viewpoint * 0.15f +
-                surface * 0.35f +
-                geometry * 0.20f +
-                textureQ * 0.10f
-            ).toInt().coerceIn(0, 100)
+        val qualityGate = com.mobilescan3d.scan.consumer.ScanQualityGate.evaluate(
+            capture = capture,
+            viewpoint = viewpoint,
+            surface = surface,
+            geometry = geometry,
+            texture = textureQ
+        )
+        val overall = qualityGate.score
 
         tvReviewScore.text = "$overall"
         tvReviewScore.setTextColor(
@@ -3695,10 +3856,10 @@ private var lastRelocPollMs = 0L
                 }
             )
         )
-        val recommendation = when {
-            overall >= 80 && viewpoint >= 70 -> "可生成"
-            overall >= 58 -> "建议补扫"
-            else -> "继续扫描"
+        val recommendation = when (qualityGate.recommendation) {
+            com.mobilescan3d.scan.consumer.ScanQualityGate.Recommendation.GENERATE -> "可生成"
+            com.mobilescan3d.scan.consumer.ScanQualityGate.Recommendation.RESCAN -> "建议补扫"
+            com.mobilescan3d.scan.consumer.ScanQualityGate.Recommendation.CONTINUE -> "继续扫描"
         }
         tvReviewRecommendation.text = recommendation
         tvReviewRecommendation.setTextColor(
@@ -3861,10 +4022,15 @@ private var lastRelocPollMs = 0L
                 return
             }
             modelOperationBusy = true
+            consumerOperationDialog.show(
+                "正在生成模型",
+                "正在导出累计分段 GLB。模型越大，处理时间可能越长。"
+            )
             toast("正在导出累计分段 GLB…")
             try {
                 exportManager.exportCurrentMeshGlbAsync(sessionId + "_segments") { r ->
                     modelOperationBusy = false
+                    consumerOperationDialog.dismiss()
                     if (isDestroyed) return@exportCurrentMeshGlbAsync
                     val mesh = exportManager.lastMesh
                     if (r.ok && mesh != null) {
@@ -3885,6 +4051,7 @@ private var lastRelocPollMs = 0L
                 }
             } catch (t: Throwable) {
                 modelOperationBusy = false
+                consumerOperationDialog.dismiss()
                 toast("累计模型导出异常：${t.javaClass.simpleName}")
             }
             return
@@ -3892,10 +4059,15 @@ private var lastRelocPollMs = 0L
 
         modelOperationBusy = true
         val label = meshQualityLabel(quality)
+        consumerOperationDialog.show(
+            "正在生成模型",
+            "正在执行网格提取、清理、简化与${if (quality == NativeBridge.MESH_QUALITY_HQ) "HQ 纹理" else "模型"}导出。"
+        )
         toast("正在重建网格（$label），请稍候…")
         try {
             exportManager.buildAndExportGlb(sessionId, quality, shape) { r ->
                 modelOperationBusy = false
+                consumerOperationDialog.dismiss()
                 if (isDestroyed || this.sessionId != sessionId) return@buildAndExportGlb
                 renderer.clearTexturedMesh()
                 val mesh = exportManager.lastMesh
@@ -3937,6 +4109,7 @@ private var lastRelocPollMs = 0L
             }
         } catch (t: Throwable) {
             modelOperationBusy = false
+            consumerOperationDialog.dismiss()
             toast("网格导出异常：${t.javaClass.simpleName}")
         }
     }
@@ -3992,11 +4165,16 @@ private var lastRelocPollMs = 0L
             toast("还没有可查看的模型，请先扫描")
             return
         }
+        consumerOperationDialog.show(
+            "正在准备 3D 模型",
+            "正在从当前融合数据提取可查看网格。"
+        )
         toast("正在生成模型，请稍候…")
         val token = scanSessionToken
         try {
             exportManager.buildMeshAsync(NativeBridge.MESH_QUALITY_NORMAL) { built ->
                 runOnUiThread {
+                    consumerOperationDialog.dismiss()
                     when {
                         isDestroyed || token != scanSessionToken -> toast("已开始新的扫描，取消查看")
                         built != null && built.triangleCount > 0 -> enterModelViewerWith(built)
@@ -4005,6 +4183,7 @@ private var lastRelocPollMs = 0L
                 }
             }
         } catch (t: Throwable) {
+            consumerOperationDialog.dismiss()
             toast("模型构建异常：${t.javaClass.simpleName}")
         }
     }
@@ -4125,6 +4304,10 @@ private var lastRelocPollMs = 0L
 
         modelOperationBusy = true
         viewerOptimizeButton.isEnabled = false
+        consumerOperationDialog.show(
+            "正在优化模型",
+            "正在去浮点/孤岛、修复小孔、保守去桌面并简化网格。"
+        )
         tvViewerStats.text = "正在优化 · 去浮点 / 去孤岛 / 去桌面 / 补小孔 / 简化…"
 
         exportManager.optimizeCurrentMeshAsync(
@@ -4132,6 +4315,7 @@ private var lastRelocPollMs = 0L
             removeSupportPlane = true
         ) { result ->
             modelOperationBusy = false
+            consumerOperationDialog.dismiss()
             viewerOptimizeButton.isEnabled = true
             if (!modelViewerActive) return@optimizeCurrentMeshAsync
 
@@ -4195,9 +4379,14 @@ private var lastRelocPollMs = 0L
     private fun undoModelOptimization() {
         modelOperationBusy = true
         viewerOptimizeButton.isEnabled = false
+        consumerOperationDialog.show(
+            "正在恢复原模型",
+            "正在恢复优化前的完整网格。"
+        )
         tvViewerStats.text = "正在恢复优化前模型…"
         exportManager.undoMeshOptimizationAsync { result ->
             modelOperationBusy = false
+            consumerOperationDialog.dismiss()
             viewerOptimizeButton.isEnabled = true
             if (!modelViewerActive) return@undoMeshOptimizationAsync
 
@@ -4432,9 +4621,12 @@ private var lastRelocPollMs = 0L
             modelViewerOverlay.visibility =
                 if (visible) android.view.View.GONE else android.view.View.VISIBLE
             if (!visible) {
-                // GLSurfaceView owns a separate Surface. Reassert the Android control layer
-                // whenever the viewer opens so its exit action cannot vanish behind GL.
                 modelViewerOverlay.bringToFront()
+                modelViewerOverlay.post {
+                    if (modelViewerActive) showViewerExitPopup()
+                }
+            } else {
+                dismissViewerExitPopup()
             }
         }
         if (::viewerBackdrop.isInitialized) {
@@ -5845,6 +6037,31 @@ private var lastRelocPollMs = 0L
 
         lastCoverageGuidance = output.primaryInstruction
 
+        if (::consumerHaptics.isInitialized) {
+            val events = scanMilestoneTracker.update(
+                active = scanning && !scanPaused,
+                stage = output.stage,
+                targetConfidence = targetConfidence,
+                coveragePercent = lastViewpointCoveragePercent
+            )
+            for (event in events) {
+                val haptic = when (event) {
+                    com.mobilescan3d.scan.consumer.ScanMilestoneTracker.Event.TARGET_LOCKED ->
+                        com.mobilescan3d.ui.ConsumerHaptics.Event.TARGET_LOCKED
+                    com.mobilescan3d.scan.consumer.ScanMilestoneTracker.Event.READY_TO_ORBIT ->
+                        com.mobilescan3d.ui.ConsumerHaptics.Event.READY_TO_ORBIT
+                    com.mobilescan3d.scan.consumer.ScanMilestoneTracker.Event.COVERAGE_25,
+                    com.mobilescan3d.scan.consumer.ScanMilestoneTracker.Event.COVERAGE_50,
+                    com.mobilescan3d.scan.consumer.ScanMilestoneTracker.Event.COVERAGE_75,
+                    com.mobilescan3d.scan.consumer.ScanMilestoneTracker.Event.COVERAGE_90 ->
+                        com.mobilescan3d.ui.ConsumerHaptics.Event.COVERAGE_MILESTONE
+                    com.mobilescan3d.scan.consumer.ScanMilestoneTracker.Event.READY_TO_BUILD ->
+                        com.mobilescan3d.ui.ConsumerHaptics.Event.READY_TO_BUILD
+                }
+                consumerHaptics.emit(haptic)
+            }
+        }
+
         if (recoveryActive && output.recoveryMode && output.recoveryRemaining == 0 && scanning && !scanPaused) {
             val now = android.os.SystemClock.elapsedRealtime()
             if (recoveryReadySinceMs == 0L) recoveryReadySinceMs = now
@@ -5971,7 +6188,9 @@ private var lastRelocPollMs = 0L
             viewpointCoverage[13] = (viewpointCoverage[13] + gain * 0.86f).coerceAtMost(1f)
         }
 
-        val sideAverage = viewpointCoverage.sliceArray(0 until 12).average().toFloat()
+        var sideSum = 0f
+        for (i in 0 until 12) sideSum += viewpointCoverage[i]
+        val sideAverage = sideSum / 12f
         val weighted = sideAverage * 0.82f +
             viewpointCoverage[12] * 0.10f +
             viewpointCoverage[13] * 0.08f
@@ -6210,16 +6429,27 @@ private var lastRelocPollMs = 0L
     }
 
     private fun showCameraRangeDialog() {
-        val items = arrayOf("自动：按深度调配辅助摄像头", "近距：优先广角辅助", "中距：优先融合几何",
-            "远距：优先长焦辅助", "切换主摄（停止扫描后，重建新会话）")
+        val items = arrayOf(
+            "自动：按深度调配辅助摄像头",
+            "近距：优先广角辅助",
+            "中距：优先融合几何",
+            "远距：优先长焦辅助",
+            "切换主摄（停止扫描后，重建新会话）",
+            "兼容模式：${if (cameraCompatMode) "已开启 · 单主摄" else "关闭"}"
+        )
         android.app.AlertDialog.Builder(this)
             .setTitle("摄像头调配 · 保持定位主摄")
             .setItems(items) { _, which ->
-                if (which == 4) { switchCamera(); return@setItems }
-                val mode = CameraRangePolicy.Mode.entries[which]
-                cameraHandler?.post {
-                    cameraRangePolicy.setMode(mode)
-                    updateCameraRange(Float.NaN, 0)
+                when (which) {
+                    4 -> switchCamera()
+                    5 -> setCameraCompatibilityMode(!cameraCompatMode)
+                    else -> {
+                        val mode = CameraRangePolicy.Mode.entries[which]
+                        cameraHandler?.post {
+                            cameraRangePolicy.setMode(mode)
+                            updateCameraRange(Float.NaN, 0)
+                        }
+                    }
                 }
             }.show()
     }
@@ -6927,6 +7157,74 @@ private var lastRelocPollMs = 0L
         updateHeader()
     }
 
+    private fun exportProjectArchive(info: com.mobilescan3d.persistence.ScanPackageManager.PackageInfo) {
+        val outputDir = java.io.File(
+            getExternalFilesDir(null) ?: filesDir,
+            "project_archives"
+        )
+        consumerOperationDialog.show(
+            "正在打包工程",
+            "正在校验模型、AR 资产与持久地图，并生成可迁移工程包。"
+        )
+        kotlin.concurrent.thread(name = "ProjectArchiveExport", isDaemon = true) {
+            val result = com.mobilescan3d.persistence.ScanPackageManager.exportArchive(
+                applicationContext,
+                info,
+                outputDir
+            )
+            runOnUiThread {
+                consumerOperationDialog.dismiss()
+                if (isDestroyed) return@runOnUiThread
+                if (result.ok && result.file != null) {
+                    shareModelFile(result.file)
+                } else {
+                    toast(result.message)
+                }
+            }
+        }
+    }
+
+    private fun importProjectArchive() {
+        projectArchiveImportLauncher.launch(
+            arrayOf("application/zip", "application/octet-stream")
+        )
+    }
+
+    private fun importProjectArchiveFromUri(uri: android.net.Uri) {
+        consumerOperationDialog.show(
+            "正在导入工程",
+            "正在复制并校验工程包；只有哈希完整的 MobileScan3D 工程才会被接受。"
+        )
+        kotlin.concurrent.thread(name = "ProjectArchiveImport", isDaemon = true) {
+            val temp = java.io.File(cacheDir, "project_import_${System.currentTimeMillis()}.zip")
+            val copyOk = try {
+                contentResolver.openInputStream(uri)?.use { input ->
+                    temp.outputStream().buffered().use { output -> input.copyTo(output) }
+                } != null && temp.length() > 0L
+            } catch (_: Throwable) {
+                false
+            }
+            val result = if (copyOk) {
+                com.mobilescan3d.persistence.ScanPackageManager.importArchive(
+                    applicationContext,
+                    temp
+                )
+            } else {
+                com.mobilescan3d.persistence.ScanPackageManager.ArchiveResult(
+                    false,
+                    "无法读取选择的工程包"
+                )
+            }
+            temp.delete()
+            runOnUiThread {
+                consumerOperationDialog.dismiss()
+                if (isDestroyed) return@runOnUiThread
+                toast(result.message)
+                if (result.ok) showProjectLibrary()
+            }
+        }
+    }
+
     private fun showProjectLibrary() {
         if (!::exportManager.isInitialized) return
         com.mobilescan3d.ui.library.ProjectLibraryDialog.show(
@@ -6935,7 +7233,9 @@ private var lastRelocPollMs = 0L
             callbacks = com.mobilescan3d.ui.library.ProjectLibraryDialog.Callbacks(
                 restorePackage = { restorePersistentArPackage(it) },
                 restoreRecovery = { restoreRecoveryCheckpoint(it) },
-                shareFile = { shareModelFile(it) }
+                shareFile = { shareModelFile(it) },
+                exportPackage = { exportProjectArchive(it) },
+                importPackage = { importProjectArchive() }
             )
         )
     }
@@ -6951,6 +7251,7 @@ private var lastRelocPollMs = 0L
                 "glb" -> "model/gltf-binary"
                 "obj" -> "text/plain"
                 "ply" -> "application/octet-stream"
+                "zip" -> "application/zip"
                 else -> "application/octet-stream"
             }
             val send = Intent(Intent.ACTION_SEND).apply {
@@ -6983,6 +7284,10 @@ private var lastRelocPollMs = 0L
             advanced.add(0, 11, 2, "扫描质量诊断")
             advanced.add(0, 12, 3, "使用帮助")
             advanced.add(0, 13, 4, this@MainActivity.getString(R.string.privacy_data_menu))
+            advanced.add(
+                0, 16, 5,
+                if (::consumerHaptics.isInitialized && consumerHaptics.isEnabled()) "触觉提示：开" else "触觉提示：关"
+            )
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     14 -> toggleGuidedScanMode()
@@ -6999,6 +7304,13 @@ private var lastRelocPollMs = 0L
                     11 -> showScanQualityReport()
                     12 -> showScanUiHelp()
                     13 -> showPrivacyAndDataInfo()
+                    16 -> {
+                        if (::consumerHaptics.isInitialized) {
+                            val enabled = !consumerHaptics.isEnabled()
+                            consumerHaptics.setEnabled(enabled)
+                            toast(if (enabled) "已开启扫描触觉提示" else "已关闭扫描触觉提示")
+                        }
+                    }
                     else -> return@setOnMenuItemClickListener false
                 }
                 true
@@ -7334,6 +7646,7 @@ private var lastRelocPollMs = 0L
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
     private fun closeCamera() {
+        cancelCameraPreviewWatchdog()
         cameraRangeSerial.incrementAndGet()
         cameraRangeSwitching = false
         rangeTimeout?.let { cameraHandler?.removeCallbacks(it) }
@@ -7363,12 +7676,42 @@ private var lastRelocPollMs = 0L
         }
     }
 
+    private fun interruptScanForBackground() {
+        if (!(scanning || scanPaused) || !sessionCreated) return
+
+        scanning = false
+        scanPaused = false
+        scanReviewActive = true
+        scanNativeReady = false
+        reviewInterrupted = true
+        backgroundReviewPreviewPending = true
+        recoveryActive = false
+        recoveryReadySinceMs = 0L
+        scanGuidanceController.clearRecoveryTargets()
+
+        synchronized(depthSessionLock) { depthGeneration++ }
+        arMeshViewing = true
+        multiCam?.updateScanState(false, sessionId, false)
+        try {
+            NativeBridge.nativeSetPersistentMapCaptureEnabled(false)
+        } catch (_: Throwable) {
+        }
+        if (::hqCapture.isInitialized) hqCapture.endScan()
+        saveRecoveryCheckpoint(force = true)
+        cameraHandler?.post { resetFillLight(); applyCaptureSettings() }
+
+        primaryButton.text = "开始扫描"
+        pauseButton.visibility = android.view.View.GONE
+        pauseButton.text = "暂停"
+    }
+
     override fun onPause() {
-        // A closed camera is a discontinuity, not a pause in a continuous VIO scan.
-        // Finalize an active scan. A review session may remain reviewable, but
-        // supplement scanning is disabled after this discontinuity.
-        if (scanning) stopScan()
-        if (scanReviewActive) {
+        // A closed camera is a discontinuity, not a pause in continuous VIO.
+        // Preserve the fused session and return to Review on resume instead of
+        // silently starting a heavy final export because of a call/Home gesture.
+        if (scanning || scanPaused) {
+            interruptScanForBackground()
+        } else if (scanReviewActive) {
             reviewInterrupted = true
             if (::reviewContinueButton.isInitialized) reviewContinueButton.isEnabled = false
         }
@@ -7392,6 +7735,10 @@ private var lastRelocPollMs = 0L
         if (scanReviewActive) {
             showScanReview(true)
             updateReviewUi()
+            if (backgroundReviewPreviewPending) {
+                backgroundReviewPreviewPending = false
+                buildReviewPreviewMesh()
+            }
         }
         if (!systemInitialized && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startSystem()
@@ -7416,6 +7763,8 @@ private var lastRelocPollMs = 0L
     }
 
     override fun onDestroy() {
+        previewWatchdogHandler.removeCallbacks(previewWatchdogRunnable)
+        if (::consumerOperationDialog.isInitialized) consumerOperationDialog.dismiss()
         started.set(false)
         scanning = false
         scanNativeReady = false

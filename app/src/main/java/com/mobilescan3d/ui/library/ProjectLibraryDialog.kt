@@ -15,7 +15,9 @@ object ProjectLibraryDialog {
     data class Callbacks(
         val restorePackage: (ScanPackageManager.PackageInfo) -> Unit,
         val restoreRecovery: (ScanRecoveryManager.Info) -> Unit,
-        val shareFile: (File) -> Unit
+        val shareFile: (File) -> Unit,
+        val exportPackage: (ScanPackageManager.PackageInfo) -> Unit,
+        val importPackage: () -> Unit
     )
 
     fun show(activity: ComponentActivity, exportDir: File, callbacks: Callbacks) {
@@ -64,6 +66,7 @@ object ProjectLibraryDialog {
         AlertDialog.Builder(activity)
             .setTitle("我的模型 · ${entries.size}")
             .setItems(labels) { _, i -> showEntry(activity, entries[i], exportDir, callbacks) }
+            .setNeutralButton("导入工程包") { _, _ -> callbacks.importPackage() }
             .setNegativeButton("关闭", null).show()
     }
 
@@ -74,7 +77,7 @@ object ProjectLibraryDialog {
         callbacks: Callbacks
     ) {
         val actions = when (entry.kind) {
-            ModelProjectLibrary.Kind.COMPLETED_PACKAGE -> arrayOf("恢复 AR", "分享模型", "重命名", "删除")
+            ModelProjectLibrary.Kind.COMPLETED_PACKAGE -> arrayOf("恢复 AR", "分享模型", "分享工程包", "重命名", "删除")
             ModelProjectLibrary.Kind.EXPORTED_MODEL -> arrayOf("分享模型", "重命名", "删除")
             ModelProjectLibrary.Kind.UNFINISHED_SCAN -> arrayOf("恢复模型", "重命名", "删除断点")
         }
@@ -85,8 +88,9 @@ object ProjectLibraryDialog {
                     ModelProjectLibrary.Kind.COMPLETED_PACKAGE -> when (which) {
                         0 -> entry.packageInfo?.let(callbacks.restorePackage)
                         1 -> entry.modelFile?.let(callbacks.shareFile)
-                        2 -> rename(activity, entry, exportDir, callbacks)
-                        3 -> confirmDelete(activity, entry, exportDir, callbacks)
+                        2 -> entry.packageInfo?.let(callbacks.exportPackage)
+                        3 -> rename(activity, entry, exportDir, callbacks)
+                        4 -> confirmDelete(activity, entry, exportDir, callbacks)
                     }
                     ModelProjectLibrary.Kind.EXPORTED_MODEL -> when (which) {
                         0 -> entry.modelFile?.let(callbacks.shareFile)
